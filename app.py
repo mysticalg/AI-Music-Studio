@@ -5,6 +5,7 @@ import json
 import math
 import os
 import struct
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -31,6 +32,84 @@ def midi_to_hz(note: int) -> float:
     return 440.0 * (2.0 ** ((note - 69) / 12.0))
 
 
+def load_wav_preview(path: Path, max_points: int = 800) -> tuple[list[float], int, float]:
+    with wave.open(str(path), "rb") as wf:
+        channels = wf.getnchannels()
+        sample_rate = wf.getframerate()
+        frames = wf.getnframes()
+        sampwidth = wf.getsampwidth()
+        raw = wf.readframes(frames)
+
+    if sampwidth != 2:
+        raise RuntimeError("Only 16-bit PCM WAV is supported for waveform preview.")
+
+    sample_count = max(1, len(raw) // 2)
+    unpacked = struct.unpack(f"<{sample_count}h", raw)
+    mono: list[float] = []
+    for i in range(0, len(unpacked), channels):
+        mono.append(unpacked[i] / 32768.0)
+
+    if not mono:
+        return [0.0], sample_rate, 0.0
+
+    bucket = max(1, len(mono) // max_points)
+    preview: list[float] = []
+    for i in range(0, len(mono), bucket):
+        window = mono[i : i + bucket]
+        preview.append(max(abs(v) for v in window))
+
+    duration = len(mono) / sample_rate
+    return preview, sample_rate, duration
+
+
+def convert_audio(input_path: Path, output_path: Path) -> None:
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+        str(output_path),
+    ]
+    try:
+        subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError as exc:
+        raise RuntimeError("ffmpeg is required for mp3 conversion but was not found in PATH.") from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(exc.stderr.decode("utf-8", errors="ignore")) from exc
+
+
+def load_wav_samples(path: Path) -> tuple[list[float], int]:
+    with wave.open(str(path), "rb") as wf:
+        channels = wf.getnchannels()
+        sample_rate = wf.getframerate()
+        frames = wf.getnframes()
+        sampwidth = wf.getsampwidth()
+        raw = wf.readframes(frames)
+
+    if sampwidth != 2:
+        raise RuntimeError("Only 16-bit PCM WAV is supported.")
+
+    sample_count = max(1, len(raw) // 2)
+    unpacked = struct.unpack(f"<{sample_count}h", raw)
+    mono: list[float] = []
+    for i in range(0, len(unpacked), channels):
+        mono.append(unpacked[i] / 32768.0)
+    return mono, sample_rate
+
+
+def write_wav_samples(path: Path, samples: list[float], sample_rate: int = 44100) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        frames = bytearray()
+        for value in samples:
+            clipped = int(clamp(value, -1.0, 1.0) * 32767)
+            frames.extend(struct.pack("<h", clipped))
+        wf.writeframes(frames)
+
+
 @dataclasses.dataclass
 class MidiNote:
     start_tick: int
@@ -54,11 +133,21 @@ class TrackState:
     rendered_audio_path: str = ""
 
 
+@dataclasses.dataclass
+class SampleClip:
+    path: str
+    start_sec: float
+    duration_sec: float
+    sample_rate: int = 44100
+    waveform_preview: list[float] = dataclasses.field(default_factory=list)
+
+
 class ProjectState:
     def __init__(self) -> None:
         self.tracks: list[TrackState] = [TrackState(name="Track 1")]
         self.bpm = DEFAULT_BPM
         self.quantize_div = 16
+        self.sample_clips: list[SampleClip] = []
 
 
 class OpenAIClient:
@@ -466,6 +555,63 @@ class TimelineWidget(QtWidgets.QTableWidget):
             self.setItem(i, 4, QtWidgets.QTableWidgetItem(str(len(track.notes))))
 
 
+class SampleTimelineWidget(QtWidgets.QGraphicsView):
+    def __init__(self, project: ProjectState) -> None:
+        super().__init__()
+        self.project = project
+        self.scene_obj = QtWidgets.QGraphicsScene(self)
+        self.setScene(self.scene_obj)
+        self.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
+        self.pixels_per_second = 80
+        self.lane_height = 110
+        self.refresh()
+
+    def refresh(self) -> None:
+        self.scene_obj.clear()
+        duration = 8.0
+        for clip in self.project.sample_clips:
+            duration = max(duration, clip.start_sec + clip.duration_sec + 1.0)
+
+        width = duration * self.pixels_per_second
+        height = self.lane_height
+        self.scene_obj.addRect(0, 0, width, height, QtGui.QPen(QtGui.QColor(70, 70, 70)), QtGui.QBrush(QtGui.QColor(35, 35, 35)))
+
+        sec = 0
+        while sec <= int(duration) + 1:
+            x = sec * self.pixels_per_second
+            pen = QtGui.QPen(QtGui.QColor(120, 120, 120) if sec % 4 == 0 else QtGui.QColor(80, 80, 80))
+            self.scene_obj.addLine(x, 0, x, height, pen)
+            text = self.scene_obj.addText(f"{sec}s")
+            text.setDefaultTextColor(QtGui.QColor(180, 180, 180))
+            text.setPos(x + 2, 2)
+            sec += 1
+
+        for clip in self.project.sample_clips:
+            x = clip.start_sec * self.pixels_per_second
+            w = max(1, clip.duration_sec * self.pixels_per_second)
+            y = 26
+            h = 70
+            self.scene_obj.addRect(x, y, w, h, QtGui.QPen(QtGui.QColor(0, 0, 0)), QtGui.QBrush(QtGui.QColor(72, 130, 200)))
+
+            if clip.waveform_preview:
+                path = QtGui.QPainterPath()
+                step = w / max(1, len(clip.waveform_preview) - 1)
+                mid = y + h / 2
+                amp = h / 2 - 6
+                path.moveTo(x, mid)
+                for i, v in enumerate(clip.waveform_preview):
+                    px = x + i * step
+                    py = mid - (v * amp)
+                    path.lineTo(px, py)
+                self.scene_obj.addPath(path, QtGui.QPen(QtGui.QColor(230, 240, 255)))
+
+            label = self.scene_obj.addText(Path(clip.path).name)
+            label.setDefaultTextColor(QtGui.QColor(240, 240, 240))
+            label.setPos(x + 4, y + 4)
+
+        self.setSceneRect(0, 0, width, height)
+
+
 class MixerWidget(QtWidgets.QWidget):
     def __init__(self, project: ProjectState, current_track_callable) -> None:
         super().__init__()
@@ -558,6 +704,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.mixer = MixerWidget(self.project, self.current_track)
         self.instruments = InstrumentFxWidget(self.project, self.current_track)
+        self.sample_timeline = SampleTimelineWidget(self.project)
+        self.sample_library = QtWidgets.QListWidget()
 
         quantize_box = QtWidgets.QComboBox()
         quantize_box.addItems(["1/4", "1/8", "1/16", "1/32"])
@@ -573,6 +721,12 @@ class MainWindow(QtWidgets.QMainWindow):
         export_btn.clicked.connect(self.export_midi)
         render_btn = QtWidgets.QPushButton("Render AI Audio Stems")
         render_btn.clicked.connect(self.render_all_tracks)
+        import_sample_btn = QtWidgets.QPushButton("Import Sample (WAV/MP3)")
+        import_sample_btn.clicked.connect(self.import_sample)
+        place_sample_btn = QtWidgets.QPushButton("Place Selected Sample On Timeline")
+        place_sample_btn.clicked.connect(self.place_selected_sample)
+        export_audio_btn = QtWidgets.QPushButton("Export Sample Timeline Audio (WAV/MP3)")
+        export_audio_btn.clicked.connect(self.export_sample_timeline_audio)
         ai_btn = QtWidgets.QPushButton("AI Compose (OpenAI Codex)")
         ai_btn.clicked.connect(self.compose_with_ai)
 
@@ -591,6 +745,11 @@ class MainWindow(QtWidgets.QMainWindow):
         left_layout.addWidget(import_btn)
         left_layout.addWidget(export_btn)
         left_layout.addWidget(render_btn)
+        left_layout.addWidget(QtWidgets.QLabel("Samples Toolbox"))
+        left_layout.addWidget(self.sample_library)
+        left_layout.addWidget(import_sample_btn)
+        left_layout.addWidget(place_sample_btn)
+        left_layout.addWidget(export_audio_btn)
         left_layout.addWidget(ai_btn)
         left_layout.addWidget(play_btn)
         left_layout.addWidget(stop_btn)
@@ -598,6 +757,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         right_tabs = QtWidgets.QTabWidget()
         right_tabs.addTab(self.timeline, "Timeline")
+        right_tabs.addTab(self.sample_timeline, "Sample Timeline")
         right_tabs.addTab(self.mixer, "Mixer")
         right_tabs.addTab(self.instruments, "Instruments / FX")
 
@@ -616,11 +776,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._populate_track_list()
         self.track_list.setCurrentRow(0)
         self._setup_virtual_piano_dock()
+        self.refresh_sample_library()
 
     def _setup_shortcuts(self) -> None:
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+N"), self, self.new_project)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+O"), self, self.import_midi)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+S"), self, self.export_midi)
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Shift+O"), self, self.import_sample)
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+E"), self, self.export_sample_timeline_audio)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+R"), self, self.render_all_tracks)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Q"), self, self.piano_roll.quantize_selected)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+G"), self, self.compose_with_ai)
@@ -691,6 +854,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._populate_track_list()
         self.track_list.setCurrentRow(0)
         self.on_notes_changed()
+        self.refresh_sample_library()
         self.statusBar().showMessage(f"AI generated {len(built_tracks)} track(s)")
 
     def _classify_and_assign_track_sound(self, track: TrackState) -> None:
@@ -715,6 +879,117 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mixer.load_track()
         self.statusBar().showMessage(f"Rendered {len(stem_paths)} AI synthesis stems to {RENDER_DIR}/")
         QtWidgets.QMessageBox.information(self, "AI synthesis rendered", "\n".join(stem_paths))
+
+    def refresh_sample_library(self) -> None:
+        self.sample_library.clear()
+        for clip in self.project.sample_clips:
+            self.sample_library.addItem(f"{Path(clip.path).name} @ {clip.start_sec:.2f}s")
+        self.sample_timeline.refresh()
+
+    def import_sample(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Import sample",
+            str(Path.cwd()),
+            "Audio files (*.wav *.mp3)",
+        )
+        if not path:
+            return
+
+        src = Path(path)
+        sample_wav = src
+        if src.suffix.lower() == ".mp3":
+            converted = Path.cwd() / "renders" / f"{src.stem}_import.wav"
+            convert_audio(src, converted)
+            sample_wav = converted
+
+        preview, sample_rate, duration = load_wav_preview(sample_wav)
+        clip = SampleClip(
+            path=str(sample_wav),
+            start_sec=0.0,
+            duration_sec=duration,
+            sample_rate=sample_rate,
+            waveform_preview=preview,
+        )
+        self.project.sample_clips.append(clip)
+        self.refresh_sample_library()
+        self.statusBar().showMessage(f"Imported sample: {src.name}")
+
+    def place_selected_sample(self) -> None:
+        row = self.sample_library.currentRow()
+        if row < 0 or row >= len(self.project.sample_clips):
+            QtWidgets.QMessageBox.information(self, "No sample selected", "Select a sample from the samples toolbox first.")
+            return
+
+        start_sec, ok = QtWidgets.QInputDialog.getDouble(
+            self,
+            "Place sample",
+            "Start time (seconds):",
+            self.project.sample_clips[row].start_sec,
+            0.0,
+            3600.0,
+            2,
+        )
+        if not ok:
+            return
+
+        self.project.sample_clips[row].start_sec = float(start_sec)
+        self.refresh_sample_library()
+
+    def export_sample_timeline_audio(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export sample timeline audio",
+            str(Path.cwd() / "sample_timeline.wav"),
+            "Audio files (*.wav *.mp3)",
+        )
+        if not path:
+            return
+
+        if not self.project.sample_clips:
+            QtWidgets.QMessageBox.information(self, "No samples", "No samples are placed on the timeline.")
+            return
+
+        sample_rate = 44100
+        max_end = 1.0
+        loaded: list[tuple[SampleClip, list[float], int]] = []
+        for clip in self.project.sample_clips:
+            wav_path = Path(clip.path)
+            if wav_path.suffix.lower() == ".mp3":
+                converted = Path.cwd() / "renders" / f"{wav_path.stem}_mix.wav"
+                convert_audio(wav_path, converted)
+                wav_path = converted
+            data, sr = load_wav_samples(wav_path)
+            loaded.append((clip, data, sr))
+            clip_len = len(data) / sr
+            max_end = max(max_end, clip.start_sec + clip_len)
+
+        mix = [0.0] * int(max_end * sample_rate)
+        for clip, data, sr in loaded:
+            if sr != sample_rate:
+                ratio = sr / sample_rate
+                resampled = []
+                for i in range(int(len(data) / ratio)):
+                    resampled.append(data[min(len(data) - 1, int(i * ratio))])
+                data = resampled
+            offset = int(clip.start_sec * sample_rate)
+            for i, v in enumerate(data):
+                idx = offset + i
+                if idx >= len(mix):
+                    break
+                mix[idx] += v * 0.7
+
+        mix = [clamp(v, -1.0, 1.0) for v in mix]
+        out = Path(path)
+        if out.suffix.lower() == ".mp3":
+            temp_wav = Path.cwd() / "renders" / "sample_timeline_export.wav"
+            write_wav_samples(temp_wav, mix, sample_rate)
+            convert_audio(temp_wav, out)
+        else:
+            write_wav_samples(out, mix, sample_rate)
+
+        self.statusBar().showMessage(f"Exported sample timeline audio: {out.name}")
+
 
     def _build_tracks_from_midi(self, midi: mido.MidiFile) -> list[TrackState]:
         built: list[TrackState] = []
@@ -818,6 +1093,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.project = ProjectState()
         self.timeline.project = self.project
         self.piano_roll.project = self.project
+        self.sample_timeline.project = self.project
         self._populate_track_list()
         self.track_list.setCurrentRow(0)
         self.on_notes_changed()
@@ -825,6 +1101,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_notes_changed(self) -> None:
         self.piano_roll.refresh()
         self.timeline.refresh()
+        self.sample_timeline.refresh()
 
     def import_midi(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Import MIDI", str(Path.cwd()), "MIDI files (*.mid *.midi)")
