@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import os
+import struct
 import sys
 import urllib.error
 import urllib.request
+import wave
 from pathlib import Path
 
 import mido
@@ -17,6 +20,15 @@ PITCH_MIN = 36
 PITCH_MAX = 84
 OPENAI_API_URL = "https://api.openai.com/v1/responses"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-codex")
+RENDER_DIR = Path("renders")
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def midi_to_hz(note: int) -> float:
+    return 440.0 * (2.0 ** ((note - 69) / 12.0))
 
 
 @dataclasses.dataclass
@@ -36,6 +48,10 @@ class TrackState:
     pan: float = 0.0
     instrument: str = "Default Synth"
     plugins: list[str] = dataclasses.field(default_factory=list)
+    midi_program: int = 0
+    midi_channel: int = 0
+    synth_profile: str = "synth"
+    rendered_audio_path: str = ""
 
 
 class ProjectState:
@@ -45,24 +61,16 @@ class ProjectState:
         self.quantize_div = 16
 
 
-class OpenAIComposer:
+class OpenAIClient:
     def __init__(self) -> None:
         self.api_key = os.getenv("OPENAI_API_KEY", "")
 
-    def compose(self, prompt: str, bars: int, bpm: int) -> dict:
+    def is_enabled(self) -> bool:
+        return bool(self.api_key)
+
+    def run_json_prompt(self, system_instruction: str, user_instruction: str) -> dict:
         if not self.api_key:
             raise RuntimeError("OPENAI_API_KEY is missing. Set it in your environment first.")
-
-        system_instruction = (
-            "You are a MIDI composer for a DAW. Return strict JSON only with the schema: "
-            "{\"tracks\": [{\"name\": str, \"instrument\": str, \"notes\": "
-            "[{\"start_beat\": number, \"duration_beat\": number, \"pitch\": int, \"velocity\": int}]}]}. "
-            "Keep pitches in MIDI range 36..84 and fit inside requested bars."
-        )
-        user_instruction = (
-            f"Create a multi-track arrangement. Prompt: {prompt}. Bars: {bars}. BPM: {bpm}. "
-            "Use 2-5 tracks and musically coherent note timing."
-        )
 
         payload = {
             "model": OPENAI_MODEL,
@@ -106,6 +114,210 @@ class OpenAIComposer:
             return json.loads(text)
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"Model response was not valid JSON: {text[:300]}") from exc
+
+
+class OpenAIComposer:
+    def __init__(self, client: OpenAIClient) -> None:
+        self.client = client
+
+    def compose(self, prompt: str, bars: int, bpm: int) -> dict:
+        system_instruction = (
+            "You are a MIDI composer for a DAW. Return strict JSON only with the schema: "
+            "{\"tracks\": [{\"name\": str, \"instrument\": str, \"notes\": "
+            "[{\"start_beat\": number, \"duration_beat\": number, \"pitch\": int, \"velocity\": int}]}]}. "
+            "Keep pitches in MIDI range 36..84 and fit inside requested bars."
+        )
+        user_instruction = (
+            f"Create a multi-track arrangement. Prompt: {prompt}. Bars: {bars}. BPM: {bpm}. "
+            "Use 2-5 tracks and musically coherent note timing."
+        )
+        return self.client.run_json_prompt(system_instruction, user_instruction)
+
+
+class InstrumentIntelligence:
+    FAMILY_PROFILES = {
+        "strings": "saw_pad",
+        "horn": "brass_stack",
+        "brass": "brass_stack",
+        "woodwind": "reed_breath",
+        "piano": "e_piano",
+        "bass": "sub_bass",
+        "guitar": "pluck",
+        "organ": "organ",
+        "synth": "synth",
+        "drums": "noise_kit",
+    }
+
+    def __init__(self, client: OpenAIClient) -> None:
+        self.client = client
+
+    def gm_instrument_name(self, program: int) -> str:
+        p = int(clamp(program, 0, 127))
+        if p < 8:
+            return "Piano"
+        if p < 16:
+            return "Chromatic"
+        if p < 24:
+            return "Organ"
+        if p < 32:
+            return "Guitar"
+        if p < 40:
+            return "Bass"
+        if p < 48:
+            return "Strings"
+        if p < 56:
+            return "Ensemble"
+        if p < 64:
+            return "Brass"
+        if p < 72:
+            return "Reed"
+        if p < 80:
+            return "Pipe"
+        if p < 88:
+            return "Lead"
+        if p < 96:
+            return "Pad"
+        if p < 104:
+            return "FX"
+        if p < 112:
+            return "Ethnic"
+        if p < 120:
+            return "Percussive"
+        return "SFX"
+
+    def _fallback_family(self, program: int, channel: int, track_name: str) -> str:
+        if channel == 9:
+            return "drums"
+        name = track_name.lower()
+        for token in ["string", "violin", "cello"]:
+            if token in name:
+                return "strings"
+        for token in ["horn", "trumpet", "trombone", "brass"]:
+            if token in name:
+                return "horn"
+        for token in ["piano", "keys"]:
+            if token in name:
+                return "piano"
+        if 32 <= program <= 39:
+            return "bass"
+        if 40 <= program <= 51:
+            return "strings"
+        if 56 <= program <= 63:
+            return "brass"
+        if 24 <= program <= 31:
+            return "guitar"
+        if 16 <= program <= 23:
+            return "organ"
+        return "synth"
+
+    def classify_family(self, program: int, channel: int, track_name: str) -> str:
+        fallback = self._fallback_family(program, channel, track_name)
+        if not self.client.is_enabled():
+            return fallback
+
+        system_instruction = (
+            "You classify MIDI tracks into one family. Return JSON only: "
+            "{\"family\": one_of:[\"strings\",\"horn\",\"brass\",\"woodwind\",\"piano\",\"bass\",\"guitar\",\"organ\",\"synth\",\"drums\"]}."
+        )
+        user_instruction = (
+            f"Track name: {track_name}. MIDI program: {program}. Channel: {channel}. "
+            f"GM guess: {self.gm_instrument_name(program)}."
+        )
+        try:
+            result = self.client.run_json_prompt(system_instruction, user_instruction)
+            family = str(result.get("family", "")).lower().strip()
+            if family in self.FAMILY_PROFILES:
+                return family
+        except Exception:
+            pass
+        return fallback
+
+
+class AISynthRenderer:
+    def __init__(self, sample_rate: int = 44100) -> None:
+        self.sample_rate = sample_rate
+
+    def _adsr(self, t: float, duration: float, a: float, d: float, s: float, r: float) -> float:
+        if t < 0 or duration <= 0:
+            return 0.0
+        if t < a:
+            return t / max(a, 1e-6)
+        if t < a + d:
+            return 1.0 - (1.0 - s) * ((t - a) / max(d, 1e-6))
+        if t < max(0.0, duration - r):
+            return s
+        if t < duration:
+            return s * (1.0 - (t - (duration - r)) / max(r, 1e-6))
+        return 0.0
+
+    def _wave(self, phase: float, profile: str) -> float:
+        if profile == "sub_bass":
+            return math.sin(phase)
+        if profile == "pluck":
+            return 0.7 * math.sin(phase) + 0.3 * math.sin(2.0 * phase)
+        if profile == "organ":
+            return 0.6 * math.sin(phase) + 0.25 * math.sin(2.0 * phase) + 0.15 * math.sin(3.0 * phase)
+        if profile == "saw_pad":
+            frac = (phase / (2 * math.pi)) % 1.0
+            return 2.0 * frac - 1.0
+        if profile == "brass_stack":
+            return 0.5 * math.sin(phase) + 0.35 * math.sin(2.0 * phase) + 0.15 * math.sin(3.0 * phase)
+        if profile == "reed_breath":
+            return 0.8 * math.sin(phase) + 0.2 * math.sin(4.0 * phase)
+        if profile == "noise_kit":
+            return math.sin(phase * 13.0) * math.sin(phase * 7.0)
+        if profile == "e_piano":
+            return 0.8 * math.sin(phase) + 0.2 * math.sin(6.0 * phase)
+        return math.sin(phase) + 0.2 * math.sin(2.0 * phase)
+
+    def _profile_envelope(self, profile: str) -> tuple[float, float, float, float]:
+        if profile in {"pluck", "e_piano"}:
+            return (0.005, 0.08, 0.45, 0.12)
+        if profile in {"strings", "saw_pad", "organ"}:
+            return (0.03, 0.25, 0.75, 0.18)
+        if profile in {"brass_stack", "reed_breath"}:
+            return (0.015, 0.1, 0.65, 0.1)
+        if profile == "noise_kit":
+            return (0.001, 0.02, 0.2, 0.03)
+        if profile == "sub_bass":
+            return (0.01, 0.06, 0.75, 0.08)
+        return (0.01, 0.1, 0.65, 0.12)
+
+    def render_track(self, track: TrackState, bpm: int, output_path: Path) -> None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        max_tick = max((n.start_tick + n.duration_tick for n in track.notes), default=0)
+        max_sec = (max_tick / TICKS_PER_BEAT) * (60.0 / max(1, bpm)) + 1.0
+        total_samples = int(max_sec * self.sample_rate)
+        data = [0.0] * max(1, total_samples)
+
+        a, d, s, r = self._profile_envelope(track.synth_profile)
+        for note in track.notes:
+            start_sec = (note.start_tick / TICKS_PER_BEAT) * (60.0 / max(1, bpm))
+            dur_sec = (note.duration_tick / TICKS_PER_BEAT) * (60.0 / max(1, bpm))
+            start_idx = int(start_sec * self.sample_rate)
+            note_samples = max(1, int(dur_sec * self.sample_rate))
+            freq = midi_to_hz(note.pitch)
+            amp = (note.velocity / 127.0) * track.volume * 0.4
+
+            for i in range(note_samples):
+                idx = start_idx + i
+                if idx >= len(data):
+                    break
+                t = i / self.sample_rate
+                phase = 2.0 * math.pi * freq * t
+                env = self._adsr(t, dur_sec, a, d, s, r)
+                sample = self._wave(phase, track.synth_profile) * env * amp
+                data[idx] += sample
+
+        with wave.open(str(output_path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(self.sample_rate)
+            frames = bytearray()
+            for value in data:
+                clipped = int(clamp(value, -1.0, 1.0) * 32767)
+                frames.extend(struct.pack("<h", clipped))
+            wf.writeframes(frames)
 
 
 class PianoRollWidget(QtWidgets.QGraphicsView):
@@ -234,9 +446,9 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
 
 class TimelineWidget(QtWidgets.QTableWidget):
     def __init__(self, project: ProjectState) -> None:
-        super().__init__(0, 3)
+        super().__init__(0, 5)
         self.project = project
-        self.setHorizontalHeaderLabels(["Track", "Length (beats)", "Notes"])
+        self.setHorizontalHeaderLabels(["Track", "Instrument", "Profile", "Length (beats)", "Notes"])
         self.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.verticalHeader().setVisible(False)
         self.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
@@ -248,8 +460,10 @@ class TimelineWidget(QtWidgets.QTableWidget):
             max_tick = max((n.start_tick + n.duration_tick for n in track.notes), default=0)
             length_beats = max_tick / TICKS_PER_BEAT
             self.setItem(i, 0, QtWidgets.QTableWidgetItem(track.name))
-            self.setItem(i, 1, QtWidgets.QTableWidgetItem(f"{length_beats:.2f}"))
-            self.setItem(i, 2, QtWidgets.QTableWidgetItem(str(len(track.notes))))
+            self.setItem(i, 1, QtWidgets.QTableWidgetItem(track.instrument))
+            self.setItem(i, 2, QtWidgets.QTableWidgetItem(track.synth_profile))
+            self.setItem(i, 3, QtWidgets.QTableWidgetItem(f"{length_beats:.2f}"))
+            self.setItem(i, 4, QtWidgets.QTableWidgetItem(str(len(track.notes))))
 
 
 class MixerWidget(QtWidgets.QWidget):
@@ -264,8 +478,11 @@ class MixerWidget(QtWidgets.QWidget):
         self.pan = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.pan.setRange(-100, 100)
         self.pan.setValue(0)
+        self.rendered_path = QtWidgets.QLineEdit()
+        self.rendered_path.setReadOnly(True)
         layout.addRow("Volume", self.volume)
         layout.addRow("Pan", self.pan)
+        layout.addRow("Rendered audio", self.rendered_path)
 
         self.volume.valueChanged.connect(self.apply_changes)
         self.pan.valueChanged.connect(self.apply_changes)
@@ -274,6 +491,7 @@ class MixerWidget(QtWidgets.QWidget):
         track = self.current_track_callable()
         self.volume.setValue(int(track.volume * 100))
         self.pan.setValue(int(track.pan * 100))
+        self.rendered_path.setText(track.rendered_audio_path)
 
     def apply_changes(self) -> None:
         track = self.current_track_callable()
@@ -291,7 +509,10 @@ class InstrumentFxWidget(QtWidgets.QWidget):
         form = QtWidgets.QFormLayout()
         self.instrument = QtWidgets.QComboBox()
         self.instrument.addItems(["Default Synth", "Piano", "Bass", "Lead", "Sampler", "External VST (placeholder)"])
+        self.profile = QtWidgets.QLineEdit()
+        self.profile.setReadOnly(True)
         form.addRow("Instrument", self.instrument)
+        form.addRow("AI synth profile", self.profile)
 
         self.fx_controls: dict[str, QtWidgets.QSlider] = {}
         for fx in ["EQ", "Compression", "Distortion", "Phaser", "Flanger", "Delay", "Reverb"]:
@@ -309,6 +530,7 @@ class InstrumentFxWidget(QtWidgets.QWidget):
         idx = self.instrument.findText(track.instrument)
         if idx >= 0:
             self.instrument.setCurrentIndex(idx)
+        self.profile.setText(track.synth_profile)
 
     def apply_changes(self) -> None:
         track = self.current_track_callable()
@@ -320,9 +542,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.project = ProjectState()
-        self.composer = OpenAIComposer()
+        self.ai_client = OpenAIClient()
+        self.composer = OpenAIComposer(self.ai_client)
+        self.instrument_ai = InstrumentIntelligence(self.ai_client)
+        self.renderer = AISynthRenderer()
         self.setWindowTitle("AI Music Studio")
-        self.resize(1400, 850)
+        self.resize(1500, 900)
 
         self.track_list = QtWidgets.QListWidget()
         self.track_list.currentRowChanged.connect(self._track_changed)
@@ -342,10 +567,12 @@ class MainWindow(QtWidgets.QMainWindow):
         add_track_btn = QtWidgets.QPushButton("+ Track")
         add_track_btn.clicked.connect(self.add_track)
 
-        import_btn = QtWidgets.QPushButton("Import MIDI")
+        import_btn = QtWidgets.QPushButton("Import MIDI + AI Instrument Render")
         import_btn.clicked.connect(self.import_midi)
         export_btn = QtWidgets.QPushButton("Export MIDI")
         export_btn.clicked.connect(self.export_midi)
+        render_btn = QtWidgets.QPushButton("Render AI Audio Stems")
+        render_btn.clicked.connect(self.render_all_tracks)
         ai_btn = QtWidgets.QPushButton("AI Compose (OpenAI Codex)")
         ai_btn.clicked.connect(self.compose_with_ai)
 
@@ -363,6 +590,7 @@ class MainWindow(QtWidgets.QMainWindow):
         left_layout.addWidget(quantize_box)
         left_layout.addWidget(import_btn)
         left_layout.addWidget(export_btn)
+        left_layout.addWidget(render_btn)
         left_layout.addWidget(ai_btn)
         left_layout.addWidget(play_btn)
         left_layout.addWidget(stop_btn)
@@ -376,12 +604,12 @@ class MainWindow(QtWidgets.QMainWindow):
         splitter_vertical = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
         splitter_vertical.addWidget(self.piano_roll)
         splitter_vertical.addWidget(right_tabs)
-        splitter_vertical.setSizes([500, 300])
+        splitter_vertical.setSizes([550, 320])
 
         splitter_main = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         splitter_main.addWidget(left_panel)
         splitter_main.addWidget(splitter_vertical)
-        splitter_main.setSizes([250, 1100])
+        splitter_main.setSizes([320, 1180])
 
         self.setCentralWidget(splitter_main)
         self._setup_shortcuts()
@@ -393,6 +621,7 @@ class MainWindow(QtWidgets.QMainWindow):
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+N"), self, self.new_project)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+O"), self, self.import_midi)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+S"), self, self.export_midi)
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+R"), self, self.render_all_tracks)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Q"), self, self.piano_roll.quantize_selected)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+G"), self, self.compose_with_ai)
         QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Delete), self, self.piano_roll.delete_selected)
@@ -437,6 +666,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             state = TrackState(name=str(track.get("name") or f"AI Track {idx}"))
             state.instrument = str(track.get("instrument") or "Default Synth")
+            state.synth_profile = "synth"
             for note in track.get("notes", []):
                 if not isinstance(note, dict):
                     continue
@@ -463,6 +693,95 @@ class MainWindow(QtWidgets.QMainWindow):
         self.on_notes_changed()
         self.statusBar().showMessage(f"AI generated {len(built_tracks)} track(s)")
 
+    def _classify_and_assign_track_sound(self, track: TrackState) -> None:
+        family = self.instrument_ai.classify_family(track.midi_program, track.midi_channel, track.name)
+        profile = InstrumentIntelligence.FAMILY_PROFILES.get(family, "synth")
+        gm_name = self.instrument_ai.gm_instrument_name(track.midi_program)
+        track.instrument = f"{gm_name} ({family})"
+        track.synth_profile = profile
+
+    def render_all_tracks(self) -> None:
+        if not self.project.tracks:
+            return
+        stem_paths: list[str] = []
+        for index, track in enumerate(self.project.tracks, start=1):
+            stem_name = f"track_{index:02d}_{track.name.replace(' ', '_')}.wav"
+            stem_path = RENDER_DIR / stem_name
+            self.renderer.render_track(track, self.project.bpm, stem_path)
+            track.rendered_audio_path = str(stem_path)
+            stem_paths.append(str(stem_path))
+
+        self.timeline.refresh()
+        self.mixer.load_track()
+        self.statusBar().showMessage(f"Rendered {len(stem_paths)} AI synthesis stems to {RENDER_DIR}/")
+        QtWidgets.QMessageBox.information(self, "AI synthesis rendered", "\n".join(stem_paths))
+
+    def _build_tracks_from_midi(self, midi: mido.MidiFile) -> list[TrackState]:
+        built: list[TrackState] = []
+        for track_idx, mtrack in enumerate(midi.tracks):
+            abs_tick = 0
+            channel_program: dict[int, int] = {ch: 0 for ch in range(16)}
+            active_notes: dict[tuple[int, int], tuple[int, int]] = {}
+            channel_data: dict[int, TrackState] = {}
+
+            for msg in mtrack:
+                abs_tick += msg.time
+                if hasattr(msg, "channel"):
+                    channel = int(msg.channel)
+                else:
+                    channel = 0
+
+                if msg.type == "program_change":
+                    channel_program[channel] = int(msg.program)
+                    if channel not in channel_data:
+                        channel_data[channel] = TrackState(
+                            name=f"{mtrack.name or f'Track {track_idx + 1}'} [Ch {channel + 1}]",
+                            midi_program=channel_program[channel],
+                            midi_channel=channel,
+                        )
+                    else:
+                        channel_data[channel].midi_program = channel_program[channel]
+                    continue
+
+                if msg.type == "note_on" and msg.velocity > 0:
+                    program = channel_program.get(channel, 0)
+                    active_notes[(channel, msg.note)] = (abs_tick, program)
+                    if channel not in channel_data:
+                        channel_data[channel] = TrackState(
+                            name=f"{mtrack.name or f'Track {track_idx + 1}'} [Ch {channel + 1}]",
+                            midi_program=program,
+                            midi_channel=channel,
+                        )
+                    continue
+
+                if (msg.type in {"note_off", "note_on"} and msg.velocity == 0) or msg.type == "note_off":
+                    key = (channel, msg.note)
+                    if key in active_notes:
+                        start_tick, program = active_notes.pop(key)
+                        if channel not in channel_data:
+                            channel_data[channel] = TrackState(
+                                name=f"{mtrack.name or f'Track {track_idx + 1}'} [Ch {channel + 1}]",
+                                midi_program=program,
+                                midi_channel=channel,
+                            )
+                        state = channel_data[channel]
+                        state.midi_program = program
+                        state.notes.append(
+                            MidiNote(
+                                start_tick=start_tick,
+                                duration_tick=max(1, abs_tick - start_tick),
+                                pitch=int(msg.note),
+                                velocity=int(getattr(msg, "velocity", 100) or 100),
+                            )
+                        )
+
+            for state in channel_data.values():
+                if state.notes:
+                    self._classify_and_assign_track_sound(state)
+                    built.append(state)
+
+        return built
+
     def insert_live_note(self, pitch: int) -> None:
         track = self.current_track()
         cursor_tick = max((n.start_tick + n.duration_tick for n in track.notes), default=0)
@@ -479,7 +798,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _populate_track_list(self) -> None:
         self.track_list.clear()
         for track in self.project.tracks:
-            self.track_list.addItem(track.name)
+            self.track_list.addItem(f"{track.name} • {track.instrument}")
 
     def _track_changed(self, row: int) -> None:
         if row < 0:
@@ -513,21 +832,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         midi = mido.MidiFile(path)
-        self.project.tracks = []
-        for i, mtrack in enumerate(midi.tracks):
-            state = TrackState(name=mtrack.name or f"Track {i + 1}")
-            abs_tick = 0
-            active: dict[int, int] = {}
-            for msg in mtrack:
-                abs_tick += msg.time
-                if msg.type == "note_on" and msg.velocity > 0:
-                    active[msg.note] = abs_tick
-                elif msg.type in {"note_off", "note_on"} and msg.note in active:
-                    start = active.pop(msg.note)
-                    state.notes.append(
-                        MidiNote(start_tick=start, duration_tick=max(1, abs_tick - start), pitch=msg.note, velocity=getattr(msg, "velocity", 100))
-                    )
-            self.project.tracks.append(state)
+        self.project.tracks = self._build_tracks_from_midi(midi)
 
         if not self.project.tracks:
             self.project.tracks = [TrackState(name="Track 1")]
@@ -535,7 +840,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._populate_track_list()
         self.track_list.setCurrentRow(0)
         self.on_notes_changed()
-        self.statusBar().showMessage(f"Imported MIDI: {Path(path).name}")
+
+        do_render = QtWidgets.QMessageBox.question(
+            self,
+            "AI synthesis render",
+            "Imported MIDI and assigned AI instrument profiles per channel. Render synthesized audio stems now?",
+        )
+        if do_render == QtWidgets.QMessageBox.StandardButton.Yes:
+            self.render_all_tracks()
+
+        self.statusBar().showMessage(f"Imported MIDI with {len(self.project.tracks)} track(s): {Path(path).name}")
 
     def export_midi(self) -> None:
         path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export MIDI", str(Path.cwd() / "project.mid"), "MIDI files (*.mid)")
@@ -547,11 +861,22 @@ class MainWindow(QtWidgets.QMainWindow):
             mtrack = mido.MidiTrack()
             mtrack.name = track_state.name
             midi.tracks.append(mtrack)
+            mtrack.append(mido.Message("program_change", channel=track_state.midi_channel, program=int(clamp(track_state.midi_program, 0, 127)), time=0))
 
             events: list[tuple[int, mido.Message]] = []
             for note in track_state.notes:
-                events.append((note.start_tick, mido.Message("note_on", note=note.pitch, velocity=note.velocity, time=0)))
-                events.append((note.start_tick + note.duration_tick, mido.Message("note_off", note=note.pitch, velocity=0, time=0)))
+                events.append(
+                    (
+                        note.start_tick,
+                        mido.Message("note_on", channel=track_state.midi_channel, note=note.pitch, velocity=note.velocity, time=0),
+                    )
+                )
+                events.append(
+                    (
+                        note.start_tick + note.duration_tick,
+                        mido.Message("note_off", channel=track_state.midi_channel, note=note.pitch, velocity=0, time=0),
+                    )
+                )
 
             events.sort(key=lambda x: x[0])
             current = 0
