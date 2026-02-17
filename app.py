@@ -181,6 +181,7 @@ class ProjectState:
         self.tracks: list[TrackState] = [TrackState(name="Track 1")]
         self.bpm = DEFAULT_BPM
         self.quantize_div = 16
+        self.quantize_triplet = False
         self.vsti_paths: list[str] = []
         self.vsti_rack: list[VSTInstrument] = []
         self.sample_assets: list[SampleAsset] = []
@@ -529,13 +530,24 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         self.tool = 'select'
         self.note_length_div = 8
         self._line_start: QtCore.QPointF | None = None
+        self._pencil_note: MidiNote | None = None
+        self._pencil_anchor_tick = 0
+        self._drag_anchor_tick = 0
+        self._drag_anchor_pitch = 0
+        self._drag_selected_snapshot: list[tuple[MidiNote, int, int]] = []
         self.refresh()
 
     def current_track(self) -> TrackState:
         return self.project.tracks[self.get_track_index()]
 
+    def _quantize_ticks(self) -> int:
+        beats = 4.0 / max(1, self.project.quantize_div)
+        if getattr(self.project, 'quantize_triplet', False):
+            beats *= 2.0 / 3.0
+        return max(1, int(round(beats * TICKS_PER_BEAT)))
+
     def _grid_tick(self) -> int:
-        return max(1, TICKS_PER_BEAT * 4 // self.project.quantize_div)
+        return self._quantize_ticks()
 
     def _pos_to_beat_pitch(self, pos: QtCore.QPointF) -> tuple[float, int]:
         beat = max(0.0, pos.x() / self.cell_w)
@@ -544,7 +556,7 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         return beat, pitch
 
     def _length_ticks(self) -> int:
-        return max(1, int((4 / max(1, self.note_length_div)) * TICKS_PER_BEAT))
+        return max(1, self._quantize_ticks())
 
     def set_tool(self, tool: str) -> None:
         self.tool = tool
@@ -621,7 +633,7 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         length_menu = menu.addMenu('Note Length')
         length_group = QtGui.QActionGroup(menu)
         length_group.setExclusive(True)
-        for div in [1, 2, 4, 8, 16, 32]:
+        for div in [1, 2, 4, 8, 16, 32, 64]:
             action = length_menu.addAction(f'1/{div}')
             action.setCheckable(True)
             action.setChecked(self.note_length_div == div)
@@ -643,13 +655,15 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
                 return note
         return None
 
-    def _insert_note_at(self, scene_pos: QtCore.QPointF) -> None:
+    def _insert_note_at(self, scene_pos: QtCore.QPointF) -> MidiNote:
         beat, pitch = self._pos_to_beat_pitch(scene_pos)
         grid = self._grid_tick()
-        start_tick = round((beat * TICKS_PER_BEAT) / grid) * grid
-        self.current_track().notes.append(MidiNote(start_tick=int(start_tick), duration_tick=self._length_ticks(), pitch=pitch))
+        start_tick = int(round((beat * TICKS_PER_BEAT) / grid) * grid)
+        note = MidiNote(start_tick=start_tick, duration_tick=self._length_ticks(), pitch=pitch)
+        self.current_track().notes.append(note)
         self.refresh()
         self.noteChanged.emit()
+        return note
 
     def _erase_note_at(self, scene_pos: QtCore.QPointF) -> None:
         note = self._find_note_at(scene_pos)
@@ -683,7 +697,9 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         scene_pos = self.mapToScene(event.position().toPoint())
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
             if self.tool == 'pencil':
-                self._insert_note_at(scene_pos)
+                note = self._insert_note_at(scene_pos)
+                self._pencil_note = note
+                self._pencil_anchor_tick = note.start_tick
                 return
             if self.tool == 'eraser':
                 self._erase_note_at(scene_pos)
@@ -694,7 +710,49 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
             if self.tool == 'line':
                 self._line_start = scene_pos
                 return
+            if self.tool == 'select':
+                clicked = self._find_note_at(scene_pos)
+                if clicked is not None:
+                    self.sync_selection()
+                    if not clicked.selected:
+                        for note in self.current_track().notes:
+                            note.selected = False
+                        clicked.selected = True
+                    self._drag_anchor_tick = clicked.start_tick
+                    self._drag_anchor_pitch = clicked.pitch
+                    self._drag_selected_snapshot = [
+                        (n, n.start_tick, n.pitch) for n in self.current_track().notes if n.selected
+                    ]
+                    self.refresh()
+                    return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        scene_pos = self.mapToScene(event.position().toPoint())
+        if self.tool == 'pencil' and self._pencil_note is not None:
+            beat, _ = self._pos_to_beat_pitch(scene_pos)
+            grid = self._grid_tick()
+            end_tick = int(round((beat * TICKS_PER_BEAT) / grid) * grid)
+            new_duration = max(grid, end_tick - self._pencil_anchor_tick + grid)
+            self._pencil_note.duration_tick = new_duration
+            self.refresh()
+            self.noteChanged.emit()
+            return
+
+        if self.tool == 'select' and self._drag_selected_snapshot:
+            beat, pitch = self._pos_to_beat_pitch(scene_pos)
+            grid = self._grid_tick()
+            current_tick = int(round((beat * TICKS_PER_BEAT) / grid) * grid)
+            delta_tick = current_tick - self._drag_anchor_tick
+            delta_pitch = pitch - self._drag_anchor_pitch
+            for note, start_tick, start_pitch in self._drag_selected_snapshot:
+                note.start_tick = max(0, start_tick + delta_tick)
+                note.pitch = max(PITCH_MIN, min(PITCH_MAX, start_pitch + delta_pitch))
+            self.refresh()
+            self.noteChanged.emit()
+            return
+
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
         if self.tool == 'line' and self._line_start is not None and event.button() == QtCore.Qt.MouseButton.LeftButton:
@@ -718,6 +776,9 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
             self.refresh()
             self.noteChanged.emit()
             return
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self._pencil_note = None
+            self._drag_selected_snapshot = []
         self._line_start = None
         super().mouseReleaseEvent(event)
 
@@ -736,7 +797,7 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
 
     def quantize_selected(self) -> None:
         self.sync_selection()
-        grid = TICKS_PER_BEAT * 4 // self.project.quantize_div
+        grid = self._grid_tick()
         for note in self.current_track().notes:
             if note.selected:
                 note.start_tick = round(note.start_tick / grid) * grid
@@ -1219,10 +1280,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.arrangement_overview = ArrangementOverviewWidget(self.project, self.set_playhead_position)
         self.sample_library = SampleLibraryWidget()
 
-        quantize_box = QtWidgets.QComboBox()
-        quantize_box.addItems(["1/4", "1/8", "1/16", "1/32"])
-        quantize_box.setCurrentText("1/16")
-        quantize_box.currentTextChanged.connect(lambda text: setattr(self.project, "quantize_div", int(text.split("/")[1])))
+        self.quantize_box = QtWidgets.QComboBox()
+        quantize_values = [
+            "1/1", "1/2", "1/2T", "1/4", "1/4T", "1/8", "1/8T", "1/16", "1/16T", "1/32", "1/32T", "1/64", "1/64T"
+        ]
+        self.quantize_box.addItems(quantize_values)
+        self.quantize_box.setCurrentText("1/16")
+        self.quantize_box.currentTextChanged.connect(self.on_quantize_changed)
+        self.quantize_snap_btn = QtWidgets.QPushButton("Snap")
+        self.quantize_snap_btn.clicked.connect(self.piano_roll.quantize_selected)
 
         add_track_btn = QtWidgets.QPushButton("+ Track (Sample/Instrument)")
         add_track_btn.clicked.connect(self.add_track)
@@ -1245,7 +1311,10 @@ class MainWindow(QtWidgets.QMainWindow):
         left_layout.addWidget(self.track_list)
         left_layout.addWidget(add_track_btn)
         left_layout.addWidget(QtWidgets.QLabel("Quantize"))
-        left_layout.addWidget(quantize_box)
+        quantize_row = QtWidgets.QHBoxLayout()
+        quantize_row.addWidget(self.quantize_box)
+        quantize_row.addWidget(self.quantize_snap_btn)
+        left_layout.addLayout(quantize_row)
         left_layout.addWidget(import_btn)
         left_layout.addWidget(render_btn)
         left_layout.addWidget(QtWidgets.QLabel("Samples Toolbox"))
@@ -1367,6 +1436,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tempo_spin.valueChanged.connect(self.update_tempo)
         transport.addWidget(QtWidgets.QLabel('Tempo'))
         transport.addWidget(self.tempo_spin)
+
+    def on_quantize_changed(self, text: str) -> None:
+        value = text.strip().upper()
+        triplet = value.endswith('T')
+        if triplet:
+            value = value[:-1]
+        try:
+            div = int(value.split('/')[1])
+        except Exception:
+            div = 16
+            triplet = False
+        self.project.quantize_div = max(1, div)
+        self.project.quantize_triplet = triplet
+        self.piano_roll.quantize_selected()
 
     def update_locators(self) -> None:
         self.project.left_locator_sec = min(self.left_locator.value(), self.right_locator.value())
