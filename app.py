@@ -228,6 +228,7 @@ class ProjectState:
         self.vsti_paths: list[str] = []
         self.sample_paths: list[str] = []
         self.vsti_rack: list[VSTInstrument] = []
+        self.carla_host_path: str = ''
         self.sample_assets: list[SampleAsset] = []
         self.sample_clips: list[SampleClip] = []
         self.midi_sections: list[MidiSection] = []
@@ -1794,6 +1795,16 @@ class MainWindow(QtWidgets.QMainWindow):
         add_vsti_to_rack = QtGui.QAction('Add Discovered VSTI To Rack', self)
         add_vsti_to_rack.triggered.connect(self.add_discovered_vsti_to_rack)
         instruments_menu.addAction(add_vsti_to_rack)
+        instruments_menu.addSeparator()
+        set_carla_host = QtGui.QAction('Set Carla Host Binary…', self)
+        set_carla_host.triggered.connect(self.set_carla_host_binary)
+        verify_carla_host = QtGui.QAction('Verify Carla Host', self)
+        verify_carla_host.triggered.connect(self.verify_carla_host)
+        clear_carla_host = QtGui.QAction('Use PATH Carla Detection', self)
+        clear_carla_host.triggered.connect(self.clear_carla_host_binary)
+        instruments_menu.addAction(set_carla_host)
+        instruments_menu.addAction(verify_carla_host)
+        instruments_menu.addAction(clear_carla_host)
         self.vsti_menu = instruments_menu
 
         tracks_menu = settings.addMenu('Tracks')
@@ -2163,6 +2174,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         self.project.vsti_paths = [p for p in payload.get('vsti_paths', []) if isinstance(p, str)]
+        carla_path = payload.get('carla_host_path', '')
+        self.project.carla_host_path = carla_path if isinstance(carla_path, str) else ''
         self.project.sample_paths = [p for p in payload.get('sample_paths', []) if isinstance(p, str)]
         rack_paths = [p for p in payload.get('vsti_rack_paths', []) if isinstance(p, str)]
         self.project.vsti_paths = [p for p in self.project.vsti_paths if Path(p).exists()]
@@ -2179,6 +2192,7 @@ class MainWindow(QtWidgets.QMainWindow):
             'vsti_paths': self.project.vsti_paths,
             'vsti_rack_paths': [v.path for v in self.project.vsti_rack],
             'sample_paths': self.project.sample_paths,
+            'carla_host_path': self.project.carla_host_path,
         }
         APP_PREFS_PATH.write_text(json.dumps(payload, indent=2))
 
@@ -2270,7 +2284,49 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.information(self, 'VSTI not found', f'No rack VSTI named {vsti_name}.')
 
     def _carla_single_binary(self) -> str:
+        configured = self.project.carla_host_path.strip() if hasattr(self.project, 'carla_host_path') else ''
+        if configured and Path(configured).exists():
+            return configured
         return shutil.which('carla-single') or shutil.which('carla') or ''
+
+    def set_carla_host_binary(self) -> None:
+        current = self._carla_single_binary() or str(Path.cwd())
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Choose Carla host binary', current, 'Executable (*)')
+        if not path:
+            return
+        chosen = Path(path)
+        if not chosen.exists() or not chosen.is_file():
+            QtWidgets.QMessageBox.warning(self, 'Invalid Carla host', 'Selected path is not a valid executable file.')
+            return
+        self.project.carla_host_path = str(chosen)
+        self._save_preferences()
+        self.statusBar().showMessage(f'Configured Carla host: {chosen.name}')
+        self.refresh_vsti_rack_ui()
+
+    def clear_carla_host_binary(self) -> None:
+        self.project.carla_host_path = ''
+        self._save_preferences()
+        self.refresh_vsti_rack_ui()
+        self.statusBar().showMessage('Carla host configuration cleared. Using PATH detection.')
+
+    def verify_carla_host(self) -> None:
+        host = self._carla_single_binary()
+        if not host:
+            QtWidgets.QMessageBox.information(self, 'Carla not found', 'Carla host was not found. Install carla-single/carla or set a custom binary path in Settings > Instruments > Set Carla Host Binary…')
+            return
+        source = 'custom path' if self.project.carla_host_path and Path(self.project.carla_host_path).exists() and Path(self.project.carla_host_path) == Path(host) else 'PATH discovery'
+        version_line = ''
+        try:
+            result = subprocess.run([host, '--version'], check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
+            raw = (result.stdout or result.stderr).decode('utf-8', errors='ignore').strip()
+            version_line = raw.splitlines()[0] if raw else ''
+        except Exception:
+            version_line = ''
+        self.statusBar().showMessage(f'Carla host ready ({source}): {host}')
+        details = f'Using Carla host: {host}\nSource: {source}'
+        if version_line:
+            details += f'\nVersion: {version_line}'
+        QtWidgets.QMessageBox.information(self, 'Carla host ready', details)
 
     def open_vsti_gui_by_name(self, vsti_name: str) -> None:
         for vst in self.project.vsti_rack:
@@ -2338,8 +2394,16 @@ class MainWindow(QtWidgets.QMainWindow):
             existing = [a for a in self.vsti_menu.actions() if a.property('rack_item')]
             for action in existing:
                 self.vsti_menu.removeAction(action)
+            host = self._carla_single_binary()
+            host_flag = '✓' if host else '⚠'
+            host_label = Path(host).name if host else 'Not found (configure or install carla-single)'
+            host_action = QtGui.QAction(f'Carla host: {host_flag} {host_label}', self)
+            host_action.setProperty('rack_item', True)
+            host_action.setEnabled(False)
+            separator = self.vsti_menu.addSeparator()
+            separator.setProperty('rack_item', True)
+            self.vsti_menu.addAction(host_action)
             if self.project.vsti_rack:
-                self.vsti_menu.addSeparator()
                 for vst in self.project.vsti_rack:
                     loaded_flag = '✓' if self.vsti_binary_loader.is_loaded(vst.path) else '⚠'
                     action = QtGui.QAction(f'Rack: {loaded_flag} {vst.name}', self)
