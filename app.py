@@ -600,6 +600,11 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         for note in self.current_track().notes:
             self._draw_note(note)
 
+        bpm = max(1, self.project.bpm)
+        playhead_beat = self.project.playhead_sec * (bpm / 60.0)
+        playhead_x = playhead_beat * self.cell_w
+        self.scene_obj.addLine(playhead_x, 0, playhead_x, height, QtGui.QPen(QtGui.QColor(255, 90, 90), 2))
+
         self.setSceneRect(0, 0, width, height)
 
     def _draw_note(self, note: MidiNote) -> None:
@@ -807,6 +812,26 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         self.refresh()
         self.noteChanged.emit()
 
+    def duplicate_selected_by_grid(self) -> None:
+        self.sync_selection()
+        grid = self._grid_tick()
+        selected = [n for n in self.current_track().notes if n.selected]
+        if not selected:
+            return
+        for note in self.current_track().notes:
+            note.selected = False
+        for note in selected:
+            duplicated = MidiNote(
+                start_tick=max(0, note.start_tick + grid),
+                duration_tick=note.duration_tick,
+                pitch=note.pitch,
+                velocity=note.velocity,
+                selected=True,
+            )
+            self.current_track().notes.append(duplicated)
+        self.refresh()
+        self.noteChanged.emit()
+
 
 class VelocityEditorWidget(QtWidgets.QGraphicsView):
     velocityChanged = QtCore.Signal()
@@ -841,6 +866,11 @@ class VelocityEditorWidget(QtWidgets.QGraphicsView):
             color = QtGui.QColor(255, 175, 80) if note.selected else QtGui.QColor(110, 210, 110)
             rect = self.scene_obj.addRect(x, y, w, h, QtGui.QPen(QtCore.Qt.PenStyle.NoPen), QtGui.QBrush(color))
             rect.setData(0, note)
+
+        bpm = max(1, self.project.bpm)
+        playhead_beat = self.project.playhead_sec * (bpm / 60.0)
+        playhead_x = playhead_beat * self.cell_w
+        self.scene_obj.addLine(playhead_x, 0, playhead_x, height, QtGui.QPen(QtGui.QColor(255, 90, 90), 2))
 
         self.setSceneRect(0, 0, width, height)
 
@@ -1596,6 +1626,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.project.right_locator_sec = max(self.left_locator.value(), self.right_locator.value())
         self.sample_timeline.refresh()
         self.arrangement_overview.refresh()
+        self.piano_roll.refresh()
+        self.velocity_editor.refresh()
         self.timeline.refresh()
 
     def set_playhead_position(self, sec: float) -> None:
@@ -1606,6 +1638,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.playhead_spin.blockSignals(False)
         self.sample_timeline.refresh()
         self.arrangement_overview.refresh()
+        self.piano_roll.refresh()
+        self.velocity_editor.refresh()
 
     def start_playback(self) -> None:
         if not self._build_playback_mix(self.playback_mix_path):
@@ -2059,6 +2093,7 @@ class MainWindow(QtWidgets.QMainWindow):
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+E"), self, self.export_sample_timeline_audio)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+R"), self, self.render_all_tracks)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Q"), self, self.piano_roll.quantize_selected)
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+D"), self, self.piano_roll.duplicate_selected_by_grid)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+G"), self, self.compose_with_ai)
         QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Delete), self, self.piano_roll.delete_selected)
         QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Space), self, lambda: self.stop_playback() if self.playback_timer.isActive() else self.start_playback())
