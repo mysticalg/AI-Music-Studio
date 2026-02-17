@@ -556,6 +556,12 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
     def set_note_length_div(self, div: int) -> None:
         self.note_length_div = max(1, div)
 
+    def _set_headers(self) -> None:
+        locator_info = f"L {self.project.left_locator_sec:.2f}s  R {self.project.right_locator_sec:.2f}s"
+        self.setHorizontalHeaderLabels([
+            f"Track ({locator_info})", "Type", "Instrument", "Mode", "Profile", "Mute", "Solo", "Notes"
+        ])
+
     def refresh(self) -> None:
         self.scene_obj.clear()
         width = self.total_beats * self.cell_w
@@ -743,13 +749,20 @@ class TimelineWidget(QtWidgets.QTableWidget):
     def __init__(self, project: ProjectState) -> None:
         super().__init__(0, 8)
         self.project = project
-        self.setHorizontalHeaderLabels(["Track", "Type", "Instrument", "Mode", "Profile", "Mute", "Solo", "Notes"])
+        self._set_headers()
         self.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.verticalHeader().setVisible(False)
         self.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.refresh()
 
+    def _set_headers(self) -> None:
+        locator_info = f"L {self.project.left_locator_sec:.2f}s  R {self.project.right_locator_sec:.2f}s"
+        self.setHorizontalHeaderLabels([
+            f"Track ({locator_info})", "Type", "Instrument", "Mode", "Profile", "Mute", "Solo", "Notes"
+        ])
+
     def refresh(self) -> None:
+        self._set_headers()
         self.setRowCount(len(self.project.tracks))
         for i, track in enumerate(self.project.tracks):
             self.setItem(i, 0, QtWidgets.QTableWidgetItem(track.name))
@@ -1351,6 +1364,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.project.right_locator_sec = max(self.left_locator.value(), self.right_locator.value())
         self.sample_timeline.refresh()
         self.arrangement_overview.refresh()
+        self.timeline.refresh()
 
     def set_playhead_position(self, sec: float) -> None:
         self.project.playhead_sec = max(0.0, float(sec))
@@ -1727,8 +1741,13 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, "No samples", "No samples are placed on the timeline.")
             return
 
+        left = self.project.left_locator_sec
+        right = self.project.right_locator_sec
+        if right <= left:
+            QtWidgets.QMessageBox.warning(self, "Invalid locators", "Right locator must be greater than left locator for export.")
+            return
+
         sample_rate = 44100
-        max_end = 1.0
         loaded: list[tuple[SampleClip, list[float], int]] = []
         for clip in self.project.sample_clips:
             wav_path = Path(clip.path)
@@ -1738,10 +1757,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 wav_path = converted
             data, sr = load_wav_samples(wav_path)
             loaded.append((clip, data, sr))
-            clip_len = len(data) / sr
-            max_end = max(max_end, clip.start_sec + clip_len)
 
-        mix = [0.0] * int(max_end * sample_rate)
+        mix_length = int((right - left) * sample_rate)
+        mix = [0.0] * max(1, mix_length)
         for clip, data, sr in loaded:
             if sr != sample_rate:
                 ratio = sr / sample_rate
@@ -1749,9 +1767,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 for i in range(int(len(data) / ratio)):
                     resampled.append(data[min(len(data) - 1, int(i * ratio))])
                 data = resampled
-            offset = int(clip.start_sec * sample_rate)
-            for i, v in enumerate(data):
-                idx = offset + i
+
+            clip_start = clip.start_sec
+            clip_end = clip.start_sec + (len(data) / sample_rate)
+            if clip_end <= left or clip_start >= right:
+                continue
+
+            overlap_start = max(left, clip_start)
+            overlap_end = min(right, clip_end)
+            src_start = int((overlap_start - clip_start) * sample_rate)
+            src_end = int((overlap_end - clip_start) * sample_rate)
+            dst_offset = int((overlap_start - left) * sample_rate)
+
+            for i, v in enumerate(data[src_start:src_end]):
+                idx = dst_offset + i
                 if idx >= len(mix):
                     break
                 mix[idx] += v * 0.7
@@ -1950,6 +1979,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path:
             return
 
+        left_sec = self.project.left_locator_sec
+        right_sec = self.project.right_locator_sec
+        if right_sec <= left_sec:
+            QtWidgets.QMessageBox.warning(self, "Invalid locators", "Right locator must be greater than left locator for export.")
+            return
+
+        sec_per_tick = 60.0 / max(1, self.project.bpm) / TICKS_PER_BEAT
+        left_tick = int(left_sec / sec_per_tick)
+        right_tick = int(right_sec / sec_per_tick)
+
         midi = mido.MidiFile(ticks_per_beat=TICKS_PER_BEAT)
         for track_state in self.project.tracks:
             mtrack = mido.MidiTrack()
@@ -1959,18 +1998,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
             events: list[tuple[int, mido.Message]] = []
             for note in track_state.notes:
-                events.append(
-                    (
-                        note.start_tick,
-                        mido.Message("note_on", channel=track_state.midi_channel, note=note.pitch, velocity=note.velocity, time=0),
-                    )
-                )
-                events.append(
-                    (
-                        note.start_tick + note.duration_tick,
-                        mido.Message("note_off", channel=track_state.midi_channel, note=note.pitch, velocity=0, time=0),
-                    )
-                )
+                note_start = note.start_tick
+                note_end = note.start_tick + note.duration_tick
+                if note_end <= left_tick or note_start >= right_tick:
+                    continue
+
+                clipped_start = max(left_tick, note_start)
+                clipped_end = min(right_tick, note_end)
+                start_rel = clipped_start - left_tick
+                end_rel = clipped_end - left_tick
+
+                events.append((start_rel, mido.Message("note_on", channel=track_state.midi_channel, note=note.pitch, velocity=note.velocity, time=0)))
+                events.append((end_rel, mido.Message("note_off", channel=track_state.midi_channel, note=note.pitch, velocity=0, time=0)))
 
             events.sort(key=lambda x: x[0])
             current = 0
