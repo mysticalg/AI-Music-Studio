@@ -8,7 +8,8 @@ A desktop MIDI editor DAW prototype with a GUI built in **PySide6**, with:
 ## Implemented features
 
 - Track timeline panel for MIDI tracks
-- Piano roll editor with mouse note drawing/selection
+- Piano roll editor with right-click mini toolbar (selector, pencil, scissors, eraser, line tool)
+- Note length selector in-editor for drawing tools
 - Quantization (1/4, 1/8, 1/16, 1/32)
 - MIDI import/export (`.mid`) via `mido`
 - MIDI import by channel/program into separate tracks
@@ -17,10 +18,11 @@ A desktop MIDI editor DAW prototype with a GUI built in **PySide6**, with:
 - **Sample toolbox** for WAV/MP3 sample import
 - **Sample timeline tab** that displays waveform blocks when samples are placed
 - **Sample timeline audio export** to WAV or MP3
-- Mixer board (volume + pan per track)
-- Instrument board (instrument + synth profile + FX metadata)
+- Mixer board (volume + pan + mute/solo per track)
+- Instrument board (instrument type + GM/VSTI rack selection + FX metadata)
 - Built-in FX rack controls for EQ, Compression, Distortion, Phaser, Flanger, Delay, Reverb
 - Virtual piano keyboard input (computer keyboard)
+- Floating transport bar with playback controls, tempo setting, and loop locators
 - Keyboard shortcuts for transport/editing
 - OpenAI Codex composition from natural language prompts
 
@@ -35,10 +37,15 @@ export OPENAI_MODEL="gpt-5-codex"
 ```
 
 OpenAI is used for:
-- AI composition (`Ctrl+G`), and
+- AI composition (`Ctrl+G`),
+- Codex track assistant actions from **Settings > OpenAI > Prompt Codex About Tracks**, and
 - optional instrument-family classification during MIDI import.
 
-If no API key is present, classification falls back to deterministic GM/track-name heuristics.
+You can connect OpenAI in-app via **Settings > OpenAI > Connect** using either:
+- API key mode, or
+- OAuth (PKCE) mode by opening browser login, then pasting the returned authorization code.
+
+If OpenAI is not connected, classification falls back to deterministic GM/track-name heuristics.
 
 ## Audio format notes (WAV/MP3)
 

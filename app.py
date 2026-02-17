@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import base64
 import dataclasses
+import hashlib
 import json
 import math
 import os
+import secrets
 import struct
 import subprocess
 import sys
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import wave
+import webbrowser
 from pathlib import Path
 
 import mido
@@ -122,20 +128,40 @@ class MidiNote:
 @dataclasses.dataclass
 class TrackState:
     name: str
+    track_type: str = "instrument"
     notes: list[MidiNote] = dataclasses.field(default_factory=list)
     volume: float = 0.8
     pan: float = 0.0
     instrument: str = "Default Synth"
+    instrument_mode: str = "AI Synth"
+    rack_vsti: str = ""
     plugins: list[str] = dataclasses.field(default_factory=list)
     midi_program: int = 0
     midi_channel: int = 0
     synth_profile: str = "synth"
     rendered_audio_path: str = ""
+    mute: bool = False
+    solo: bool = False
+
+
+@dataclasses.dataclass
+class VSTInstrument:
+    name: str
+    path: str
+
+
+@dataclasses.dataclass
+class SampleAsset:
+    path: str
+    duration_sec: float
+    sample_rate: int = 44100
+    waveform_preview: list[float] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
 class SampleClip:
     path: str
+    track_index: int
     start_sec: float
     duration_sec: float
     sample_rate: int = 44100
@@ -147,19 +173,86 @@ class ProjectState:
         self.tracks: list[TrackState] = [TrackState(name="Track 1")]
         self.bpm = DEFAULT_BPM
         self.quantize_div = 16
+        self.vsti_paths: list[str] = []
+        self.vsti_rack: list[VSTInstrument] = []
+        self.sample_assets: list[SampleAsset] = []
         self.sample_clips: list[SampleClip] = []
+        self.left_locator_sec = 0.0
+        self.right_locator_sec = 8.0
 
 
 class OpenAIClient:
+    AUTH_PATH = Path('.openai_auth.json')
+
     def __init__(self) -> None:
         self.api_key = os.getenv("OPENAI_API_KEY", "")
+        self.oauth_access_token = ""
+        self.oauth_refresh_token = ""
+        self.oauth_expires_at = 0.0
+        self._load_saved_auth()
+
+    def _load_saved_auth(self) -> None:
+        if not self.AUTH_PATH.exists():
+            return
+        try:
+            payload = json.loads(self.AUTH_PATH.read_text())
+        except Exception:
+            return
+        self.api_key = payload.get('api_key', self.api_key)
+        self.oauth_access_token = payload.get('oauth_access_token', '')
+        self.oauth_refresh_token = payload.get('oauth_refresh_token', '')
+        self.oauth_expires_at = float(payload.get('oauth_expires_at', 0.0) or 0.0)
+
+    def _save_auth(self) -> None:
+        payload = {
+            'api_key': self.api_key,
+            'oauth_access_token': self.oauth_access_token,
+            'oauth_refresh_token': self.oauth_refresh_token,
+            'oauth_expires_at': self.oauth_expires_at,
+        }
+        self.AUTH_PATH.write_text(json.dumps(payload, indent=2))
 
     def is_enabled(self) -> bool:
-        return bool(self.api_key)
+        return bool(self.api_key or self.oauth_access_token)
+
+    def auth_status(self) -> str:
+        if self.oauth_access_token:
+            if self.oauth_expires_at > time.time():
+                mins = int((self.oauth_expires_at - time.time()) / 60)
+                return f"OpenAI connected via OAuth (expires in ~{max(0, mins)} min)"
+            return "OpenAI connected via OAuth"
+        if self.api_key:
+            return "OpenAI connected via API key"
+        return "OpenAI not connected"
+
+    def set_api_key(self, api_key: str) -> None:
+        self.api_key = api_key.strip()
+        self.oauth_access_token = ''
+        self.oauth_refresh_token = ''
+        self.oauth_expires_at = 0.0
+        self._save_auth()
+
+    def set_oauth_tokens(self, access_token: str, refresh_token: str = '', expires_in: int = 3600) -> None:
+        self.api_key = ''
+        self.oauth_access_token = access_token.strip()
+        self.oauth_refresh_token = refresh_token.strip()
+        self.oauth_expires_at = time.time() + max(0, int(expires_in or 0))
+        self._save_auth()
+
+    def clear_auth(self) -> None:
+        self.api_key = ''
+        self.oauth_access_token = ''
+        self.oauth_refresh_token = ''
+        self.oauth_expires_at = 0.0
+        self._save_auth()
+
+    def _authorization_header(self) -> str:
+        token = self.oauth_access_token or self.api_key
+        return f"Bearer {token}"
 
     def run_json_prompt(self, system_instruction: str, user_instruction: str) -> dict:
-        if not self.api_key:
-            raise RuntimeError("OPENAI_API_KEY is missing. Set it in your environment first.")
+        if not self.is_enabled():
+            raise RuntimeError("OpenAI is not connected. Use Settings > OpenAI to connect via API key or OAuth.")
 
         payload = {
             "model": OPENAI_MODEL,
@@ -173,7 +266,7 @@ class OpenAIClient:
             OPENAI_API_URL,
             data=json.dumps(payload).encode("utf-8"),
             headers={
-                "Authorization": f"Bearer {self.api_key}",
+                "Authorization": self._authorization_header(),
                 "Content-Type": "application/json",
             },
             method="POST",
@@ -423,13 +516,35 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         self.cell_w = 24
         self.cell_h = 14
         self.total_beats = 64
-        self._drawing = False
-        self._draw_start: QtCore.QPointF | None = None
-        self._current_rect_item: QtWidgets.QGraphicsRectItem | None = None
+        self.tool = 'select'
+        self.note_length_div = 8
+        self._line_start: QtCore.QPointF | None = None
         self.refresh()
 
     def current_track(self) -> TrackState:
         return self.project.tracks[self.get_track_index()]
+
+    def _grid_tick(self) -> int:
+        return max(1, TICKS_PER_BEAT * 4 // self.project.quantize_div)
+
+    def _pos_to_beat_pitch(self, pos: QtCore.QPointF) -> tuple[float, int]:
+        beat = max(0.0, pos.x() / self.cell_w)
+        pitch_idx = int(pos.y() // self.cell_h)
+        pitch = max(PITCH_MIN, min(PITCH_MAX, PITCH_MAX - pitch_idx))
+        return beat, pitch
+
+    def _length_ticks(self) -> int:
+        return max(1, int((4 / max(1, self.note_length_div)) * TICKS_PER_BEAT))
+
+    def set_tool(self, tool: str) -> None:
+        self.tool = tool
+        if self.tool == 'select':
+            self.setDragMode(QtWidgets.QGraphicsView.DragMode.RubberBandDrag)
+        else:
+            self.setDragMode(QtWidgets.QGraphicsView.DragMode.NoDrag)
+
+    def set_note_length_div(self, div: int) -> None:
+        self.note_length_div = max(1, div)
 
     def refresh(self) -> None:
         self.scene_obj.clear()
@@ -468,45 +583,126 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         item.setData(0, note)
         item.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
 
-    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
-        if event.button() == QtCore.Qt.MouseButton.LeftButton and (event.modifiers() & QtCore.Qt.KeyboardModifier.ShiftModifier):
-            self._drawing = True
-            self._draw_start = self.mapToScene(event.position().toPoint())
-            self._current_rect_item = self.scene_obj.addRect(QtCore.QRectF(self._draw_start, self._draw_start), QtGui.QPen(QtGui.QColor("yellow")))
+    def contextMenuEvent(self, event: QtGui.QContextMenuEvent) -> None:
+        menu = QtWidgets.QMenu(self)
+        tools_menu = menu.addMenu('Editor Tools')
+        actions: dict[str, QtGui.QAction] = {}
+        group = QtGui.QActionGroup(menu)
+        group.setExclusive(True)
+        for key, label in [
+            ('select', 'Selector'),
+            ('pencil', 'Pencil'),
+            ('scissors', 'Scissors'),
+            ('eraser', 'Eraser'),
+            ('line', 'Line Tool'),
+        ]:
+            action = tools_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(self.tool == key)
+            group.addAction(action)
+            actions[key] = action
+
+        length_menu = menu.addMenu('Note Length')
+        length_group = QtGui.QActionGroup(menu)
+        length_group.setExclusive(True)
+        for div in [1, 2, 4, 8, 16, 32]:
+            action = length_menu.addAction(f'1/{div}')
+            action.setCheckable(True)
+            action.setChecked(self.note_length_div == div)
+            length_group.addAction(action)
+            action.triggered.connect(lambda checked=False, d=div: self.set_note_length_div(d))
+
+        chosen = menu.exec(event.globalPos())
+        if chosen is None:
             return
+        for key, action in actions.items():
+            if chosen == action:
+                self.set_tool(key)
+                break
+
+    def _find_note_at(self, scene_pos: QtCore.QPointF) -> MidiNote | None:
+        for item in self.items(self.mapFromScene(scene_pos)):
+            note = item.data(0)
+            if isinstance(note, MidiNote):
+                return note
+        return None
+
+    def _insert_note_at(self, scene_pos: QtCore.QPointF) -> None:
+        beat, pitch = self._pos_to_beat_pitch(scene_pos)
+        grid = self._grid_tick()
+        start_tick = round((beat * TICKS_PER_BEAT) / grid) * grid
+        self.current_track().notes.append(MidiNote(start_tick=int(start_tick), duration_tick=self._length_ticks(), pitch=pitch))
+        self.refresh()
+        self.noteChanged.emit()
+
+    def _erase_note_at(self, scene_pos: QtCore.QPointF) -> None:
+        note = self._find_note_at(scene_pos)
+        if note is None:
+            return
+        track = self.current_track()
+        track.notes = [n for n in track.notes if n is not note]
+        self.refresh()
+        self.noteChanged.emit()
+
+    def _slice_note_at(self, scene_pos: QtCore.QPointF) -> None:
+        note = self._find_note_at(scene_pos)
+        if note is None:
+            return
+        beat, _ = self._pos_to_beat_pitch(scene_pos)
+        cut_tick = int(beat * TICKS_PER_BEAT)
+        start = note.start_tick
+        end = note.start_tick + note.duration_tick
+        if cut_tick <= start or cut_tick >= end:
+            return
+        left = cut_tick - start
+        right = end - cut_tick
+        if left < 1 or right < 1:
+            return
+        note.duration_tick = left
+        self.current_track().notes.append(MidiNote(start_tick=cut_tick, duration_tick=right, pitch=note.pitch, velocity=note.velocity))
+        self.refresh()
+        self.noteChanged.emit()
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        scene_pos = self.mapToScene(event.position().toPoint())
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            if self.tool == 'pencil':
+                self._insert_note_at(scene_pos)
+                return
+            if self.tool == 'eraser':
+                self._erase_note_at(scene_pos)
+                return
+            if self.tool == 'scissors':
+                self._slice_note_at(scene_pos)
+                return
+            if self.tool == 'line':
+                self._line_start = scene_pos
+                return
         super().mousePressEvent(event)
 
-    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
-        if self._drawing and self._current_rect_item is not None and self._draw_start is not None:
-            pos = self.mapToScene(event.position().toPoint())
-            rect = QtCore.QRectF(self._draw_start, pos).normalized()
-            self._current_rect_item.setRect(rect)
-            return
-        super().mouseMoveEvent(event)
-
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
-        if self._drawing and self._draw_start is not None:
-            self._drawing = False
-            end = self.mapToScene(event.position().toPoint())
-            rect = QtCore.QRectF(self._draw_start, end).normalized()
-            if self._current_rect_item is not None:
-                self.scene_obj.removeItem(self._current_rect_item)
-                self._current_rect_item = None
-
-            start_beat = max(0.0, rect.left() / self.cell_w)
-            end_beat = max(start_beat + 0.125, rect.right() / self.cell_w)
-            pitch_idx = int(rect.top() // self.cell_h)
-            pitch = max(PITCH_MIN, min(PITCH_MAX, PITCH_MAX - pitch_idx))
-
-            note = MidiNote(
-                start_tick=int(start_beat * TICKS_PER_BEAT),
-                duration_tick=max(60, int((end_beat - start_beat) * TICKS_PER_BEAT)),
-                pitch=pitch,
-            )
-            self.current_track().notes.append(note)
+        if self.tool == 'line' and self._line_start is not None and event.button() == QtCore.Qt.MouseButton.LeftButton:
+            end_pos = self.mapToScene(event.position().toPoint())
+            start_beat, start_pitch = self._pos_to_beat_pitch(self._line_start)
+            end_beat, end_pitch = self._pos_to_beat_pitch(end_pos)
+            if end_beat < start_beat:
+                start_beat, end_beat = end_beat, start_beat
+                start_pitch, end_pitch = end_pitch, start_pitch
+            note_len_beats = 4 / max(1, self.note_length_div)
+            count = max(1, int((end_beat - start_beat) / max(0.001, note_len_beats)) + 1)
+            track = self.current_track()
+            for i in range(count):
+                t = 0.0 if count == 1 else i / (count - 1)
+                beat = start_beat + (end_beat - start_beat) * t
+                pitch = int(round(start_pitch + (end_pitch - start_pitch) * t))
+                grid = self._grid_tick()
+                start_tick = round((beat * TICKS_PER_BEAT) / grid) * grid
+                track.notes.append(MidiNote(start_tick=int(start_tick), duration_tick=self._length_ticks(), pitch=max(PITCH_MIN, min(PITCH_MAX, pitch))))
+            self._line_start = None
             self.refresh()
             self.noteChanged.emit()
             return
+        self._line_start = None
         super().mouseReleaseEvent(event)
 
     def sync_selection(self) -> None:
@@ -535,9 +731,9 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
 
 class TimelineWidget(QtWidgets.QTableWidget):
     def __init__(self, project: ProjectState) -> None:
-        super().__init__(0, 5)
+        super().__init__(0, 8)
         self.project = project
-        self.setHorizontalHeaderLabels(["Track", "Instrument", "Profile", "Length (beats)", "Notes"])
+        self.setHorizontalHeaderLabels(["Track", "Type", "Instrument", "Mode", "Profile", "Mute", "Solo", "Notes"])
         self.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.verticalHeader().setVisible(False)
         self.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
@@ -546,53 +742,97 @@ class TimelineWidget(QtWidgets.QTableWidget):
     def refresh(self) -> None:
         self.setRowCount(len(self.project.tracks))
         for i, track in enumerate(self.project.tracks):
-            max_tick = max((n.start_tick + n.duration_tick for n in track.notes), default=0)
-            length_beats = max_tick / TICKS_PER_BEAT
             self.setItem(i, 0, QtWidgets.QTableWidgetItem(track.name))
-            self.setItem(i, 1, QtWidgets.QTableWidgetItem(track.instrument))
-            self.setItem(i, 2, QtWidgets.QTableWidgetItem(track.synth_profile))
-            self.setItem(i, 3, QtWidgets.QTableWidgetItem(f"{length_beats:.2f}"))
-            self.setItem(i, 4, QtWidgets.QTableWidgetItem(str(len(track.notes))))
+            self.setItem(i, 1, QtWidgets.QTableWidgetItem(track.track_type.title()))
+            self.setItem(i, 2, QtWidgets.QTableWidgetItem(track.instrument))
+            self.setItem(i, 3, QtWidgets.QTableWidgetItem(track.instrument_mode))
+            self.setItem(i, 4, QtWidgets.QTableWidgetItem(track.synth_profile))
+            self.setItem(i, 5, QtWidgets.QTableWidgetItem('Yes' if track.mute else 'No'))
+            self.setItem(i, 6, QtWidgets.QTableWidgetItem('Yes' if track.solo else 'No'))
+            self.setItem(i, 7, QtWidgets.QTableWidgetItem(str(len(track.notes))))
 
 
 class SampleTimelineWidget(QtWidgets.QGraphicsView):
-    def __init__(self, project: ProjectState) -> None:
+    def __init__(self, project: ProjectState, get_sample_track_indices, on_drop_sample) -> None:
         super().__init__()
         self.project = project
+        self.get_sample_track_indices = get_sample_track_indices
+        self.on_drop_sample = on_drop_sample
         self.scene_obj = QtWidgets.QGraphicsScene(self)
         self.setScene(self.scene_obj)
         self.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
         self.pixels_per_second = 80
         self.lane_height = 110
+        self.setAcceptDrops(True)
         self.refresh()
+
+    def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
+        if event.mimeData().hasText() and event.mimeData().text().startswith('sample_asset:'):
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dragMoveEvent(self, event: QtGui.QDragMoveEvent) -> None:
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event: QtGui.QDropEvent) -> None:
+        payload = event.mimeData().text()
+        if not payload.startswith('sample_asset:'):
+            event.ignore()
+            return
+        try:
+            sample_idx = int(payload.split(':', 1)[1])
+        except ValueError:
+            event.ignore()
+            return
+        pos = self.mapToScene(event.position().toPoint())
+        sample_tracks = self.get_sample_track_indices()
+        if not sample_tracks:
+            QtWidgets.QMessageBox.information(self, 'No sample track', 'Create a sample track first, then drag a sample here.')
+            event.ignore()
+            return
+        lane = int(pos.y() // self.lane_height)
+        lane = max(0, min(lane, len(sample_tracks) - 1))
+        start_sec = max(0.0, pos.x() / self.pixels_per_second)
+        self.on_drop_sample(sample_idx, sample_tracks[lane], start_sec)
+        event.acceptProposedAction()
 
     def refresh(self) -> None:
         self.scene_obj.clear()
-        duration = 8.0
+        sample_tracks = self.get_sample_track_indices()
+        lane_count = max(1, len(sample_tracks))
+        duration = max(8.0, self.project.right_locator_sec + 1.0)
         for clip in self.project.sample_clips:
             duration = max(duration, clip.start_sec + clip.duration_sec + 1.0)
 
         width = duration * self.pixels_per_second
-        height = self.lane_height
+        height = self.lane_height * lane_count
         self.scene_obj.addRect(0, 0, width, height, QtGui.QPen(QtGui.QColor(70, 70, 70)), QtGui.QBrush(QtGui.QColor(35, 35, 35)))
+
+        for lane in range(lane_count):
+            y0 = lane * self.lane_height
+            self.scene_obj.addLine(0, y0, width, y0, QtGui.QPen(QtGui.QColor(65, 65, 65)))
 
         sec = 0
         while sec <= int(duration) + 1:
             x = sec * self.pixels_per_second
             pen = QtGui.QPen(QtGui.QColor(120, 120, 120) if sec % 4 == 0 else QtGui.QColor(80, 80, 80))
             self.scene_obj.addLine(x, 0, x, height, pen)
-            text = self.scene_obj.addText(f"{sec}s")
-            text.setDefaultTextColor(QtGui.QColor(180, 180, 180))
-            text.setPos(x + 2, 2)
             sec += 1
 
+        for locator_sec, color in ((self.project.left_locator_sec, QtGui.QColor(0, 200, 160)), (self.project.right_locator_sec, QtGui.QColor(240, 200, 0))):
+            x = locator_sec * self.pixels_per_second
+            self.scene_obj.addLine(x, 0, x, height, QtGui.QPen(color, 2))
+
         for clip in self.project.sample_clips:
+            if clip.track_index not in sample_tracks:
+                continue
+            lane = sample_tracks.index(clip.track_index)
             x = clip.start_sec * self.pixels_per_second
             w = max(1, clip.duration_sec * self.pixels_per_second)
-            y = 26
+            y = lane * self.lane_height + 26
             h = 70
             self.scene_obj.addRect(x, y, w, h, QtGui.QPen(QtGui.QColor(0, 0, 0)), QtGui.QBrush(QtGui.QColor(72, 130, 200)))
-
             if clip.waveform_preview:
                 path = QtGui.QPainterPath()
                 step = w / max(1, len(clip.waveform_preview) - 1)
@@ -600,11 +840,8 @@ class SampleTimelineWidget(QtWidgets.QGraphicsView):
                 amp = h / 2 - 6
                 path.moveTo(x, mid)
                 for i, v in enumerate(clip.waveform_preview):
-                    px = x + i * step
-                    py = mid - (v * amp)
-                    path.lineTo(px, py)
+                    path.lineTo(x + i * step, mid - (v * amp))
                 self.scene_obj.addPath(path, QtGui.QPen(QtGui.QColor(230, 240, 255)))
-
             label = self.scene_obj.addText(Path(clip.path).name)
             label.setDefaultTextColor(QtGui.QColor(240, 240, 240))
             label.setPos(x + 4, y + 4)
@@ -624,40 +861,56 @@ class MixerWidget(QtWidgets.QWidget):
         self.pan = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.pan.setRange(-100, 100)
         self.pan.setValue(0)
+        self.mute = QtWidgets.QCheckBox('Mute')
+        self.solo = QtWidgets.QCheckBox('Solo')
         self.rendered_path = QtWidgets.QLineEdit()
         self.rendered_path.setReadOnly(True)
         layout.addRow("Volume", self.volume)
         layout.addRow("Pan", self.pan)
+        layout.addRow("Track state", self.mute)
+        layout.addRow("", self.solo)
         layout.addRow("Rendered audio", self.rendered_path)
 
         self.volume.valueChanged.connect(self.apply_changes)
         self.pan.valueChanged.connect(self.apply_changes)
+        self.mute.toggled.connect(self.apply_changes)
+        self.solo.toggled.connect(self.apply_changes)
 
     def load_track(self) -> None:
         track = self.current_track_callable()
         self.volume.setValue(int(track.volume * 100))
         self.pan.setValue(int(track.pan * 100))
+        self.mute.setChecked(track.mute)
+        self.solo.setChecked(track.solo)
         self.rendered_path.setText(track.rendered_audio_path)
 
     def apply_changes(self) -> None:
         track = self.current_track_callable()
         track.volume = self.volume.value() / 100
         track.pan = self.pan.value() / 100
+        track.mute = self.mute.isChecked()
+        track.solo = self.solo.isChecked()
 
 
 class InstrumentFxWidget(QtWidgets.QWidget):
-    def __init__(self, project: ProjectState, current_track_callable) -> None:
+    def __init__(self, project: ProjectState, current_track_callable, refresh_vsti_choices_callable) -> None:
         super().__init__()
         self.project = project
         self.current_track_callable = current_track_callable
+        self.refresh_vsti_choices_callable = refresh_vsti_choices_callable
 
         root = QtWidgets.QVBoxLayout(self)
         form = QtWidgets.QFormLayout()
+        self.instrument_mode = QtWidgets.QComboBox()
+        self.instrument_mode.addItems(["AI Synth", "General MIDI", "VSTI Rack"])
         self.instrument = QtWidgets.QComboBox()
-        self.instrument.addItems(["Default Synth", "Piano", "Bass", "Lead", "Sampler", "External VST (placeholder)"])
+        self.instrument.addItems(["Default Synth", "Piano", "Bass", "Lead", "Sampler"])
+        self.vsti_selector = QtWidgets.QComboBox()
         self.profile = QtWidgets.QLineEdit()
         self.profile.setReadOnly(True)
+        form.addRow("Instrument type", self.instrument_mode)
         form.addRow("Instrument", self.instrument)
+        form.addRow("VSTI rack", self.vsti_selector)
         form.addRow("AI synth profile", self.profile)
 
         self.fx_controls: dict[str, QtWidgets.QSlider] = {}
@@ -670,18 +923,134 @@ class InstrumentFxWidget(QtWidgets.QWidget):
 
         root.addLayout(form)
         self.instrument.currentTextChanged.connect(self.apply_changes)
+        self.instrument_mode.currentTextChanged.connect(self.apply_changes)
+        self.vsti_selector.currentTextChanged.connect(self.apply_changes)
+
+    def reload_vsti_choices(self) -> None:
+        current = self.vsti_selector.currentText()
+        self.vsti_selector.clear()
+        self.vsti_selector.addItem('None')
+        for vst in self.project.vsti_rack:
+            self.vsti_selector.addItem(vst.name)
+        idx = self.vsti_selector.findText(current)
+        if idx >= 0:
+            self.vsti_selector.setCurrentIndex(idx)
 
     def load_track(self) -> None:
+        self.reload_vsti_choices()
         track = self.current_track_callable()
+        idx_mode = self.instrument_mode.findText(track.instrument_mode)
+        if idx_mode >= 0:
+            self.instrument_mode.setCurrentIndex(idx_mode)
         idx = self.instrument.findText(track.instrument)
         if idx >= 0:
             self.instrument.setCurrentIndex(idx)
+        rack_idx = self.vsti_selector.findText(track.rack_vsti or 'None')
+        if rack_idx >= 0:
+            self.vsti_selector.setCurrentIndex(rack_idx)
         self.profile.setText(track.synth_profile)
 
     def apply_changes(self) -> None:
         track = self.current_track_callable()
+        track.instrument_mode = self.instrument_mode.currentText()
         track.instrument = self.instrument.currentText()
+        track.rack_vsti = '' if self.vsti_selector.currentText() == 'None' else self.vsti_selector.currentText()
         track.plugins = [f"{name}:{slider.value()}" for name, slider in self.fx_controls.items()]
+
+
+class SampleLibraryWidget(QtWidgets.QListWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setDragEnabled(True)
+
+    def mimeData(self, items):
+        mime = super().mimeData(items)
+        if items:
+            payload = items[0].data(QtCore.Qt.ItemDataRole.UserRole)
+            if isinstance(payload, str):
+                mime.setText(payload)
+        return mime
+
+
+class OpenAIConnectDialog(QtWidgets.QDialog):
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle('Connect OpenAI')
+        self.resize(620, 420)
+        self.code_verifier = ''
+
+        layout = QtWidgets.QVBoxLayout(self)
+        tabs = QtWidgets.QTabWidget()
+        layout.addWidget(tabs)
+
+        api_key_tab = QtWidgets.QWidget()
+        api_key_form = QtWidgets.QFormLayout(api_key_tab)
+        self.api_key_input = QtWidgets.QLineEdit()
+        self.api_key_input.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        api_key_form.addRow('API key', self.api_key_input)
+        tabs.addTab(api_key_tab, 'API Key')
+
+        oauth_tab = QtWidgets.QWidget()
+        oauth_form = QtWidgets.QFormLayout(oauth_tab)
+        self.client_id_input = QtWidgets.QLineEdit(os.getenv('OPENAI_OAUTH_CLIENT_ID', ''))
+        self.auth_url_input = QtWidgets.QLineEdit(os.getenv('OPENAI_OAUTH_AUTHORIZE_URL', 'https://auth.openai.com/oauth/authorize'))
+        self.token_url_input = QtWidgets.QLineEdit(os.getenv('OPENAI_OAUTH_TOKEN_URL', 'https://auth.openai.com/oauth/token'))
+        self.redirect_uri_input = QtWidgets.QLineEdit(os.getenv('OPENAI_OAUTH_REDIRECT_URI', 'http://127.0.0.1:8765/callback'))
+        self.scope_input = QtWidgets.QLineEdit(os.getenv('OPENAI_OAUTH_SCOPE', 'openid profile email'))
+        self.auth_code_input = QtWidgets.QLineEdit()
+        self.auth_code_input.setPlaceholderText('Paste the authorization code from redirect URL here')
+        oauth_form.addRow('Client ID', self.client_id_input)
+        oauth_form.addRow('Authorize URL', self.auth_url_input)
+        oauth_form.addRow('Token URL', self.token_url_input)
+        oauth_form.addRow('Redirect URI', self.redirect_uri_input)
+        oauth_form.addRow('Scope', self.scope_input)
+        oauth_form.addRow('Authorization code', self.auth_code_input)
+
+        oauth_buttons = QtWidgets.QHBoxLayout()
+        self.open_browser_btn = QtWidgets.QPushButton('Open OAuth Login')
+        self.open_browser_btn.clicked.connect(self.open_oauth_login)
+        oauth_buttons.addWidget(self.open_browser_btn)
+        tabs.addTab(oauth_tab, 'OAuth')
+        oauth_form.addRow('', oauth_buttons)
+
+        self.status_label = QtWidgets.QLabel('')
+        layout.addWidget(self.status_label)
+
+        buttons = QtWidgets.QDialogButtonBox()
+        self.connect_btn = buttons.addButton('Connect', QtWidgets.QDialogButtonBox.ButtonRole.AcceptRole)
+        cancel_btn = buttons.addButton(QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        self.connect_btn.clicked.connect(self.accept)
+        cancel_btn.clicked.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.tabs = tabs
+
+    def open_oauth_login(self) -> None:
+        self.code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(48)).decode().rstrip('=')
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(self.code_verifier.encode()).digest()).decode().rstrip('=')
+        params = {
+            'response_type': 'code',
+            'client_id': self.client_id_input.text().strip(),
+            'redirect_uri': self.redirect_uri_input.text().strip(),
+            'scope': self.scope_input.text().strip(),
+            'code_challenge': challenge,
+            'code_challenge_method': 'S256',
+            'state': secrets.token_urlsafe(16),
+        }
+        url = f"{self.auth_url_input.text().strip()}?{urllib.parse.urlencode(params)}"
+        webbrowser.open(url)
+        self.status_label.setText('Browser opened. After login, paste the returned authorization code and click Connect.')
+
+    def auth_payload(self) -> dict:
+        return {
+            'mode': 'api_key' if self.tabs.currentIndex() == 0 else 'oauth',
+            'api_key': self.api_key_input.text().strip(),
+            'client_id': self.client_id_input.text().strip(),
+            'token_url': self.token_url_input.text().strip(),
+            'redirect_uri': self.redirect_uri_input.text().strip(),
+            'auth_code': self.auth_code_input.text().strip(),
+            'code_verifier': self.code_verifier,
+        }
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -703,16 +1072,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.piano_roll.noteChanged.connect(self.on_notes_changed)
 
         self.mixer = MixerWidget(self.project, self.current_track)
-        self.instruments = InstrumentFxWidget(self.project, self.current_track)
-        self.sample_timeline = SampleTimelineWidget(self.project)
-        self.sample_library = QtWidgets.QListWidget()
+        self.instruments = InstrumentFxWidget(self.project, self.current_track, self.refresh_vsti_rack_ui)
+        self.sample_timeline = SampleTimelineWidget(self.project, self.sample_track_indices, self.place_sample_asset_on_track)
+        self.sample_library = SampleLibraryWidget()
 
         quantize_box = QtWidgets.QComboBox()
         quantize_box.addItems(["1/4", "1/8", "1/16", "1/32"])
         quantize_box.setCurrentText("1/16")
         quantize_box.currentTextChanged.connect(lambda text: setattr(self.project, "quantize_div", int(text.split("/")[1])))
 
-        add_track_btn = QtWidgets.QPushButton("+ Track")
+        add_track_btn = QtWidgets.QPushButton("+ Track (Sample/Instrument)")
         add_track_btn.clicked.connect(self.add_track)
 
         import_btn = QtWidgets.QPushButton("Import MIDI + AI Instrument Render")
@@ -730,11 +1099,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ai_btn = QtWidgets.QPushButton("AI Compose (OpenAI Codex)")
         ai_btn.clicked.connect(self.compose_with_ai)
 
-        play_btn = QtWidgets.QPushButton("Play")
-        stop_btn = QtWidgets.QPushButton("Stop")
-        play_btn.clicked.connect(lambda: self.statusBar().showMessage("Playback started (simulation)"))
-        stop_btn.clicked.connect(lambda: self.statusBar().showMessage("Playback stopped"))
-
+        
         left_panel = QtWidgets.QWidget()
         left_layout = QtWidgets.QVBoxLayout(left_panel)
         left_layout.addWidget(QtWidgets.QLabel("Tracks"))
@@ -751,8 +1116,6 @@ class MainWindow(QtWidgets.QMainWindow):
         left_layout.addWidget(place_sample_btn)
         left_layout.addWidget(export_audio_btn)
         left_layout.addWidget(ai_btn)
-        left_layout.addWidget(play_btn)
-        left_layout.addWidget(stop_btn)
         left_layout.addStretch()
 
         right_tabs = QtWidgets.QTabWidget()
@@ -772,10 +1135,254 @@ class MainWindow(QtWidgets.QMainWindow):
         splitter_main.setSizes([320, 1180])
 
         self.setCentralWidget(splitter_main)
+        self._setup_menus()
+        self._setup_floating_transport()
         self._setup_shortcuts()
         self._populate_track_list()
         self.track_list.setCurrentRow(0)
         self._setup_virtual_piano_dock()
+        self.refresh_sample_library()
+
+    def _setup_menus(self) -> None:
+        settings = self.menuBar().addMenu('Settings')
+
+        instruments_menu = settings.addMenu('Instruments')
+        add_vsti = QtGui.QAction('Add VSTI Path', self)
+        add_vsti.triggered.connect(self.add_vsti_path)
+        instruments_menu.addAction(add_vsti)
+        self.vsti_menu = instruments_menu
+
+        openai_menu = settings.addMenu('OpenAI')
+        connect_openai = QtGui.QAction('Connect', self)
+        connect_openai.triggered.connect(self.connect_openai)
+        disconnect_openai = QtGui.QAction('Disconnect', self)
+        disconnect_openai.triggered.connect(self.disconnect_openai)
+        codex_tracks = QtGui.QAction('Prompt Codex About Tracks', self)
+        codex_tracks.triggered.connect(self.codex_track_assistant)
+        openai_menu.addAction(connect_openai)
+        openai_menu.addAction(disconnect_openai)
+        openai_menu.addSeparator()
+        openai_menu.addAction(codex_tracks)
+        self.openai_status_action = QtGui.QAction(self.ai_client.auth_status(), self)
+        self.openai_status_action.setEnabled(False)
+        openai_menu.addAction(self.openai_status_action)
+
+        self.refresh_vsti_rack_ui()
+        self.refresh_openai_status()
+
+    def _setup_floating_transport(self) -> None:
+        transport = QtWidgets.QToolBar('Transport', self)
+        transport.setFloatable(True)
+        transport.setMovable(True)
+        self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, transport)
+        play_action = transport.addAction('Play')
+        stop_action = transport.addAction('Stop')
+        play_action.triggered.connect(lambda: self.statusBar().showMessage('Playback started (simulation)'))
+        stop_action.triggered.connect(lambda: self.statusBar().showMessage('Playback stopped'))
+        transport.addSeparator()
+        self.left_locator = QtWidgets.QDoubleSpinBox()
+        self.left_locator.setRange(0.0, 3600.0)
+        self.left_locator.setValue(self.project.left_locator_sec)
+        self.right_locator = QtWidgets.QDoubleSpinBox()
+        self.right_locator.setRange(0.0, 3600.0)
+        self.right_locator.setValue(self.project.right_locator_sec)
+        self.left_locator.valueChanged.connect(self.update_locators)
+        self.right_locator.valueChanged.connect(self.update_locators)
+        transport.addWidget(QtWidgets.QLabel('L'))
+        transport.addWidget(self.left_locator)
+        transport.addWidget(QtWidgets.QLabel('R'))
+        transport.addWidget(self.right_locator)
+        transport.addSeparator()
+        self.tempo_spin = QtWidgets.QSpinBox()
+        self.tempo_spin.setRange(20, 300)
+        self.tempo_spin.setValue(self.project.bpm)
+        self.tempo_spin.valueChanged.connect(self.update_tempo)
+        transport.addWidget(QtWidgets.QLabel('Tempo'))
+        transport.addWidget(self.tempo_spin)
+
+    def update_locators(self) -> None:
+        self.project.left_locator_sec = min(self.left_locator.value(), self.right_locator.value())
+        self.project.right_locator_sec = max(self.left_locator.value(), self.right_locator.value())
+        self.sample_timeline.refresh()
+
+    def update_tempo(self, bpm: int) -> None:
+        self.project.bpm = int(bpm)
+        self.statusBar().showMessage(f'Tempo set to {self.project.bpm} BPM')
+
+    def add_vsti_path(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Choose VST instrument', str(Path.cwd()), 'VST Plugins (*.dll *.vst3 *.so);;All files (*)')
+        if not path:
+            return
+        self.project.vsti_paths.append(path)
+        self.project.vsti_rack.append(VSTInstrument(name=Path(path).stem, path=path))
+        self.refresh_vsti_rack_ui()
+        self.statusBar().showMessage(f'Added VSTI to rack: {Path(path).name}')
+
+    def refresh_vsti_rack_ui(self) -> None:
+        if hasattr(self, 'vsti_menu'):
+            existing = [a for a in self.vsti_menu.actions() if a.property('rack_item')]
+            for action in existing:
+                self.vsti_menu.removeAction(action)
+            if self.project.vsti_rack:
+                self.vsti_menu.addSeparator()
+                for vst in self.project.vsti_rack:
+                    action = QtGui.QAction(f'Rack: {vst.name}', self)
+                    action.setProperty('rack_item', True)
+                    action.setEnabled(False)
+                    self.vsti_menu.addAction(action)
+        self.instruments.reload_vsti_choices()
+        self._populate_track_list()
+
+    def refresh_openai_status(self) -> None:
+        if hasattr(self, 'openai_status_action'):
+            self.openai_status_action.setText(self.ai_client.auth_status())
+
+    def connect_openai(self) -> None:
+        dialog = OpenAIConnectDialog(self)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        payload = dialog.auth_payload()
+        try:
+            if payload['mode'] == 'api_key':
+                if not payload['api_key']:
+                    raise RuntimeError('Please provide an API key.')
+                self.ai_client.set_api_key(payload['api_key'])
+            else:
+                self._exchange_oauth_code(payload)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, 'OpenAI connection failed', str(exc))
+            return
+        self.refresh_openai_status()
+        self.statusBar().showMessage('OpenAI connected successfully')
+
+    def _exchange_oauth_code(self, payload: dict) -> None:
+        if not payload['client_id'] or not payload['token_url'] or not payload['auth_code']:
+            raise RuntimeError('OAuth requires client id, token URL, and authorization code.')
+        if not payload['code_verifier']:
+            raise RuntimeError('Click "Open OAuth Login" first so a PKCE code verifier is generated.')
+
+        req_body = urllib.parse.urlencode(
+            {
+                'grant_type': 'authorization_code',
+                'client_id': payload['client_id'],
+                'code': payload['auth_code'],
+                'redirect_uri': payload['redirect_uri'],
+                'code_verifier': payload['code_verifier'],
+            }
+        ).encode('utf-8')
+        request = urllib.request.Request(
+            payload['token_url'],
+            data=req_body,
+            headers={'Content-Type': 'application/x-www-form-urlencoded'},
+            method='POST',
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                token_payload = json.loads(response.read().decode('utf-8'))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode('utf-8', errors='ignore')
+            raise RuntimeError(f'OAuth token exchange failed: {exc.code} {detail}') from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f'OAuth token exchange network failure: {exc}') from exc
+
+        access_token = token_payload.get('access_token', '')
+        if not access_token:
+            raise RuntimeError(f'No access_token in OAuth response: {token_payload}')
+        self.ai_client.set_oauth_tokens(
+            access_token=access_token,
+            refresh_token=token_payload.get('refresh_token', ''),
+            expires_in=int(token_payload.get('expires_in', 3600) or 3600),
+        )
+
+    def disconnect_openai(self) -> None:
+        self.ai_client.clear_auth()
+        self.refresh_openai_status()
+        self.statusBar().showMessage('OpenAI disconnected')
+
+    def codex_track_assistant(self) -> None:
+        if not self.ai_client.is_enabled():
+            QtWidgets.QMessageBox.information(self, 'OpenAI not connected', 'Connect OpenAI first via Settings > OpenAI > Connect.')
+            return
+
+        prompt, ok = QtWidgets.QInputDialog.getMultiLineText(
+            self,
+            'Codex Track Assistant',
+            'Describe how Codex should modify existing tracks:',
+            'Rename tracks, set mute/solo, and adjust instrument modes for arrangement cleanup.',
+        )
+        if not ok or not prompt.strip():
+            return
+
+        track_context = []
+        for idx, track in enumerate(self.project.tracks, start=1):
+            track_context.append(
+                {
+                    'index': idx,
+                    'name': track.name,
+                    'track_type': track.track_type,
+                    'instrument': track.instrument,
+                    'instrument_mode': track.instrument_mode,
+                    'mute': track.mute,
+                    'solo': track.solo,
+                    'note_count': len(track.notes),
+                }
+            )
+
+        system_instruction = (
+            'You are a DAW assistant. Return strict JSON with schema '
+            '{"actions":[{"track_index":int,"rename":str|null,"mute":bool|null,"solo":bool|null,'
+            '"instrument_mode":str|null,"instrument":str|null}]}. Do not include markdown.'
+        )
+        user_instruction = f"User request: {prompt}\n\nTracks:\n{json.dumps(track_context)}"
+        try:
+            result = self.ai_client.run_json_prompt(system_instruction, user_instruction)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, 'Codex assistant failed', str(exc))
+            return
+
+        changed = 0
+        for action in result.get('actions', []):
+            if not isinstance(action, dict):
+                continue
+            idx = int(action.get('track_index', 0)) - 1
+            if idx < 0 or idx >= len(self.project.tracks):
+                continue
+            track = self.project.tracks[idx]
+            rename = action.get('rename')
+            if isinstance(rename, str) and rename.strip():
+                track.name = rename.strip()
+                changed += 1
+            if isinstance(action.get('mute'), bool):
+                track.mute = action['mute']
+                changed += 1
+            if isinstance(action.get('solo'), bool):
+                track.solo = action['solo']
+                changed += 1
+            mode = action.get('instrument_mode')
+            if isinstance(mode, str) and mode in {'AI Synth', 'General MIDI', 'VSTI Rack', 'Sample'}:
+                track.instrument_mode = mode
+                changed += 1
+            instrument = action.get('instrument')
+            if isinstance(instrument, str) and instrument.strip():
+                track.instrument = instrument.strip()
+                changed += 1
+
+        if changed:
+            self._populate_track_list()
+            self.timeline.refresh()
+            self.mixer.load_track()
+            self.instruments.load_track()
+        self.statusBar().showMessage(f'Codex applied {changed} track updates')
+
+    def sample_track_indices(self) -> list[int]:
+        return [i for i, track in enumerate(self.project.tracks) if track.track_type == 'sample']
+
+    def place_sample_asset_on_track(self, asset_index: int, track_index: int, start_sec: float) -> None:
+        if asset_index < 0 or asset_index >= len(self.project.sample_assets):
+            return
+        asset = self.project.sample_assets[asset_index]
+        clip = SampleClip(path=asset.path, track_index=track_index, start_sec=start_sec, duration_sec=asset.duration_sec, sample_rate=asset.sample_rate, waveform_preview=asset.waveform_preview)
+        self.project.sample_clips.append(clip)
         self.refresh_sample_library()
 
     def _setup_shortcuts(self) -> None:
@@ -882,8 +1489,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def refresh_sample_library(self) -> None:
         self.sample_library.clear()
-        for clip in self.project.sample_clips:
-            self.sample_library.addItem(f"{Path(clip.path).name} @ {clip.start_sec:.2f}s")
+        for idx, asset in enumerate(self.project.sample_assets):
+            item = QtWidgets.QListWidgetItem(f"{Path(asset.path).name} ({asset.duration_sec:.2f}s)")
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, f"sample_asset:{idx}")
+            self.sample_library.addItem(item)
         self.sample_timeline.refresh()
 
     def import_sample(self) -> None:
@@ -904,37 +1513,29 @@ class MainWindow(QtWidgets.QMainWindow):
             sample_wav = converted
 
         preview, sample_rate, duration = load_wav_preview(sample_wav)
-        clip = SampleClip(
+        asset = SampleAsset(
             path=str(sample_wav),
-            start_sec=0.0,
             duration_sec=duration,
             sample_rate=sample_rate,
             waveform_preview=preview,
         )
-        self.project.sample_clips.append(clip)
+        self.project.sample_assets.append(asset)
         self.refresh_sample_library()
-        self.statusBar().showMessage(f"Imported sample: {src.name}")
+        self.statusBar().showMessage(f"Imported sample asset: {src.name}")
 
     def place_selected_sample(self) -> None:
         row = self.sample_library.currentRow()
-        if row < 0 or row >= len(self.project.sample_clips):
+        if row < 0 or row >= len(self.project.sample_assets):
             QtWidgets.QMessageBox.information(self, "No sample selected", "Select a sample from the samples toolbox first.")
             return
-
-        start_sec, ok = QtWidgets.QInputDialog.getDouble(
-            self,
-            "Place sample",
-            "Start time (seconds):",
-            self.project.sample_clips[row].start_sec,
-            0.0,
-            3600.0,
-            2,
-        )
+        sample_tracks = self.sample_track_indices()
+        if not sample_tracks:
+            QtWidgets.QMessageBox.information(self, "No sample track", "Create a sample track before placing samples.")
+            return
+        start_sec, ok = QtWidgets.QInputDialog.getDouble(self, "Place sample", "Start time (seconds):", 0.0, 0.0, 3600.0, 2)
         if not ok:
             return
-
-        self.project.sample_clips[row].start_sec = float(start_sec)
-        self.refresh_sample_library()
+        self.place_sample_asset_on_track(row, sample_tracks[0], float(start_sec))
 
     def export_sample_timeline_audio(self) -> None:
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -1073,27 +1674,40 @@ class MainWindow(QtWidgets.QMainWindow):
     def _populate_track_list(self) -> None:
         self.track_list.clear()
         for track in self.project.tracks:
-            self.track_list.addItem(f"{track.name} • {track.instrument}")
+            extra = f"VST:{track.rack_vsti}" if track.rack_vsti else track.instrument
+            self.track_list.addItem(f"{track.name} • {track.track_type} • {extra}")
 
     def _track_changed(self, row: int) -> None:
         if row < 0:
             return
+        track = self.current_track()
+        self.piano_roll.setEnabled(track.track_type == 'instrument')
         self.piano_roll.refresh()
         self.mixer.load_track()
         self.instruments.load_track()
 
     def add_track(self) -> None:
+        track_type, ok = QtWidgets.QInputDialog.getItem(self, 'Add track', 'Track type:', ['instrument', 'sample'], 0, False)
+        if not ok:
+            return
         idx = len(self.project.tracks) + 1
-        self.project.tracks.append(TrackState(name=f"Track {idx}"))
+        state = TrackState(name=f"Track {idx}", track_type=track_type)
+        if track_type == 'sample':
+            state.instrument = 'Sample Track'
+            state.instrument_mode = 'Sample'
+        self.project.tracks.append(state)
         self._populate_track_list()
         self.track_list.setCurrentRow(idx - 1)
         self.timeline.refresh()
+        self.sample_timeline.refresh()
 
     def new_project(self) -> None:
         self.project = ProjectState()
         self.timeline.project = self.project
         self.piano_roll.project = self.project
         self.sample_timeline.project = self.project
+        if hasattr(self, 'tempo_spin'):
+            self.tempo_spin.setValue(self.project.bpm)
         self._populate_track_list()
         self.track_list.setCurrentRow(0)
         self.on_notes_changed()
