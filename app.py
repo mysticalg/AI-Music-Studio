@@ -150,6 +150,7 @@ class TrackState:
     plugins: list[str] = dataclasses.field(default_factory=list)
     vsti_parameters: dict[str, float] = dataclasses.field(default_factory=dict)
     vsti_state_path: str = ""
+    carla_automation_enabled: bool = True
     midi_program: int = 0
     midi_channel: int = 0
     synth_profile: str = "synth"
@@ -1670,6 +1671,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.media_player.mediaStatusChanged.connect(self._on_media_status_changed)
         self.selected_audio_output_id = ""
         self.playback_mix_path = Path.cwd() / "renders" / "_playback_mix.wav"
+        self.carla_bridge_state_path = Path.cwd() / "renders" / "carla_bridge_state.json"
         self._playback_loop_ms = 0
         self.setWindowTitle("AI Music Studio")
         self.resize(1500, 900)
@@ -1805,6 +1807,19 @@ class MainWindow(QtWidgets.QMainWindow):
         instruments_menu.addAction(set_carla_host)
         instruments_menu.addAction(verify_carla_host)
         instruments_menu.addAction(clear_carla_host)
+        instruments_menu.addSeparator()
+        export_carla_session = QtGui.QAction('Export Carla Session Snapshot…', self)
+        export_carla_session.triggered.connect(self.export_carla_session_snapshot)
+        import_carla_session = QtGui.QAction('Import Carla Session Snapshot…', self)
+        import_carla_session.triggered.connect(self.import_carla_session_snapshot)
+        instruments_menu.addAction(export_carla_session)
+        instruments_menu.addAction(import_carla_session)
+        instruments_menu.addSeparator()
+        self.carla_transport_bridge_action = QtGui.QAction('Enable Carla Transport Bridge', self)
+        self.carla_transport_bridge_action.setCheckable(True)
+        self.carla_transport_bridge_action.setChecked(True)
+        self.carla_transport_bridge_action.toggled.connect(self.toggle_carla_transport_bridge)
+        instruments_menu.addAction(self.carla_transport_bridge_action)
         self.vsti_menu = instruments_menu
 
         tracks_menu = settings.addMenu('Tracks')
@@ -1949,6 +1964,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._playback_started_at = time.time()
         self._playback_origin_sec = self.project.playhead_sec
         self.playback_timer.start()
+        self._apply_carla_parameter_bridge()
+        self._write_carla_bridge_state()
         self.statusBar().showMessage(f'Playback started at {self.project.bpm} BPM ({self._playback_rate:.2f}x)')
 
     def stop_playback(self) -> None:
@@ -1956,6 +1973,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, 'playback_timer'):
             self.playback_timer.stop()
         self.media_player.stop()
+        self._write_carla_bridge_state()
         if should_reset:
             self.set_playhead_position(0.0)
             self.statusBar().showMessage('Playback reset to 0.00s')
@@ -1978,6 +1996,54 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.media_player.setPosition(0)
                 self.media_player.play()
         self.set_playhead_position(new_pos)
+        self._apply_carla_parameter_bridge()
+        self._write_carla_bridge_state()
+
+    def toggle_carla_transport_bridge(self, enabled: bool) -> None:
+        state = 'enabled' if enabled else 'disabled'
+        self.statusBar().showMessage(f'Carla transport bridge {state}')
+        self._write_carla_bridge_state()
+
+    def _apply_carla_parameter_bridge(self) -> None:
+        if not hasattr(self, 'carla_transport_bridge_action') or not self.carla_transport_bridge_action.isChecked():
+            return
+        for track in self.project.tracks:
+            if track.instrument_mode != 'VSTI Rack' or not track.rack_vsti or not track.carla_automation_enabled:
+                continue
+            track.vsti_parameters['Param 1'] = float(max(0.0, min(100.0, track.volume * 100.0)))
+            track.vsti_parameters['Param 2'] = float(max(0.0, min(100.0, (track.pan + 1.0) * 50.0)))
+
+    def _write_carla_bridge_state(self) -> None:
+        enabled = hasattr(self, 'carla_transport_bridge_action') and self.carla_transport_bridge_action.isChecked()
+        payload = {
+            'enabled': bool(enabled),
+            'playing': bool(self.playback_timer.isActive()) if hasattr(self, 'playback_timer') else False,
+            'bpm': int(self.project.bpm),
+            'playhead_sec': float(self.project.playhead_sec),
+            'left_locator_sec': float(self.project.left_locator_sec),
+            'right_locator_sec': float(self.project.right_locator_sec),
+            'timestamp': time.time(),
+            'tracks': [],
+        }
+        for idx, track in enumerate(self.project.tracks):
+            if track.instrument_mode != 'VSTI Rack' or not track.rack_vsti:
+                continue
+            payload['tracks'].append({
+                'index': idx,
+                'name': track.name,
+                'rack_vsti': track.rack_vsti,
+                'vsti_state_path': track.vsti_state_path,
+                'automation_enabled': track.carla_automation_enabled,
+                'mapped_params': {
+                    'Param 1': float(track.vsti_parameters.get('Param 1', 50.0)),
+                    'Param 2': float(track.vsti_parameters.get('Param 2', 50.0)),
+                },
+            })
+        try:
+            self.carla_bridge_state_path.parent.mkdir(parents=True, exist_ok=True)
+            self.carla_bridge_state_path.write_text(json.dumps(payload, indent=2))
+        except Exception:
+            pass
 
     def _on_media_status_changed(self, status: QtMultimedia.QMediaPlayer.MediaStatus) -> None:
         if status == QtMultimedia.QMediaPlayer.MediaStatus.EndOfMedia and self.playback_timer.isActive():
@@ -2282,6 +2348,73 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._load_vsti_binary_path(vst.path, show_message=True)
                 return
         QtWidgets.QMessageBox.information(self, 'VSTI not found', f'No rack VSTI named {vsti_name}.')
+
+    def export_carla_session_snapshot(self) -> None:
+        default_path = Path.cwd() / 'renders' / 'carla_session_snapshot.json'
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, 'Export Carla session snapshot', str(default_path), 'JSON (*.json)')
+        if not path:
+            return
+        data = {
+            'carla_host_path': self.project.carla_host_path,
+            'tracks': [
+                {
+                    'name': t.name,
+                    'instrument_mode': t.instrument_mode,
+                    'rack_vsti': t.rack_vsti,
+                    'vsti_state_path': t.vsti_state_path,
+                    'vsti_parameters': t.vsti_parameters,
+                    'carla_automation_enabled': t.carla_automation_enabled,
+                }
+                for t in self.project.tracks
+            ],
+        }
+        try:
+            Path(path).write_text(json.dumps(data, indent=2))
+            self.statusBar().showMessage(f'Exported Carla snapshot: {Path(path).name}')
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, 'Export failed', str(exc))
+
+    def import_carla_session_snapshot(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Import Carla session snapshot', str(Path.cwd()), 'JSON (*.json)')
+        if not path:
+            return
+        try:
+            data = json.loads(Path(path).read_text())
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, 'Import failed', str(exc))
+            return
+
+        host = data.get('carla_host_path', '')
+        if isinstance(host, str):
+            self.project.carla_host_path = host
+
+        tracks_data = data.get('tracks', [])
+        if isinstance(tracks_data, list):
+            for idx, payload in enumerate(tracks_data):
+                if idx >= len(self.project.tracks) or not isinstance(payload, dict):
+                    continue
+                track = self.project.tracks[idx]
+                track.instrument_mode = str(payload.get('instrument_mode', track.instrument_mode))
+                track.rack_vsti = str(payload.get('rack_vsti', track.rack_vsti))
+                track.vsti_state_path = str(payload.get('vsti_state_path', track.vsti_state_path))
+                params = payload.get('vsti_parameters', {})
+                if isinstance(params, dict):
+                    normalized: dict[str, float] = {}
+                    for k, v in params.items():
+                        try:
+                            normalized[str(k)] = float(v)
+                        except Exception:
+                            continue
+                    if normalized:
+                        track.vsti_parameters = normalized
+                auto_enabled = payload.get('carla_automation_enabled', track.carla_automation_enabled)
+                track.carla_automation_enabled = bool(auto_enabled)
+
+        self._save_preferences()
+        self.refresh_vsti_rack_ui()
+        self.on_track_instrument_changed()
+        self._write_carla_bridge_state()
+        self.statusBar().showMessage(f'Imported Carla snapshot: {Path(path).name}')
 
     def _carla_single_binary(self) -> str:
         configured = self.project.carla_host_path.strip() if hasattr(self.project, 'carla_host_path') else ''

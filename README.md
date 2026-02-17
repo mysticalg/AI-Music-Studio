@@ -71,18 +71,18 @@ We will integrate with [Carla](https://github.com/falkTX/Carla) as an **external
 
 ### Implementation phases
 
-- **Phase 1: External host baseline**
+- **Phase 1: External host baseline** ✅
   - Detect Carla binaries in PATH (or configure/reset host detection in **Settings > Instruments** using **Set Carla Host Binary…** and **Use PATH Carla Detection**).
   - Launch selected rack plugin GUI in Carla.
   - Store per-track Carla state path references.
 
-- **Phase 2: Session interoperability**
-  - Save/load Carla project or plugin state files per song.
-  - Add reopen/relink actions for plugin chains.
+- **Phase 2: Session interoperability** ✅
+  - Export/import Carla session snapshots from **Settings > Instruments** (host path, rack assignment, VST state path, and VST parameter values).
+  - Re-link track Carla metadata across sessions.
 
-- **Phase 3: Transport + automation bridge**
-  - Add transport sync and targeted parameter mapping.
-  - Reassess fork/embedding only if clear product requirements demand it.
+- **Phase 3: Transport + automation bridge** ✅
+  - Write live bridge state to `renders/carla_bridge_state.json` during playback (transport, locators, rack-track mappings).
+  - Apply targeted parameter mapping for rack tracks (`Param 1` from volume, `Param 2` from pan) when bridge is enabled.
 
 ## Quick start
 
