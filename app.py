@@ -518,10 +518,13 @@ class AISynthRenderer:
 class PianoRollWidget(QtWidgets.QGraphicsView):
     noteChanged = QtCore.Signal()
 
-    def __init__(self, project: ProjectState, get_track_index_callable) -> None:
+    def __init__(self, project: ProjectState, get_track_index_callable, set_playhead_callable=None, set_left_locator_callable=None, set_right_locator_callable=None) -> None:
         super().__init__()
         self.project = project
         self.get_track_index = get_track_index_callable
+        self.set_playhead = set_playhead_callable or (lambda sec: setattr(self.project, 'playhead_sec', max(0.0, float(sec))))
+        self.set_left_locator = set_left_locator_callable or (lambda sec: setattr(self.project, 'left_locator_sec', max(0.0, float(sec))))
+        self.set_right_locator = set_right_locator_callable or (lambda sec: setattr(self.project, 'right_locator_sec', max(0.0, float(sec))))
         self.scene_obj = QtWidgets.QGraphicsScene(self)
         self.setScene(self.scene_obj)
         self.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
@@ -537,6 +540,8 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         self._drag_anchor_tick = 0
         self._drag_anchor_pitch = 0
         self._drag_selected_snapshot: list[tuple[MidiNote, int, int]] = []
+        self._drag_playhead = False
+        self._locator_ruler_height = 16
         self.refresh()
 
     def current_track(self) -> TrackState:
@@ -702,6 +707,20 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
         scene_pos = self.mapToScene(event.position().toPoint())
+        sec = max(0.0, scene_pos.x() / self.cell_w * (60.0 / max(1, self.project.bpm)))
+
+        if scene_pos.y() <= self._locator_ruler_height and event.button() in (QtCore.Qt.MouseButton.LeftButton, QtCore.Qt.MouseButton.RightButton):
+            if event.button() == QtCore.Qt.MouseButton.RightButton or bool(event.modifiers() & QtCore.Qt.KeyboardModifier.ShiftModifier):
+                self.set_right_locator(sec)
+            else:
+                self.set_left_locator(sec)
+            return
+
+        if abs(scene_pos.x() - (self.project.playhead_sec * (self.project.bpm / 60.0) * self.cell_w)) <= 6 and event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self._drag_playhead = True
+            self.set_playhead(sec)
+            return
+
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
             if self.tool == 'pencil':
                 note = self._insert_note_at(scene_pos)
@@ -736,6 +755,10 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
         scene_pos = self.mapToScene(event.position().toPoint())
+        if self._drag_playhead:
+            sec = max(0.0, scene_pos.x() / self.cell_w * (60.0 / max(1, self.project.bpm)))
+            self.set_playhead(sec)
+            return
         if self.tool == 'pencil' and self._pencil_note is not None:
             beat, _ = self._pos_to_beat_pitch(scene_pos)
             grid = self._grid_tick()
@@ -784,6 +807,7 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
             self.noteChanged.emit()
             return
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self._drag_playhead = False
             self._pencil_note = None
             self._drag_selected_snapshot = []
         self._line_start = None
@@ -1047,10 +1071,12 @@ class SampleTimelineWidget(QtWidgets.QGraphicsView):
 class ArrangementOverviewWidget(QtWidgets.QGraphicsView):
     locatorChanged = QtCore.Signal(float)
 
-    def __init__(self, project: ProjectState, set_locator_callable, on_section_moved_callable, get_bpm_callable) -> None:
+    def __init__(self, project: ProjectState, set_locator_callable, set_left_locator_callable, set_right_locator_callable, on_section_moved_callable, get_bpm_callable) -> None:
         super().__init__()
         self.project = project
         self.set_locator_callable = set_locator_callable
+        self.set_left_locator_callable = set_left_locator_callable
+        self.set_right_locator_callable = set_right_locator_callable
         self.on_section_moved = on_section_moved_callable
         self.get_bpm = get_bpm_callable
         self.scene_obj = QtWidgets.QGraphicsScene(self)
@@ -1062,6 +1088,8 @@ class ArrangementOverviewWidget(QtWidgets.QGraphicsView):
         self._drag_origin_start_sec = 0.0
         self._drag_origin_track_index = 0
         self.arrangement_quantize_mode = "beat"
+        self._drag_playhead = False
+        self._locator_ruler_height = 16
         self.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
         self.setMouseTracking(True)
         self.refresh()
@@ -1133,7 +1161,21 @@ class ArrangementOverviewWidget(QtWidgets.QGraphicsView):
         self.set_locator_callable(sec)
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        scene_pos = self.mapToScene(event.position().toPoint())
+        sec = max(0.0, scene_pos.x() / self.pixels_per_second)
+
+        if scene_pos.y() <= self._locator_ruler_height and event.button() in (QtCore.Qt.MouseButton.LeftButton, QtCore.Qt.MouseButton.RightButton):
+            if event.button() == QtCore.Qt.MouseButton.RightButton or bool(event.modifiers() & QtCore.Qt.KeyboardModifier.ShiftModifier):
+                self.set_right_locator_callable(sec)
+            else:
+                self.set_left_locator_callable(sec)
+            return
+
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            if abs(scene_pos.x() - (self.project.playhead_sec * self.pixels_per_second)) <= 6:
+                self._drag_playhead = True
+                self.set_locator_callable(sec)
+                return
             item = self.itemAt(event.position().toPoint())
             if item is not None and item.data(0) is not None:
                 self._drag_index = int(item.data(0))
@@ -1148,6 +1190,10 @@ class ArrangementOverviewWidget(QtWidgets.QGraphicsView):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        if self._drag_playhead:
+            sec = max(0.0, self.mapToScene(event.position().toPoint()).x() / self.pixels_per_second)
+            self.set_locator_callable(sec)
+            return
         if self._drag_index is not None and 0 <= self._drag_index < len(self.project.midi_sections):
             pos = self.mapToScene(event.position().toPoint())
             x_sec = pos.x() / self.pixels_per_second
@@ -1162,7 +1208,9 @@ class ArrangementOverviewWidget(QtWidgets.QGraphicsView):
 
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
-            if self._drag_index is None:
+            if self._drag_playhead:
+                self._drag_playhead = False
+            elif self._drag_index is None:
                 self._set_playhead_from_event(event)
             elif 0 <= self._drag_index < len(self.project.midi_sections):
                 section = self.project.midi_sections[self._drag_index]
@@ -1419,7 +1467,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.track_list.currentRowChanged.connect(self._track_changed)
 
         self.timeline = TimelineWidget(self.project)
-        self.piano_roll = PianoRollWidget(self.project, self.current_track_index)
+        self.piano_roll = PianoRollWidget(self.project, self.current_track_index, self.set_playhead_position, self.set_left_locator_position, self.set_right_locator_position)
         self.piano_roll.noteChanged.connect(self.on_notes_changed)
         self.velocity_editor = VelocityEditorWidget(self.project, self.current_track_index)
         self.velocity_editor.velocityChanged.connect(self.on_notes_changed)
@@ -1427,7 +1475,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mixer = MixerWidget(self.project, self.current_track)
         self.instruments = InstrumentFxWidget(self.project, self.current_track, self.refresh_vsti_rack_ui)
         self.sample_timeline = SampleTimelineWidget(self.project, self.sample_track_indices, self.place_sample_asset_on_track, self.set_playhead_position)
-        self.arrangement_overview = ArrangementOverviewWidget(self.project, self.set_playhead_position, self.apply_arrangement_section_move, lambda: self.project.bpm)
+        self.arrangement_overview = ArrangementOverviewWidget(self.project, self.set_playhead_position, self.set_left_locator_position, self.set_right_locator_position, self.apply_arrangement_section_move, lambda: self.project.bpm)
         self.sample_library = SampleLibraryWidget()
 
         self.quantize_box = QtWidgets.QComboBox()
@@ -1620,6 +1668,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.project.quantize_div = max(1, div)
         self.project.quantize_triplet = triplet
         self.piano_roll.quantize_selected()
+
+    def set_left_locator_position(self, sec: float) -> None:
+        self.project.left_locator_sec = min(max(0.0, float(sec)), self.project.right_locator_sec)
+        self.left_locator.blockSignals(True)
+        self.left_locator.setValue(self.project.left_locator_sec)
+        self.left_locator.blockSignals(False)
+        self.update_locators()
+
+    def set_right_locator_position(self, sec: float) -> None:
+        self.project.right_locator_sec = max(max(0.0, float(sec)), self.project.left_locator_sec)
+        self.right_locator.blockSignals(True)
+        self.right_locator.setValue(self.project.right_locator_sec)
+        self.right_locator.blockSignals(False)
+        self.update_locators()
 
     def update_locators(self) -> None:
         self.project.left_locator_sec = min(self.left_locator.value(), self.right_locator.value())
