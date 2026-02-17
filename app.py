@@ -28,6 +28,7 @@ PITCH_MAX = 84
 OPENAI_API_URL = "https://api.openai.com/v1/responses"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-codex")
 RENDER_DIR = Path("renders")
+APP_PREFS_PATH = Path(".ai_music_studio_prefs.json")
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -183,6 +184,7 @@ class ProjectState:
         self.quantize_div = 16
         self.quantize_triplet = False
         self.vsti_paths: list[str] = []
+        self.sample_paths: list[str] = []
         self.vsti_rack: list[VSTInstrument] = []
         self.sample_assets: list[SampleAsset] = []
         self.sample_clips: list[SampleClip] = []
@@ -806,6 +808,75 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         self.noteChanged.emit()
 
 
+class VelocityEditorWidget(QtWidgets.QGraphicsView):
+    velocityChanged = QtCore.Signal()
+
+    def __init__(self, project: ProjectState, get_track_index_callable) -> None:
+        super().__init__()
+        self.project = project
+        self.get_track_index = get_track_index_callable
+        self.scene_obj = QtWidgets.QGraphicsScene(self)
+        self.setScene(self.scene_obj)
+        self.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
+        self.setFixedHeight(140)
+        self.cell_w = 24
+        self.total_beats = 64
+        self._drag_note: MidiNote | None = None
+        self.refresh()
+
+    def current_track(self) -> TrackState:
+        return self.project.tracks[self.get_track_index()]
+
+    def refresh(self) -> None:
+        self.scene_obj.clear()
+        width = self.total_beats * self.cell_w
+        height = 120
+        self.scene_obj.addRect(0, 0, width, height, QtGui.QPen(QtGui.QColor(70, 70, 70)), QtGui.QBrush(QtGui.QColor(28, 28, 28)))
+
+        for note in self.current_track().notes:
+            x = note.start_tick / TICKS_PER_BEAT * self.cell_w
+            w = max(2, note.duration_tick / TICKS_PER_BEAT * self.cell_w)
+            h = max(2, int((note.velocity / 127.0) * (height - 12)))
+            y = height - h
+            color = QtGui.QColor(255, 175, 80) if note.selected else QtGui.QColor(110, 210, 110)
+            rect = self.scene_obj.addRect(x, y, w, h, QtGui.QPen(QtCore.Qt.PenStyle.NoPen), QtGui.QBrush(color))
+            rect.setData(0, note)
+
+        self.setSceneRect(0, 0, width, height)
+
+    def _apply_velocity_from_pos(self, scene_pos: QtCore.QPointF) -> None:
+        if self._drag_note is None:
+            return
+        height = 120
+        y = max(0.0, min(float(height), scene_pos.y()))
+        vel = int(round((1.0 - (y / height)) * 127.0))
+        self._drag_note.velocity = max(1, min(127, vel))
+        self.refresh()
+        self.velocityChanged.emit()
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            item = self.itemAt(event.position().toPoint())
+            if item is not None:
+                note = item.data(0)
+                if isinstance(note, MidiNote):
+                    self._drag_note = note
+                    self._apply_velocity_from_pos(self.mapToScene(event.position().toPoint()))
+                    return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        if self._drag_note is not None:
+            self._apply_velocity_from_pos(self.mapToScene(event.position().toPoint()))
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self._drag_note = None
+        super().mouseReleaseEvent(event)
+
+
 class TimelineWidget(QtWidgets.QTableWidget):
     def __init__(self, project: ProjectState) -> None:
         super().__init__(0, 8)
@@ -1303,6 +1374,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.composer = OpenAIComposer(self.ai_client)
         self.instrument_ai = InstrumentIntelligence(self.ai_client)
         self.renderer = AISynthRenderer()
+        self._load_preferences()
         self.audio_output = QtMultimedia.QAudioOutput(self)
         self.media_player = QtMultimedia.QMediaPlayer(self)
         self.media_player.setAudioOutput(self.audio_output)
@@ -1319,6 +1391,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timeline = TimelineWidget(self.project)
         self.piano_roll = PianoRollWidget(self.project, self.current_track_index)
         self.piano_roll.noteChanged.connect(self.on_notes_changed)
+        self.velocity_editor = VelocityEditorWidget(self.project, self.current_track_index)
+        self.velocity_editor.velocityChanged.connect(self.on_notes_changed)
 
         self.mixer = MixerWidget(self.project, self.current_track)
         self.instruments = InstrumentFxWidget(self.project, self.current_track, self.refresh_vsti_rack_ui)
@@ -1377,10 +1451,18 @@ class MainWindow(QtWidgets.QMainWindow):
         right_tabs.addTab(self.mixer, "Mixer")
         right_tabs.addTab(self.instruments, "Instruments / FX")
 
+        note_editor = QtWidgets.QWidget()
+        note_editor_layout = QtWidgets.QVBoxLayout(note_editor)
+        note_editor_layout.setContentsMargins(0, 0, 0, 0)
+        note_editor_layout.setSpacing(4)
+        note_editor_layout.addWidget(self.piano_roll)
+        note_editor_layout.addWidget(QtWidgets.QLabel('Velocity Editor'))
+        note_editor_layout.addWidget(self.velocity_editor)
+
         splitter_vertical = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
-        splitter_vertical.addWidget(self.piano_roll)
+        splitter_vertical.addWidget(note_editor)
         splitter_vertical.addWidget(right_tabs)
-        splitter_vertical.setSizes([550, 320])
+        splitter_vertical.setSizes([600, 320])
 
         splitter_main = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         splitter_main.addWidget(left_panel)
@@ -1395,6 +1477,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.track_list.setCurrentRow(0)
         self._setup_virtual_piano_dock()
         self.refresh_sample_library()
+        self.scan_sample_paths()
 
     def _setup_menus(self) -> None:
         file_menu = self.menuBar().addMenu('File')
@@ -1415,6 +1498,9 @@ class MainWindow(QtWidgets.QMainWindow):
         add_vsti = QtGui.QAction('Add VSTI Path', self)
         add_vsti.triggered.connect(self.add_vsti_path)
         instruments_menu.addAction(add_vsti)
+        add_vsti_folder = QtGui.QAction('Add VSTI Folder', self)
+        add_vsti_folder.triggered.connect(self.add_vsti_folder)
+        instruments_menu.addAction(add_vsti_folder)
         self.vsti_menu = instruments_menu
 
         openai_menu = settings.addMenu('OpenAI')
@@ -1431,6 +1517,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.openai_status_action = QtGui.QAction(self.ai_client.auth_status(), self)
         self.openai_status_action.setEnabled(False)
         openai_menu.addAction(self.openai_status_action)
+
+        samples_menu = settings.addMenu('Sample Paths')
+        add_sample_path = QtGui.QAction('Add Sample Folder', self)
+        add_sample_path.triggered.connect(self.add_sample_path)
+        scan_sample_paths = QtGui.QAction('Scan Sample Folders', self)
+        scan_sample_paths.triggered.connect(self.scan_sample_paths)
+        samples_menu.addAction(add_sample_path)
+        samples_menu.addAction(scan_sample_paths)
 
         self.audio_output_menu = settings.addMenu('Audio Output')
         self.refresh_audio_output_menu()
@@ -1698,12 +1792,95 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.on_notes_changed()
 
+    def _load_preferences(self) -> None:
+        if not APP_PREFS_PATH.exists():
+            return
+        try:
+            payload = json.loads(APP_PREFS_PATH.read_text())
+        except Exception:
+            return
+
+        self.project.vsti_paths = [p for p in payload.get('vsti_paths', []) if isinstance(p, str)]
+        self.project.sample_paths = [p for p in payload.get('sample_paths', []) if isinstance(p, str)]
+        rack = []
+        for path in self.project.vsti_paths:
+            if Path(path).exists():
+                rack.append(VSTInstrument(name=Path(path).stem, path=path))
+        self.project.vsti_rack = rack
+
+    def _save_preferences(self) -> None:
+        payload = {
+            'vsti_paths': self.project.vsti_paths,
+            'sample_paths': self.project.sample_paths,
+        }
+        APP_PREFS_PATH.write_text(json.dumps(payload, indent=2))
+
+    def add_vsti_folder(self) -> None:
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, 'Choose VST folder', str(Path.cwd()))
+        if not folder:
+            return
+        found = []
+        for ext in ('*.dll', '*.vst3', '*.so'):
+            found.extend(Path(folder).glob(ext))
+        added = 0
+        for plugin in found:
+            pstr = str(plugin)
+            if pstr in self.project.vsti_paths:
+                continue
+            self.project.vsti_paths.append(pstr)
+            self.project.vsti_rack.append(VSTInstrument(name=plugin.stem, path=pstr))
+            added += 1
+        self._save_preferences()
+        self.refresh_vsti_rack_ui()
+        self.statusBar().showMessage(f'Added {added} VSTI plugin(s) from folder')
+
+    def add_sample_path(self) -> None:
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, 'Choose sample folder', str(Path.cwd()))
+        if not folder:
+            return
+        if folder not in self.project.sample_paths:
+            self.project.sample_paths.append(folder)
+            self._save_preferences()
+        self.statusBar().showMessage(f'Added sample folder: {Path(folder).name}')
+
+    def scan_sample_paths(self) -> None:
+        seen = {Path(a.path).resolve() for a in self.project.sample_assets if Path(a.path).exists()}
+        added = 0
+        for root in self.project.sample_paths:
+            root_path = Path(root)
+            if not root_path.exists():
+                continue
+            for ext in ('*.wav', '*.mp3'):
+                for file in root_path.rglob(ext):
+                    resolved = file.resolve()
+                    if resolved in seen:
+                        continue
+                    try:
+                        src = file
+                        sample_wav = src
+                        if src.suffix.lower() == '.mp3':
+                            converted = Path.cwd() / 'renders' / f'{src.stem}_import.wav'
+                            convert_audio(src, converted)
+                            sample_wav = converted
+                        preview, sample_rate, duration = load_wav_preview(sample_wav)
+                        self.project.sample_assets.append(SampleAsset(path=str(sample_wav), duration_sec=duration, sample_rate=sample_rate, waveform_preview=preview))
+                        seen.add(resolved)
+                        added += 1
+                    except Exception:
+                        continue
+        self.refresh_sample_library()
+        self.statusBar().showMessage(f'Scanned sample folders. Added {added} sample(s).')
+
     def add_vsti_path(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Choose VST instrument', str(Path.cwd()), 'VST Plugins (*.dll *.vst3 *.so);;All files (*)')
         if not path:
             return
+        if path in self.project.vsti_paths:
+            self.statusBar().showMessage(f'VSTI already added: {Path(path).name}')
+            return
         self.project.vsti_paths.append(path)
         self.project.vsti_rack.append(VSTInstrument(name=Path(path).stem, path=path))
+        self._save_preferences()
         self.refresh_vsti_rack_ui()
         self.statusBar().showMessage(f'Added VSTI to rack: {Path(path).name}')
 
@@ -1949,6 +2126,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.project.tracks = built_tracks
         self._populate_track_list()
         self.track_list.setCurrentRow(0)
+        self.refresh_vsti_rack_ui()
+        self.scan_sample_paths()
         self.on_notes_changed()
         self.refresh_sample_library()
         self.statusBar().showMessage(f"AI generated {len(built_tracks)} track(s)")
@@ -2204,7 +2383,9 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         track = self.current_track()
         self.piano_roll.setEnabled(track.track_type == 'instrument')
+        self.velocity_editor.setEnabled(track.track_type == 'instrument')
         self.piano_roll.refresh()
+        self.velocity_editor.refresh()
         self.mixer.load_track()
         self.instruments.load_track()
 
@@ -2227,8 +2408,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def new_project(self) -> None:
         self.project = ProjectState()
+        self._load_preferences()
         self.timeline.project = self.project
         self.piano_roll.project = self.project
+        self.velocity_editor.project = self.project
         self.sample_timeline.project = self.project
         self.arrangement_overview.project = self.project
         if hasattr(self, 'tempo_spin'):
@@ -2239,10 +2422,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.set_playhead_position(self.project.playhead_sec)
         self._populate_track_list()
         self.track_list.setCurrentRow(0)
+        self.refresh_vsti_rack_ui()
+        self.scan_sample_paths()
         self.on_notes_changed()
 
     def on_notes_changed(self) -> None:
         self.piano_roll.refresh()
+        self.velocity_editor.refresh()
         self.timeline.refresh()
         self.sample_timeline.refresh()
         self.rebuild_midi_sections()
@@ -2261,6 +2447,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._populate_track_list()
         self.track_list.setCurrentRow(0)
+        self.refresh_vsti_rack_ui()
+        self.scan_sample_paths()
         self.on_notes_changed()
 
         do_render = QtWidgets.QMessageBox.question(
