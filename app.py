@@ -1306,8 +1306,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.audio_output = QtMultimedia.QAudioOutput(self)
         self.media_player = QtMultimedia.QMediaPlayer(self)
         self.media_player.setAudioOutput(self.audio_output)
+        self.media_player.mediaStatusChanged.connect(self._on_media_status_changed)
         self.selected_audio_output_id = ""
         self.playback_mix_path = Path.cwd() / "renders" / "_playback_mix.wav"
+        self._playback_loop_ms = 0
         self.setWindowTitle("AI Music Studio")
         self.resize(1500, 900)
 
@@ -1516,10 +1518,12 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, 'Nothing to play', 'No playable audio was found. Add notes or sample clips first.')
             return
         self._playback_rate = max(0.2, self.project.bpm / DEFAULT_BPM)
+        self._playback_loop_ms = max(1, int((self.project.right_locator_sec - self.project.left_locator_sec) * 1000))
         self.media_player.setSource(QtCore.QUrl.fromLocalFile(str(self.playback_mix_path.resolve())))
         self.media_player.setPlaybackRate(self._playback_rate)
         seek_sec = max(0.0, self.project.playhead_sec - self.project.left_locator_sec)
-        self.media_player.setPosition(int(seek_sec * 1000))
+        seek_ms = int(seek_sec * 1000) % self._playback_loop_ms
+        self.media_player.setPosition(seek_ms)
         self.media_player.play()
         self._playback_started_at = time.time()
         self._playback_origin_sec = self.project.playhead_sec
@@ -1538,9 +1542,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage('Playback stopped')
 
     def _tick_playback(self) -> None:
-        if self.media_player.playbackState() == QtMultimedia.QMediaPlayer.PlaybackState.PlayingState:
+        if self.media_player.playbackState() == QtMultimedia.QMediaPlayer.PlaybackState.PlayingState and self._playback_loop_ms > 0:
             left = self.project.left_locator_sec
-            new_pos = left + (self.media_player.position() / 1000.0)
+            loop_pos_ms = self.media_player.position() % self._playback_loop_ms
+            new_pos = left + (loop_pos_ms / 1000.0)
         else:
             elapsed = time.time() - self._playback_started_at
             new_pos = self._playback_origin_sec + (elapsed * self._playback_rate)
@@ -1550,9 +1555,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self._playback_origin_sec = new_pos
             if self.media_player.playbackState() == QtMultimedia.QMediaPlayer.PlaybackState.PlayingState:
                 self.media_player.setPosition(0)
-                if self.media_player.playbackState() != QtMultimedia.QMediaPlayer.PlaybackState.PlayingState:
-                    self.media_player.play()
+                self.media_player.play()
         self.set_playhead_position(new_pos)
+
+    def _on_media_status_changed(self, status: QtMultimedia.QMediaPlayer.MediaStatus) -> None:
+        if status == QtMultimedia.QMediaPlayer.MediaStatus.EndOfMedia and self.playback_timer.isActive():
+            self.media_player.setPosition(0)
+            self.media_player.play()
 
     def update_tempo(self, bpm: int) -> None:
         self.project.bpm = int(bpm)
