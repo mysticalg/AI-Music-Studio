@@ -8,6 +8,7 @@ import json
 import math
 import os
 import secrets
+import shutil
 import struct
 import subprocess
 import sys
@@ -148,6 +149,7 @@ class TrackState:
     rack_vsti: str = ""
     plugins: list[str] = dataclasses.field(default_factory=list)
     vsti_parameters: dict[str, float] = dataclasses.field(default_factory=dict)
+    vsti_state_path: str = ""
     midi_program: int = 0
     midi_channel: int = 0
     synth_profile: str = "synth"
@@ -1375,13 +1377,14 @@ class MixerWidget(QtWidgets.QWidget):
 
 
 class InstrumentFxWidget(QtWidgets.QWidget):
-    def __init__(self, project: ProjectState, current_track_callable, refresh_vsti_choices_callable, on_track_updated_callable=None, load_selected_vsti_callable=None) -> None:
+    def __init__(self, project: ProjectState, current_track_callable, refresh_vsti_choices_callable, on_track_updated_callable=None, load_selected_vsti_callable=None, open_vsti_gui_callable=None) -> None:
         super().__init__()
         self.project = project
         self.current_track_callable = current_track_callable
         self.refresh_vsti_choices_callable = refresh_vsti_choices_callable
         self.on_track_updated = on_track_updated_callable
         self.load_selected_vsti = load_selected_vsti_callable
+        self.open_vsti_gui = open_vsti_gui_callable
 
         root = QtWidgets.QVBoxLayout(self)
         form = QtWidgets.QFormLayout()
@@ -1416,9 +1419,11 @@ class InstrumentFxWidget(QtWidgets.QWidget):
         btn_row = QtWidgets.QHBoxLayout()
         self.assign_rack_btn = QtWidgets.QPushButton('Use Selected Rack VSTI')
         self.load_vsti_btn = QtWidgets.QPushButton('Load Selected VSTI Binary')
+        self.open_vsti_gui_btn = QtWidgets.QPushButton('Open VSTI GUI')
         self.edit_vsti_params_btn = QtWidgets.QPushButton('Edit VSTI Parameters')
         btn_row.addWidget(self.assign_rack_btn)
         btn_row.addWidget(self.load_vsti_btn)
+        btn_row.addWidget(self.open_vsti_gui_btn)
         btn_row.addWidget(self.edit_vsti_params_btn)
         root.addLayout(btn_row)
 
@@ -1429,6 +1434,7 @@ class InstrumentFxWidget(QtWidgets.QWidget):
         self.midi_program.valueChanged.connect(self.apply_changes)
         self.assign_rack_btn.clicked.connect(self.assign_selected_rack_vsti)
         self.load_vsti_btn.clicked.connect(self.load_selected_vsti_binary)
+        self.open_vsti_gui_btn.clicked.connect(self.open_selected_vsti_gui)
         self.edit_vsti_params_btn.clicked.connect(self.edit_vsti_parameters)
         for slider in self.fx_controls.values():
             slider.valueChanged.connect(self.apply_changes)
@@ -1511,6 +1517,15 @@ class InstrumentFxWidget(QtWidgets.QWidget):
             QtWidgets.QMessageBox.information(self, 'No rack VSTI', 'Select a rack VSTI first.')
             return
         self.load_selected_vsti(selected)
+
+    def open_selected_vsti_gui(self) -> None:
+        if not callable(self.open_vsti_gui):
+            return
+        selected = '' if self.vsti_selector.currentText() == 'None' else self.vsti_selector.currentText()
+        if not selected:
+            QtWidgets.QMessageBox.information(self, 'No rack VSTI', 'Select a rack VSTI first.')
+            return
+        self.open_vsti_gui(selected)
 
     def edit_vsti_parameters(self) -> None:
         track = self.current_track_callable()
@@ -1670,7 +1685,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.velocity_editor.velocityChanged.connect(self.on_notes_changed)
 
         self.mixer = MixerWidget(self.project, self.current_track)
-        self.instruments = InstrumentFxWidget(self.project, self.current_track, self.refresh_vsti_rack_ui, self.on_track_instrument_changed, self.load_vsti_binary_by_name)
+        self.instruments = InstrumentFxWidget(self.project, self.current_track, self.refresh_vsti_rack_ui, self.on_track_instrument_changed, self.load_vsti_binary_by_name, self.open_vsti_gui_by_name)
         self.sample_timeline = SampleTimelineWidget(self.project, self.sample_track_indices, self.place_sample_asset_on_track, self.set_playhead_position)
         self.arrangement_overview = ArrangementOverviewWidget(self.project, self.set_playhead_position, self.set_left_locator_position, self.set_right_locator_position, self.apply_arrangement_section_move, lambda: self.project.bpm)
         self.sample_library = SampleLibraryWidget()
@@ -2252,6 +2267,37 @@ class MainWindow(QtWidgets.QMainWindow):
             if vst.name == vsti_name:
                 self._load_vsti_binary_path(vst.path, show_message=True)
                 return
+        QtWidgets.QMessageBox.information(self, 'VSTI not found', f'No rack VSTI named {vsti_name}.')
+
+    def _carla_single_binary(self) -> str:
+        return shutil.which('carla-single') or shutil.which('carla') or ''
+
+    def open_vsti_gui_by_name(self, vsti_name: str) -> None:
+        for vst in self.project.vsti_rack:
+            if vst.name != vsti_name:
+                continue
+            host = self._carla_single_binary()
+            if not host:
+                QtWidgets.QMessageBox.information(
+                    self,
+                    'Missing VST host',
+                    'Install the free Carla host (carla-single) to open real plugin GUIs.\nThis app will still process audio via pedalboard when possible.',
+                )
+                return
+
+            plugin_path = Path(vst.path)
+            plugin_type = 'vst3' if plugin_path.suffix.lower() == '.vst3' else 'vst2'
+            command = [host, plugin_type, str(plugin_path)]
+            try:
+                subprocess.Popen(command)
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(self, 'Failed to open VST GUI', str(exc))
+                return
+
+            track = self.current_track()
+            track.vsti_state_path = str(Path.cwd() / 'renders' / f'{track.name.replace(" ", "_")}_{vst.name}_carla.state')
+            self.statusBar().showMessage(f'Opened VST GUI in Carla host: {vst.name}')
+            return
         QtWidgets.QMessageBox.information(self, 'VSTI not found', f'No rack VSTI named {vsti_name}.')
 
     def add_discovered_vsti_to_rack(self) -> None:
