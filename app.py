@@ -1607,6 +1607,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.track_list = QtWidgets.QListWidget()
         self.track_list.currentRowChanged.connect(self._track_changed)
+        self.track_list.viewport().installEventFilter(self)
+        self.last_added_track_type = 'instrument'
 
         self.timeline = TimelineWidget(self.project)
         self.piano_roll = PianoRollWidget(self.project, self.current_track_index, self.set_playhead_position, self.set_left_locator_position, self.set_right_locator_position)
@@ -2689,6 +2691,15 @@ class MainWindow(QtWidgets.QMainWindow):
         track.notes.append(MidiNote(start_tick=cursor_tick, duration_tick=TICKS_PER_BEAT // 2, pitch=pitch))
         self.on_notes_changed()
 
+    def eventFilter(self, watched: QtCore.QObject, event: QtCore.QEvent) -> bool:
+        if watched is self.track_list.viewport() and event.type() == QtCore.QEvent.Type.MouseButtonDblClick:
+            if isinstance(event, QtGui.QMouseEvent):
+                item = self.track_list.itemAt(event.position().toPoint())
+                if item is None:
+                    self.add_track(preferred_type=self.last_added_track_type, ask=False)
+                    return True
+        return super().eventFilter(watched, event)
+
     def current_track_index(self) -> int:
         row = self.track_list.currentRow()
         return 0 if row < 0 else row
@@ -2714,10 +2725,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mixer.load_track()
         self.instruments.load_track()
 
-    def add_track(self) -> None:
-        track_type, ok = QtWidgets.QInputDialog.getItem(self, 'Add track', 'Track type:', ['instrument', 'sample'], 0, False)
-        if not ok:
-            return
+    def add_track(self, preferred_type: str | None = None, ask: bool = True) -> None:
+        track_type = preferred_type or self.last_added_track_type or 'instrument'
+        if ask:
+            default_idx = 1 if track_type == 'sample' else 0
+            chosen, ok = QtWidgets.QInputDialog.getItem(self, 'Add track', 'Track type:', ['instrument', 'sample'], default_idx, False)
+            if not ok:
+                return
+            track_type = str(chosen)
+
+        if track_type not in {'instrument', 'sample'}:
+            track_type = 'instrument'
+
         idx = len(self.project.tracks) + 1
         used_channels = {t.midi_channel for t in self.project.tracks if t.track_type == 'instrument'}
         next_channel = next((ch for ch in range(16) if ch not in used_channels), idx % 16)
@@ -2725,6 +2744,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if track_type == 'sample':
             state.instrument = 'Sample Track'
             state.instrument_mode = 'Sample'
+
+        self.last_added_track_type = track_type
         self.project.tracks.append(state)
         self._populate_track_list()
         self.track_list.setCurrentRow(idx - 1)
