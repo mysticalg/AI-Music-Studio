@@ -150,6 +150,8 @@ class TrackState:
     plugins: list[str] = dataclasses.field(default_factory=list)
     vsti_parameters: dict[str, float] = dataclasses.field(default_factory=dict)
     vsti_state_path: str = ""
+    vsti_output_gain_db: float = 0.0
+    vsti_wet_mix: float = 100.0
     carla_automation_enabled: bool = True
     midi_program: int = 0
     midi_channel: int = 0
@@ -1379,7 +1381,7 @@ class MixerWidget(QtWidgets.QWidget):
 
 
 class InstrumentFxWidget(QtWidgets.QWidget):
-    def __init__(self, project: ProjectState, current_track_callable, refresh_vsti_choices_callable, on_track_updated_callable=None, load_selected_vsti_callable=None, open_vsti_gui_callable=None) -> None:
+    def __init__(self, project: ProjectState, current_track_callable, refresh_vsti_choices_callable, on_track_updated_callable=None, load_selected_vsti_callable=None, open_vsti_gui_callable=None, vsti_param_names_callable=None) -> None:
         super().__init__()
         self.project = project
         self.current_track_callable = current_track_callable
@@ -1387,6 +1389,7 @@ class InstrumentFxWidget(QtWidgets.QWidget):
         self.on_track_updated = on_track_updated_callable
         self.load_selected_vsti = load_selected_vsti_callable
         self.open_vsti_gui = open_vsti_gui_callable
+        self.vsti_param_names_callable = vsti_param_names_callable
 
         root = QtWidgets.QVBoxLayout(self)
         form = QtWidgets.QFormLayout()
@@ -1538,14 +1541,43 @@ class InstrumentFxWidget(QtWidgets.QWidget):
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle(f'VSTI Parameters - {track.rack_vsti}')
         layout = QtWidgets.QFormLayout(dialog)
+        param_names: list[str] = []
+        if callable(self.vsti_param_names_callable):
+            param_names = self.vsti_param_names_callable(track.rack_vsti)
+        if not param_names:
+            param_names = [f'Param {i}' for i in range(1, 9)]
+
         sliders: dict[str, QtWidgets.QSlider] = {}
-        for i in range(1, 9):
-            key = f'Param {i}'
+        for key in param_names[:12]:
             slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
             slider.setRange(0, 100)
             slider.setValue(int(track.vsti_parameters.get(key, 50)))
             layout.addRow(key, slider)
             sliders[key] = slider
+
+        gain_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        gain_slider.setRange(-240, 240)
+        gain_slider.setValue(int(track.vsti_output_gain_db * 10.0))
+        gain_label = QtWidgets.QLabel(f'{track.vsti_output_gain_db:.1f} dB')
+        gain_slider.valueChanged.connect(lambda value: gain_label.setText(f'{value / 10.0:.1f} dB'))
+        gain_row = QtWidgets.QHBoxLayout()
+        gain_row.addWidget(gain_slider)
+        gain_row.addWidget(gain_label)
+        gain_widget = QtWidgets.QWidget()
+        gain_widget.setLayout(gain_row)
+        layout.addRow('Output gain', gain_widget)
+
+        wet_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        wet_slider.setRange(0, 100)
+        wet_slider.setValue(int(track.vsti_wet_mix))
+        wet_label = QtWidgets.QLabel(f'{track.vsti_wet_mix:.0f}%')
+        wet_slider.valueChanged.connect(lambda value: wet_label.setText(f'{value:.0f}%'))
+        wet_row = QtWidgets.QHBoxLayout()
+        wet_row.addWidget(wet_slider)
+        wet_row.addWidget(wet_label)
+        wet_widget = QtWidgets.QWidget()
+        wet_widget.setLayout(wet_row)
+        layout.addRow('Wet mix', wet_widget)
 
         buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(dialog.accept)
@@ -1556,6 +1588,8 @@ class InstrumentFxWidget(QtWidgets.QWidget):
             return
 
         track.vsti_parameters = {name: float(slider.value()) for name, slider in sliders.items()}
+        track.vsti_output_gain_db = gain_slider.value() / 10.0
+        track.vsti_wet_mix = float(wet_slider.value())
         if callable(self.on_track_updated):
             self.on_track_updated()
 
@@ -1664,6 +1698,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.instrument_ai = InstrumentIntelligence(self.ai_client)
         self.renderer = AISynthRenderer()
         self.vsti_binary_loader = VSTBinaryLoader()
+        self.vsti_plugin_metadata: dict[str, list[str]] = {}
         self._load_preferences()
         self.audio_output = QtMultimedia.QAudioOutput(self)
         self.media_player = QtMultimedia.QMediaPlayer(self)
@@ -1688,7 +1723,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.velocity_editor.velocityChanged.connect(self.on_notes_changed)
 
         self.mixer = MixerWidget(self.project, self.current_track)
-        self.instruments = InstrumentFxWidget(self.project, self.current_track, self.refresh_vsti_rack_ui, self.on_track_instrument_changed, self.load_vsti_binary_by_name, self.open_vsti_gui_by_name)
+        self.instruments = InstrumentFxWidget(self.project, self.current_track, self.refresh_vsti_rack_ui, self.on_track_instrument_changed, self.load_vsti_binary_by_name, self.open_vsti_gui_by_name, self.vsti_parameter_names_for_rack)
         self.sample_timeline = SampleTimelineWidget(self.project, self.sample_track_indices, self.place_sample_asset_on_track, self.set_playhead_position)
         self.arrangement_overview = ArrangementOverviewWidget(self.project, self.set_playhead_position, self.set_left_locator_position, self.set_right_locator_position, self.apply_arrangement_section_move, lambda: self.project.bpm)
         self.sample_library = SampleLibraryWidget()
@@ -2101,6 +2136,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 return vst.path
         return ''
 
+    def vsti_parameter_names_for_rack(self, rack_name: str) -> list[str]:
+        plugin_path = self._rack_vsti_path(rack_name)
+        if not plugin_path:
+            return []
+        return list(self.vsti_plugin_metadata.get(plugin_path, []))
+
+    def _capture_vsti_metadata(self, plugin_path: str) -> None:
+        if not PEDALBOARD_AVAILABLE or plugin_path in self.vsti_plugin_metadata:
+            return
+        try:
+            plugin = load_plugin(plugin_path)
+            names = [str(name) for name in plugin.parameters.keys()]
+            self.vsti_plugin_metadata[plugin_path] = names
+        except Exception:
+            self.vsti_plugin_metadata[plugin_path] = []
+
     def _process_track_with_vsti(self, track: TrackState, data: list[float], sample_rate: int) -> list[float]:
         if not PEDALBOARD_AVAILABLE:
             return data
@@ -2113,26 +2164,31 @@ class MainWindow(QtWidgets.QMainWindow):
 
         try:
             plugin = load_plugin(plugin_path)
-            param_values = [track.vsti_parameters.get(f'Param {i}', 50.0) for i in range(1, 9)]
-            for idx, (_name, param) in enumerate(plugin.parameters.items()):
-                if idx >= len(param_values):
-                    break
+            param_names = [str(name) for name in plugin.parameters.keys()]
+            self.vsti_plugin_metadata[plugin_path] = param_names
+            for idx, param in enumerate(plugin.parameters.values()):
+                key = param_names[idx] if idx < len(param_names) else f'Param {idx + 1}'
+                param_value = track.vsti_parameters.get(key, track.vsti_parameters.get(f'Param {idx + 1}', 50.0))
                 try:
-                    param.raw_value = max(0.0, min(1.0, float(param_values[idx]) / 100.0))
+                    param.raw_value = max(0.0, min(1.0, float(param_value) / 100.0))
                 except Exception:
                     pass
 
-            audio = np.asarray(data, dtype=np.float32)[None, :]
+            dry_audio = np.asarray(data, dtype=np.float32)[None, :]
             block = 1024
             chunks = []
-            for start in range(0, audio.shape[1], block):
-                piece = audio[:, start : start + block]
+            for start in range(0, dry_audio.shape[1], block):
+                piece = dry_audio[:, start : start + block]
                 processed = plugin.process(piece, sample_rate, reset=(start == 0))
                 chunks.append(processed)
             if not chunks:
                 return data
-            merged = np.concatenate(chunks, axis=1)
-            return merged[0].astype(np.float32).tolist()
+            wet_audio = np.concatenate(chunks, axis=1)
+            wet_mix = max(0.0, min(1.0, float(track.vsti_wet_mix) / 100.0))
+            merged = (wet_audio * wet_mix) + (dry_audio * (1.0 - wet_mix))
+            gain_linear = 10.0 ** (float(track.vsti_output_gain_db) / 20.0)
+            merged = merged * gain_linear
+            return np.clip(merged[0], -1.0, 1.0).astype(np.float32).tolist()
         except Exception as exc:
             self.statusBar().showMessage(f'VST process fallback to synth for {track.name}: {exc}')
             return data
@@ -2252,6 +2308,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.project.vsti_rack = rack
         for vst in self.project.vsti_rack:
             self.vsti_binary_loader.load(vst.path)
+            self._capture_vsti_metadata(vst.path)
 
     def _save_preferences(self) -> None:
         payload = {
@@ -2334,10 +2391,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _load_vsti_binary_path(self, path: str, show_message: bool = True) -> bool:
         ok, detail = self.vsti_binary_loader.load(path)
+        if ok:
+            self._capture_vsti_metadata(path)
         if show_message:
             name = Path(path).name
             if ok:
-                self.statusBar().showMessage(f'Loaded VSTI binary: {name}')
+                mode = 'native wrapper + pedalboard' if PEDALBOARD_AVAILABLE else 'binary-only (install pedalboard for audio processing)'
+                self.statusBar().showMessage(f'Loaded VSTI binary: {name} ({mode})')
             else:
                 QtWidgets.QMessageBox.warning(self, 'VSTI load failed', f'Could not load {name}\n\n{detail}')
         return ok
@@ -2465,27 +2525,59 @@ class MainWindow(QtWidgets.QMainWindow):
         for vst in self.project.vsti_rack:
             if vst.name != vsti_name:
                 continue
-            host = self._carla_single_binary()
-            if not host:
-                QtWidgets.QMessageBox.information(
-                    self,
-                    'Missing VST host',
-                    'Install the free Carla host (carla-single) to open real plugin GUIs.\nThis app will still process audio via pedalboard when possible.',
-                )
-                return
-
-            plugin_path = Path(vst.path)
-            plugin_type = 'vst3' if plugin_path.suffix.lower() == '.vst3' else 'vst2'
-            command = [host, plugin_type, str(plugin_path)]
-            try:
-                subprocess.Popen(command)
-            except Exception as exc:
-                QtWidgets.QMessageBox.warning(self, 'Failed to open VST GUI', str(exc))
-                return
 
             track = self.current_track()
-            track.vsti_state_path = str(Path.cwd() / 'renders' / f'{track.name.replace(" ", "_")}_{vst.name}_carla.state')
-            self.statusBar().showMessage(f'Opened VST GUI in Carla host: {vst.name}')
+            self._capture_vsti_metadata(vst.path)
+            param_names = self.vsti_parameter_names_for_rack(vsti_name)
+            if not param_names:
+                param_names = [f'Param {i}' for i in range(1, 9)]
+
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle(f'Native VSTI Wrapper - {vst.name}')
+            dialog.resize(560, 480)
+            layout = QtWidgets.QVBoxLayout(dialog)
+            info = QtWidgets.QLabel(
+                'This is a built-in VSTI wrapper UI. Parameter changes are applied during playback/render via pedalboard.\n'
+                "Use Carla only if you need the plugin's original vendor GUI window."
+            )
+            info.setWordWrap(True)
+            layout.addWidget(info)
+
+            scroll = QtWidgets.QScrollArea()
+            scroll.setWidgetResizable(True)
+            body = QtWidgets.QWidget()
+            form = QtWidgets.QFormLayout(body)
+            sliders: dict[str, QtWidgets.QSlider] = {}
+
+            for key in param_names[:24]:
+                slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+                slider.setRange(0, 100)
+                slider.setValue(int(track.vsti_parameters.get(key, 50)))
+                value_label = QtWidgets.QLabel(f"{slider.value()}%")
+                slider.valueChanged.connect(lambda v, lbl=value_label: lbl.setText(f"{v}%"))
+                row = QtWidgets.QHBoxLayout()
+                row.addWidget(slider)
+                row.addWidget(value_label)
+                row_widget = QtWidgets.QWidget()
+                row_widget.setLayout(row)
+                form.addRow(key, row_widget)
+                sliders[key] = slider
+
+            scroll.setWidget(body)
+            layout.addWidget(scroll)
+
+            buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+            buttons.accepted.connect(dialog.accept)
+            buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
+
+            if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+                return
+
+            for key, slider in sliders.items():
+                track.vsti_parameters[key] = float(slider.value())
+            self.statusBar().showMessage(f'Updated VSTI wrapper controls: {vst.name}')
+            self.on_track_instrument_changed()
             return
         QtWidgets.QMessageBox.information(self, 'VSTI not found', f'No rack VSTI named {vsti_name}.')
 
