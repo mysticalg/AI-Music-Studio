@@ -22,6 +22,15 @@ from pathlib import Path
 import mido
 from PySide6 import QtCore, QtGui, QtMultimedia, QtWidgets
 
+try:
+    import numpy as np
+    from pedalboard import load_plugin
+    PEDALBOARD_AVAILABLE = True
+except Exception:
+    np = None
+    load_plugin = None
+    PEDALBOARD_AVAILABLE = False
+
 TICKS_PER_BEAT = 480
 DEFAULT_BPM = 120
 PITCH_MIN = 36
@@ -1994,6 +2003,48 @@ class MainWindow(QtWidgets.QMainWindow):
         self.audio_output.setDevice(QtMultimedia.QMediaDevices.defaultAudioOutput())
         self.refresh_audio_output_menu()
 
+    def _rack_vsti_path(self, rack_name: str) -> str:
+        for vst in self.project.vsti_rack:
+            if vst.name == rack_name:
+                return vst.path
+        return ''
+
+    def _process_track_with_vsti(self, track: TrackState, data: list[float], sample_rate: int) -> list[float]:
+        if not PEDALBOARD_AVAILABLE:
+            return data
+        if track.instrument_mode != 'VSTI Rack' or not track.rack_vsti:
+            return data
+
+        plugin_path = self._rack_vsti_path(track.rack_vsti)
+        if not plugin_path or not Path(plugin_path).exists():
+            return data
+
+        try:
+            plugin = load_plugin(plugin_path)
+            param_values = [track.vsti_parameters.get(f'Param {i}', 50.0) for i in range(1, 9)]
+            for idx, (_name, param) in enumerate(plugin.parameters.items()):
+                if idx >= len(param_values):
+                    break
+                try:
+                    param.raw_value = max(0.0, min(1.0, float(param_values[idx]) / 100.0))
+                except Exception:
+                    pass
+
+            audio = np.asarray(data, dtype=np.float32)[None, :]
+            block = 1024
+            chunks = []
+            for start in range(0, audio.shape[1], block):
+                piece = audio[:, start : start + block]
+                processed = plugin.process(piece, sample_rate, reset=(start == 0))
+                chunks.append(processed)
+            if not chunks:
+                return data
+            merged = np.concatenate(chunks, axis=1)
+            return merged[0].astype(np.float32).tolist()
+        except Exception as exc:
+            self.statusBar().showMessage(f'VST process fallback to synth for {track.name}: {exc}')
+            return data
+
     def _build_playback_mix(self, out_path: Path) -> bool:
         left = self.project.left_locator_sec
         right = self.project.right_locator_sec
@@ -2019,6 +2070,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 stem_path = Path.cwd() / 'renders' / f'_play_track_{idx}.wav'
                 self.renderer.render_track(track, self.project.bpm, stem_path)
                 data, sr = load_wav_samples(stem_path)
+                data = self._process_track_with_vsti(track, data, sr)
             if sr != sample_rate:
                 ratio = sr / sample_rate
                 data = [data[min(len(data) - 1, int(i * ratio))] for i in range(max(1, int(len(data) / ratio)))]
