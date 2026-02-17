@@ -53,6 +53,37 @@ If OpenAI is not connected, classification falls back to deterministic GM/track-
 - MP3 import/export requires `ffmpeg` available on your system PATH.
 - Imported MP3 files are converted to WAV internally for waveform preview/rendering.
 
+## Carla integration plan (external dependency, no fork)
+
+We will integrate with [Carla](https://github.com/falkTX/Carla) as an **external dependency** and **not fork Carla initially**.
+
+### Decision
+
+- Keep AI Music Studio as the arranger/editor UI.
+- Use Carla (`carla-single` / `carla`) as the plugin host for VST runtime and GUI.
+- Track Carla as an upstream dependency and avoid maintaining a custom Carla branch in the first iteration.
+
+### Why this approach
+
+- Fastest path to production use with the least maintenance overhead.
+- Preserves cross-platform host behavior already provided by Carla.
+- Keeps this repo focused on composition, timeline, and workflow UX.
+
+### Implementation phases
+
+- **Phase 1: External host baseline** ✅
+  - Detect Carla binaries in PATH (or configure/reset host detection in **Settings > Instruments** using **Set Carla Host Binary…** and **Use PATH Carla Detection**).
+  - Launch selected rack plugin GUI in Carla.
+  - Store per-track Carla state path references.
+
+- **Phase 2: Session interoperability** ✅
+  - Export/import Carla session snapshots from **Settings > Instruments** (host path, rack assignment, VST state path, and VST parameter values).
+  - Re-link track Carla metadata across sessions.
+
+- **Phase 3: Transport + automation bridge** ✅
+  - Write live bridge state to `renders/carla_bridge_state.json` during playback (transport, locators, rack-track mappings).
+  - Apply targeted parameter mapping for rack tracks (`Param 1` from volume, `Param 2` from pan) when bridge is enabled.
+
 ## Quick start
 
 ```bash
