@@ -17,10 +17,11 @@ A desktop MIDI editor DAW prototype with a GUI built in **PySide6**, with:
 - **Sample toolbox** for WAV/MP3 sample import
 - **Sample timeline tab** that displays waveform blocks when samples are placed
 - **Sample timeline audio export** to WAV or MP3
-- Mixer board (volume + pan per track)
-- Instrument board (instrument + synth profile + FX metadata)
+- Mixer board (volume + pan + mute/solo per track)
+- Instrument board (instrument type + GM/VSTI rack selection + FX metadata)
 - Built-in FX rack controls for EQ, Compression, Distortion, Phaser, Flanger, Delay, Reverb
 - Virtual piano keyboard input (computer keyboard)
+- Floating transport bar with playback controls and loop locators
 - Keyboard shortcuts for transport/editing
 - OpenAI Codex composition from natural language prompts
 

@@ -122,20 +122,40 @@ class MidiNote:
 @dataclasses.dataclass
 class TrackState:
     name: str
+    track_type: str = "instrument"
     notes: list[MidiNote] = dataclasses.field(default_factory=list)
     volume: float = 0.8
     pan: float = 0.0
     instrument: str = "Default Synth"
+    instrument_mode: str = "AI Synth"
+    rack_vsti: str = ""
     plugins: list[str] = dataclasses.field(default_factory=list)
     midi_program: int = 0
     midi_channel: int = 0
     synth_profile: str = "synth"
     rendered_audio_path: str = ""
+    mute: bool = False
+    solo: bool = False
+
+
+@dataclasses.dataclass
+class VSTInstrument:
+    name: str
+    path: str
+
+
+@dataclasses.dataclass
+class SampleAsset:
+    path: str
+    duration_sec: float
+    sample_rate: int = 44100
+    waveform_preview: list[float] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
 class SampleClip:
     path: str
+    track_index: int
     start_sec: float
     duration_sec: float
     sample_rate: int = 44100
@@ -147,7 +167,12 @@ class ProjectState:
         self.tracks: list[TrackState] = [TrackState(name="Track 1")]
         self.bpm = DEFAULT_BPM
         self.quantize_div = 16
+        self.vsti_paths: list[str] = []
+        self.vsti_rack: list[VSTInstrument] = []
+        self.sample_assets: list[SampleAsset] = []
         self.sample_clips: list[SampleClip] = []
+        self.left_locator_sec = 0.0
+        self.right_locator_sec = 8.0
 
 
 class OpenAIClient:
@@ -535,9 +560,9 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
 
 class TimelineWidget(QtWidgets.QTableWidget):
     def __init__(self, project: ProjectState) -> None:
-        super().__init__(0, 5)
+        super().__init__(0, 8)
         self.project = project
-        self.setHorizontalHeaderLabels(["Track", "Instrument", "Profile", "Length (beats)", "Notes"])
+        self.setHorizontalHeaderLabels(["Track", "Type", "Instrument", "Mode", "Profile", "Mute", "Solo", "Notes"])
         self.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.verticalHeader().setVisible(False)
         self.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
@@ -546,53 +571,97 @@ class TimelineWidget(QtWidgets.QTableWidget):
     def refresh(self) -> None:
         self.setRowCount(len(self.project.tracks))
         for i, track in enumerate(self.project.tracks):
-            max_tick = max((n.start_tick + n.duration_tick for n in track.notes), default=0)
-            length_beats = max_tick / TICKS_PER_BEAT
             self.setItem(i, 0, QtWidgets.QTableWidgetItem(track.name))
-            self.setItem(i, 1, QtWidgets.QTableWidgetItem(track.instrument))
-            self.setItem(i, 2, QtWidgets.QTableWidgetItem(track.synth_profile))
-            self.setItem(i, 3, QtWidgets.QTableWidgetItem(f"{length_beats:.2f}"))
-            self.setItem(i, 4, QtWidgets.QTableWidgetItem(str(len(track.notes))))
+            self.setItem(i, 1, QtWidgets.QTableWidgetItem(track.track_type.title()))
+            self.setItem(i, 2, QtWidgets.QTableWidgetItem(track.instrument))
+            self.setItem(i, 3, QtWidgets.QTableWidgetItem(track.instrument_mode))
+            self.setItem(i, 4, QtWidgets.QTableWidgetItem(track.synth_profile))
+            self.setItem(i, 5, QtWidgets.QTableWidgetItem('Yes' if track.mute else 'No'))
+            self.setItem(i, 6, QtWidgets.QTableWidgetItem('Yes' if track.solo else 'No'))
+            self.setItem(i, 7, QtWidgets.QTableWidgetItem(str(len(track.notes))))
 
 
 class SampleTimelineWidget(QtWidgets.QGraphicsView):
-    def __init__(self, project: ProjectState) -> None:
+    def __init__(self, project: ProjectState, get_sample_track_indices, on_drop_sample) -> None:
         super().__init__()
         self.project = project
+        self.get_sample_track_indices = get_sample_track_indices
+        self.on_drop_sample = on_drop_sample
         self.scene_obj = QtWidgets.QGraphicsScene(self)
         self.setScene(self.scene_obj)
         self.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
         self.pixels_per_second = 80
         self.lane_height = 110
+        self.setAcceptDrops(True)
         self.refresh()
+
+    def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
+        if event.mimeData().hasText() and event.mimeData().text().startswith('sample_asset:'):
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dragMoveEvent(self, event: QtGui.QDragMoveEvent) -> None:
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event: QtGui.QDropEvent) -> None:
+        payload = event.mimeData().text()
+        if not payload.startswith('sample_asset:'):
+            event.ignore()
+            return
+        try:
+            sample_idx = int(payload.split(':', 1)[1])
+        except ValueError:
+            event.ignore()
+            return
+        pos = self.mapToScene(event.position().toPoint())
+        sample_tracks = self.get_sample_track_indices()
+        if not sample_tracks:
+            QtWidgets.QMessageBox.information(self, 'No sample track', 'Create a sample track first, then drag a sample here.')
+            event.ignore()
+            return
+        lane = int(pos.y() // self.lane_height)
+        lane = max(0, min(lane, len(sample_tracks) - 1))
+        start_sec = max(0.0, pos.x() / self.pixels_per_second)
+        self.on_drop_sample(sample_idx, sample_tracks[lane], start_sec)
+        event.acceptProposedAction()
 
     def refresh(self) -> None:
         self.scene_obj.clear()
-        duration = 8.0
+        sample_tracks = self.get_sample_track_indices()
+        lane_count = max(1, len(sample_tracks))
+        duration = max(8.0, self.project.right_locator_sec + 1.0)
         for clip in self.project.sample_clips:
             duration = max(duration, clip.start_sec + clip.duration_sec + 1.0)
 
         width = duration * self.pixels_per_second
-        height = self.lane_height
+        height = self.lane_height * lane_count
         self.scene_obj.addRect(0, 0, width, height, QtGui.QPen(QtGui.QColor(70, 70, 70)), QtGui.QBrush(QtGui.QColor(35, 35, 35)))
+
+        for lane in range(lane_count):
+            y0 = lane * self.lane_height
+            self.scene_obj.addLine(0, y0, width, y0, QtGui.QPen(QtGui.QColor(65, 65, 65)))
 
         sec = 0
         while sec <= int(duration) + 1:
             x = sec * self.pixels_per_second
             pen = QtGui.QPen(QtGui.QColor(120, 120, 120) if sec % 4 == 0 else QtGui.QColor(80, 80, 80))
             self.scene_obj.addLine(x, 0, x, height, pen)
-            text = self.scene_obj.addText(f"{sec}s")
-            text.setDefaultTextColor(QtGui.QColor(180, 180, 180))
-            text.setPos(x + 2, 2)
             sec += 1
 
+        for locator_sec, color in ((self.project.left_locator_sec, QtGui.QColor(0, 200, 160)), (self.project.right_locator_sec, QtGui.QColor(240, 200, 0))):
+            x = locator_sec * self.pixels_per_second
+            self.scene_obj.addLine(x, 0, x, height, QtGui.QPen(color, 2))
+
         for clip in self.project.sample_clips:
+            if clip.track_index not in sample_tracks:
+                continue
+            lane = sample_tracks.index(clip.track_index)
             x = clip.start_sec * self.pixels_per_second
             w = max(1, clip.duration_sec * self.pixels_per_second)
-            y = 26
+            y = lane * self.lane_height + 26
             h = 70
             self.scene_obj.addRect(x, y, w, h, QtGui.QPen(QtGui.QColor(0, 0, 0)), QtGui.QBrush(QtGui.QColor(72, 130, 200)))
-
             if clip.waveform_preview:
                 path = QtGui.QPainterPath()
                 step = w / max(1, len(clip.waveform_preview) - 1)
@@ -600,11 +669,8 @@ class SampleTimelineWidget(QtWidgets.QGraphicsView):
                 amp = h / 2 - 6
                 path.moveTo(x, mid)
                 for i, v in enumerate(clip.waveform_preview):
-                    px = x + i * step
-                    py = mid - (v * amp)
-                    path.lineTo(px, py)
+                    path.lineTo(x + i * step, mid - (v * amp))
                 self.scene_obj.addPath(path, QtGui.QPen(QtGui.QColor(230, 240, 255)))
-
             label = self.scene_obj.addText(Path(clip.path).name)
             label.setDefaultTextColor(QtGui.QColor(240, 240, 240))
             label.setPos(x + 4, y + 4)
@@ -624,40 +690,56 @@ class MixerWidget(QtWidgets.QWidget):
         self.pan = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.pan.setRange(-100, 100)
         self.pan.setValue(0)
+        self.mute = QtWidgets.QCheckBox('Mute')
+        self.solo = QtWidgets.QCheckBox('Solo')
         self.rendered_path = QtWidgets.QLineEdit()
         self.rendered_path.setReadOnly(True)
         layout.addRow("Volume", self.volume)
         layout.addRow("Pan", self.pan)
+        layout.addRow("Track state", self.mute)
+        layout.addRow("", self.solo)
         layout.addRow("Rendered audio", self.rendered_path)
 
         self.volume.valueChanged.connect(self.apply_changes)
         self.pan.valueChanged.connect(self.apply_changes)
+        self.mute.toggled.connect(self.apply_changes)
+        self.solo.toggled.connect(self.apply_changes)
 
     def load_track(self) -> None:
         track = self.current_track_callable()
         self.volume.setValue(int(track.volume * 100))
         self.pan.setValue(int(track.pan * 100))
+        self.mute.setChecked(track.mute)
+        self.solo.setChecked(track.solo)
         self.rendered_path.setText(track.rendered_audio_path)
 
     def apply_changes(self) -> None:
         track = self.current_track_callable()
         track.volume = self.volume.value() / 100
         track.pan = self.pan.value() / 100
+        track.mute = self.mute.isChecked()
+        track.solo = self.solo.isChecked()
 
 
 class InstrumentFxWidget(QtWidgets.QWidget):
-    def __init__(self, project: ProjectState, current_track_callable) -> None:
+    def __init__(self, project: ProjectState, current_track_callable, refresh_vsti_choices_callable) -> None:
         super().__init__()
         self.project = project
         self.current_track_callable = current_track_callable
+        self.refresh_vsti_choices_callable = refresh_vsti_choices_callable
 
         root = QtWidgets.QVBoxLayout(self)
         form = QtWidgets.QFormLayout()
+        self.instrument_mode = QtWidgets.QComboBox()
+        self.instrument_mode.addItems(["AI Synth", "General MIDI", "VSTI Rack"])
         self.instrument = QtWidgets.QComboBox()
-        self.instrument.addItems(["Default Synth", "Piano", "Bass", "Lead", "Sampler", "External VST (placeholder)"])
+        self.instrument.addItems(["Default Synth", "Piano", "Bass", "Lead", "Sampler"])
+        self.vsti_selector = QtWidgets.QComboBox()
         self.profile = QtWidgets.QLineEdit()
         self.profile.setReadOnly(True)
+        form.addRow("Instrument type", self.instrument_mode)
         form.addRow("Instrument", self.instrument)
+        form.addRow("VSTI rack", self.vsti_selector)
         form.addRow("AI synth profile", self.profile)
 
         self.fx_controls: dict[str, QtWidgets.QSlider] = {}
@@ -670,18 +752,53 @@ class InstrumentFxWidget(QtWidgets.QWidget):
 
         root.addLayout(form)
         self.instrument.currentTextChanged.connect(self.apply_changes)
+        self.instrument_mode.currentTextChanged.connect(self.apply_changes)
+        self.vsti_selector.currentTextChanged.connect(self.apply_changes)
+
+    def reload_vsti_choices(self) -> None:
+        current = self.vsti_selector.currentText()
+        self.vsti_selector.clear()
+        self.vsti_selector.addItem('None')
+        for vst in self.project.vsti_rack:
+            self.vsti_selector.addItem(vst.name)
+        idx = self.vsti_selector.findText(current)
+        if idx >= 0:
+            self.vsti_selector.setCurrentIndex(idx)
 
     def load_track(self) -> None:
+        self.reload_vsti_choices()
         track = self.current_track_callable()
+        idx_mode = self.instrument_mode.findText(track.instrument_mode)
+        if idx_mode >= 0:
+            self.instrument_mode.setCurrentIndex(idx_mode)
         idx = self.instrument.findText(track.instrument)
         if idx >= 0:
             self.instrument.setCurrentIndex(idx)
+        rack_idx = self.vsti_selector.findText(track.rack_vsti or 'None')
+        if rack_idx >= 0:
+            self.vsti_selector.setCurrentIndex(rack_idx)
         self.profile.setText(track.synth_profile)
 
     def apply_changes(self) -> None:
         track = self.current_track_callable()
+        track.instrument_mode = self.instrument_mode.currentText()
         track.instrument = self.instrument.currentText()
+        track.rack_vsti = '' if self.vsti_selector.currentText() == 'None' else self.vsti_selector.currentText()
         track.plugins = [f"{name}:{slider.value()}" for name, slider in self.fx_controls.items()]
+
+
+class SampleLibraryWidget(QtWidgets.QListWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setDragEnabled(True)
+
+    def mimeData(self, items):
+        mime = super().mimeData(items)
+        if items:
+            payload = items[0].data(QtCore.Qt.ItemDataRole.UserRole)
+            if isinstance(payload, str):
+                mime.setText(payload)
+        return mime
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -703,16 +820,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.piano_roll.noteChanged.connect(self.on_notes_changed)
 
         self.mixer = MixerWidget(self.project, self.current_track)
-        self.instruments = InstrumentFxWidget(self.project, self.current_track)
-        self.sample_timeline = SampleTimelineWidget(self.project)
-        self.sample_library = QtWidgets.QListWidget()
+        self.instruments = InstrumentFxWidget(self.project, self.current_track, self.refresh_vsti_rack_ui)
+        self.sample_timeline = SampleTimelineWidget(self.project, self.sample_track_indices, self.place_sample_asset_on_track)
+        self.sample_library = SampleLibraryWidget()
 
         quantize_box = QtWidgets.QComboBox()
         quantize_box.addItems(["1/4", "1/8", "1/16", "1/32"])
         quantize_box.setCurrentText("1/16")
         quantize_box.currentTextChanged.connect(lambda text: setattr(self.project, "quantize_div", int(text.split("/")[1])))
 
-        add_track_btn = QtWidgets.QPushButton("+ Track")
+        add_track_btn = QtWidgets.QPushButton("+ Track (Sample/Instrument)")
         add_track_btn.clicked.connect(self.add_track)
 
         import_btn = QtWidgets.QPushButton("Import MIDI + AI Instrument Render")
@@ -730,11 +847,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ai_btn = QtWidgets.QPushButton("AI Compose (OpenAI Codex)")
         ai_btn.clicked.connect(self.compose_with_ai)
 
-        play_btn = QtWidgets.QPushButton("Play")
-        stop_btn = QtWidgets.QPushButton("Stop")
-        play_btn.clicked.connect(lambda: self.statusBar().showMessage("Playback started (simulation)"))
-        stop_btn.clicked.connect(lambda: self.statusBar().showMessage("Playback stopped"))
-
+        
         left_panel = QtWidgets.QWidget()
         left_layout = QtWidgets.QVBoxLayout(left_panel)
         left_layout.addWidget(QtWidgets.QLabel("Tracks"))
@@ -751,8 +864,6 @@ class MainWindow(QtWidgets.QMainWindow):
         left_layout.addWidget(place_sample_btn)
         left_layout.addWidget(export_audio_btn)
         left_layout.addWidget(ai_btn)
-        left_layout.addWidget(play_btn)
-        left_layout.addWidget(stop_btn)
         left_layout.addStretch()
 
         right_tabs = QtWidgets.QTabWidget()
@@ -772,10 +883,84 @@ class MainWindow(QtWidgets.QMainWindow):
         splitter_main.setSizes([320, 1180])
 
         self.setCentralWidget(splitter_main)
+        self._setup_menus()
+        self._setup_floating_transport()
         self._setup_shortcuts()
         self._populate_track_list()
         self.track_list.setCurrentRow(0)
         self._setup_virtual_piano_dock()
+        self.refresh_sample_library()
+
+    def _setup_menus(self) -> None:
+        settings = self.menuBar().addMenu('Settings')
+        instruments_menu = settings.addMenu('Instruments')
+        add_vsti = QtGui.QAction('Add VSTI Path', self)
+        add_vsti.triggered.connect(self.add_vsti_path)
+        instruments_menu.addAction(add_vsti)
+        self.vsti_menu = instruments_menu
+        self.refresh_vsti_rack_ui()
+
+    def _setup_floating_transport(self) -> None:
+        transport = QtWidgets.QToolBar('Transport', self)
+        transport.setFloatable(True)
+        transport.setMovable(True)
+        self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, transport)
+        play_action = transport.addAction('Play')
+        stop_action = transport.addAction('Stop')
+        play_action.triggered.connect(lambda: self.statusBar().showMessage('Playback started (simulation)'))
+        stop_action.triggered.connect(lambda: self.statusBar().showMessage('Playback stopped'))
+        transport.addSeparator()
+        self.left_locator = QtWidgets.QDoubleSpinBox()
+        self.left_locator.setRange(0.0, 3600.0)
+        self.left_locator.setValue(self.project.left_locator_sec)
+        self.right_locator = QtWidgets.QDoubleSpinBox()
+        self.right_locator.setRange(0.0, 3600.0)
+        self.right_locator.setValue(self.project.right_locator_sec)
+        self.left_locator.valueChanged.connect(self.update_locators)
+        self.right_locator.valueChanged.connect(self.update_locators)
+        transport.addWidget(QtWidgets.QLabel('L'))
+        transport.addWidget(self.left_locator)
+        transport.addWidget(QtWidgets.QLabel('R'))
+        transport.addWidget(self.right_locator)
+
+    def update_locators(self) -> None:
+        self.project.left_locator_sec = min(self.left_locator.value(), self.right_locator.value())
+        self.project.right_locator_sec = max(self.left_locator.value(), self.right_locator.value())
+        self.sample_timeline.refresh()
+
+    def add_vsti_path(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Choose VST instrument', str(Path.cwd()), 'VST Plugins (*.dll *.vst3 *.so);;All files (*)')
+        if not path:
+            return
+        self.project.vsti_paths.append(path)
+        self.project.vsti_rack.append(VSTInstrument(name=Path(path).stem, path=path))
+        self.refresh_vsti_rack_ui()
+        self.statusBar().showMessage(f'Added VSTI to rack: {Path(path).name}')
+
+    def refresh_vsti_rack_ui(self) -> None:
+        if hasattr(self, 'vsti_menu'):
+            existing = [a for a in self.vsti_menu.actions() if a.property('rack_item')]
+            for action in existing:
+                self.vsti_menu.removeAction(action)
+            if self.project.vsti_rack:
+                self.vsti_menu.addSeparator()
+                for vst in self.project.vsti_rack:
+                    action = QtGui.QAction(f'Rack: {vst.name}', self)
+                    action.setProperty('rack_item', True)
+                    action.setEnabled(False)
+                    self.vsti_menu.addAction(action)
+        self.instruments.reload_vsti_choices()
+        self._populate_track_list()
+
+    def sample_track_indices(self) -> list[int]:
+        return [i for i, track in enumerate(self.project.tracks) if track.track_type == 'sample']
+
+    def place_sample_asset_on_track(self, asset_index: int, track_index: int, start_sec: float) -> None:
+        if asset_index < 0 or asset_index >= len(self.project.sample_assets):
+            return
+        asset = self.project.sample_assets[asset_index]
+        clip = SampleClip(path=asset.path, track_index=track_index, start_sec=start_sec, duration_sec=asset.duration_sec, sample_rate=asset.sample_rate, waveform_preview=asset.waveform_preview)
+        self.project.sample_clips.append(clip)
         self.refresh_sample_library()
 
     def _setup_shortcuts(self) -> None:
@@ -882,8 +1067,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def refresh_sample_library(self) -> None:
         self.sample_library.clear()
-        for clip in self.project.sample_clips:
-            self.sample_library.addItem(f"{Path(clip.path).name} @ {clip.start_sec:.2f}s")
+        for idx, asset in enumerate(self.project.sample_assets):
+            item = QtWidgets.QListWidgetItem(f"{Path(asset.path).name} ({asset.duration_sec:.2f}s)")
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, f"sample_asset:{idx}")
+            self.sample_library.addItem(item)
         self.sample_timeline.refresh()
 
     def import_sample(self) -> None:
@@ -904,37 +1091,29 @@ class MainWindow(QtWidgets.QMainWindow):
             sample_wav = converted
 
         preview, sample_rate, duration = load_wav_preview(sample_wav)
-        clip = SampleClip(
+        asset = SampleAsset(
             path=str(sample_wav),
-            start_sec=0.0,
             duration_sec=duration,
             sample_rate=sample_rate,
             waveform_preview=preview,
         )
-        self.project.sample_clips.append(clip)
+        self.project.sample_assets.append(asset)
         self.refresh_sample_library()
-        self.statusBar().showMessage(f"Imported sample: {src.name}")
+        self.statusBar().showMessage(f"Imported sample asset: {src.name}")
 
     def place_selected_sample(self) -> None:
         row = self.sample_library.currentRow()
-        if row < 0 or row >= len(self.project.sample_clips):
+        if row < 0 or row >= len(self.project.sample_assets):
             QtWidgets.QMessageBox.information(self, "No sample selected", "Select a sample from the samples toolbox first.")
             return
-
-        start_sec, ok = QtWidgets.QInputDialog.getDouble(
-            self,
-            "Place sample",
-            "Start time (seconds):",
-            self.project.sample_clips[row].start_sec,
-            0.0,
-            3600.0,
-            2,
-        )
+        sample_tracks = self.sample_track_indices()
+        if not sample_tracks:
+            QtWidgets.QMessageBox.information(self, "No sample track", "Create a sample track before placing samples.")
+            return
+        start_sec, ok = QtWidgets.QInputDialog.getDouble(self, "Place sample", "Start time (seconds):", 0.0, 0.0, 3600.0, 2)
         if not ok:
             return
-
-        self.project.sample_clips[row].start_sec = float(start_sec)
-        self.refresh_sample_library()
+        self.place_sample_asset_on_track(row, sample_tracks[0], float(start_sec))
 
     def export_sample_timeline_audio(self) -> None:
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
@@ -1073,21 +1252,32 @@ class MainWindow(QtWidgets.QMainWindow):
     def _populate_track_list(self) -> None:
         self.track_list.clear()
         for track in self.project.tracks:
-            self.track_list.addItem(f"{track.name} • {track.instrument}")
+            extra = f"VST:{track.rack_vsti}" if track.rack_vsti else track.instrument
+            self.track_list.addItem(f"{track.name} • {track.track_type} • {extra}")
 
     def _track_changed(self, row: int) -> None:
         if row < 0:
             return
+        track = self.current_track()
+        self.piano_roll.setEnabled(track.track_type == 'instrument')
         self.piano_roll.refresh()
         self.mixer.load_track()
         self.instruments.load_track()
 
     def add_track(self) -> None:
+        track_type, ok = QtWidgets.QInputDialog.getItem(self, 'Add track', 'Track type:', ['instrument', 'sample'], 0, False)
+        if not ok:
+            return
         idx = len(self.project.tracks) + 1
-        self.project.tracks.append(TrackState(name=f"Track {idx}"))
+        state = TrackState(name=f"Track {idx}", track_type=track_type)
+        if track_type == 'sample':
+            state.instrument = 'Sample Track'
+            state.instrument_mode = 'Sample'
+        self.project.tracks.append(state)
         self._populate_track_list()
         self.track_list.setCurrentRow(idx - 1)
         self.timeline.refresh()
+        self.sample_timeline.refresh()
 
     def new_project(self) -> None:
         self.project = ProjectState()
