@@ -168,6 +168,14 @@ class SampleClip:
     waveform_preview: list[float] = dataclasses.field(default_factory=list)
 
 
+@dataclasses.dataclass
+class MidiSection:
+    track_index: int
+    start_sec: float
+    duration_sec: float
+    name: str = "MIDI Part"
+
+
 class ProjectState:
     def __init__(self) -> None:
         self.tracks: list[TrackState] = [TrackState(name="Track 1")]
@@ -177,8 +185,10 @@ class ProjectState:
         self.vsti_rack: list[VSTInstrument] = []
         self.sample_assets: list[SampleAsset] = []
         self.sample_clips: list[SampleClip] = []
+        self.midi_sections: list[MidiSection] = []
         self.left_locator_sec = 0.0
         self.right_locator_sec = 8.0
+        self.playhead_sec = 0.0
 
 
 class OpenAIClient:
@@ -546,6 +556,12 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
     def set_note_length_div(self, div: int) -> None:
         self.note_length_div = max(1, div)
 
+    def _set_headers(self) -> None:
+        locator_info = f"L {self.project.left_locator_sec:.2f}s  R {self.project.right_locator_sec:.2f}s"
+        self.setHorizontalHeaderLabels([
+            f"Track ({locator_info})", "Type", "Instrument", "Mode", "Profile", "Mute", "Solo", "Notes"
+        ])
+
     def refresh(self) -> None:
         self.scene_obj.clear()
         width = self.total_beats * self.cell_w
@@ -733,13 +749,20 @@ class TimelineWidget(QtWidgets.QTableWidget):
     def __init__(self, project: ProjectState) -> None:
         super().__init__(0, 8)
         self.project = project
-        self.setHorizontalHeaderLabels(["Track", "Type", "Instrument", "Mode", "Profile", "Mute", "Solo", "Notes"])
+        self._set_headers()
         self.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.verticalHeader().setVisible(False)
         self.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.refresh()
 
+    def _set_headers(self) -> None:
+        locator_info = f"L {self.project.left_locator_sec:.2f}s  R {self.project.right_locator_sec:.2f}s"
+        self.setHorizontalHeaderLabels([
+            f"Track ({locator_info})", "Type", "Instrument", "Mode", "Profile", "Mute", "Solo", "Notes"
+        ])
+
     def refresh(self) -> None:
+        self._set_headers()
         self.setRowCount(len(self.project.tracks))
         for i, track in enumerate(self.project.tracks):
             self.setItem(i, 0, QtWidgets.QTableWidgetItem(track.name))
@@ -753,11 +776,12 @@ class TimelineWidget(QtWidgets.QTableWidget):
 
 
 class SampleTimelineWidget(QtWidgets.QGraphicsView):
-    def __init__(self, project: ProjectState, get_sample_track_indices, on_drop_sample) -> None:
+    def __init__(self, project: ProjectState, get_sample_track_indices, on_drop_sample, set_locator_callable) -> None:
         super().__init__()
         self.project = project
         self.get_sample_track_indices = get_sample_track_indices
         self.on_drop_sample = on_drop_sample
+        self.set_locator_callable = set_locator_callable
         self.scene_obj = QtWidgets.QGraphicsScene(self)
         self.setScene(self.scene_obj)
         self.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
@@ -824,6 +848,9 @@ class SampleTimelineWidget(QtWidgets.QGraphicsView):
             x = locator_sec * self.pixels_per_second
             self.scene_obj.addLine(x, 0, x, height, QtGui.QPen(color, 2))
 
+        playhead_x = self.project.playhead_sec * self.pixels_per_second
+        self.scene_obj.addLine(playhead_x, 0, playhead_x, height, QtGui.QPen(QtGui.QColor(255, 90, 90), 2))
+
         for clip in self.project.sample_clips:
             if clip.track_index not in sample_tracks:
                 continue
@@ -847,6 +874,116 @@ class SampleTimelineWidget(QtWidgets.QGraphicsView):
             label.setPos(x + 4, y + 4)
 
         self.setSceneRect(0, 0, width, height)
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            sec = max(0.0, self.mapToScene(event.position().toPoint()).x() / self.pixels_per_second)
+            self.set_locator_callable(sec)
+        super().mousePressEvent(event)
+
+
+class ArrangementOverviewWidget(QtWidgets.QGraphicsView):
+    locatorChanged = QtCore.Signal(float)
+
+    def __init__(self, project: ProjectState, set_locator_callable) -> None:
+        super().__init__()
+        self.project = project
+        self.set_locator_callable = set_locator_callable
+        self.scene_obj = QtWidgets.QGraphicsScene(self)
+        self.setScene(self.scene_obj)
+        self.pixels_per_second = 80
+        self.lane_height = 56
+        self._drag_index: int | None = None
+        self._drag_offset_sec = 0.0
+        self.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
+        self.setMouseTracking(True)
+        self.refresh()
+
+    def _duration_seconds(self) -> float:
+        duration = max(8.0, self.project.right_locator_sec + 1.0)
+        for section in self.project.midi_sections:
+            duration = max(duration, section.start_sec + section.duration_sec + 1.0)
+        return duration
+
+    def _lane_count(self) -> int:
+        return max(1, len(self.project.tracks))
+
+    def refresh(self) -> None:
+        self.scene_obj.clear()
+        duration = self._duration_seconds()
+        lane_count = self._lane_count()
+        width = duration * self.pixels_per_second
+        height = lane_count * self.lane_height
+
+        self.scene_obj.addRect(0, 0, width, height, QtGui.QPen(QtGui.QColor(70, 70, 70)), QtGui.QBrush(QtGui.QColor(33, 33, 33)))
+
+        for lane in range(lane_count):
+            y = lane * self.lane_height
+            self.scene_obj.addLine(0, y, width, y, QtGui.QPen(QtGui.QColor(62, 62, 62)))
+            if lane < len(self.project.tracks):
+                label = self.scene_obj.addText(self.project.tracks[lane].name)
+                label.setDefaultTextColor(QtGui.QColor(188, 188, 188))
+                label.setPos(4, y + 2)
+
+        sec = 0
+        while sec <= int(duration) + 1:
+            x = sec * self.pixels_per_second
+            self.scene_obj.addLine(x, 0, x, height, QtGui.QPen(QtGui.QColor(96, 96, 96) if sec % 4 == 0 else QtGui.QColor(74, 74, 74)))
+            sec += 1
+
+        for idx, section in enumerate(self.project.midi_sections):
+            if section.track_index >= lane_count:
+                continue
+            x = section.start_sec * self.pixels_per_second
+            w = max(10, section.duration_sec * self.pixels_per_second)
+            y = section.track_index * self.lane_height + 20
+            h = self.lane_height - 24
+            rect = self.scene_obj.addRect(x, y, w, h, QtGui.QPen(QtGui.QColor(0, 0, 0)), QtGui.QBrush(QtGui.QColor(125, 88, 220)))
+            rect.setData(0, idx)
+            label = self.scene_obj.addText(section.name)
+            label.setDefaultTextColor(QtGui.QColor(242, 242, 242))
+            label.setPos(x + 4, y + 2)
+
+        locator_x = self.project.playhead_sec * self.pixels_per_second
+        self.scene_obj.addLine(locator_x, 0, locator_x, height, QtGui.QPen(QtGui.QColor(255, 80, 80), 2))
+
+        for locator_sec, color in ((self.project.left_locator_sec, QtGui.QColor(0, 200, 160)), (self.project.right_locator_sec, QtGui.QColor(240, 200, 0))):
+            x = locator_sec * self.pixels_per_second
+            self.scene_obj.addLine(x, 0, x, height, QtGui.QPen(color, 1))
+
+        self.setSceneRect(0, 0, width, height)
+
+    def _set_playhead_from_event(self, event: QtGui.QMouseEvent) -> None:
+        sec = max(0.0, self.mapToScene(event.position().toPoint()).x() / self.pixels_per_second)
+        self.set_locator_callable(sec)
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            item = self.itemAt(event.position().toPoint())
+            if item is not None and item.data(0) is not None:
+                self._drag_index = int(item.data(0))
+                section = self.project.midi_sections[self._drag_index]
+                x_sec = self.mapToScene(event.position().toPoint()).x() / self.pixels_per_second
+                self._drag_offset_sec = max(0.0, x_sec - section.start_sec)
+            else:
+                self._drag_index = None
+                self._set_playhead_from_event(event)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        if self._drag_index is not None and 0 <= self._drag_index < len(self.project.midi_sections):
+            x_sec = self.mapToScene(event.position().toPoint()).x() / self.pixels_per_second
+            self.project.midi_sections[self._drag_index].start_sec = max(0.0, x_sec - self._drag_offset_sec)
+            self.refresh()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            if self._drag_index is None:
+                self._set_playhead_from_event(event)
+            self._drag_index = None
+        super().mouseReleaseEvent(event)
 
 
 class MixerWidget(QtWidgets.QWidget):
@@ -1073,7 +1210,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.mixer = MixerWidget(self.project, self.current_track)
         self.instruments = InstrumentFxWidget(self.project, self.current_track, self.refresh_vsti_rack_ui)
-        self.sample_timeline = SampleTimelineWidget(self.project, self.sample_track_indices, self.place_sample_asset_on_track)
+        self.sample_timeline = SampleTimelineWidget(self.project, self.sample_track_indices, self.place_sample_asset_on_track, self.set_playhead_position)
+        self.arrangement_overview = ArrangementOverviewWidget(self.project, self.set_playhead_position)
         self.sample_library = SampleLibraryWidget()
 
         quantize_box = QtWidgets.QComboBox()
@@ -1086,16 +1224,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         import_btn = QtWidgets.QPushButton("Import MIDI + AI Instrument Render")
         import_btn.clicked.connect(self.import_midi)
-        export_btn = QtWidgets.QPushButton("Export MIDI")
-        export_btn.clicked.connect(self.export_midi)
         render_btn = QtWidgets.QPushButton("Render AI Audio Stems")
         render_btn.clicked.connect(self.render_all_tracks)
         import_sample_btn = QtWidgets.QPushButton("Import Sample (WAV/MP3)")
         import_sample_btn.clicked.connect(self.import_sample)
         place_sample_btn = QtWidgets.QPushButton("Place Selected Sample On Timeline")
         place_sample_btn.clicked.connect(self.place_selected_sample)
-        export_audio_btn = QtWidgets.QPushButton("Export Sample Timeline Audio (WAV/MP3)")
-        export_audio_btn.clicked.connect(self.export_sample_timeline_audio)
         ai_btn = QtWidgets.QPushButton("AI Compose (OpenAI Codex)")
         ai_btn.clicked.connect(self.compose_with_ai)
 
@@ -1108,18 +1242,17 @@ class MainWindow(QtWidgets.QMainWindow):
         left_layout.addWidget(QtWidgets.QLabel("Quantize"))
         left_layout.addWidget(quantize_box)
         left_layout.addWidget(import_btn)
-        left_layout.addWidget(export_btn)
         left_layout.addWidget(render_btn)
         left_layout.addWidget(QtWidgets.QLabel("Samples Toolbox"))
         left_layout.addWidget(self.sample_library)
         left_layout.addWidget(import_sample_btn)
         left_layout.addWidget(place_sample_btn)
-        left_layout.addWidget(export_audio_btn)
         left_layout.addWidget(ai_btn)
         left_layout.addStretch()
 
         right_tabs = QtWidgets.QTabWidget()
         right_tabs.addTab(self.timeline, "Timeline")
+        right_tabs.addTab(self.arrangement_overview, "Arrangement Overview")
         right_tabs.addTab(self.sample_timeline, "Sample Timeline")
         right_tabs.addTab(self.mixer, "Mixer")
         right_tabs.addTab(self.instruments, "Instruments / FX")
@@ -1144,6 +1277,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_sample_library()
 
     def _setup_menus(self) -> None:
+        file_menu = self.menuBar().addMenu('File')
+        import_midi_action = QtGui.QAction('Import MIDI + AI Instrument Render', self)
+        import_midi_action.triggered.connect(self.import_midi)
+        export_midi_action = QtGui.QAction('Export MIDI', self)
+        export_midi_action.triggered.connect(self.export_midi)
+        export_audio_action = QtGui.QAction('Export Sample Timeline Audio (WAV/MP3)', self)
+        export_audio_action.triggered.connect(self.export_sample_timeline_audio)
+        file_menu.addAction(import_midi_action)
+        file_menu.addSeparator()
+        file_menu.addAction(export_midi_action)
+        file_menu.addAction(export_audio_action)
+
         settings = self.menuBar().addMenu('Settings')
 
         instruments_menu = settings.addMenu('Instruments')
@@ -1171,15 +1316,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_openai_status()
 
     def _setup_floating_transport(self) -> None:
+        self.playback_timer = QtCore.QTimer(self)
+        self.playback_timer.setInterval(33)
+        self.playback_timer.timeout.connect(self._tick_playback)
+        self._playback_started_at = 0.0
+        self._playback_origin_sec = 0.0
+
         transport = QtWidgets.QToolBar('Transport', self)
         transport.setFloatable(True)
         transport.setMovable(True)
         self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, transport)
         play_action = transport.addAction('Play')
         stop_action = transport.addAction('Stop')
-        play_action.triggered.connect(lambda: self.statusBar().showMessage('Playback started (simulation)'))
-        stop_action.triggered.connect(lambda: self.statusBar().showMessage('Playback stopped'))
+        play_action.triggered.connect(self.start_playback)
+        stop_action.triggered.connect(self.stop_playback)
         transport.addSeparator()
+        self.playhead_spin = QtWidgets.QDoubleSpinBox()
+        self.playhead_spin.setRange(0.0, 3600.0)
+        self.playhead_spin.setDecimals(2)
+        self.playhead_spin.setSingleStep(0.1)
+        self.playhead_spin.setValue(self.project.playhead_sec)
+        self.playhead_spin.valueChanged.connect(self.set_playhead_position)
+        transport.addWidget(QtWidgets.QLabel('Playhead'))
+        transport.addWidget(self.playhead_spin)
         self.left_locator = QtWidgets.QDoubleSpinBox()
         self.left_locator.setRange(0.0, 3600.0)
         self.left_locator.setValue(self.project.left_locator_sec)
@@ -1204,6 +1363,37 @@ class MainWindow(QtWidgets.QMainWindow):
         self.project.left_locator_sec = min(self.left_locator.value(), self.right_locator.value())
         self.project.right_locator_sec = max(self.left_locator.value(), self.right_locator.value())
         self.sample_timeline.refresh()
+        self.arrangement_overview.refresh()
+        self.timeline.refresh()
+
+    def set_playhead_position(self, sec: float) -> None:
+        self.project.playhead_sec = max(0.0, float(sec))
+        if hasattr(self, 'playhead_spin'):
+            self.playhead_spin.blockSignals(True)
+            self.playhead_spin.setValue(self.project.playhead_sec)
+            self.playhead_spin.blockSignals(False)
+        self.sample_timeline.refresh()
+        self.arrangement_overview.refresh()
+
+    def start_playback(self) -> None:
+        self._playback_started_at = time.time()
+        self._playback_origin_sec = self.project.playhead_sec
+        self.playback_timer.start()
+        self.statusBar().showMessage('Playback started (simulation)')
+
+    def stop_playback(self) -> None:
+        if hasattr(self, 'playback_timer'):
+            self.playback_timer.stop()
+        self.statusBar().showMessage('Playback stopped')
+
+    def _tick_playback(self) -> None:
+        elapsed = time.time() - self._playback_started_at
+        new_pos = self._playback_origin_sec + elapsed
+        if new_pos > self.project.right_locator_sec:
+            new_pos = self.project.left_locator_sec
+            self._playback_started_at = time.time()
+            self._playback_origin_sec = new_pos
+        self.set_playhead_position(new_pos)
 
     def update_tempo(self, bpm: int) -> None:
         self.project.bpm = int(bpm)
@@ -1395,7 +1585,7 @@ class MainWindow(QtWidgets.QMainWindow):
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Q"), self, self.piano_roll.quantize_selected)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+G"), self, self.compose_with_ai)
         QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Delete), self, self.piano_roll.delete_selected)
-        QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Space), self, lambda: self.statusBar().showMessage("Play/Stop toggled"))
+        QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Space), self, lambda: self.stop_playback() if self.playback_timer.isActive() else self.start_playback())
 
     def _setup_virtual_piano_dock(self) -> None:
         key_map = {"Z": 60, "X": 62, "C": 64, "V": 65, "B": 67, "N": 69, "M": 71, ",": 72}
@@ -1551,8 +1741,13 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.information(self, "No samples", "No samples are placed on the timeline.")
             return
 
+        left = self.project.left_locator_sec
+        right = self.project.right_locator_sec
+        if right <= left:
+            QtWidgets.QMessageBox.warning(self, "Invalid locators", "Right locator must be greater than left locator for export.")
+            return
+
         sample_rate = 44100
-        max_end = 1.0
         loaded: list[tuple[SampleClip, list[float], int]] = []
         for clip in self.project.sample_clips:
             wav_path = Path(clip.path)
@@ -1562,10 +1757,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 wav_path = converted
             data, sr = load_wav_samples(wav_path)
             loaded.append((clip, data, sr))
-            clip_len = len(data) / sr
-            max_end = max(max_end, clip.start_sec + clip_len)
 
-        mix = [0.0] * int(max_end * sample_rate)
+        mix_length = int((right - left) * sample_rate)
+        mix = [0.0] * max(1, mix_length)
         for clip, data, sr in loaded:
             if sr != sample_rate:
                 ratio = sr / sample_rate
@@ -1573,9 +1767,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 for i in range(int(len(data) / ratio)):
                     resampled.append(data[min(len(data) - 1, int(i * ratio))])
                 data = resampled
-            offset = int(clip.start_sec * sample_rate)
-            for i, v in enumerate(data):
-                idx = offset + i
+
+            clip_start = clip.start_sec
+            clip_end = clip.start_sec + (len(data) / sample_rate)
+            if clip_end <= left or clip_start >= right:
+                continue
+
+            overlap_start = max(left, clip_start)
+            overlap_end = min(right, clip_end)
+            src_start = int((overlap_start - clip_start) * sample_rate)
+            src_end = int((overlap_end - clip_start) * sample_rate)
+            dst_offset = int((overlap_start - left) * sample_rate)
+
+            for i, v in enumerate(data[src_start:src_end]):
+                idx = dst_offset + i
                 if idx >= len(mix):
                     break
                 mix[idx] += v * 0.7
@@ -1658,6 +1863,24 @@ class MainWindow(QtWidgets.QMainWindow):
 
         return built
 
+    def rebuild_midi_sections(self) -> None:
+        sections: list[MidiSection] = []
+        for i, track in enumerate(self.project.tracks):
+            if track.track_type != 'instrument' or not track.notes:
+                continue
+            start_tick = min(note.start_tick for note in track.notes)
+            end_tick = max(note.start_tick + note.duration_tick for note in track.notes)
+            sec_per_tick = 60.0 / max(1, self.project.bpm) / TICKS_PER_BEAT
+            sections.append(
+                MidiSection(
+                    track_index=i,
+                    start_sec=start_tick * sec_per_tick,
+                    duration_sec=max(0.1, (end_tick - start_tick) * sec_per_tick),
+                    name=f"{track.name} Part",
+                )
+            )
+        self.project.midi_sections = sections
+
     def insert_live_note(self, pitch: int) -> None:
         track = self.current_track()
         cursor_tick = max((n.start_tick + n.duration_tick for n in track.notes), default=0)
@@ -1700,14 +1923,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.track_list.setCurrentRow(idx - 1)
         self.timeline.refresh()
         self.sample_timeline.refresh()
+        self.rebuild_midi_sections()
+        self.arrangement_overview.refresh()
 
     def new_project(self) -> None:
         self.project = ProjectState()
         self.timeline.project = self.project
         self.piano_roll.project = self.project
         self.sample_timeline.project = self.project
+        self.arrangement_overview.project = self.project
         if hasattr(self, 'tempo_spin'):
             self.tempo_spin.setValue(self.project.bpm)
+        if hasattr(self, 'left_locator'):
+            self.left_locator.setValue(self.project.left_locator_sec)
+            self.right_locator.setValue(self.project.right_locator_sec)
+        self.set_playhead_position(self.project.playhead_sec)
         self._populate_track_list()
         self.track_list.setCurrentRow(0)
         self.on_notes_changed()
@@ -1716,6 +1946,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.piano_roll.refresh()
         self.timeline.refresh()
         self.sample_timeline.refresh()
+        self.rebuild_midi_sections()
+        self.arrangement_overview.refresh()
 
     def import_midi(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Import MIDI", str(Path.cwd()), "MIDI files (*.mid *.midi)")
@@ -1747,6 +1979,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path:
             return
 
+        left_sec = self.project.left_locator_sec
+        right_sec = self.project.right_locator_sec
+        if right_sec <= left_sec:
+            QtWidgets.QMessageBox.warning(self, "Invalid locators", "Right locator must be greater than left locator for export.")
+            return
+
+        sec_per_tick = 60.0 / max(1, self.project.bpm) / TICKS_PER_BEAT
+        left_tick = int(left_sec / sec_per_tick)
+        right_tick = int(right_sec / sec_per_tick)
+
         midi = mido.MidiFile(ticks_per_beat=TICKS_PER_BEAT)
         for track_state in self.project.tracks:
             mtrack = mido.MidiTrack()
@@ -1756,18 +1998,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
             events: list[tuple[int, mido.Message]] = []
             for note in track_state.notes:
-                events.append(
-                    (
-                        note.start_tick,
-                        mido.Message("note_on", channel=track_state.midi_channel, note=note.pitch, velocity=note.velocity, time=0),
-                    )
-                )
-                events.append(
-                    (
-                        note.start_tick + note.duration_tick,
-                        mido.Message("note_off", channel=track_state.midi_channel, note=note.pitch, velocity=0, time=0),
-                    )
-                )
+                note_start = note.start_tick
+                note_end = note.start_tick + note.duration_tick
+                if note_end <= left_tick or note_start >= right_tick:
+                    continue
+
+                clipped_start = max(left_tick, note_start)
+                clipped_end = min(right_tick, note_end)
+                start_rel = clipped_start - left_tick
+                end_rel = clipped_end - left_tick
+
+                events.append((start_rel, mido.Message("note_on", channel=track_state.midi_channel, note=note.pitch, velocity=note.velocity, time=0)))
+                events.append((end_rel, mido.Message("note_off", channel=track_state.midi_channel, note=note.pitch, velocity=0, time=0)))
 
             events.sort(key=lambda x: x[0])
             current = 0
