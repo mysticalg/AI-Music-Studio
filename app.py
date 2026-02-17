@@ -798,6 +798,13 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
 
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
             if self.tool == 'pencil':
+                clicked = self._find_note_at(scene_pos)
+                if clicked is not None:
+                    for note in self.current_track().notes:
+                        note.selected = (note is clicked)
+                    self.refresh()
+                    self.noteChanged.emit()
+                    return
                 note = self._insert_note_at(scene_pos)
                 self._pencil_note = note
                 self._pencil_anchor_tick = note.start_tick
@@ -825,7 +832,13 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
                         (n, n.start_tick, n.pitch) for n in self.current_track().notes if n.selected
                     ]
                     self.refresh()
+                    self.noteChanged.emit()
                     return
+                for note in self.current_track().notes:
+                    note.selected = False
+                self.refresh()
+                self.noteChanged.emit()
+                return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
@@ -1712,6 +1725,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resize(1500, 900)
 
         self.track_list = QtWidgets.QListWidget()
+        self._selected_track_index = 0
         self.track_list.currentRowChanged.connect(self._track_changed)
         self.track_list.viewport().installEventFilter(self)
         self.last_added_track_type = 'instrument'
@@ -3154,23 +3168,38 @@ class MainWindow(QtWidgets.QMainWindow):
         return super().eventFilter(watched, event)
 
     def current_track_index(self) -> int:
+        if not self.project.tracks:
+            return 0
         row = self.track_list.currentRow()
-        return 0 if row < 0 else row
+        if row < 0:
+            return max(0, min(self._selected_track_index, len(self.project.tracks) - 1))
+        self._selected_track_index = row
+        return row
 
     def current_track(self) -> TrackState:
         return self.project.tracks[self.current_track_index()]
 
     def _populate_track_list(self) -> None:
+        selected = self.current_track_index() if self.project.tracks else 0
+        self.track_list.blockSignals(True)
         self.track_list.clear()
         for track in self.project.tracks:
             extra = f"VST:{track.rack_vsti}" if track.rack_vsti else track.instrument
             ch = f"Ch {track.midi_channel + 1}" if track.track_type == 'instrument' else 'Sample'
             self.track_list.addItem(f"{track.name} • {track.track_type} • {ch} • {track.instrument_mode} • {extra}")
+        if self.project.tracks:
+            safe_index = max(0, min(selected, len(self.project.tracks) - 1))
+            self._selected_track_index = safe_index
+            self.track_list.setCurrentRow(safe_index)
+        self.track_list.blockSignals(False)
+        if self.project.tracks:
+            self._track_changed(self._selected_track_index)
 
     def _track_changed(self, row: int) -> None:
-        if row < 0:
+        if row < 0 or row >= len(self.project.tracks):
             return
-        track = self.current_track()
+        self._selected_track_index = row
+        track = self.project.tracks[row]
         self.piano_roll.setEnabled(track.track_type == 'instrument')
         self.velocity_editor.setEnabled(track.track_type == 'instrument')
         self.piano_roll.refresh()
