@@ -1335,11 +1335,12 @@ class MixerWidget(QtWidgets.QWidget):
 
 
 class InstrumentFxWidget(QtWidgets.QWidget):
-    def __init__(self, project: ProjectState, current_track_callable, refresh_vsti_choices_callable) -> None:
+    def __init__(self, project: ProjectState, current_track_callable, refresh_vsti_choices_callable, on_track_updated_callable=None) -> None:
         super().__init__()
         self.project = project
         self.current_track_callable = current_track_callable
         self.refresh_vsti_choices_callable = refresh_vsti_choices_callable
+        self.on_track_updated = on_track_updated_callable
 
         root = QtWidgets.QVBoxLayout(self)
         form = QtWidgets.QFormLayout()
@@ -1367,6 +1368,8 @@ class InstrumentFxWidget(QtWidgets.QWidget):
         self.instrument.currentTextChanged.connect(self.apply_changes)
         self.instrument_mode.currentTextChanged.connect(self.apply_changes)
         self.vsti_selector.currentTextChanged.connect(self.apply_changes)
+        for slider in self.fx_controls.values():
+            slider.valueChanged.connect(self.apply_changes)
 
     def reload_vsti_choices(self) -> None:
         current = self.vsti_selector.currentText()
@@ -1381,23 +1384,43 @@ class InstrumentFxWidget(QtWidgets.QWidget):
     def load_track(self) -> None:
         self.reload_vsti_choices()
         track = self.current_track_callable()
+
+        self.instrument_mode.blockSignals(True)
+        self.instrument.blockSignals(True)
+        self.vsti_selector.blockSignals(True)
+
         idx_mode = self.instrument_mode.findText(track.instrument_mode)
         if idx_mode >= 0:
             self.instrument_mode.setCurrentIndex(idx_mode)
+
         idx = self.instrument.findText(track.instrument)
+        if idx < 0 and track.instrument:
+            self.instrument.addItem(track.instrument)
+            idx = self.instrument.findText(track.instrument)
         if idx >= 0:
             self.instrument.setCurrentIndex(idx)
+
         rack_idx = self.vsti_selector.findText(track.rack_vsti or 'None')
         if rack_idx >= 0:
             self.vsti_selector.setCurrentIndex(rack_idx)
+
+        self.instrument_mode.blockSignals(False)
+        self.instrument.blockSignals(False)
+        self.vsti_selector.blockSignals(False)
         self.profile.setText(track.synth_profile)
 
     def apply_changes(self) -> None:
         track = self.current_track_callable()
         track.instrument_mode = self.instrument_mode.currentText()
-        track.instrument = self.instrument.currentText()
-        track.rack_vsti = '' if self.vsti_selector.currentText() == 'None' else self.vsti_selector.currentText()
+        selected_rack = '' if self.vsti_selector.currentText() == 'None' else self.vsti_selector.currentText()
+        track.rack_vsti = selected_rack
+        if track.instrument_mode == 'VSTI Rack' and selected_rack:
+            track.instrument = selected_rack
+        else:
+            track.instrument = self.instrument.currentText()
         track.plugins = [f"{name}:{slider.value()}" for name, slider in self.fx_controls.items()]
+        if callable(self.on_track_updated):
+            self.on_track_updated()
 
 
 class SampleLibraryWidget(QtWidgets.QListWidget):
@@ -1524,7 +1547,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.velocity_editor.velocityChanged.connect(self.on_notes_changed)
 
         self.mixer = MixerWidget(self.project, self.current_track)
-        self.instruments = InstrumentFxWidget(self.project, self.current_track, self.refresh_vsti_rack_ui)
+        self.instruments = InstrumentFxWidget(self.project, self.current_track, self.refresh_vsti_rack_ui, self.on_track_instrument_changed)
         self.sample_timeline = SampleTimelineWidget(self.project, self.sample_track_indices, self.place_sample_asset_on_track, self.set_playhead_position)
         self.arrangement_overview = ArrangementOverviewWidget(self.project, self.set_playhead_position, self.set_left_locator_position, self.set_right_locator_position, self.apply_arrangement_section_move, lambda: self.project.bpm)
         self.sample_library = SampleLibraryWidget()
@@ -1634,6 +1657,11 @@ class MainWindow(QtWidgets.QMainWindow):
         add_vsti_to_rack.triggered.connect(self.add_discovered_vsti_to_rack)
         instruments_menu.addAction(add_vsti_to_rack)
         self.vsti_menu = instruments_menu
+
+        tracks_menu = settings.addMenu('Tracks')
+        assign_track_instrument = QtGui.QAction('Assign Instrument To Selected Track', self)
+        assign_track_instrument.triggered.connect(self.assign_instrument_to_selected_track)
+        tracks_menu.addAction(assign_track_instrument)
 
         openai_menu = settings.addMenu('OpenAI')
         connect_openai = QtGui.QAction('Connect', self)
@@ -2087,6 +2115,45 @@ class MainWindow(QtWidgets.QMainWindow):
     def refresh_openai_status(self) -> None:
         if hasattr(self, 'openai_status_action'):
             self.openai_status_action.setText(self.ai_client.auth_status())
+
+    def on_track_instrument_changed(self) -> None:
+        self._populate_track_list()
+        self.timeline.refresh()
+
+    def assign_instrument_to_selected_track(self) -> None:
+        if not self.project.tracks:
+            return
+        row = self.track_list.currentRow()
+        if row < 0:
+            row = 0
+        track = self.project.tracks[row]
+
+        mode, ok = QtWidgets.QInputDialog.getItem(self, 'Track Instrument Mode', 'Mode:', ['AI Synth', 'General MIDI', 'VSTI Rack'], 0, False)
+        if not ok:
+            return
+        track.instrument_mode = mode
+
+        if mode == 'VSTI Rack':
+            if not self.project.vsti_rack:
+                QtWidgets.QMessageBox.information(self, 'No rack instruments', 'Load a VST into the rack first from Settings > Instruments.')
+                return
+            options = [v.name for v in self.project.vsti_rack]
+            chosen, ok = QtWidgets.QInputDialog.getItem(self, 'Assign Rack Instrument', 'Rack instrument:', options, 0, False)
+            if not ok:
+                return
+            track.rack_vsti = chosen
+            track.instrument = chosen
+        else:
+            options = [self.instruments.instrument.itemText(i) for i in range(self.instruments.instrument.count())]
+            chosen, ok = QtWidgets.QInputDialog.getItem(self, 'Assign Instrument', 'Instrument:', options, 0, False)
+            if not ok:
+                return
+            track.rack_vsti = ''
+            track.instrument = chosen
+
+        self._populate_track_list()
+        self.timeline.refresh()
+        self.instruments.load_track()
 
     def connect_openai(self) -> None:
         dialog = OpenAIConnectDialog(self)
