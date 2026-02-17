@@ -532,7 +532,7 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         self.cell_w = 24
         self.cell_h = 14
         self.total_beats = 64
-        self.tool = 'select'
+        self.tool = 'pencil'
         self.note_length_div = 8
         self._line_start: QtCore.QPointF | None = None
         self._pencil_note: MidiNote | None = None
@@ -618,6 +618,13 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
             self._draw_note(note)
 
         bpm = max(1, self.project.bpm)
+        for label, locator_sec, color in (('L', self.project.left_locator_sec, QtGui.QColor(0, 200, 160)), ('R', self.project.right_locator_sec, QtGui.QColor(240, 200, 0))):
+            locator_x = locator_sec * (bpm / 60.0) * self.cell_w
+            self.scene_obj.addLine(locator_x, 0, locator_x, height, QtGui.QPen(color, 2))
+            tag = self.scene_obj.addSimpleText(label)
+            tag.setBrush(QtGui.QBrush(color))
+            tag.setPos(locator_x + 2, 0)
+
         playhead_beat = self.project.playhead_sec * (bpm / 60.0)
         playhead_x = playhead_beat * self.cell_w
         self.scene_obj.addLine(playhead_x, 0, playhead_x, height, QtGui.QPen(QtGui.QColor(255, 90, 90), 2))
@@ -914,6 +921,13 @@ class VelocityEditorWidget(QtWidgets.QGraphicsView):
             rect.setData(0, note)
 
         bpm = max(1, self.project.bpm)
+        for label, locator_sec, color in (('L', self.project.left_locator_sec, QtGui.QColor(0, 200, 160)), ('R', self.project.right_locator_sec, QtGui.QColor(240, 200, 0))):
+            locator_x = locator_sec * (bpm / 60.0) * self.cell_w
+            self.scene_obj.addLine(locator_x, 0, locator_x, height, QtGui.QPen(color, 2))
+            tag = self.scene_obj.addSimpleText(label)
+            tag.setBrush(QtGui.QBrush(color))
+            tag.setPos(locator_x + 2, 0)
+
         playhead_beat = self.project.playhead_sec * (bpm / 60.0)
         playhead_x = playhead_beat * self.cell_w
         self.scene_obj.addLine(playhead_x, 0, playhead_x, height, QtGui.QPen(QtGui.QColor(255, 90, 90), 2))
@@ -1616,6 +1630,9 @@ class MainWindow(QtWidgets.QMainWindow):
         add_vsti_folder = QtGui.QAction('Add VSTI Folder', self)
         add_vsti_folder.triggered.connect(self.add_vsti_folder)
         instruments_menu.addAction(add_vsti_folder)
+        add_vsti_to_rack = QtGui.QAction('Add Discovered VSTI To Rack', self)
+        add_vsti_to_rack.triggered.connect(self.add_discovered_vsti_to_rack)
+        instruments_menu.addAction(add_vsti_to_rack)
         self.vsti_menu = instruments_menu
 
         openai_menu = settings.addMenu('OpenAI')
@@ -1935,8 +1952,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.project.vsti_paths = [p for p in payload.get('vsti_paths', []) if isinstance(p, str)]
         self.project.sample_paths = [p for p in payload.get('sample_paths', []) if isinstance(p, str)]
+        rack_paths = [p for p in payload.get('vsti_rack_paths', []) if isinstance(p, str)]
+        self.project.vsti_paths = [p for p in self.project.vsti_paths if Path(p).exists()]
         rack = []
-        for path in self.project.vsti_paths:
+        for path in rack_paths:
             if Path(path).exists():
                 rack.append(VSTInstrument(name=Path(path).stem, path=path))
         self.project.vsti_rack = rack
@@ -1944,28 +1963,43 @@ class MainWindow(QtWidgets.QMainWindow):
     def _save_preferences(self) -> None:
         payload = {
             'vsti_paths': self.project.vsti_paths,
+            'vsti_rack_paths': [v.path for v in self.project.vsti_rack],
             'sample_paths': self.project.sample_paths,
         }
         APP_PREFS_PATH.write_text(json.dumps(payload, indent=2))
+
+    def _discover_vstis_in_folder(self, folder: Path) -> list[Path]:
+        discovered: list[Path] = []
+        for path in folder.rglob('*'):
+            name = path.name.lower()
+            if path.is_file() and path.suffix.lower() in {'.dll', '.so', '.vst3'}:
+                discovered.append(path)
+            elif path.is_dir() and name.endswith('.vst3'):
+                discovered.append(path)
+        unique: list[Path] = []
+        seen: set[str] = set()
+        for path in discovered:
+            key = str(path.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(path)
+        return unique
 
     def add_vsti_folder(self) -> None:
         folder = QtWidgets.QFileDialog.getExistingDirectory(self, 'Choose VST folder', str(Path.cwd()))
         if not folder:
             return
-        found = []
-        for ext in ('*.dll', '*.vst3', '*.so'):
-            found.extend(Path(folder).glob(ext))
+        found = self._discover_vstis_in_folder(Path(folder))
         added = 0
         for plugin in found:
             pstr = str(plugin)
             if pstr in self.project.vsti_paths:
                 continue
             self.project.vsti_paths.append(pstr)
-            self.project.vsti_rack.append(VSTInstrument(name=plugin.stem, path=pstr))
             added += 1
         self._save_preferences()
-        self.refresh_vsti_rack_ui()
-        self.statusBar().showMessage(f'Added {added} VSTI plugin(s) from folder')
+        self.statusBar().showMessage(f'Discovered {added} VSTI plugin(s) from folder. Add desired plugins to rack from Settings > Instruments > Add Discovered VSTI To Rack.')
 
     def add_sample_path(self) -> None:
         folder = QtWidgets.QFileDialog.getExistingDirectory(self, 'Choose sample folder', str(Path.cwd()))
@@ -2004,14 +2038,32 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_sample_library()
         self.statusBar().showMessage(f'Scanned sample folders. Added {added} sample(s).')
 
+    def add_discovered_vsti_to_rack(self) -> None:
+        available = [path for path in self.project.vsti_paths if Path(path).exists() and path not in {v.path for v in self.project.vsti_rack}]
+        if not available:
+            QtWidgets.QMessageBox.information(self, 'No discovered VSTI', 'No discovered VST instruments are available to add to the rack.')
+            return
+
+        labels = [Path(path).stem for path in available]
+        selected, ok = QtWidgets.QInputDialog.getItem(self, 'Add VSTI To Rack', 'Choose instrument:', labels, 0, False)
+        if not ok:
+            return
+        idx = labels.index(selected)
+        chosen_path = available[idx]
+        self.project.vsti_rack.append(VSTInstrument(name=Path(chosen_path).stem, path=chosen_path))
+        self._save_preferences()
+        self.refresh_vsti_rack_ui()
+        self.statusBar().showMessage(f'Added to rack: {Path(chosen_path).stem}')
+
     def add_vsti_path(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Choose VST instrument', str(Path.cwd()), 'VST Plugins (*.dll *.vst3 *.so);;All files (*)')
         if not path:
             return
-        if path in self.project.vsti_paths:
-            self.statusBar().showMessage(f'VSTI already added: {Path(path).name}')
+        if path not in self.project.vsti_paths:
+            self.project.vsti_paths.append(path)
+        if path in {v.path for v in self.project.vsti_rack}:
+            self.statusBar().showMessage(f'VSTI already loaded in rack: {Path(path).name}')
             return
-        self.project.vsti_paths.append(path)
         self.project.vsti_rack.append(VSTInstrument(name=Path(path).stem, path=path))
         self._save_preferences()
         self.refresh_vsti_rack_ui()
