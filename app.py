@@ -19,7 +19,7 @@ import webbrowser
 from pathlib import Path
 
 import mido
-from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6 import QtCore, QtGui, QtMultimedia, QtWidgets
 
 TICKS_PER_BEAT = 480
 DEFAULT_BPM = 120
@@ -1198,6 +1198,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.composer = OpenAIComposer(self.ai_client)
         self.instrument_ai = InstrumentIntelligence(self.ai_client)
         self.renderer = AISynthRenderer()
+        self.audio_output = QtMultimedia.QAudioOutput(self)
+        self.media_player = QtMultimedia.QMediaPlayer(self)
+        self.media_player.setAudioOutput(self.audio_output)
+        self.selected_audio_output_id = ""
+        self.playback_mix_path = Path.cwd() / "renders" / "_playback_mix.wav"
         self.setWindowTitle("AI Music Studio")
         self.resize(1500, 900)
 
@@ -1312,6 +1317,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.openai_status_action.setEnabled(False)
         openai_menu.addAction(self.openai_status_action)
 
+        self.audio_output_menu = settings.addMenu('Audio Output')
+        self.refresh_audio_output_menu()
+
         self.refresh_vsti_rack_ui()
         self.refresh_openai_status()
 
@@ -1321,6 +1329,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.playback_timer.timeout.connect(self._tick_playback)
         self._playback_started_at = 0.0
         self._playback_origin_sec = 0.0
+        self._playback_rate = 1.0
 
         transport = QtWidgets.QToolBar('Transport', self)
         transport.setFloatable(True)
@@ -1376,28 +1385,145 @@ class MainWindow(QtWidgets.QMainWindow):
         self.arrangement_overview.refresh()
 
     def start_playback(self) -> None:
+        if not self._build_playback_mix(self.playback_mix_path):
+            QtWidgets.QMessageBox.information(self, 'Nothing to play', 'No playable audio was found. Add notes or sample clips first.')
+            return
+        self._playback_rate = max(0.2, self.project.bpm / DEFAULT_BPM)
+        self.media_player.setSource(QtCore.QUrl.fromLocalFile(str(self.playback_mix_path.resolve())))
+        self.media_player.setPlaybackRate(self._playback_rate)
+        seek_sec = max(0.0, self.project.playhead_sec - self.project.left_locator_sec)
+        self.media_player.setPosition(int(seek_sec * 1000))
+        self.media_player.play()
         self._playback_started_at = time.time()
         self._playback_origin_sec = self.project.playhead_sec
         self.playback_timer.start()
-        self.statusBar().showMessage('Playback started (simulation)')
+        self.statusBar().showMessage(f'Playback started at {self.project.bpm} BPM ({self._playback_rate:.2f}x)')
 
     def stop_playback(self) -> None:
         if hasattr(self, 'playback_timer'):
             self.playback_timer.stop()
+        self.media_player.stop()
         self.statusBar().showMessage('Playback stopped')
 
     def _tick_playback(self) -> None:
-        elapsed = time.time() - self._playback_started_at
-        new_pos = self._playback_origin_sec + elapsed
+        if self.media_player.playbackState() == QtMultimedia.QMediaPlayer.PlaybackState.PlayingState:
+            left = self.project.left_locator_sec
+            new_pos = left + (self.media_player.position() / 1000.0)
+        else:
+            elapsed = time.time() - self._playback_started_at
+            new_pos = self._playback_origin_sec + (elapsed * self._playback_rate)
         if new_pos > self.project.right_locator_sec:
             new_pos = self.project.left_locator_sec
             self._playback_started_at = time.time()
             self._playback_origin_sec = new_pos
+            if self.media_player.playbackState() == QtMultimedia.QMediaPlayer.PlaybackState.PlayingState:
+                self.media_player.setPosition(0)
         self.set_playhead_position(new_pos)
 
     def update_tempo(self, bpm: int) -> None:
         self.project.bpm = int(bpm)
         self.statusBar().showMessage(f'Tempo set to {self.project.bpm} BPM')
+
+    def refresh_audio_output_menu(self) -> None:
+        if not hasattr(self, 'audio_output_menu'):
+            return
+        self.audio_output_menu.clear()
+        group = QtGui.QActionGroup(self.audio_output_menu)
+        group.setExclusive(True)
+
+        default_action = self.audio_output_menu.addAction('System Default Soundcard')
+        default_action.setCheckable(True)
+        default_action.setChecked(not self.selected_audio_output_id)
+        default_action.triggered.connect(lambda: self.set_audio_output_device(''))
+        group.addAction(default_action)
+
+        self.audio_output_menu.addSeparator()
+        for device in QtMultimedia.QMediaDevices.audioOutputs():
+            action = self.audio_output_menu.addAction(device.description())
+            action.setCheckable(True)
+            device_id = bytes(device.id()).hex()
+            action.setChecked(self.selected_audio_output_id == device_id)
+            action.triggered.connect(lambda _checked=False, d=device: self.set_audio_output_device(bytes(d.id()).hex()))
+            group.addAction(action)
+
+    def set_audio_output_device(self, device_id: str) -> None:
+        self.selected_audio_output_id = device_id
+        if not device_id:
+            self.audio_output.setDevice(QtMultimedia.QMediaDevices.defaultAudioOutput())
+            self.statusBar().showMessage('Audio output set to system default soundcard')
+            self.refresh_audio_output_menu()
+            return
+
+        for device in QtMultimedia.QMediaDevices.audioOutputs():
+            if bytes(device.id()).hex() == device_id:
+                self.audio_output.setDevice(device)
+                self.statusBar().showMessage(f'Audio output set to {device.description()}')
+                self.refresh_audio_output_menu()
+                return
+
+        self.selected_audio_output_id = ''
+        self.audio_output.setDevice(QtMultimedia.QMediaDevices.defaultAudioOutput())
+        self.refresh_audio_output_menu()
+
+    def _build_playback_mix(self, out_path: Path) -> bool:
+        left = self.project.left_locator_sec
+        right = self.project.right_locator_sec
+        if right <= left:
+            return False
+
+        sample_rate = 44100
+        mix = [0.0] * max(1, int((right - left) * sample_rate))
+        has_audio = False
+
+        solo_tracks = {idx for idx, t in enumerate(self.project.tracks) if t.solo}
+        for idx, track in enumerate(self.project.tracks):
+            if track.track_type != 'instrument' or not track.notes:
+                continue
+            if solo_tracks and idx not in solo_tracks:
+                continue
+            if track.mute:
+                continue
+
+            stem_path = Path.cwd() / 'renders' / f'_play_track_{idx}.wav'
+            self.renderer.render_track(track, self.project.bpm, stem_path)
+            data, sr = load_wav_samples(stem_path)
+            if sr != sample_rate:
+                ratio = sr / sample_rate
+                data = [data[min(len(data) - 1, int(i * ratio))] for i in range(max(1, int(len(data) / ratio)))]
+            for i, value in enumerate(data):
+                if i >= len(mix):
+                    break
+                mix[i] += value
+            has_audio = True
+
+        for clip in self.project.sample_clips:
+            wav_path = Path(clip.path)
+            if wav_path.suffix.lower() == '.mp3':
+                converted = Path.cwd() / 'renders' / f'{wav_path.stem}_play.wav'
+                convert_audio(wav_path, converted)
+                wav_path = converted
+            data, sr = load_wav_samples(wav_path)
+            if sr != sample_rate:
+                ratio = sr / sample_rate
+                data = [data[min(len(data) - 1, int(i * ratio))] for i in range(max(1, int(len(data) / ratio)))]
+
+            clip_start = clip.start_sec
+            clip_end = clip.start_sec + (len(data) / sample_rate)
+            if clip_end <= left or clip_start >= right:
+                continue
+            overlap_start = max(left, clip_start)
+            src_start = int((overlap_start - clip_start) * sample_rate)
+            dst_start = int((overlap_start - left) * sample_rate)
+            count = min(len(data) - src_start, len(mix) - dst_start)
+            for i in range(max(0, count)):
+                mix[dst_start + i] += data[src_start + i] * 0.7
+            has_audio = True
+
+        if not has_audio:
+            return False
+
+        write_wav_samples(out_path, [clamp(v, -1.0, 1.0) for v in mix], sample_rate)
+        return True
 
     def add_vsti_path(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Choose VST instrument', str(Path.cwd()), 'VST Plugins (*.dll *.vst3 *.so);;All files (*)')
