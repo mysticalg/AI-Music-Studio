@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import ctypes
 import dataclasses
 import hashlib
 import json
@@ -150,6 +151,35 @@ class TrackState:
 class VSTInstrument:
     name: str
     path: str
+
+
+class VSTBinaryLoader:
+    def __init__(self) -> None:
+        self._handles: dict[str, object] = {}
+        self._errors: dict[str, str] = {}
+
+    def is_loaded(self, path: str) -> bool:
+        return path in self._handles
+
+    def load(self, path: str) -> tuple[bool, str]:
+        normalized = str(Path(path))
+        if normalized in self._handles:
+            return True, 'Already loaded'
+        try:
+            suffix = Path(normalized).suffix.lower()
+            if os.name == 'nt' and suffix == '.dll':
+                handle = ctypes.WinDLL(normalized)
+            else:
+                handle = ctypes.CDLL(normalized)
+            self._handles[normalized] = handle
+            self._errors.pop(normalized, None)
+            return True, 'Loaded successfully'
+        except Exception as exc:
+            self._errors[normalized] = str(exc)
+            return False, str(exc)
+
+    def last_error(self, path: str) -> str:
+        return self._errors.get(str(Path(path)), '')
 
 
 @dataclasses.dataclass
@@ -1336,12 +1366,13 @@ class MixerWidget(QtWidgets.QWidget):
 
 
 class InstrumentFxWidget(QtWidgets.QWidget):
-    def __init__(self, project: ProjectState, current_track_callable, refresh_vsti_choices_callable, on_track_updated_callable=None) -> None:
+    def __init__(self, project: ProjectState, current_track_callable, refresh_vsti_choices_callable, on_track_updated_callable=None, load_selected_vsti_callable=None) -> None:
         super().__init__()
         self.project = project
         self.current_track_callable = current_track_callable
         self.refresh_vsti_choices_callable = refresh_vsti_choices_callable
         self.on_track_updated = on_track_updated_callable
+        self.load_selected_vsti = load_selected_vsti_callable
 
         root = QtWidgets.QVBoxLayout(self)
         form = QtWidgets.QFormLayout()
@@ -1375,8 +1406,10 @@ class InstrumentFxWidget(QtWidgets.QWidget):
 
         btn_row = QtWidgets.QHBoxLayout()
         self.assign_rack_btn = QtWidgets.QPushButton('Use Selected Rack VSTI')
+        self.load_vsti_btn = QtWidgets.QPushButton('Load Selected VSTI Binary')
         self.edit_vsti_params_btn = QtWidgets.QPushButton('Edit VSTI Parameters')
         btn_row.addWidget(self.assign_rack_btn)
+        btn_row.addWidget(self.load_vsti_btn)
         btn_row.addWidget(self.edit_vsti_params_btn)
         root.addLayout(btn_row)
 
@@ -1386,6 +1419,7 @@ class InstrumentFxWidget(QtWidgets.QWidget):
         self.midi_channel.valueChanged.connect(self.apply_changes)
         self.midi_program.valueChanged.connect(self.apply_changes)
         self.assign_rack_btn.clicked.connect(self.assign_selected_rack_vsti)
+        self.load_vsti_btn.clicked.connect(self.load_selected_vsti_binary)
         self.edit_vsti_params_btn.clicked.connect(self.edit_vsti_parameters)
         for slider in self.fx_controls.values():
             slider.valueChanged.connect(self.apply_changes)
@@ -1459,6 +1493,15 @@ class InstrumentFxWidget(QtWidgets.QWidget):
         self.instrument_mode.setCurrentText('VSTI Rack')
         self.vsti_selector.setCurrentText(selected)
         self.apply_changes()
+
+    def load_selected_vsti_binary(self) -> None:
+        if not callable(self.load_selected_vsti):
+            return
+        selected = '' if self.vsti_selector.currentText() == 'None' else self.vsti_selector.currentText()
+        if not selected:
+            QtWidgets.QMessageBox.information(self, 'No rack VSTI', 'Select a rack VSTI first.')
+            return
+        self.load_selected_vsti(selected)
 
     def edit_vsti_parameters(self) -> None:
         track = self.current_track_callable()
@@ -1594,6 +1637,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.composer = OpenAIComposer(self.ai_client)
         self.instrument_ai = InstrumentIntelligence(self.ai_client)
         self.renderer = AISynthRenderer()
+        self.vsti_binary_loader = VSTBinaryLoader()
         self._load_preferences()
         self.audio_output = QtMultimedia.QAudioOutput(self)
         self.media_player = QtMultimedia.QMediaPlayer(self)
@@ -1617,7 +1661,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.velocity_editor.velocityChanged.connect(self.on_notes_changed)
 
         self.mixer = MixerWidget(self.project, self.current_track)
-        self.instruments = InstrumentFxWidget(self.project, self.current_track, self.refresh_vsti_rack_ui, self.on_track_instrument_changed)
+        self.instruments = InstrumentFxWidget(self.project, self.current_track, self.refresh_vsti_rack_ui, self.on_track_instrument_changed, self.load_vsti_binary_by_name)
         self.sample_timeline = SampleTimelineWidget(self.project, self.sample_track_indices, self.place_sample_asset_on_track, self.set_playhead_position)
         self.arrangement_overview = ArrangementOverviewWidget(self.project, self.set_playhead_position, self.set_left_locator_position, self.set_right_locator_position, self.apply_arrangement_section_move, lambda: self.project.bpm)
         self.sample_library = SampleLibraryWidget()
@@ -2060,6 +2104,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if Path(path).exists():
                 rack.append(VSTInstrument(name=Path(path).stem, path=path))
         self.project.vsti_rack = rack
+        for vst in self.project.vsti_rack:
+            self.vsti_binary_loader.load(vst.path)
 
     def _save_preferences(self) -> None:
         payload = {
@@ -2139,6 +2185,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_sample_library()
         self.statusBar().showMessage(f'Scanned sample folders. Added {added} sample(s).')
 
+    def _load_vsti_binary_path(self, path: str, show_message: bool = True) -> bool:
+        ok, detail = self.vsti_binary_loader.load(path)
+        if show_message:
+            name = Path(path).name
+            if ok:
+                self.statusBar().showMessage(f'Loaded VSTI binary: {name}')
+            else:
+                QtWidgets.QMessageBox.warning(self, 'VSTI load failed', f'Could not load {name}\n\n{detail}')
+        return ok
+
+    def load_vsti_binary_by_name(self, vsti_name: str) -> None:
+        for vst in self.project.vsti_rack:
+            if vst.name == vsti_name:
+                self._load_vsti_binary_path(vst.path, show_message=True)
+                return
+        QtWidgets.QMessageBox.information(self, 'VSTI not found', f'No rack VSTI named {vsti_name}.')
+
     def add_discovered_vsti_to_rack(self) -> None:
         available = [path for path in self.project.vsti_paths if Path(path).exists() and path not in {v.path for v in self.project.vsti_rack}]
         if not available:
@@ -2152,6 +2215,7 @@ class MainWindow(QtWidgets.QMainWindow):
         idx = labels.index(selected)
         chosen_path = available[idx]
         self.project.vsti_rack.append(VSTInstrument(name=Path(chosen_path).stem, path=chosen_path))
+        self._load_vsti_binary_path(chosen_path, show_message=False)
         self._save_preferences()
         self.refresh_vsti_rack_ui()
         self.statusBar().showMessage(f'Added to rack: {Path(chosen_path).stem}')
@@ -2166,6 +2230,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(f'VSTI already loaded in rack: {Path(path).name}')
             return
         self.project.vsti_rack.append(VSTInstrument(name=Path(path).stem, path=path))
+        self._load_vsti_binary_path(path, show_message=False)
         self._save_preferences()
         self.refresh_vsti_rack_ui()
         self.statusBar().showMessage(f'Added VSTI to rack: {Path(path).name}')
@@ -2178,7 +2243,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.project.vsti_rack:
                 self.vsti_menu.addSeparator()
                 for vst in self.project.vsti_rack:
-                    action = QtGui.QAction(f'Rack: {vst.name}', self)
+                    loaded_flag = '✓' if self.vsti_binary_loader.is_loaded(vst.path) else '⚠'
+                    action = QtGui.QAction(f'Rack: {loaded_flag} {vst.name}', self)
                     action.setProperty('rack_item', True)
                     action.setEnabled(False)
                     self.vsti_menu.addAction(action)
