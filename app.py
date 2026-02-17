@@ -1726,7 +1726,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.track_list = QtWidgets.QListWidget()
         self._selected_track_index = 0
-        self._resolving_current_track_index = False
         self.track_list.currentRowChanged.connect(self._track_changed)
         self.track_list.viewport().installEventFilter(self)
         self.last_added_track_type = 'instrument'
@@ -3171,17 +3170,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def current_track_index(self) -> int:
         if not self.project.tracks:
             return 0
-        if self._resolving_current_track_index:
-            return max(0, min(self._selected_track_index, len(self.project.tracks) - 1))
-        self._resolving_current_track_index = True
-        row = self.track_list.currentRow()
-        try:
-            if row < 0:
-                return max(0, min(self._selected_track_index, len(self.project.tracks) - 1))
-            self._selected_track_index = row
-            return row
-        finally:
-            self._resolving_current_track_index = False
+        return max(0, min(self._selected_track_index, len(self.project.tracks) - 1))
 
     def current_track(self) -> TrackState:
         return self.project.tracks[self.current_track_index()]
