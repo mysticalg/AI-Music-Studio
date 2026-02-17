@@ -946,16 +946,21 @@ class SampleTimelineWidget(QtWidgets.QGraphicsView):
 class ArrangementOverviewWidget(QtWidgets.QGraphicsView):
     locatorChanged = QtCore.Signal(float)
 
-    def __init__(self, project: ProjectState, set_locator_callable) -> None:
+    def __init__(self, project: ProjectState, set_locator_callable, on_section_moved_callable, get_bpm_callable) -> None:
         super().__init__()
         self.project = project
         self.set_locator_callable = set_locator_callable
+        self.on_section_moved = on_section_moved_callable
+        self.get_bpm = get_bpm_callable
         self.scene_obj = QtWidgets.QGraphicsScene(self)
         self.setScene(self.scene_obj)
         self.pixels_per_second = 80
         self.lane_height = 56
         self._drag_index: int | None = None
         self._drag_offset_sec = 0.0
+        self._drag_origin_start_sec = 0.0
+        self._drag_origin_track_index = 0
+        self.arrangement_quantize_mode = "beat"
         self.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
         self.setMouseTracking(True)
         self.refresh()
@@ -1014,6 +1019,14 @@ class ArrangementOverviewWidget(QtWidgets.QGraphicsView):
 
         self.setSceneRect(0, 0, width, height)
 
+    def _snap_seconds(self, sec: float) -> float:
+        bpm = max(1, int(self.get_bpm()))
+        beat_sec = 60.0 / bpm
+        grid = beat_sec * 4.0 if self.arrangement_quantize_mode == 'bar' else beat_sec
+        if grid <= 0:
+            return max(0.0, sec)
+        return max(0.0, round(sec / grid) * grid)
+
     def _set_playhead_from_event(self, event: QtGui.QMouseEvent) -> None:
         sec = max(0.0, self.mapToScene(event.position().toPoint()).x() / self.pixels_per_second)
         self.set_locator_callable(sec)
@@ -1026,6 +1039,8 @@ class ArrangementOverviewWidget(QtWidgets.QGraphicsView):
                 section = self.project.midi_sections[self._drag_index]
                 x_sec = self.mapToScene(event.position().toPoint()).x() / self.pixels_per_second
                 self._drag_offset_sec = max(0.0, x_sec - section.start_sec)
+                self._drag_origin_start_sec = section.start_sec
+                self._drag_origin_track_index = section.track_index
             else:
                 self._drag_index = None
                 self._set_playhead_from_event(event)
@@ -1033,8 +1048,13 @@ class ArrangementOverviewWidget(QtWidgets.QGraphicsView):
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
         if self._drag_index is not None and 0 <= self._drag_index < len(self.project.midi_sections):
-            x_sec = self.mapToScene(event.position().toPoint()).x() / self.pixels_per_second
-            self.project.midi_sections[self._drag_index].start_sec = max(0.0, x_sec - self._drag_offset_sec)
+            pos = self.mapToScene(event.position().toPoint())
+            x_sec = pos.x() / self.pixels_per_second
+            lane = int(max(0, pos.y()) // self.lane_height)
+            lane = max(0, min(self._lane_count() - 1, lane))
+            section = self.project.midi_sections[self._drag_index]
+            section.start_sec = self._snap_seconds(max(0.0, x_sec - self._drag_offset_sec))
+            section.track_index = lane
             self.refresh()
             return
         super().mouseMoveEvent(event)
@@ -1043,8 +1063,32 @@ class ArrangementOverviewWidget(QtWidgets.QGraphicsView):
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
             if self._drag_index is None:
                 self._set_playhead_from_event(event)
+            elif 0 <= self._drag_index < len(self.project.midi_sections):
+                section = self.project.midi_sections[self._drag_index]
+                self.on_section_moved(
+                    self._drag_index,
+                    self._drag_origin_start_sec,
+                    section.start_sec,
+                    self._drag_origin_track_index,
+                    section.track_index,
+                )
             self._drag_index = None
         super().mouseReleaseEvent(event)
+
+    def contextMenuEvent(self, event: QtGui.QContextMenuEvent) -> None:
+        menu = QtWidgets.QMenu(self)
+        quantize_menu = menu.addMenu('Arrangement Quantize')
+        beat_action = quantize_menu.addAction('Beat')
+        bar_action = quantize_menu.addAction('Bar')
+        beat_action.setCheckable(True)
+        bar_action.setCheckable(True)
+        beat_action.setChecked(self.arrangement_quantize_mode == 'beat')
+        bar_action.setChecked(self.arrangement_quantize_mode == 'bar')
+        chosen = menu.exec(event.globalPos())
+        if chosen == beat_action:
+            self.arrangement_quantize_mode = 'beat'
+        elif chosen == bar_action:
+            self.arrangement_quantize_mode = 'bar'
 
 
 class MixerWidget(QtWidgets.QWidget):
@@ -1277,7 +1321,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mixer = MixerWidget(self.project, self.current_track)
         self.instruments = InstrumentFxWidget(self.project, self.current_track, self.refresh_vsti_rack_ui)
         self.sample_timeline = SampleTimelineWidget(self.project, self.sample_track_indices, self.place_sample_asset_on_track, self.set_playhead_position)
-        self.arrangement_overview = ArrangementOverviewWidget(self.project, self.set_playhead_position)
+        self.arrangement_overview = ArrangementOverviewWidget(self.project, self.set_playhead_position, self.apply_arrangement_section_move, lambda: self.project.bpm)
         self.sample_library = SampleLibraryWidget()
 
         self.quantize_box = QtWidgets.QComboBox()
@@ -1483,9 +1527,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(f'Playback started at {self.project.bpm} BPM ({self._playback_rate:.2f}x)')
 
     def stop_playback(self) -> None:
+        should_reset = hasattr(self, 'playback_timer') and (not self.playback_timer.isActive())
         if hasattr(self, 'playback_timer'):
             self.playback_timer.stop()
         self.media_player.stop()
+        if should_reset:
+            self.set_playhead_position(0.0)
+            self.statusBar().showMessage('Playback reset to 0.00s')
+            return
         self.statusBar().showMessage('Playback stopped')
 
     def _tick_playback(self) -> None:
@@ -1501,6 +1550,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._playback_origin_sec = new_pos
             if self.media_player.playbackState() == QtMultimedia.QMediaPlayer.PlaybackState.PlayingState:
                 self.media_player.setPosition(0)
+                if self.media_player.playbackState() != QtMultimedia.QMediaPlayer.PlaybackState.PlayingState:
+                    self.media_player.play()
         self.set_playhead_position(new_pos)
 
     def update_tempo(self, bpm: int) -> None:
@@ -1607,6 +1658,36 @@ class MainWindow(QtWidgets.QMainWindow):
 
         write_wav_samples(out_path, [clamp(v, -1.0, 1.0) for v in mix], sample_rate)
         return True
+
+
+    def apply_arrangement_section_move(self, section_index: int, old_start_sec: float, new_start_sec: float, old_track_index: int, new_track_index: int) -> None:
+        if not (0 <= old_track_index < len(self.project.tracks)):
+            return
+        if not (0 <= new_track_index < len(self.project.tracks)):
+            new_track_index = old_track_index
+
+        old_track = self.project.tracks[old_track_index]
+        if old_track.track_type != 'instrument':
+            return
+
+        new_track = self.project.tracks[new_track_index]
+        if new_track.track_type != 'instrument':
+            new_track_index = old_track_index
+            new_track = old_track
+
+        sec_per_tick = 60.0 / max(1, self.project.bpm) / TICKS_PER_BEAT
+        delta_tick = int(round((new_start_sec - old_start_sec) / max(1e-9, sec_per_tick)))
+
+        moved_notes = list(old_track.notes)
+        if delta_tick != 0:
+            for note in moved_notes:
+                note.start_tick = max(0, note.start_tick + delta_tick)
+
+        if new_track_index != old_track_index:
+            new_track.notes.extend(moved_notes)
+            old_track.notes = []
+
+        self.on_notes_changed()
 
     def add_vsti_path(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Choose VST instrument', str(Path.cwd()), 'VST Plugins (*.dll *.vst3 *.so);;All files (*)')
