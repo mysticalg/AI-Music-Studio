@@ -1712,6 +1712,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.renderer = AISynthRenderer()
         self.vsti_binary_loader = VSTBinaryLoader()
         self.vsti_plugin_metadata: dict[str, list[str]] = {}
+        self.vsti_directory = Path.cwd() / 'vsti'
+        self.vsti_directory.mkdir(parents=True, exist_ok=True)
         self._load_preferences()
         self.audio_output = QtMultimedia.QAudioOutput(self)
         self.media_player = QtMultimedia.QMediaPlayer(self)
@@ -2150,6 +2152,70 @@ class MainWindow(QtWidgets.QMainWindow):
                 return vst.path
         return ''
 
+    def _normalized_vsti_path(self, path: str) -> str:
+        return str(Path(path).expanduser().resolve())
+
+    def _is_in_vsti_directory(self, path: str) -> bool:
+        try:
+            resolved = Path(path).expanduser().resolve()
+        except Exception:
+            return False
+        return resolved == self.vsti_directory or self.vsti_directory in resolved.parents
+
+    def _add_vsti_to_rack(self, plugin_path: str, show_status: bool = True) -> bool:
+        normalized_path = self._normalized_vsti_path(plugin_path)
+        if not self._is_in_vsti_directory(normalized_path):
+            if show_status:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    'Invalid VSTI location',
+                    f'Rack plugins must live inside:\n{self.vsti_directory}',
+                )
+            return False
+
+        existing_paths = {self._normalized_vsti_path(v.path) for v in self.project.vsti_rack}
+        if normalized_path in existing_paths:
+            if show_status:
+                self.statusBar().showMessage(f'VSTI already in rack: {Path(normalized_path).name}')
+            return False
+
+        name = Path(normalized_path).stem
+        if any(v.name == name for v in self.project.vsti_rack):
+            name = f'{name} ({hashlib.sha1(normalized_path.encode("utf-8")).hexdigest()[:6]})'
+
+        self.project.vsti_rack.append(VSTInstrument(name=name, path=normalized_path))
+        if normalized_path not in self.project.vsti_paths:
+            self.project.vsti_paths.append(normalized_path)
+        self._load_vsti_binary_path(normalized_path, show_message=False)
+        return True
+
+    def _dedupe_and_filter_vsti_state(self) -> None:
+        unique_paths: list[str] = []
+        seen_paths: set[str] = set()
+        for path in self.project.vsti_paths:
+            normalized = self._normalized_vsti_path(path)
+            if normalized in seen_paths:
+                continue
+            if not self._is_in_vsti_directory(normalized):
+                continue
+            if not Path(normalized).exists():
+                continue
+            seen_paths.add(normalized)
+            unique_paths.append(normalized)
+        self.project.vsti_paths = unique_paths
+
+        rack: list[VSTInstrument] = []
+        rack_seen: set[str] = set()
+        for vst in self.project.vsti_rack:
+            normalized = self._normalized_vsti_path(vst.path)
+            if normalized in rack_seen:
+                continue
+            if normalized not in seen_paths:
+                continue
+            rack_seen.add(normalized)
+            rack.append(VSTInstrument(name=Path(normalized).stem, path=normalized))
+        self.project.vsti_rack = rack
+
     def vsti_parameter_names_for_rack(self, rack_name: str) -> list[str]:
         plugin_path = self._rack_vsti_path(rack_name)
         if not plugin_path:
@@ -2320,6 +2386,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if Path(path).exists():
                 rack.append(VSTInstrument(name=Path(path).stem, path=path))
         self.project.vsti_rack = rack
+        self._dedupe_and_filter_vsti_state()
         for vst in self.project.vsti_rack:
             self.vsti_binary_loader.load(vst.path)
             self._capture_vsti_metadata(vst.path)
@@ -2352,13 +2419,16 @@ class MainWindow(QtWidgets.QMainWindow):
         return unique
 
     def add_vsti_folder(self) -> None:
-        folder = QtWidgets.QFileDialog.getExistingDirectory(self, 'Choose VST folder', str(Path.cwd()))
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, 'Choose VST folder', str(self.vsti_directory))
         if not folder:
+            return
+        if not self._is_in_vsti_directory(folder):
+            QtWidgets.QMessageBox.warning(self, 'Invalid VST folder', f'Choose a folder inside {self.vsti_directory}.')
             return
         found = self._discover_vstis_in_folder(Path(folder))
         added = 0
         for plugin in found:
-            pstr = str(plugin)
+            pstr = self._normalized_vsti_path(str(plugin))
             if pstr in self.project.vsti_paths:
                 continue
             self.project.vsti_paths.append(pstr)
@@ -2596,7 +2666,13 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.information(self, 'VSTI not found', f'No rack VSTI named {vsti_name}.')
 
     def add_discovered_vsti_to_rack(self) -> None:
-        available = [path for path in self.project.vsti_paths if Path(path).exists() and path not in {v.path for v in self.project.vsti_rack}]
+        available = [
+            path
+            for path in self.project.vsti_paths
+            if Path(path).exists()
+            and self._is_in_vsti_directory(path)
+            and self._normalized_vsti_path(path) not in {self._normalized_vsti_path(v.path) for v in self.project.vsti_rack}
+        ]
         if not available:
             QtWidgets.QMessageBox.information(self, 'No discovered VSTI', 'No discovered VST instruments are available to add to the rack.')
             return
@@ -2607,23 +2683,19 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         idx = labels.index(selected)
         chosen_path = available[idx]
-        self.project.vsti_rack.append(VSTInstrument(name=Path(chosen_path).stem, path=chosen_path))
-        self._load_vsti_binary_path(chosen_path, show_message=False)
+        self._add_vsti_to_rack(chosen_path, show_status=False)
+        self._dedupe_and_filter_vsti_state()
         self._save_preferences()
         self.refresh_vsti_rack_ui()
         self.statusBar().showMessage(f'Added to rack: {Path(chosen_path).stem}')
 
     def add_vsti_path(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Choose VST instrument', str(Path.cwd()), 'VST Plugins (*.dll *.vst3 *.so);;All files (*)')
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Choose VST instrument', str(self.vsti_directory), 'VST Plugins (*.dll *.vst3 *.so);;All files (*)')
         if not path:
             return
-        if path not in self.project.vsti_paths:
-            self.project.vsti_paths.append(path)
-        if path in {v.path for v in self.project.vsti_rack}:
-            self.statusBar().showMessage(f'VSTI already loaded in rack: {Path(path).name}')
+        if not self._add_vsti_to_rack(path, show_status=True):
             return
-        self.project.vsti_rack.append(VSTInstrument(name=Path(path).stem, path=path))
-        self._load_vsti_binary_path(path, show_message=False)
+        self._dedupe_and_filter_vsti_state()
         self._save_preferences()
         self.refresh_vsti_rack_ui()
         self.statusBar().showMessage(f'Added VSTI to rack: {Path(path).name}')
