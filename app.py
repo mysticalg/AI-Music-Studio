@@ -598,6 +598,18 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
             pen = QtGui.QPen(QtGui.QColor(120, 120, 120) if beat % 4 == 0 else QtGui.QColor(80, 80, 80))
             self.scene_obj.addLine(x, 0, x, height, pen)
 
+        self.scene_obj.addRect(0, 0, width, self._locator_ruler_height, QtGui.QPen(QtGui.QColor(88, 88, 88)), QtGui.QBrush(QtGui.QColor(28, 28, 28, 220)))
+        sec = 0
+        max_sec = int((self.total_beats * 60.0) / max(1, self.project.bpm)) + 1
+        while sec <= max_sec:
+            x = sec * self.project.bpm / 60.0 * self.cell_w
+            self.scene_obj.addLine(x, 0, x, self._locator_ruler_height, QtGui.QPen(QtGui.QColor(130, 130, 130)))
+            if sec % 2 == 0:
+                label = self.scene_obj.addSimpleText(f"{sec}s")
+                label.setBrush(QtGui.QBrush(QtGui.QColor(210, 210, 210)))
+                label.setPos(x + 2, 0)
+            sec += 1
+
         for i in range(pitch_count + 1):
             y = i * self.cell_h
             self.scene_obj.addLine(0, y, width, y, QtGui.QPen(QtGui.QColor(80, 80, 80)))
@@ -622,6 +634,16 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         item = self.scene_obj.addRect(rect, QtGui.QPen(QtGui.QColor(0, 0, 0)), QtGui.QBrush(color))
         item.setData(0, note)
         item.setFlag(QtWidgets.QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
+
+    def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
+        if event.modifiers() & QtCore.Qt.KeyboardModifier.ControlModifier:
+            delta = event.angleDelta().y()
+            step = 2 if delta > 0 else -2
+            self.cell_w = max(8, min(96, self.cell_w + step))
+            self.refresh()
+            event.accept()
+            return
+        super().wheelEvent(event)
 
     def contextMenuEvent(self, event: QtGui.QContextMenuEvent) -> None:
         menu = QtWidgets.QMenu(self)
@@ -1120,10 +1142,15 @@ class ArrangementOverviewWidget(QtWidgets.QGraphicsView):
                 label.setDefaultTextColor(QtGui.QColor(188, 188, 188))
                 label.setPos(4, y + 2)
 
+        self.scene_obj.addRect(0, 0, width, self._locator_ruler_height, QtGui.QPen(QtGui.QColor(88, 88, 88)), QtGui.QBrush(QtGui.QColor(28, 28, 28, 220)))
         sec = 0
         while sec <= int(duration) + 1:
             x = sec * self.pixels_per_second
             self.scene_obj.addLine(x, 0, x, height, QtGui.QPen(QtGui.QColor(96, 96, 96) if sec % 4 == 0 else QtGui.QColor(74, 74, 74)))
+            if sec % 2 == 0:
+                label = self.scene_obj.addSimpleText(f"{sec}s")
+                label.setBrush(QtGui.QBrush(QtGui.QColor(210, 210, 210)))
+                label.setPos(x + 2, 0)
             sec += 1
 
         for idx, section in enumerate(self.project.midi_sections):
@@ -1223,6 +1250,16 @@ class ArrangementOverviewWidget(QtWidgets.QGraphicsView):
                 )
             self._drag_index = None
         super().mouseReleaseEvent(event)
+
+    def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
+        if event.modifiers() & QtCore.Qt.KeyboardModifier.ControlModifier:
+            delta = event.angleDelta().y()
+            step = 8 if delta > 0 else -8
+            self.pixels_per_second = max(24, min(320, self.pixels_per_second + step))
+            self.refresh()
+            event.accept()
+            return
+        super().wheelEvent(event)
 
     def contextMenuEvent(self, event: QtGui.QContextMenuEvent) -> None:
         menu = QtWidgets.QMenu(self)
