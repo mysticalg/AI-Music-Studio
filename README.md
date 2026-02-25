@@ -114,3 +114,7 @@ python app.py
 - `Ctrl+G` → AI Compose
 - `Delete` → Delete selected notes
 - `Z/X/C/V/B/N/M/,` → Trigger virtual piano notes
+
+## Experimental VST3 instrument scaffold
+
+A JUCE-based instrument scaffold is available in `plugins/AdvancedVSTi` with core synthesis modules (multi-wave oscillator, unison, FM, sync, filter modes, ADSR + curved envelopes, LFO routing, arp, rhythm gate). See `plugins/AdvancedVSTi/README.md` for build steps.
