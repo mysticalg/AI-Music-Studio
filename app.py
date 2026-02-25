@@ -2026,6 +2026,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.piano_roll.refresh()
         self.velocity_editor.refresh()
 
+    def _reload_playback_mix_if_running(self) -> None:
+        if not hasattr(self, 'playback_timer') or not self.playback_timer.isActive():
+            return
+
+        if not self._build_playback_mix(self.playback_mix_path):
+            self.stop_playback()
+            return
+
+        self._playback_rate = max(0.2, self.project.bpm / DEFAULT_BPM)
+        self._playback_loop_ms = max(1, int((self.project.right_locator_sec - self.project.left_locator_sec) * 1000))
+        seek_sec = max(0.0, self.project.playhead_sec - self.project.left_locator_sec)
+        seek_ms = int(seek_sec * 1000) % self._playback_loop_ms
+
+        self.media_player.setSource(QtCore.QUrl.fromLocalFile(str(self.playback_mix_path.resolve())))
+        self.media_player.setPlaybackRate(self._playback_rate)
+        self.media_player.setPosition(seek_ms)
+        self.media_player.play()
+
     def start_playback(self) -> None:
         if not self._build_playback_mix(self.playback_mix_path):
             QtWidgets.QMessageBox.information(self, 'Nothing to play', 'No playable audio was found. Add notes or sample clips first.')
@@ -2757,6 +2775,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_track_instrument_changed(self) -> None:
         self._update_selected_track_list_item()
         self.timeline.refresh()
+        self._reload_playback_mix_if_running()
 
     def assign_instrument_to_selected_track(self) -> None:
         if not self.project.tracks:
@@ -3365,6 +3384,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sample_timeline.refresh()
         self.rebuild_midi_sections()
         self.arrangement_overview.refresh()
+        self._reload_playback_mix_if_running()
 
     def import_midi(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Import MIDI", str(Path.cwd()), "MIDI files (*.mid *.midi)")
