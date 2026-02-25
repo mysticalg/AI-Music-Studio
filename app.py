@@ -4,6 +4,7 @@ import base64
 import ctypes
 import dataclasses
 import hashlib
+import http.server
 import json
 import math
 import os
@@ -11,6 +12,7 @@ import secrets
 import struct
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -1663,6 +1665,15 @@ class OpenAIConnectDialog(QtWidgets.QDialog):
         self.setWindowTitle('Connect OpenAI')
         self.resize(620, 420)
         self.code_verifier = ''
+        self.oauth_state_expected = ''
+        self.oauth_callback_code = ''
+        self.oauth_callback_error = ''
+        self.oauth_callback_server: http.server.ThreadingHTTPServer | None = None
+        self.oauth_callback_thread: threading.Thread | None = None
+
+        self.oauth_callback_timer = QtCore.QTimer(self)
+        self.oauth_callback_timer.setInterval(300)
+        self.oauth_callback_timer.timeout.connect(self._poll_oauth_callback)
 
         layout = QtWidgets.QVBoxLayout(self)
         tabs = QtWidgets.QTabWidget()
@@ -1696,7 +1707,7 @@ class OpenAIConnectDialog(QtWidgets.QDialog):
         oauth_form.addRow('Authorization code (optional)', self.auth_code_input)
 
         oauth_buttons = QtWidgets.QHBoxLayout()
-        self.open_browser_btn = QtWidgets.QPushButton('Open OAuth Login (Advanced)')
+        self.open_browser_btn = QtWidgets.QPushButton('Open OAuth Login in External Browser (Advanced)')
         self.open_browser_btn.clicked.connect(self.open_oauth_login)
         oauth_buttons.addWidget(self.open_browser_btn)
         tabs.addTab(oauth_tab, 'OAuth / Access Token')
@@ -1733,18 +1744,111 @@ class OpenAIConnectDialog(QtWidgets.QDialog):
 
         self.code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(48)).decode().rstrip('=')
         challenge = base64.urlsafe_b64encode(hashlib.sha256(self.code_verifier.encode()).digest()).decode().rstrip('=')
+        state = secrets.token_urlsafe(16)
         params = {
             'response_type': 'code',
             'redirect_uri': redirect_uri,
             'scope': scope,
             'code_challenge': challenge,
             'code_challenge_method': 'S256',
-            'state': secrets.token_urlsafe(16),
+            'state': state,
         }
         params['client_id'] = client_id
         url = f"{auth_url}?{urllib.parse.urlencode(params)}"
+        self.oauth_state_expected = state
+        self.oauth_callback_code = ''
+        self.oauth_callback_error = ''
+
+        callback_ready = self._start_oauth_callback_listener(redirect_uri)
         webbrowser.open(url)
-        self.status_label.setText('Browser opened. Prefer pasting an access token directly. Use auth code exchange only if your OAuth app requires it.')
+        if callback_ready:
+            self.status_label.setText('External browser opened. Waiting for redirect to auto-fill authorization code...')
+        else:
+            self.status_label.setText('External browser opened. If auto-capture is unavailable, paste the authorization code manually.')
+
+    def _start_oauth_callback_listener(self, redirect_uri: str) -> bool:
+        self._stop_oauth_callback_listener()
+        parsed = urllib.parse.urlparse(redirect_uri)
+        if parsed.scheme.lower() != 'http':
+            return False
+        if parsed.hostname not in {'localhost', '127.0.0.1'}:
+            return False
+        if parsed.port is None:
+            return False
+
+        dialog = self
+        callback_path = parsed.path or '/'
+
+        class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802
+                req_url = urllib.parse.urlparse(self.path)
+                if req_url.path != callback_path:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                params = urllib.parse.parse_qs(req_url.query)
+                state = (params.get('state') or [''])[0]
+                error = (params.get('error') or [''])[0]
+                code = (params.get('code') or [''])[0]
+                if state and state != dialog.oauth_state_expected:
+                    dialog.oauth_callback_error = 'OAuth state mismatch in redirect response.'
+                elif error:
+                    dialog.oauth_callback_error = f'OAuth authorization failed: {error}'
+                elif code:
+                    dialog.oauth_callback_code = code
+                else:
+                    dialog.oauth_callback_error = 'OAuth redirect did not include an authorization code.'
+
+                body = (
+                    '<html><body><h3>Authorization received.</h3>'
+                    '<p>You can return to AI Music Studio now.</p></body></html>'
+                ).encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        try:
+            server = http.server.ThreadingHTTPServer((parsed.hostname, parsed.port), OAuthCallbackHandler)
+        except OSError:
+            return False
+
+        self.oauth_callback_server = server
+        self.oauth_callback_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        self.oauth_callback_thread.start()
+        self.oauth_callback_timer.start()
+        return True
+
+    def _stop_oauth_callback_listener(self) -> None:
+        self.oauth_callback_timer.stop()
+        if self.oauth_callback_server is not None:
+            self.oauth_callback_server.shutdown()
+            self.oauth_callback_server.server_close()
+            self.oauth_callback_server = None
+        self.oauth_callback_thread = None
+
+    def _poll_oauth_callback(self) -> None:
+        if self.oauth_callback_error:
+            msg = self.oauth_callback_error
+            self.oauth_callback_error = ''
+            self._stop_oauth_callback_listener()
+            self.status_label.setText(msg)
+            QtWidgets.QMessageBox.warning(self, 'OAuth redirect error', msg)
+            return
+        if self.oauth_callback_code:
+            code = self.oauth_callback_code
+            self.oauth_callback_code = ''
+            self.auth_code_input.setText(code)
+            self._stop_oauth_callback_listener()
+            self.status_label.setText('Authorization code captured from external browser redirect. Click Connect.')
+
+    def done(self, result: int) -> None:
+        self._stop_oauth_callback_listener()
+        super().done(result)
 
     def auth_payload(self) -> dict:
         return {
