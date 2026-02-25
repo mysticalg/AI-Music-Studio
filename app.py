@@ -1674,8 +1674,8 @@ class OpenAIConnectDialog(QtWidgets.QDialog):
         self.access_token_input.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
         self.access_token_input.setPlaceholderText('Paste OpenAI access token here (no client_id required)')
         self.client_id_input = QtWidgets.QLineEdit(os.getenv('OPENAI_OAUTH_CLIENT_ID', ''))
-        self.auth_url_input = QtWidgets.QLineEdit(os.getenv('OPENAI_OAUTH_AUTHORIZE_URL', 'https://auth.openai.com/authorize'))
-        self.token_url_input = QtWidgets.QLineEdit(os.getenv('OPENAI_OAUTH_TOKEN_URL', 'https://auth0.openai.com/oauth/token'))
+        self.auth_url_input = QtWidgets.QLineEdit(os.getenv('OPENAI_OAUTH_AUTHORIZE_URL', 'https://auth.openai.com/oauth/authorize'))
+        self.token_url_input = QtWidgets.QLineEdit(os.getenv('OPENAI_OAUTH_TOKEN_URL', 'https://auth.openai.com/oauth/token'))
         self.redirect_uri_input = QtWidgets.QLineEdit(os.getenv('OPENAI_OAUTH_REDIRECT_URI', 'http://127.0.0.1:8765/callback'))
         self.scope_input = QtWidgets.QLineEdit(os.getenv('OPENAI_OAUTH_SCOPE', 'openid profile offline_access'))
         self.auth_code_input = QtWidgets.QLineEdit()
@@ -1718,6 +1718,11 @@ class OpenAIConnectDialog(QtWidgets.QDialog):
             self.status_label.setText(msg)
             QtWidgets.QMessageBox.warning(self, 'Missing OAuth configuration', msg)
             return
+        if not client_id:
+            msg = 'Advanced OAuth login requires Client ID. For simple setup, paste an access token and click Connect.'
+            self.status_label.setText(msg)
+            QtWidgets.QMessageBox.warning(self, 'Missing OAuth client_id', msg)
+            return
 
         self.code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(48)).decode().rstrip('=')
         challenge = base64.urlsafe_b64encode(hashlib.sha256(self.code_verifier.encode()).digest()).decode().rstrip('=')
@@ -1729,8 +1734,7 @@ class OpenAIConnectDialog(QtWidgets.QDialog):
             'code_challenge_method': 'S256',
             'state': secrets.token_urlsafe(16),
         }
-        if client_id:
-            params['client_id'] = client_id
+        params['client_id'] = client_id
         url = f"{auth_url}?{urllib.parse.urlencode(params)}"
         webbrowser.open(url)
         self.status_label.setText('Browser opened. Prefer pasting an access token directly. Use auth code exchange only if your OAuth app requires it.')
@@ -2846,19 +2850,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage('OpenAI connected successfully')
 
     def _exchange_oauth_code(self, payload: dict) -> None:
-        if not payload['token_url'] or not payload['auth_code']:
-            raise RuntimeError('Provide an access token, or use advanced OAuth code exchange with token URL + authorization code.')
+        if not payload['token_url'] or not payload['auth_code'] or not payload.get('client_id'):
+            raise RuntimeError('Advanced OAuth code exchange requires client id, token URL, and authorization code. Otherwise paste an access token directly.')
         if not payload['code_verifier']:
             raise RuntimeError('Click "Open OAuth Login (Advanced)" first so a PKCE code verifier is generated.')
 
         request_data = {
             'grant_type': 'authorization_code',
+            'client_id': payload['client_id'],
             'code': payload['auth_code'],
             'redirect_uri': payload['redirect_uri'],
             'code_verifier': payload['code_verifier'],
         }
-        if payload.get('client_id'):
-            request_data['client_id'] = payload['client_id']
 
         req_body = urllib.parse.urlencode(request_data).encode('utf-8')
         request = urllib.request.Request(
