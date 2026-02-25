@@ -12,7 +12,24 @@ This folder adds a JUCE-based VST instrument scaffold with these implemented blo
 - Arpeggiator modes: up, down, up/down, random.
 - Rhythm gate and per-note oscillator length gate.
 
-## Build (Windows example)
+## Automated GitHub build + download
+
+The repository includes a GitHub Actions workflow at `.github/workflows/build-vsti.yml` that compiles the plugin on `windows-latest` and uploads a downloadable ZIP artifact.
+
+### When it runs
+
+- Pushes affecting `plugins/AdvancedVSTi/**`
+- Pull requests affecting `plugins/AdvancedVSTi/**`
+- Manual runs from **Actions > Build AdvancedVSTi > Run workflow**
+
+### How to download
+
+1. Open the **Actions** tab in GitHub.
+2. Open a successful **Build AdvancedVSTi** run.
+3. Download the artifact named **AdvancedVSTi-windows-release**.
+4. Unzip it and load the contained `.vst3` plugin in your VST3 host.
+
+## Build locally (Windows example)
 
 1. Install JUCE and CMake.
 2. Configure:

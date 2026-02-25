@@ -117,4 +117,4 @@ python app.py
 
 ## Experimental VST3 instrument scaffold
 
-A JUCE-based instrument scaffold is available in `plugins/AdvancedVSTi` with core synthesis modules (multi-wave oscillator, unison, FM, sync, filter modes, ADSR + curved envelopes, LFO routing, arp, rhythm gate). See `plugins/AdvancedVSTi/README.md` for build steps.
+A JUCE-based instrument scaffold is available in `plugins/AdvancedVSTi` with core synthesis modules (multi-wave oscillator, unison, FM, sync, filter modes, ADSR + curved envelopes, LFO routing, arp, rhythm gate). See `plugins/AdvancedVSTi/README.md` for build steps. The project now includes a GitHub Actions workflow (`.github/workflows/build-vsti.yml`) that builds a Windows release artifact you can download from the Actions tab.
