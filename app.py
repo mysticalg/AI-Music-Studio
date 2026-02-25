@@ -8,7 +8,6 @@ import json
 import math
 import os
 import secrets
-import shutil
 import struct
 import subprocess
 import sys
@@ -152,7 +151,6 @@ class TrackState:
     vsti_state_path: str = ""
     vsti_output_gain_db: float = 0.0
     vsti_wet_mix: float = 100.0
-    carla_automation_enabled: bool = True
     midi_program: int = 0
     midi_channel: int = 0
     synth_profile: str = "synth"
@@ -231,7 +229,6 @@ class ProjectState:
         self.vsti_paths: list[str] = []
         self.sample_paths: list[str] = []
         self.vsti_rack: list[VSTInstrument] = []
-        self.carla_host_path: str = ''
         self.sample_assets: list[SampleAsset] = []
         self.sample_clips: list[SampleClip] = []
         self.midi_sections: list[MidiSection] = []
@@ -1670,25 +1667,29 @@ class OpenAIConnectDialog(QtWidgets.QDialog):
 
         oauth_tab = QtWidgets.QWidget()
         oauth_form = QtWidgets.QFormLayout(oauth_tab)
+        self.access_token_input = QtWidgets.QLineEdit()
+        self.access_token_input.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+        self.access_token_input.setPlaceholderText('Paste OpenAI access token here (no client_id required)')
         self.client_id_input = QtWidgets.QLineEdit(os.getenv('OPENAI_OAUTH_CLIENT_ID', ''))
         self.auth_url_input = QtWidgets.QLineEdit(os.getenv('OPENAI_OAUTH_AUTHORIZE_URL', 'https://auth.openai.com/oauth/authorize'))
         self.token_url_input = QtWidgets.QLineEdit(os.getenv('OPENAI_OAUTH_TOKEN_URL', 'https://auth.openai.com/oauth/token'))
         self.redirect_uri_input = QtWidgets.QLineEdit(os.getenv('OPENAI_OAUTH_REDIRECT_URI', 'http://127.0.0.1:8765/callback'))
-        self.scope_input = QtWidgets.QLineEdit(os.getenv('OPENAI_OAUTH_SCOPE', 'openid profile email'))
+        self.scope_input = QtWidgets.QLineEdit(os.getenv('OPENAI_OAUTH_SCOPE', 'openid profile offline_access'))
         self.auth_code_input = QtWidgets.QLineEdit()
-        self.auth_code_input.setPlaceholderText('Paste the authorization code from redirect URL here')
-        oauth_form.addRow('Client ID', self.client_id_input)
+        self.auth_code_input.setPlaceholderText('Optional: paste authorization code from redirect URL')
+        oauth_form.addRow('Access token', self.access_token_input)
+        oauth_form.addRow('Client ID (optional)', self.client_id_input)
         oauth_form.addRow('Authorize URL', self.auth_url_input)
         oauth_form.addRow('Token URL', self.token_url_input)
         oauth_form.addRow('Redirect URI', self.redirect_uri_input)
         oauth_form.addRow('Scope', self.scope_input)
-        oauth_form.addRow('Authorization code', self.auth_code_input)
+        oauth_form.addRow('Authorization code (optional)', self.auth_code_input)
 
         oauth_buttons = QtWidgets.QHBoxLayout()
-        self.open_browser_btn = QtWidgets.QPushButton('Open OAuth Login')
+        self.open_browser_btn = QtWidgets.QPushButton('Open OAuth Login (Advanced)')
         self.open_browser_btn.clicked.connect(self.open_oauth_login)
         oauth_buttons.addWidget(self.open_browser_btn)
-        tabs.addTab(oauth_tab, 'OAuth')
+        tabs.addTab(oauth_tab, 'OAuth / Access Token')
         oauth_form.addRow('', oauth_buttons)
 
         self.status_label = QtWidgets.QLabel('')
@@ -1704,25 +1705,42 @@ class OpenAIConnectDialog(QtWidgets.QDialog):
         self.tabs = tabs
 
     def open_oauth_login(self) -> None:
+        client_id = self.client_id_input.text().strip()
+        auth_url = self.auth_url_input.text().strip()
+        redirect_uri = self.redirect_uri_input.text().strip()
+        scope = self.scope_input.text().strip()
+
+        if not auth_url or not redirect_uri:
+            msg = 'OAuth authorize URL and redirect URI are required.'
+            self.status_label.setText(msg)
+            QtWidgets.QMessageBox.warning(self, 'Missing OAuth configuration', msg)
+            return
+        if not client_id:
+            msg = 'Advanced OAuth login requires Client ID. For simple setup, paste an access token and click Connect.'
+            self.status_label.setText(msg)
+            QtWidgets.QMessageBox.warning(self, 'Missing OAuth client_id', msg)
+            return
+
         self.code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(48)).decode().rstrip('=')
         challenge = base64.urlsafe_b64encode(hashlib.sha256(self.code_verifier.encode()).digest()).decode().rstrip('=')
         params = {
             'response_type': 'code',
-            'client_id': self.client_id_input.text().strip(),
-            'redirect_uri': self.redirect_uri_input.text().strip(),
-            'scope': self.scope_input.text().strip(),
+            'redirect_uri': redirect_uri,
+            'scope': scope,
             'code_challenge': challenge,
             'code_challenge_method': 'S256',
             'state': secrets.token_urlsafe(16),
         }
-        url = f"{self.auth_url_input.text().strip()}?{urllib.parse.urlencode(params)}"
+        params['client_id'] = client_id
+        url = f"{auth_url}?{urllib.parse.urlencode(params)}"
         webbrowser.open(url)
-        self.status_label.setText('Browser opened. After login, paste the returned authorization code and click Connect.')
+        self.status_label.setText('Browser opened. Prefer pasting an access token directly. Use auth code exchange only if your OAuth app requires it.')
 
     def auth_payload(self) -> dict:
         return {
             'mode': 'api_key' if self.tabs.currentIndex() == 0 else 'oauth',
             'api_key': self.api_key_input.text().strip(),
+            'access_token': self.access_token_input.text().strip(),
             'client_id': self.client_id_input.text().strip(),
             'token_url': self.token_url_input.text().strip(),
             'redirect_uri': self.redirect_uri_input.text().strip(),
@@ -1750,7 +1768,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.media_player.mediaStatusChanged.connect(self._on_media_status_changed)
         self.selected_audio_output_id = ""
         self.playback_mix_path = Path.cwd() / "renders" / "_playback_mix.wav"
-        self.carla_bridge_state_path = Path.cwd() / "renders" / "carla_bridge_state.json"
         self._playback_loop_ms = 0
         self.setWindowTitle("AI Music Studio")
         self.resize(1500, 900)
@@ -1878,29 +1895,6 @@ class MainWindow(QtWidgets.QMainWindow):
         add_vsti_to_rack = QtGui.QAction('Add Discovered VSTI To Rack', self)
         add_vsti_to_rack.triggered.connect(self.add_discovered_vsti_to_rack)
         instruments_menu.addAction(add_vsti_to_rack)
-        instruments_menu.addSeparator()
-        set_carla_host = QtGui.QAction('Set Carla Host Binary…', self)
-        set_carla_host.triggered.connect(self.set_carla_host_binary)
-        verify_carla_host = QtGui.QAction('Verify Carla Host', self)
-        verify_carla_host.triggered.connect(self.verify_carla_host)
-        clear_carla_host = QtGui.QAction('Use PATH Carla Detection', self)
-        clear_carla_host.triggered.connect(self.clear_carla_host_binary)
-        instruments_menu.addAction(set_carla_host)
-        instruments_menu.addAction(verify_carla_host)
-        instruments_menu.addAction(clear_carla_host)
-        instruments_menu.addSeparator()
-        export_carla_session = QtGui.QAction('Export Carla Session Snapshot…', self)
-        export_carla_session.triggered.connect(self.export_carla_session_snapshot)
-        import_carla_session = QtGui.QAction('Import Carla Session Snapshot…', self)
-        import_carla_session.triggered.connect(self.import_carla_session_snapshot)
-        instruments_menu.addAction(export_carla_session)
-        instruments_menu.addAction(import_carla_session)
-        instruments_menu.addSeparator()
-        self.carla_transport_bridge_action = QtGui.QAction('Enable Carla Transport Bridge', self)
-        self.carla_transport_bridge_action.setCheckable(True)
-        self.carla_transport_bridge_action.setChecked(True)
-        self.carla_transport_bridge_action.toggled.connect(self.toggle_carla_transport_bridge)
-        instruments_menu.addAction(self.carla_transport_bridge_action)
         self.vsti_menu = instruments_menu
 
         tracks_menu = settings.addMenu('Tracks')
@@ -1944,6 +1938,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._playback_started_at = 0.0
         self._playback_origin_sec = 0.0
         self._playback_rate = 1.0
+        self._last_playhead_ui_refresh = 0.0
+        self._playhead_ui_refresh_interval = 0.066
 
         transport = QtWidgets.QToolBar('Transport', self)
         transport.setFloatable(True)
@@ -2019,12 +2015,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.velocity_editor.refresh()
         self.timeline.refresh()
 
-    def set_playhead_position(self, sec: float) -> None:
+    def set_playhead_position(self, sec: float, playback_tick: bool = False) -> None:
         self.project.playhead_sec = max(0.0, float(sec))
         if hasattr(self, 'playhead_spin'):
             self.playhead_spin.blockSignals(True)
             self.playhead_spin.setValue(self.project.playhead_sec)
             self.playhead_spin.blockSignals(False)
+
+        if playback_tick:
+            now = time.time()
+            if now - self._last_playhead_ui_refresh < self._playhead_ui_refresh_interval:
+                return
+            self._last_playhead_ui_refresh = now
+
         self.sample_timeline.refresh()
         self.arrangement_overview.refresh()
         self.piano_roll.refresh()
@@ -2063,8 +2066,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._playback_started_at = time.time()
         self._playback_origin_sec = self.project.playhead_sec
         self.playback_timer.start()
-        self._apply_carla_parameter_bridge()
-        self._write_carla_bridge_state()
         self.statusBar().showMessage(f'Playback started at {self.project.bpm} BPM ({self._playback_rate:.2f}x)')
 
     def stop_playback(self) -> None:
@@ -2072,7 +2073,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, 'playback_timer'):
             self.playback_timer.stop()
         self.media_player.stop()
-        self._write_carla_bridge_state()
         if should_reset:
             self.set_playhead_position(0.0)
             self.statusBar().showMessage('Playback reset to 0.00s')
@@ -2094,55 +2094,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.media_player.playbackState() == QtMultimedia.QMediaPlayer.PlaybackState.PlayingState:
                 self.media_player.setPosition(0)
                 self.media_player.play()
-        self.set_playhead_position(new_pos)
-        self._apply_carla_parameter_bridge()
-        self._write_carla_bridge_state()
-
-    def toggle_carla_transport_bridge(self, enabled: bool) -> None:
-        state = 'enabled' if enabled else 'disabled'
-        self.statusBar().showMessage(f'Carla transport bridge {state}')
-        self._write_carla_bridge_state()
-
-    def _apply_carla_parameter_bridge(self) -> None:
-        if not hasattr(self, 'carla_transport_bridge_action') or not self.carla_transport_bridge_action.isChecked():
-            return
-        for track in self.project.tracks:
-            if track.instrument_mode != 'VSTI Rack' or not track.rack_vsti or not track.carla_automation_enabled:
-                continue
-            track.vsti_parameters['Param 1'] = float(max(0.0, min(100.0, track.volume * 100.0)))
-            track.vsti_parameters['Param 2'] = float(max(0.0, min(100.0, (track.pan + 1.0) * 50.0)))
-
-    def _write_carla_bridge_state(self) -> None:
-        enabled = hasattr(self, 'carla_transport_bridge_action') and self.carla_transport_bridge_action.isChecked()
-        payload = {
-            'enabled': bool(enabled),
-            'playing': bool(self.playback_timer.isActive()) if hasattr(self, 'playback_timer') else False,
-            'bpm': int(self.project.bpm),
-            'playhead_sec': float(self.project.playhead_sec),
-            'left_locator_sec': float(self.project.left_locator_sec),
-            'right_locator_sec': float(self.project.right_locator_sec),
-            'timestamp': time.time(),
-            'tracks': [],
-        }
-        for idx, track in enumerate(self.project.tracks):
-            if track.instrument_mode != 'VSTI Rack' or not track.rack_vsti:
-                continue
-            payload['tracks'].append({
-                'index': idx,
-                'name': track.name,
-                'rack_vsti': track.rack_vsti,
-                'vsti_state_path': track.vsti_state_path,
-                'automation_enabled': track.carla_automation_enabled,
-                'mapped_params': {
-                    'Param 1': float(track.vsti_parameters.get('Param 1', 50.0)),
-                    'Param 2': float(track.vsti_parameters.get('Param 2', 50.0)),
-                },
-            })
-        try:
-            self.carla_bridge_state_path.parent.mkdir(parents=True, exist_ok=True)
-            self.carla_bridge_state_path.write_text(json.dumps(payload, indent=2))
-        except Exception:
-            pass
+        self.set_playhead_position(new_pos, playback_tick=True)
 
     def _on_media_status_changed(self, status: QtMultimedia.QMediaPlayer.MediaStatus) -> None:
         if status == QtMultimedia.QMediaPlayer.MediaStatus.EndOfMedia and self.playback_timer.isActive():
@@ -2424,8 +2376,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         self.project.vsti_paths = [p for p in payload.get('vsti_paths', []) if isinstance(p, str)]
-        carla_path = payload.get('carla_host_path', '')
-        self.project.carla_host_path = carla_path if isinstance(carla_path, str) else ''
         self.project.sample_paths = [p for p in payload.get('sample_paths', []) if isinstance(p, str)]
         rack_paths = [p for p in payload.get('vsti_rack_paths', []) if isinstance(p, str)]
         self.project.vsti_paths = [p for p in self.project.vsti_paths if Path(p).exists()]
@@ -2444,7 +2394,6 @@ class MainWindow(QtWidgets.QMainWindow):
             'vsti_paths': self.project.vsti_paths,
             'vsti_rack_paths': [v.path for v in self.project.vsti_rack],
             'sample_paths': self.project.sample_paths,
-            'carla_host_path': self.project.carla_host_path,
         }
         APP_PREFS_PATH.write_text(json.dumps(payload, indent=2))
 
@@ -2541,118 +2490,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
         QtWidgets.QMessageBox.information(self, 'VSTI not found', f'No rack VSTI named {vsti_name}.')
 
-    def export_carla_session_snapshot(self) -> None:
-        default_path = Path.cwd() / 'renders' / 'carla_session_snapshot.json'
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, 'Export Carla session snapshot', str(default_path), 'JSON (*.json)')
-        if not path:
-            return
-        data = {
-            'carla_host_path': self.project.carla_host_path,
-            'tracks': [
-                {
-                    'name': t.name,
-                    'instrument_mode': t.instrument_mode,
-                    'rack_vsti': t.rack_vsti,
-                    'vsti_state_path': t.vsti_state_path,
-                    'vsti_parameters': t.vsti_parameters,
-                    'carla_automation_enabled': t.carla_automation_enabled,
-                }
-                for t in self.project.tracks
-            ],
-        }
-        try:
-            Path(path).write_text(json.dumps(data, indent=2))
-            self.statusBar().showMessage(f'Exported Carla snapshot: {Path(path).name}')
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, 'Export failed', str(exc))
-
-    def import_carla_session_snapshot(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Import Carla session snapshot', str(Path.cwd()), 'JSON (*.json)')
-        if not path:
-            return
-        try:
-            data = json.loads(Path(path).read_text())
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(self, 'Import failed', str(exc))
-            return
-
-        host = data.get('carla_host_path', '')
-        if isinstance(host, str):
-            self.project.carla_host_path = host
-
-        tracks_data = data.get('tracks', [])
-        if isinstance(tracks_data, list):
-            for idx, payload in enumerate(tracks_data):
-                if idx >= len(self.project.tracks) or not isinstance(payload, dict):
-                    continue
-                track = self.project.tracks[idx]
-                track.instrument_mode = str(payload.get('instrument_mode', track.instrument_mode))
-                track.rack_vsti = str(payload.get('rack_vsti', track.rack_vsti))
-                track.vsti_state_path = str(payload.get('vsti_state_path', track.vsti_state_path))
-                params = payload.get('vsti_parameters', {})
-                if isinstance(params, dict):
-                    normalized: dict[str, float] = {}
-                    for k, v in params.items():
-                        try:
-                            normalized[str(k)] = float(v)
-                        except Exception:
-                            continue
-                    if normalized:
-                        track.vsti_parameters = normalized
-                auto_enabled = payload.get('carla_automation_enabled', track.carla_automation_enabled)
-                track.carla_automation_enabled = bool(auto_enabled)
-
-        self._save_preferences()
-        self.refresh_vsti_rack_ui()
-        self.on_track_instrument_changed()
-        self._write_carla_bridge_state()
-        self.statusBar().showMessage(f'Imported Carla snapshot: {Path(path).name}')
-
-    def _carla_single_binary(self) -> str:
-        configured = self.project.carla_host_path.strip() if hasattr(self.project, 'carla_host_path') else ''
-        if configured and Path(configured).exists():
-            return configured
-        return shutil.which('carla-single') or shutil.which('carla') or ''
-
-    def set_carla_host_binary(self) -> None:
-        current = self._carla_single_binary() or str(Path.cwd())
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Choose Carla host binary', current, 'Executable (*)')
-        if not path:
-            return
-        chosen = Path(path)
-        if not chosen.exists() or not chosen.is_file():
-            QtWidgets.QMessageBox.warning(self, 'Invalid Carla host', 'Selected path is not a valid executable file.')
-            return
-        self.project.carla_host_path = str(chosen)
-        self._save_preferences()
-        self.statusBar().showMessage(f'Configured Carla host: {chosen.name}')
-        self.refresh_vsti_rack_ui()
-
-    def clear_carla_host_binary(self) -> None:
-        self.project.carla_host_path = ''
-        self._save_preferences()
-        self.refresh_vsti_rack_ui()
-        self.statusBar().showMessage('Carla host configuration cleared. Using PATH detection.')
-
-    def verify_carla_host(self) -> None:
-        host = self._carla_single_binary()
-        if not host:
-            QtWidgets.QMessageBox.information(self, 'Carla not found', 'Carla host was not found. Install carla-single/carla or set a custom binary path in Settings > Instruments > Set Carla Host Binary…')
-            return
-        source = 'custom path' if self.project.carla_host_path and Path(self.project.carla_host_path).exists() and Path(self.project.carla_host_path) == Path(host) else 'PATH discovery'
-        version_line = ''
-        try:
-            result = subprocess.run([host, '--version'], check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
-            raw = (result.stdout or result.stderr).decode('utf-8', errors='ignore').strip()
-            version_line = raw.splitlines()[0] if raw else ''
-        except Exception:
-            version_line = ''
-        self.statusBar().showMessage(f'Carla host ready ({source}): {host}')
-        details = f'Using Carla host: {host}\nSource: {source}'
-        if version_line:
-            details += f'\nVersion: {version_line}'
-        QtWidgets.QMessageBox.information(self, 'Carla host ready', details)
-
     def open_vsti_gui_by_name(self, vsti_name: str) -> None:
         for vst in self.project.vsti_rack:
             if vst.name != vsti_name:
@@ -2669,8 +2506,7 @@ class MainWindow(QtWidgets.QMainWindow):
             dialog.resize(560, 480)
             layout = QtWidgets.QVBoxLayout(dialog)
             info = QtWidgets.QLabel(
-                'This is a built-in VSTI wrapper UI. Parameter changes are applied during playback/render via pedalboard.\n'
-                "Use Carla only if you need the plugin's original vendor GUI window."
+                'This is a built-in VSTI wrapper UI. Parameter changes are applied during playback/render via pedalboard.'
             )
             info.setWordWrap(True)
             layout.addWidget(info)
@@ -2753,15 +2589,8 @@ class MainWindow(QtWidgets.QMainWindow):
             existing = [a for a in self.vsti_menu.actions() if a.property('rack_item')]
             for action in existing:
                 self.vsti_menu.removeAction(action)
-            host = self._carla_single_binary()
-            host_flag = '✓' if host else '⚠'
-            host_label = Path(host).name if host else 'Not found (configure or install carla-single)'
-            host_action = QtGui.QAction(f'Carla host: {host_flag} {host_label}', self)
-            host_action.setProperty('rack_item', True)
-            host_action.setEnabled(False)
             separator = self.vsti_menu.addSeparator()
             separator.setProperty('rack_item', True)
-            self.vsti_menu.addAction(host_action)
             if self.project.vsti_rack:
                 for vst in self.project.vsti_rack:
                     loaded_flag = '✓' if self.vsti_binary_loader.is_loaded(vst.path) else '⚠'
@@ -2818,7 +2647,10 @@ class MainWindow(QtWidgets.QMainWindow):
                     raise RuntimeError('Please provide an API key.')
                 self.ai_client.set_api_key(payload['api_key'])
             else:
-                self._exchange_oauth_code(payload)
+                if payload.get('access_token'):
+                    self.ai_client.set_oauth_tokens(access_token=payload['access_token'], expires_in=3600 * 24)
+                else:
+                    self._exchange_oauth_code(payload)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, 'OpenAI connection failed', str(exc))
             return
@@ -2826,20 +2658,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage('OpenAI connected successfully')
 
     def _exchange_oauth_code(self, payload: dict) -> None:
-        if not payload['client_id'] or not payload['token_url'] or not payload['auth_code']:
-            raise RuntimeError('OAuth requires client id, token URL, and authorization code.')
+        if not payload['token_url'] or not payload['auth_code'] or not payload.get('client_id'):
+            raise RuntimeError('Advanced OAuth code exchange requires client id, token URL, and authorization code. Otherwise paste an access token directly.')
         if not payload['code_verifier']:
-            raise RuntimeError('Click "Open OAuth Login" first so a PKCE code verifier is generated.')
+            raise RuntimeError('Click "Open OAuth Login (Advanced)" first so a PKCE code verifier is generated.')
 
-        req_body = urllib.parse.urlencode(
-            {
-                'grant_type': 'authorization_code',
-                'client_id': payload['client_id'],
-                'code': payload['auth_code'],
-                'redirect_uri': payload['redirect_uri'],
-                'code_verifier': payload['code_verifier'],
-            }
-        ).encode('utf-8')
+        request_data = {
+            'grant_type': 'authorization_code',
+            'client_id': payload['client_id'],
+            'code': payload['auth_code'],
+            'redirect_uri': payload['redirect_uri'],
+            'code_verifier': payload['code_verifier'],
+        }
+
+        req_body = urllib.parse.urlencode(request_data).encode('utf-8')
         request = urllib.request.Request(
             payload['token_url'],
             data=req_body,
