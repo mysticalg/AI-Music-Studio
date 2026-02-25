@@ -1529,6 +1529,14 @@ class InstrumentFxWidget(QtWidgets.QWidget):
             track.instrument_mode = 'General MIDI'
         track.rack_vsti = ''
         track.instrument = self.instrument.currentText()
+
+        sender = self.sender()
+        if sender is self.instrument:
+            default_program = self._default_gm_program(track.instrument)
+            self.midi_program.blockSignals(True)
+            self.midi_program.setValue(default_program)
+            self.midi_program.blockSignals(False)
+
         track.midi_channel = int(self.midi_channel.value()) - 1
         track.midi_program = int(self.midi_program.value())
         track.synth_profile = self._infer_synth_profile(track.instrument, track.midi_program)
@@ -1536,6 +1544,32 @@ class InstrumentFxWidget(QtWidgets.QWidget):
         track.plugins = [f"{name}:{slider.value()}" for name, slider in self.fx_controls.items()]
         if callable(self.on_track_updated):
             self.on_track_updated()
+
+    @staticmethod
+    def _default_gm_program(instrument_name: str) -> int:
+        normalized = instrument_name.strip().lower()
+        defaults = {
+            'piano': 0,
+            'chromatic': 8,
+            'organ': 16,
+            'guitar': 24,
+            'bass': 32,
+            'strings': 40,
+            'brass': 56,
+            'reed': 64,
+            'pipe': 72,
+            'lead': 80,
+            'pad': 88,
+            'percussive': 112,
+            'ensemble': 48,
+            'fx': 96,
+            'ethnic': 104,
+            'sfx': 120,
+        }
+        for token, program in defaults.items():
+            if token in normalized:
+                return program
+        return 0
 
     @staticmethod
     def _infer_synth_profile(instrument_name: str, midi_program: int) -> str:
@@ -2739,6 +2773,7 @@ class MainWindow(QtWidgets.QMainWindow):
         track.instrument_mode = 'General MIDI'
         track.rack_vsti = ''
         track.instrument = chosen
+        track.midi_program = self.instruments._default_gm_program(track.instrument)
         track.synth_profile = self.instruments._infer_synth_profile(track.instrument, track.midi_program)
 
         self._populate_track_list()
