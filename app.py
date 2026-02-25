@@ -1965,6 +1965,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._playback_started_at = 0.0
         self._playback_origin_sec = 0.0
         self._playback_rate = 1.0
+        self._last_playhead_ui_refresh = 0.0
+        self._playhead_ui_refresh_interval = 0.066
+        self._last_bridge_state_write = 0.0
+        self._bridge_state_write_interval = 0.2
 
         transport = QtWidgets.QToolBar('Transport', self)
         transport.setFloatable(True)
@@ -2040,12 +2044,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.velocity_editor.refresh()
         self.timeline.refresh()
 
-    def set_playhead_position(self, sec: float) -> None:
+    def set_playhead_position(self, sec: float, playback_tick: bool = False) -> None:
         self.project.playhead_sec = max(0.0, float(sec))
         if hasattr(self, 'playhead_spin'):
             self.playhead_spin.blockSignals(True)
             self.playhead_spin.setValue(self.project.playhead_sec)
             self.playhead_spin.blockSignals(False)
+
+        if playback_tick:
+            now = time.time()
+            if now - self._last_playhead_ui_refresh < self._playhead_ui_refresh_interval:
+                return
+            self._last_playhead_ui_refresh = now
+
         self.sample_timeline.refresh()
         self.arrangement_overview.refresh()
         self.piano_roll.refresh()
@@ -2085,7 +2096,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._playback_origin_sec = self.project.playhead_sec
         self.playback_timer.start()
         self._apply_carla_parameter_bridge()
-        self._write_carla_bridge_state()
+        self._write_carla_bridge_state(force=True)
         self.statusBar().showMessage(f'Playback started at {self.project.bpm} BPM ({self._playback_rate:.2f}x)')
 
     def stop_playback(self) -> None:
@@ -2093,7 +2104,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, 'playback_timer'):
             self.playback_timer.stop()
         self.media_player.stop()
-        self._write_carla_bridge_state()
+        self._write_carla_bridge_state(force=True)
         if should_reset:
             self.set_playhead_position(0.0)
             self.statusBar().showMessage('Playback reset to 0.00s')
@@ -2115,14 +2126,14 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.media_player.playbackState() == QtMultimedia.QMediaPlayer.PlaybackState.PlayingState:
                 self.media_player.setPosition(0)
                 self.media_player.play()
-        self.set_playhead_position(new_pos)
+        self.set_playhead_position(new_pos, playback_tick=True)
         self._apply_carla_parameter_bridge()
         self._write_carla_bridge_state()
 
     def toggle_carla_transport_bridge(self, enabled: bool) -> None:
         state = 'enabled' if enabled else 'disabled'
         self.statusBar().showMessage(f'Carla transport bridge {state}')
-        self._write_carla_bridge_state()
+        self._write_carla_bridge_state(force=True)
 
     def _apply_carla_parameter_bridge(self) -> None:
         if not hasattr(self, 'carla_transport_bridge_action') or not self.carla_transport_bridge_action.isChecked():
@@ -2133,7 +2144,12 @@ class MainWindow(QtWidgets.QMainWindow):
             track.vsti_parameters['Param 1'] = float(max(0.0, min(100.0, track.volume * 100.0)))
             track.vsti_parameters['Param 2'] = float(max(0.0, min(100.0, (track.pan + 1.0) * 50.0)))
 
-    def _write_carla_bridge_state(self) -> None:
+    def _write_carla_bridge_state(self, force: bool = False) -> None:
+        now = time.time()
+        if not force and now - self._last_bridge_state_write < self._bridge_state_write_interval:
+            return
+        self._last_bridge_state_write = now
+
         enabled = hasattr(self, 'carla_transport_bridge_action') and self.carla_transport_bridge_action.isChecked()
         payload = {
             'enabled': bool(enabled),
@@ -2142,7 +2158,7 @@ class MainWindow(QtWidgets.QMainWindow):
             'playhead_sec': float(self.project.playhead_sec),
             'left_locator_sec': float(self.project.left_locator_sec),
             'right_locator_sec': float(self.project.right_locator_sec),
-            'timestamp': time.time(),
+            'timestamp': now,
             'tracks': [],
         }
         for idx, track in enumerate(self.project.tracks):
