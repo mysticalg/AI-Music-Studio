@@ -1704,18 +1704,34 @@ class OpenAIConnectDialog(QtWidgets.QDialog):
         self.tabs = tabs
 
     def open_oauth_login(self) -> None:
+        client_id = self.client_id_input.text().strip()
+        auth_url = self.auth_url_input.text().strip()
+        redirect_uri = self.redirect_uri_input.text().strip()
+        scope = self.scope_input.text().strip()
+
+        if not client_id:
+            msg = 'OAuth client_id is required. Set OPENAI_OAUTH_CLIENT_ID or paste your app Client ID.'
+            self.status_label.setText(msg)
+            QtWidgets.QMessageBox.warning(self, 'Missing OAuth client_id', msg)
+            return
+        if not auth_url or not redirect_uri:
+            msg = 'OAuth authorize URL and redirect URI are required.'
+            self.status_label.setText(msg)
+            QtWidgets.QMessageBox.warning(self, 'Missing OAuth configuration', msg)
+            return
+
         self.code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(48)).decode().rstrip('=')
         challenge = base64.urlsafe_b64encode(hashlib.sha256(self.code_verifier.encode()).digest()).decode().rstrip('=')
         params = {
             'response_type': 'code',
-            'client_id': self.client_id_input.text().strip(),
-            'redirect_uri': self.redirect_uri_input.text().strip(),
-            'scope': self.scope_input.text().strip(),
+            'client_id': client_id,
+            'redirect_uri': redirect_uri,
+            'scope': scope,
             'code_challenge': challenge,
             'code_challenge_method': 'S256',
             'state': secrets.token_urlsafe(16),
         }
-        url = f"{self.auth_url_input.text().strip()}?{urllib.parse.urlencode(params)}"
+        url = f"{auth_url}?{urllib.parse.urlencode(params)}"
         webbrowser.open(url)
         self.status_label.setText('Browser opened. After login, paste the returned authorization code and click Connect.')
 
