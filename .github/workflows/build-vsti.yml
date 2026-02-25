@@ -1,0 +1,59 @@
+name: Build AdvancedVSTi
+
+on:
+  push:
+    paths:
+      - "plugins/AdvancedVSTi/**"
+      - ".github/workflows/build-vsti.yml"
+  pull_request:
+    paths:
+      - "plugins/AdvancedVSTi/**"
+      - ".github/workflows/build-vsti.yml"
+  workflow_dispatch:
+
+jobs:
+  build-windows-vst3:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Clone JUCE
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/juce-framework/JUCE.git JUCE
+
+      - name: Configure CMake
+        shell: bash
+        run: |
+          cmake -S plugins/AdvancedVSTi -B plugins/AdvancedVSTi/build -DJUCE_DIR="${GITHUB_WORKSPACE}/JUCE"
+
+      - name: Build Release
+        shell: bash
+        run: |
+          cmake --build plugins/AdvancedVSTi/build --config Release
+
+      - name: Package plugin artifacts
+        shell: pwsh
+        run: |
+          $artifactRoot = "plugins/AdvancedVSTi/build/AdvancedVSTi_artefacts/Release"
+          if (-not (Test-Path $artifactRoot)) {
+            Write-Error "Expected build artifacts not found at $artifactRoot"
+          }
+
+          New-Item -ItemType Directory -Path "plugins/AdvancedVSTi/dist" -Force | Out-Null
+
+          $packagePath = "plugins/AdvancedVSTi/dist/AdvancedVSTi-windows-release.zip"
+          if (Test-Path $packagePath) {
+            Remove-Item $packagePath -Force
+          }
+
+          Compress-Archive -Path "$artifactRoot/*" -DestinationPath $packagePath
+
+      - name: Upload downloadable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AdvancedVSTi-windows-release
+          path: plugins/AdvancedVSTi/dist/AdvancedVSTi-windows-release.zip
+          if-no-files-found: error
