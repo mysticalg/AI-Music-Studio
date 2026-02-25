@@ -1351,10 +1351,11 @@ class ArrangementOverviewWidget(QtWidgets.QGraphicsView):
 
 
 class MixerWidget(QtWidgets.QWidget):
-    def __init__(self, project: ProjectState, current_track_callable) -> None:
+    def __init__(self, project: ProjectState, current_track_callable, on_track_updated_callable=None) -> None:
         super().__init__()
         self.project = project
         self.current_track_callable = current_track_callable
+        self.on_track_updated = on_track_updated_callable
 
         layout = QtWidgets.QFormLayout(self)
         self.volume = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
@@ -1391,6 +1392,8 @@ class MixerWidget(QtWidgets.QWidget):
         track.pan = self.pan.value() / 100
         track.mute = self.mute.isChecked()
         track.solo = self.solo.isChecked()
+        if callable(self.on_track_updated):
+            self.on_track_updated()
 
 
 class InstrumentFxWidget(QtWidgets.QWidget):
@@ -1754,6 +1757,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.track_list = QtWidgets.QListWidget()
         self._selected_track_index = 0
+        self._track_list_rebuilding = False
         self.track_list.currentRowChanged.connect(self._track_changed)
         self.track_list.viewport().installEventFilter(self)
         self.last_added_track_type = 'instrument'
@@ -1764,7 +1768,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.velocity_editor = VelocityEditorWidget(self.project, self.current_track_index)
         self.velocity_editor.velocityChanged.connect(self.on_notes_changed)
 
-        self.mixer = MixerWidget(self.project, self.current_track)
+        self.mixer = MixerWidget(self.project, self.current_track, self.on_mixer_track_changed)
         self.instruments = InstrumentFxWidget(self.project, self.current_track, self.refresh_vsti_rack_ui, self.on_track_instrument_changed, self.load_vsti_binary_by_name, self.open_vsti_gui_by_name, self.vsti_parameter_names_for_rack)
         self.sample_timeline = SampleTimelineWidget(self.project, self.sample_track_indices, self.place_sample_asset_on_track, self.set_playhead_position)
         self.arrangement_overview = ArrangementOverviewWidget(self.project, self.set_playhead_position, self.set_left_locator_position, self.set_right_locator_position, self.apply_arrangement_section_move, lambda: self.project.bpm)
@@ -2777,6 +2781,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timeline.refresh()
         self._reload_playback_mix_if_running()
 
+    def on_mixer_track_changed(self) -> None:
+        self._update_selected_track_list_item()
+        self._reload_playback_mix_if_running()
+
     def assign_instrument_to_selected_track(self) -> None:
         if not self.project.tracks:
             return
@@ -3291,6 +3299,51 @@ class MainWindow(QtWidgets.QMainWindow):
         ch = f"Ch {track.midi_channel + 1}" if track.track_type == 'instrument' else 'Sample'
         return f"{track.name} • {track.track_type} • {ch} • {track.instrument_mode} • {extra}"
 
+    def _track_row_widget(self, track: TrackState, row: int) -> QtWidgets.QWidget:
+        row_widget = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(row_widget)
+        layout.setContentsMargins(4, 1, 4, 1)
+        layout.setSpacing(6)
+
+        label = QtWidgets.QLabel(self._track_display_text(track))
+        label.setObjectName('track_row_label')
+        label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
+        layout.addWidget(label)
+
+        mute_btn = QtWidgets.QToolButton()
+        mute_btn.setText('M')
+        mute_btn.setCheckable(True)
+        mute_btn.setChecked(track.mute)
+        mute_btn.setToolTip('Mute track')
+        mute_btn.toggled.connect(lambda checked, idx=row: self._on_track_mute_toggled(idx, checked))
+        layout.addWidget(mute_btn)
+
+        solo_btn = QtWidgets.QToolButton()
+        solo_btn.setText('S')
+        solo_btn.setCheckable(True)
+        solo_btn.setChecked(track.solo)
+        solo_btn.setToolTip('Solo track')
+        solo_btn.toggled.connect(lambda checked, idx=row: self._on_track_solo_toggled(idx, checked))
+        layout.addWidget(solo_btn)
+
+        return row_widget
+
+    def _on_track_mute_toggled(self, row: int, checked: bool) -> None:
+        if self._track_list_rebuilding or row < 0 or row >= len(self.project.tracks):
+            return
+        self.project.tracks[row].mute = bool(checked)
+        if row == self.current_track_index():
+            self.mixer.load_track()
+        self._reload_playback_mix_if_running()
+
+    def _on_track_solo_toggled(self, row: int, checked: bool) -> None:
+        if self._track_list_rebuilding or row < 0 or row >= len(self.project.tracks):
+            return
+        self.project.tracks[row].solo = bool(checked)
+        if row == self.current_track_index():
+            self.mixer.load_track()
+        self._reload_playback_mix_if_running()
+
     def _update_selected_track_list_item(self) -> None:
         if not self.project.tracks:
             return
@@ -3300,19 +3353,30 @@ class MainWindow(QtWidgets.QMainWindow):
         item = self.track_list.item(row)
         if item is None:
             return
-        item.setText(self._track_display_text(self.project.tracks[row]))
+        widget = self.track_list.itemWidget(item)
+        if widget is None:
+            item.setText(self._track_display_text(self.project.tracks[row]))
+            return
+        label = widget.findChild(QtWidgets.QLabel, 'track_row_label')
+        if label is not None:
+            label.setText(self._track_display_text(self.project.tracks[row]))
 
     def _populate_track_list(self) -> None:
         selected = self.current_track_index() if self.project.tracks else 0
+        self._track_list_rebuilding = True
         self.track_list.blockSignals(True)
         self.track_list.clear()
-        for track in self.project.tracks:
-            self.track_list.addItem(self._track_display_text(track))
+        for row, track in enumerate(self.project.tracks):
+            item = QtWidgets.QListWidgetItem()
+            item.setSizeHint(QtCore.QSize(0, 28))
+            self.track_list.addItem(item)
+            self.track_list.setItemWidget(item, self._track_row_widget(track, row))
         if self.project.tracks:
             safe_index = max(0, min(selected, len(self.project.tracks) - 1))
             self._selected_track_index = safe_index
             self.track_list.setCurrentRow(safe_index)
         self.track_list.blockSignals(False)
+        self._track_list_rebuilding = False
         if self.project.tracks:
             self._track_changed(self._selected_track_index)
 
