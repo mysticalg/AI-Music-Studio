@@ -1351,10 +1351,11 @@ class ArrangementOverviewWidget(QtWidgets.QGraphicsView):
 
 
 class MixerWidget(QtWidgets.QWidget):
-    def __init__(self, project: ProjectState, current_track_callable) -> None:
+    def __init__(self, project: ProjectState, current_track_callable, on_track_updated_callable=None) -> None:
         super().__init__()
         self.project = project
         self.current_track_callable = current_track_callable
+        self.on_track_updated = on_track_updated_callable
 
         layout = QtWidgets.QFormLayout(self)
         self.volume = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
@@ -1391,6 +1392,8 @@ class MixerWidget(QtWidgets.QWidget):
         track.pan = self.pan.value() / 100
         track.mute = self.mute.isChecked()
         track.solo = self.solo.isChecked()
+        if callable(self.on_track_updated):
+            self.on_track_updated()
 
 
 class InstrumentFxWidget(QtWidgets.QWidget):
@@ -1403,6 +1406,7 @@ class InstrumentFxWidget(QtWidgets.QWidget):
         self.load_selected_vsti = load_selected_vsti_callable
         self.open_vsti_gui = open_vsti_gui_callable
         self.vsti_param_names_callable = vsti_param_names_callable
+        self._updating_ui = False
 
         root = QtWidgets.QVBoxLayout(self)
         form = QtWidgets.QFormLayout()
@@ -1467,6 +1471,7 @@ class InstrumentFxWidget(QtWidgets.QWidget):
 
     def reload_vsti_choices(self) -> None:
         current = self.vsti_selector.currentText()
+        self.vsti_selector.blockSignals(True)
         self.vsti_selector.clear()
         self.vsti_selector.addItem('None')
         for vst in self.project.vsti_rack:
@@ -1474,56 +1479,148 @@ class InstrumentFxWidget(QtWidgets.QWidget):
         idx = self.vsti_selector.findText(current)
         if idx >= 0:
             self.vsti_selector.setCurrentIndex(idx)
+        self.vsti_selector.blockSignals(False)
 
     def load_track(self) -> None:
-        self.reload_vsti_choices()
-        track = self.current_track_callable()
-        if track.track_type == 'instrument':
-            track.instrument_mode = 'General MIDI'
-            track.rack_vsti = ''
+        self._updating_ui = True
+        try:
+            self.reload_vsti_choices()
+            track = self.current_track_callable()
+            if track.track_type == 'instrument':
+                track.instrument_mode = 'General MIDI'
+                track.rack_vsti = ''
+                track.synth_profile = self._infer_synth_profile(track.instrument, track.midi_program)
 
-        self.instrument_mode.blockSignals(True)
-        self.instrument.blockSignals(True)
-        self.vsti_selector.blockSignals(True)
-        self.midi_channel.blockSignals(True)
-        self.midi_program.blockSignals(True)
+            self.instrument_mode.blockSignals(True)
+            self.instrument.blockSignals(True)
+            self.vsti_selector.blockSignals(True)
+            self.midi_channel.blockSignals(True)
+            self.midi_program.blockSignals(True)
 
-        idx_mode = self.instrument_mode.findText(track.instrument_mode)
-        if idx_mode >= 0:
-            self.instrument_mode.setCurrentIndex(idx_mode)
+            idx_mode = self.instrument_mode.findText(track.instrument_mode)
+            if idx_mode >= 0:
+                self.instrument_mode.setCurrentIndex(idx_mode)
 
-        idx = self.instrument.findText(track.instrument)
-        if idx < 0 and track.instrument:
-            self.instrument.addItem(track.instrument)
             idx = self.instrument.findText(track.instrument)
-        if idx >= 0:
-            self.instrument.setCurrentIndex(idx)
+            if idx < 0 and track.instrument:
+                self.instrument.addItem(track.instrument)
+                idx = self.instrument.findText(track.instrument)
+            if idx >= 0:
+                self.instrument.setCurrentIndex(idx)
 
-        rack_idx = self.vsti_selector.findText(track.rack_vsti or 'None')
-        if rack_idx >= 0:
-            self.vsti_selector.setCurrentIndex(rack_idx)
+            rack_idx = self.vsti_selector.findText(track.rack_vsti or 'None')
+            if rack_idx >= 0:
+                self.vsti_selector.setCurrentIndex(rack_idx)
 
-        self.midi_channel.setValue(int(track.midi_channel) + 1)
-        self.midi_program.setValue(int(track.midi_program))
+            self.midi_channel.setValue(int(track.midi_channel) + 1)
+            self.midi_program.setValue(int(track.midi_program))
 
-        self.instrument_mode.blockSignals(False)
-        self.instrument.blockSignals(False)
-        self.vsti_selector.blockSignals(False)
-        self.midi_channel.blockSignals(False)
-        self.midi_program.blockSignals(False)
-        self.profile.setText(track.synth_profile)
+            self.instrument_mode.blockSignals(False)
+            self.instrument.blockSignals(False)
+            self.vsti_selector.blockSignals(False)
+            self.midi_channel.blockSignals(False)
+            self.midi_program.blockSignals(False)
+            self.profile.setText(track.synth_profile)
+        finally:
+            self._updating_ui = False
 
     def apply_changes(self) -> None:
+        if self._updating_ui:
+            return
         track = self.current_track_callable()
         if track.track_type == 'instrument':
             track.instrument_mode = 'General MIDI'
         track.rack_vsti = ''
         track.instrument = self.instrument.currentText()
+
+        sender = self.sender()
+        if sender is self.instrument:
+            default_program = self._default_gm_program(track.instrument)
+            self.midi_program.blockSignals(True)
+            self.midi_program.setValue(default_program)
+            self.midi_program.blockSignals(False)
+
         track.midi_channel = int(self.midi_channel.value()) - 1
         track.midi_program = int(self.midi_program.value())
+        track.synth_profile = self._infer_synth_profile(track.instrument, track.midi_program)
+        self.profile.setText(track.synth_profile)
         track.plugins = [f"{name}:{slider.value()}" for name, slider in self.fx_controls.items()]
         if callable(self.on_track_updated):
             self.on_track_updated()
+
+    @staticmethod
+    def _default_gm_program(instrument_name: str) -> int:
+        normalized = instrument_name.strip().lower()
+        defaults = {
+            'piano': 0,
+            'chromatic': 8,
+            'organ': 16,
+            'guitar': 24,
+            'bass': 32,
+            'strings': 40,
+            'brass': 56,
+            'reed': 64,
+            'pipe': 72,
+            'lead': 80,
+            'pad': 88,
+            'percussive': 112,
+            'ensemble': 48,
+            'fx': 96,
+            'ethnic': 104,
+            'sfx': 120,
+        }
+        for token, program in defaults.items():
+            if token in normalized:
+                return program
+        return 0
+
+    @staticmethod
+    def _infer_synth_profile(instrument_name: str, midi_program: int) -> str:
+        normalized = instrument_name.strip().lower()
+        category_profile_map = {
+            'piano': 'e_piano',
+            'chromatic': 'e_piano',
+            'organ': 'organ',
+            'guitar': 'pluck',
+            'bass': 'sub_bass',
+            'strings': 'saw_pad',
+            'brass': 'brass_stack',
+            'reed': 'reed_breath',
+            'pipe': 'reed_breath',
+            'lead': 'synth',
+            'pad': 'saw_pad',
+            'percussive': 'noise_kit',
+            'ensemble': 'saw_pad',
+            'fx': 'synth',
+            'ethnic': 'pluck',
+            'sfx': 'synth',
+        }
+        for token, profile in category_profile_map.items():
+            if token in normalized:
+                return profile
+
+        program = int(clamp(midi_program, 0, 127))
+        if program < 16:
+            return 'e_piano'
+        if program < 24:
+            return 'organ'
+        if program < 32:
+            return 'pluck'
+        if program < 40:
+            return 'sub_bass'
+        if program < 56:
+            return 'saw_pad'
+        if program < 64:
+            return 'brass_stack'
+        if program < 80:
+            return 'reed_breath'
+        if program < 96:
+            return 'synth'
+        if program < 104:
+            return 'synth'
+        if program < 120:
+            return 'noise_kit'
+        return 'synth'
 
 
     def assign_selected_rack_vsti(self) -> None:
@@ -1660,6 +1757,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.track_list = QtWidgets.QListWidget()
         self._selected_track_index = 0
+        self._track_list_rebuilding = False
         self.track_list.currentRowChanged.connect(self._track_changed)
         self.track_list.viewport().installEventFilter(self)
         self.last_added_track_type = 'instrument'
@@ -1670,7 +1768,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.velocity_editor = VelocityEditorWidget(self.project, self.current_track_index)
         self.velocity_editor.velocityChanged.connect(self.on_notes_changed)
 
-        self.mixer = MixerWidget(self.project, self.current_track)
+        self.mixer = MixerWidget(self.project, self.current_track, self.on_mixer_track_changed)
         self.instruments = InstrumentFxWidget(self.project, self.current_track, self.refresh_vsti_rack_ui, self.on_track_instrument_changed, self.load_vsti_binary_by_name, self.open_vsti_gui_by_name, self.vsti_parameter_names_for_rack)
         self.sample_timeline = SampleTimelineWidget(self.project, self.sample_track_indices, self.place_sample_asset_on_track, self.set_playhead_position)
         self.arrangement_overview = ArrangementOverviewWidget(self.project, self.set_playhead_position, self.set_left_locator_position, self.set_right_locator_position, self.apply_arrangement_section_move, lambda: self.project.bpm)
@@ -1931,6 +2029,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.arrangement_overview.refresh()
         self.piano_roll.refresh()
         self.velocity_editor.refresh()
+
+    def _reload_playback_mix_if_running(self) -> None:
+        if not hasattr(self, 'playback_timer') or not self.playback_timer.isActive():
+            return
+
+        if not self._build_playback_mix(self.playback_mix_path):
+            self.stop_playback()
+            return
+
+        self._playback_rate = max(0.2, self.project.bpm / DEFAULT_BPM)
+        self._playback_loop_ms = max(1, int((self.project.right_locator_sec - self.project.left_locator_sec) * 1000))
+        seek_sec = max(0.0, self.project.playhead_sec - self.project.left_locator_sec)
+        seek_ms = int(seek_sec * 1000) % self._playback_loop_ms
+
+        self.media_player.setSource(QtCore.QUrl.fromLocalFile(str(self.playback_mix_path.resolve())))
+        self.media_player.setPlaybackRate(self._playback_rate)
+        self.media_player.setPosition(seek_ms)
+        self.media_player.play()
 
     def start_playback(self) -> None:
         if not self._build_playback_mix(self.playback_mix_path):
@@ -2661,8 +2777,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.openai_status_action.setText(self.ai_client.auth_status())
 
     def on_track_instrument_changed(self) -> None:
-        self._populate_track_list()
+        self._update_selected_track_list_item()
         self.timeline.refresh()
+        self._reload_playback_mix_if_running()
+
+    def on_mixer_track_changed(self) -> None:
+        self._update_selected_track_list_item()
+        self._reload_playback_mix_if_running()
 
     def assign_instrument_to_selected_track(self) -> None:
         if not self.project.tracks:
@@ -2679,6 +2800,8 @@ class MainWindow(QtWidgets.QMainWindow):
         track.instrument_mode = 'General MIDI'
         track.rack_vsti = ''
         track.instrument = chosen
+        track.midi_program = self.instruments._default_gm_program(track.instrument)
+        track.synth_profile = self.instruments._infer_synth_profile(track.instrument, track.midi_program)
 
         self._populate_track_list()
         self.timeline.refresh()
@@ -2884,7 +3007,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             state = TrackState(name=str(track.get("name") or f"AI Track {idx}"))
             state.instrument = str(track.get("instrument") or "Default Synth")
-            state.synth_profile = "synth"
+            state.synth_profile = self.instruments._infer_synth_profile(state.instrument, state.midi_program)
             for note in track.get("notes", []):
                 if not isinstance(note, dict):
                     continue
@@ -3170,19 +3293,90 @@ class MainWindow(QtWidgets.QMainWindow):
     def current_track(self) -> TrackState:
         return self.project.tracks[self.current_track_index()]
 
+    @staticmethod
+    def _track_display_text(track: TrackState) -> str:
+        extra = track.instrument
+        ch = f"Ch {track.midi_channel + 1}" if track.track_type == 'instrument' else 'Sample'
+        return f"{track.name} • {track.track_type} • {ch} • {track.instrument_mode} • {extra}"
+
+    def _track_row_widget(self, track: TrackState, row: int) -> QtWidgets.QWidget:
+        row_widget = QtWidgets.QWidget()
+        layout = QtWidgets.QHBoxLayout(row_widget)
+        layout.setContentsMargins(4, 1, 4, 1)
+        layout.setSpacing(6)
+
+        label = QtWidgets.QLabel(self._track_display_text(track))
+        label.setObjectName('track_row_label')
+        label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred)
+        layout.addWidget(label)
+
+        mute_btn = QtWidgets.QToolButton()
+        mute_btn.setText('M')
+        mute_btn.setCheckable(True)
+        mute_btn.setChecked(track.mute)
+        mute_btn.setToolTip('Mute track')
+        mute_btn.toggled.connect(lambda checked, idx=row: self._on_track_mute_toggled(idx, checked))
+        layout.addWidget(mute_btn)
+
+        solo_btn = QtWidgets.QToolButton()
+        solo_btn.setText('S')
+        solo_btn.setCheckable(True)
+        solo_btn.setChecked(track.solo)
+        solo_btn.setToolTip('Solo track')
+        solo_btn.toggled.connect(lambda checked, idx=row: self._on_track_solo_toggled(idx, checked))
+        layout.addWidget(solo_btn)
+
+        return row_widget
+
+    def _on_track_mute_toggled(self, row: int, checked: bool) -> None:
+        if self._track_list_rebuilding or row < 0 or row >= len(self.project.tracks):
+            return
+        self.project.tracks[row].mute = bool(checked)
+        if row == self.current_track_index():
+            self.mixer.load_track()
+        self._reload_playback_mix_if_running()
+
+    def _on_track_solo_toggled(self, row: int, checked: bool) -> None:
+        if self._track_list_rebuilding or row < 0 or row >= len(self.project.tracks):
+            return
+        self.project.tracks[row].solo = bool(checked)
+        if row == self.current_track_index():
+            self.mixer.load_track()
+        self._reload_playback_mix_if_running()
+
+    def _update_selected_track_list_item(self) -> None:
+        if not self.project.tracks:
+            return
+        row = self.current_track_index()
+        if row < 0 or row >= len(self.project.tracks):
+            return
+        item = self.track_list.item(row)
+        if item is None:
+            return
+        widget = self.track_list.itemWidget(item)
+        if widget is None:
+            item.setText(self._track_display_text(self.project.tracks[row]))
+            return
+        label = widget.findChild(QtWidgets.QLabel, 'track_row_label')
+        if label is not None:
+            label.setText(self._track_display_text(self.project.tracks[row]))
+
     def _populate_track_list(self) -> None:
         selected = self.current_track_index() if self.project.tracks else 0
+        self._track_list_rebuilding = True
         self.track_list.blockSignals(True)
         self.track_list.clear()
-        for track in self.project.tracks:
-            extra = track.instrument
-            ch = f"Ch {track.midi_channel + 1}" if track.track_type == 'instrument' else 'Sample'
-            self.track_list.addItem(f"{track.name} • {track.track_type} • {ch} • {track.instrument_mode} • {extra}")
+        for row, track in enumerate(self.project.tracks):
+            item = QtWidgets.QListWidgetItem()
+            item.setSizeHint(QtCore.QSize(0, 28))
+            self.track_list.addItem(item)
+            self.track_list.setItemWidget(item, self._track_row_widget(track, row))
         if self.project.tracks:
             safe_index = max(0, min(selected, len(self.project.tracks) - 1))
             self._selected_track_index = safe_index
             self.track_list.setCurrentRow(safe_index)
         self.track_list.blockSignals(False)
+        self._track_list_rebuilding = False
         if self.project.tracks:
             self._track_changed(self._selected_track_index)
 
@@ -3254,6 +3448,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sample_timeline.refresh()
         self.rebuild_midi_sections()
         self.arrangement_overview.refresh()
+        self._reload_playback_mix_if_running()
 
     def import_midi(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Import MIDI", str(Path.cwd()), "MIDI files (*.mid *.midi)")
