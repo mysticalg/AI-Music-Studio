@@ -43,7 +43,7 @@ OpenAI is used for:
 
 You can connect OpenAI in-app via **Settings > OpenAI > Connect** using either:
 - API key mode, or
-- OAuth (PKCE) mode by opening browser login, then pasting the returned authorization code.
+- OAuth / Access Token mode by pasting an OpenAI access token directly (recommended), with optional advanced PKCE authorization-code exchange.
 
 If OpenAI is not connected, classification falls back to deterministic GM/track-name heuristics.
 
