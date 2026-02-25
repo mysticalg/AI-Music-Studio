@@ -144,8 +144,8 @@ class TrackState:
     notes: list[MidiNote] = dataclasses.field(default_factory=list)
     volume: float = 0.8
     pan: float = 0.0
-    instrument: str = "Default Synth"
-    instrument_mode: str = "AI Synth"
+    instrument: str = "Piano"
+    instrument_mode: str = "General MIDI"
     rack_vsti: str = ""
     plugins: list[str] = dataclasses.field(default_factory=list)
     vsti_parameters: dict[str, float] = dataclasses.field(default_factory=dict)
@@ -637,7 +637,7 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
             y = i * self.cell_h
             pitch = PITCH_MAX - i
             color = QtGui.QColor(40, 40, 40) if pitch % 12 in (1, 3, 6, 8, 10) else QtGui.QColor(55, 55, 55)
-            self.scene_obj.addRect(0, y, width, self.cell_h, QtGui.QPen(QtCore.Qt.PenStyle.NoPen), QtGui.QBrush(color))
+            self.scene_obj.addRect(QtCore.QRectF(0.0, float(y), float(width), float(self.cell_h)), QtGui.QPen(QtCore.Qt.PenStyle.NoPen), QtGui.QBrush(color))
 
         for beat in range(self.total_beats + 1):
             x = beat * self.cell_w
@@ -1407,9 +1407,9 @@ class InstrumentFxWidget(QtWidgets.QWidget):
         root = QtWidgets.QVBoxLayout(self)
         form = QtWidgets.QFormLayout()
         self.instrument_mode = QtWidgets.QComboBox()
-        self.instrument_mode.addItems(["AI Synth", "General MIDI", "VSTI Rack"])
+        self.instrument_mode.addItems(["General MIDI"])
         self.instrument = QtWidgets.QComboBox()
-        self.instrument.addItems(["Default Synth", "Piano", "Bass", "Lead", "Sampler"])
+        self.instrument.addItems(["Piano", "Chromatic", "Organ", "Guitar", "Bass", "Strings", "Brass", "Reed", "Pipe", "Lead", "Pad", "Percussive"])
         self.vsti_selector = QtWidgets.QComboBox()
         self.profile = QtWidgets.QLineEdit()
         self.profile.setReadOnly(True)
@@ -1457,6 +1457,14 @@ class InstrumentFxWidget(QtWidgets.QWidget):
         for slider in self.fx_controls.values():
             slider.valueChanged.connect(self.apply_changes)
 
+        self.instrument_mode.setEnabled(False)
+        self.vsti_selector.setEnabled(False)
+        self.assign_rack_btn.setEnabled(False)
+        self.load_vsti_btn.setEnabled(False)
+        self.open_vsti_gui_btn.setEnabled(False)
+        self.edit_vsti_params_btn.setEnabled(False)
+        self.vsti_selector.setToolTip('VSTI support is temporarily disabled.')
+
     def reload_vsti_choices(self) -> None:
         current = self.vsti_selector.currentText()
         self.vsti_selector.clear()
@@ -1470,6 +1478,9 @@ class InstrumentFxWidget(QtWidgets.QWidget):
     def load_track(self) -> None:
         self.reload_vsti_choices()
         track = self.current_track_callable()
+        if track.track_type == 'instrument':
+            track.instrument_mode = 'General MIDI'
+            track.rack_vsti = ''
 
         self.instrument_mode.blockSignals(True)
         self.instrument.blockSignals(True)
@@ -1504,13 +1515,10 @@ class InstrumentFxWidget(QtWidgets.QWidget):
 
     def apply_changes(self) -> None:
         track = self.current_track_callable()
-        track.instrument_mode = self.instrument_mode.currentText()
-        selected_rack = '' if self.vsti_selector.currentText() == 'None' else self.vsti_selector.currentText()
-        track.rack_vsti = selected_rack
-        if track.instrument_mode == 'VSTI Rack' and selected_rack:
-            track.instrument = selected_rack
-        else:
-            track.instrument = self.instrument.currentText()
+        if track.track_type == 'instrument':
+            track.instrument_mode = 'General MIDI'
+        track.rack_vsti = ''
+        track.instrument = self.instrument.currentText()
         track.midi_channel = int(self.midi_channel.value()) - 1
         track.midi_program = int(self.midi_program.value())
         track.plugins = [f"{name}:{slider.value()}" for name, slider in self.fx_controls.items()]
@@ -1519,92 +1527,16 @@ class InstrumentFxWidget(QtWidgets.QWidget):
 
 
     def assign_selected_rack_vsti(self) -> None:
-        selected = '' if self.vsti_selector.currentText() == 'None' else self.vsti_selector.currentText()
-        if not selected:
-            QtWidgets.QMessageBox.information(self, 'No rack VSTI', 'Select a rack VSTI first.')
-            return
-        self.instrument_mode.setCurrentText('VSTI Rack')
-        self.vsti_selector.setCurrentText(selected)
-        self.apply_changes()
+        QtWidgets.QMessageBox.information(self, 'VSTI disabled', 'VSTI support is temporarily disabled. Use General MIDI instruments instead.')
 
     def load_selected_vsti_binary(self) -> None:
-        if not callable(self.load_selected_vsti):
-            return
-        selected = '' if self.vsti_selector.currentText() == 'None' else self.vsti_selector.currentText()
-        if not selected:
-            QtWidgets.QMessageBox.information(self, 'No rack VSTI', 'Select a rack VSTI first.')
-            return
-        self.load_selected_vsti(selected)
+        QtWidgets.QMessageBox.information(self, 'VSTI disabled', 'VSTI support is temporarily disabled.')
 
     def open_selected_vsti_gui(self) -> None:
-        if not callable(self.open_vsti_gui):
-            return
-        selected = '' if self.vsti_selector.currentText() == 'None' else self.vsti_selector.currentText()
-        if not selected:
-            QtWidgets.QMessageBox.information(self, 'No rack VSTI', 'Select a rack VSTI first.')
-            return
-        self.open_vsti_gui(selected)
+        QtWidgets.QMessageBox.information(self, 'VSTI disabled', 'VSTI support is temporarily disabled.')
 
     def edit_vsti_parameters(self) -> None:
-        track = self.current_track_callable()
-        if track.instrument_mode != 'VSTI Rack' or not track.rack_vsti:
-            QtWidgets.QMessageBox.information(self, 'No VSTI assigned', 'Assign a rack VSTI to this track first.')
-            return
-
-        dialog = QtWidgets.QDialog(self)
-        dialog.setWindowTitle(f'VSTI Parameters - {track.rack_vsti}')
-        layout = QtWidgets.QFormLayout(dialog)
-        param_names: list[str] = []
-        if callable(self.vsti_param_names_callable):
-            param_names = self.vsti_param_names_callable(track.rack_vsti)
-        if not param_names:
-            param_names = [f'Param {i}' for i in range(1, 9)]
-
-        sliders: dict[str, QtWidgets.QSlider] = {}
-        for key in param_names[:12]:
-            slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-            slider.setRange(0, 100)
-            slider.setValue(int(track.vsti_parameters.get(key, 50)))
-            layout.addRow(key, slider)
-            sliders[key] = slider
-
-        gain_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        gain_slider.setRange(-240, 240)
-        gain_slider.setValue(int(track.vsti_output_gain_db * 10.0))
-        gain_label = QtWidgets.QLabel(f'{track.vsti_output_gain_db:.1f} dB')
-        gain_slider.valueChanged.connect(lambda value: gain_label.setText(f'{value / 10.0:.1f} dB'))
-        gain_row = QtWidgets.QHBoxLayout()
-        gain_row.addWidget(gain_slider)
-        gain_row.addWidget(gain_label)
-        gain_widget = QtWidgets.QWidget()
-        gain_widget.setLayout(gain_row)
-        layout.addRow('Output gain', gain_widget)
-
-        wet_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        wet_slider.setRange(0, 100)
-        wet_slider.setValue(int(track.vsti_wet_mix))
-        wet_label = QtWidgets.QLabel(f'{track.vsti_wet_mix:.0f}%')
-        wet_slider.valueChanged.connect(lambda value: wet_label.setText(f'{value:.0f}%'))
-        wet_row = QtWidgets.QHBoxLayout()
-        wet_row.addWidget(wet_slider)
-        wet_row.addWidget(wet_label)
-        wet_widget = QtWidgets.QWidget()
-        wet_widget.setLayout(wet_row)
-        layout.addRow('Wet mix', wet_widget)
-
-        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        layout.addRow(buttons)
-
-        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
-            return
-
-        track.vsti_parameters = {name: float(slider.value()) for name, slider in sliders.items()}
-        track.vsti_output_gain_db = gain_slider.value() / 10.0
-        track.vsti_wet_mix = float(wet_slider.value())
-        if callable(self.on_track_updated):
-            self.on_track_updated()
+        QtWidgets.QMessageBox.information(self, 'VSTI disabled', 'VSTI support is temporarily disabled.')
 
 
 class SampleLibraryWidget(QtWidgets.QListWidget):
@@ -2740,28 +2672,13 @@ class MainWindow(QtWidgets.QMainWindow):
             row = 0
         track = self.project.tracks[row]
 
-        mode, ok = QtWidgets.QInputDialog.getItem(self, 'Track Instrument Mode', 'Mode:', ['AI Synth', 'General MIDI', 'VSTI Rack'], 0, False)
+        options = [self.instruments.instrument.itemText(i) for i in range(self.instruments.instrument.count())]
+        chosen, ok = QtWidgets.QInputDialog.getItem(self, 'Assign Instrument', 'General MIDI instrument:', options, 0, False)
         if not ok:
             return
-        track.instrument_mode = mode
-
-        if mode == 'VSTI Rack':
-            if not self.project.vsti_rack:
-                QtWidgets.QMessageBox.information(self, 'No rack instruments', 'Load a VST into the rack first from Settings > Instruments.')
-                return
-            options = [v.name for v in self.project.vsti_rack]
-            chosen, ok = QtWidgets.QInputDialog.getItem(self, 'Assign Rack Instrument', 'Rack instrument:', options, 0, False)
-            if not ok:
-                return
-            track.rack_vsti = chosen
-            track.instrument = chosen
-        else:
-            options = [self.instruments.instrument.itemText(i) for i in range(self.instruments.instrument.count())]
-            chosen, ok = QtWidgets.QInputDialog.getItem(self, 'Assign Instrument', 'Instrument:', options, 0, False)
-            if not ok:
-                return
-            track.rack_vsti = ''
-            track.instrument = chosen
+        track.instrument_mode = 'General MIDI'
+        track.rack_vsti = ''
+        track.instrument = chosen
 
         self._populate_track_list()
         self.timeline.refresh()
@@ -2889,7 +2806,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 track.solo = action['solo']
                 changed += 1
             mode = action.get('instrument_mode')
-            if isinstance(mode, str) and mode in {'AI Synth', 'General MIDI', 'VSTI Rack', 'Sample'}:
+            if isinstance(mode, str) and mode in {'General MIDI', 'Sample'}:
                 track.instrument_mode = mode
                 changed += 1
             instrument = action.get('instrument')
@@ -3002,6 +2919,8 @@ class MainWindow(QtWidgets.QMainWindow):
         profile = InstrumentIntelligence.FAMILY_PROFILES.get(family, "synth")
         gm_name = self.instrument_ai.gm_instrument_name(track.midi_program)
         track.instrument = f"{gm_name} ({family})"
+        track.instrument_mode = 'General MIDI'
+        track.rack_vsti = ''
         track.synth_profile = profile
 
     def render_all_tracks(self) -> None:
@@ -3256,7 +3175,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.track_list.blockSignals(True)
         self.track_list.clear()
         for track in self.project.tracks:
-            extra = f"VST:{track.rack_vsti}" if track.rack_vsti else track.instrument
+            extra = track.instrument
             ch = f"Ch {track.midi_channel + 1}" if track.track_type == 'instrument' else 'Sample'
             self.track_list.addItem(f"{track.name} • {track.track_type} • {ch} • {track.instrument_mode} • {extra}")
         if self.project.tracks:
