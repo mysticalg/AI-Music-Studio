@@ -1486,6 +1486,7 @@ class InstrumentFxWidget(QtWidgets.QWidget):
             if track.track_type == 'instrument':
                 track.instrument_mode = 'General MIDI'
                 track.rack_vsti = ''
+                track.synth_profile = self._infer_synth_profile(track.instrument, track.midi_program)
 
             self.instrument_mode.blockSignals(True)
             self.instrument.blockSignals(True)
@@ -1531,6 +1532,7 @@ class InstrumentFxWidget(QtWidgets.QWidget):
         track.midi_channel = int(self.midi_channel.value()) - 1
         track.midi_program = int(self.midi_program.value())
         track.synth_profile = self._infer_synth_profile(track.instrument, track.midi_program)
+        self.profile.setText(track.synth_profile)
         track.plugins = [f"{name}:{slider.value()}" for name, slider in self.fx_controls.items()]
         if callable(self.on_track_updated):
             self.on_track_updated()
@@ -2943,7 +2945,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             state = TrackState(name=str(track.get("name") or f"AI Track {idx}"))
             state.instrument = str(track.get("instrument") or "Default Synth")
-            state.synth_profile = "synth"
+            state.synth_profile = self.instruments._infer_synth_profile(state.instrument, state.midi_program)
             for note in track.get("notes", []):
                 if not isinstance(note, dict):
                     continue
