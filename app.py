@@ -1530,9 +1530,58 @@ class InstrumentFxWidget(QtWidgets.QWidget):
         track.instrument = self.instrument.currentText()
         track.midi_channel = int(self.midi_channel.value()) - 1
         track.midi_program = int(self.midi_program.value())
+        track.synth_profile = self._infer_synth_profile(track.instrument, track.midi_program)
         track.plugins = [f"{name}:{slider.value()}" for name, slider in self.fx_controls.items()]
         if callable(self.on_track_updated):
             self.on_track_updated()
+
+    @staticmethod
+    def _infer_synth_profile(instrument_name: str, midi_program: int) -> str:
+        normalized = instrument_name.strip().lower()
+        category_profile_map = {
+            'piano': 'e_piano',
+            'chromatic': 'e_piano',
+            'organ': 'organ',
+            'guitar': 'pluck',
+            'bass': 'sub_bass',
+            'strings': 'saw_pad',
+            'brass': 'brass_stack',
+            'reed': 'reed_breath',
+            'pipe': 'reed_breath',
+            'lead': 'synth',
+            'pad': 'saw_pad',
+            'percussive': 'noise_kit',
+            'ensemble': 'saw_pad',
+            'fx': 'synth',
+            'ethnic': 'pluck',
+            'sfx': 'synth',
+        }
+        for token, profile in category_profile_map.items():
+            if token in normalized:
+                return profile
+
+        program = int(clamp(midi_program, 0, 127))
+        if program < 16:
+            return 'e_piano'
+        if program < 24:
+            return 'organ'
+        if program < 32:
+            return 'pluck'
+        if program < 40:
+            return 'sub_bass'
+        if program < 56:
+            return 'saw_pad'
+        if program < 64:
+            return 'brass_stack'
+        if program < 80:
+            return 'reed_breath'
+        if program < 96:
+            return 'synth'
+        if program < 104:
+            return 'synth'
+        if program < 120:
+            return 'noise_kit'
+        return 'synth'
 
 
     def assign_selected_rack_vsti(self) -> None:
@@ -2688,6 +2737,7 @@ class MainWindow(QtWidgets.QMainWindow):
         track.instrument_mode = 'General MIDI'
         track.rack_vsti = ''
         track.instrument = chosen
+        track.synth_profile = self.instruments._infer_synth_profile(track.instrument, track.midi_program)
 
         self._populate_track_list()
         self.timeline.refresh()
