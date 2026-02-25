@@ -41,6 +41,16 @@ RENDER_DIR = Path("renders")
 APP_PREFS_PATH = Path(".ai_music_studio_prefs.json")
 
 
+def load_startup_preferences() -> dict:
+    if not APP_PREFS_PATH.exists():
+        return {}
+    try:
+        payload = json.loads(APP_PREFS_PATH.read_text())
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
@@ -1761,12 +1771,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.vsti_plugin_metadata: dict[str, list[str]] = {}
         self.vsti_directory = Path.cwd() / 'vsti'
         self.vsti_directory.mkdir(parents=True, exist_ok=True)
+        self.selected_audio_output_id = ''
+        self.audio_buffer_ms = 80
+        self.playback_ui_refresh_ms = 33
+        self.prefer_gpu_rendering = True
         self._load_preferences()
         self.audio_output = QtMultimedia.QAudioOutput(self)
         self.media_player = QtMultimedia.QMediaPlayer(self)
         self.media_player.setAudioOutput(self.audio_output)
         self.media_player.mediaStatusChanged.connect(self._on_media_status_changed)
-        self.selected_audio_output_id = ""
+        self._apply_selected_audio_output()
+        self._apply_audio_buffer_preference()
         self.playback_mix_path = Path.cwd() / "renders" / "_playback_mix.wav"
         self._playback_loop_ms = 0
         self.setWindowTitle("AI Music Studio")
@@ -1928,12 +1943,39 @@ class MainWindow(QtWidgets.QMainWindow):
         self.audio_output_menu = settings.addMenu('Audio Output')
         self.refresh_audio_output_menu()
 
+        performance_menu = settings.addMenu('Playback Performance')
+        self.gpu_rendering_action = QtGui.QAction('Prefer GPU Rendering (restart required)', self)
+        self.gpu_rendering_action.setCheckable(True)
+        self.gpu_rendering_action.setChecked(self.prefer_gpu_rendering)
+        self.gpu_rendering_action.triggered.connect(self.set_prefer_gpu_rendering)
+        performance_menu.addAction(self.gpu_rendering_action)
+
+        buffer_menu = performance_menu.addMenu('Audio Buffer')
+        self.audio_buffer_group = QtGui.QActionGroup(buffer_menu)
+        self.audio_buffer_group.setExclusive(True)
+        for value in (20, 40, 80, 120, 200):
+            action = buffer_menu.addAction(f'{value} ms')
+            action.setCheckable(True)
+            action.setChecked(value == self.audio_buffer_ms)
+            action.triggered.connect(lambda _checked=False, v=value: self.set_audio_buffer_ms(v))
+            self.audio_buffer_group.addAction(action)
+
+        refresh_menu = performance_menu.addMenu('Playhead Refresh')
+        self.playhead_refresh_group = QtGui.QActionGroup(refresh_menu)
+        self.playhead_refresh_group.setExclusive(True)
+        for value in (16, 33, 50, 66):
+            action = refresh_menu.addAction(f'{value} ms')
+            action.setCheckable(True)
+            action.setChecked(value == self.playback_ui_refresh_ms)
+            action.triggered.connect(lambda _checked=False, v=value: self.set_playback_ui_refresh_ms(v))
+            self.playhead_refresh_group.addAction(action)
+
         self.refresh_vsti_rack_ui()
         self.refresh_openai_status()
 
     def _setup_floating_transport(self) -> None:
         self.playback_timer = QtCore.QTimer(self)
-        self.playback_timer.setInterval(33)
+        self.playback_timer.setInterval(self.playback_ui_refresh_ms)
         self.playback_timer.timeout.connect(self._tick_playback)
         self._playback_started_at = 0.0
         self._playback_origin_sec = 0.0
@@ -2131,6 +2173,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.selected_audio_output_id = device_id
         if not device_id:
             self.audio_output.setDevice(QtMultimedia.QMediaDevices.defaultAudioOutput())
+            self._apply_audio_buffer_preference()
+            self._save_preferences()
             self.statusBar().showMessage('Audio output set to system default soundcard')
             self.refresh_audio_output_menu()
             return
@@ -2138,13 +2182,59 @@ class MainWindow(QtWidgets.QMainWindow):
         for device in QtMultimedia.QMediaDevices.audioOutputs():
             if bytes(device.id()).hex() == device_id:
                 self.audio_output.setDevice(device)
+                self._apply_audio_buffer_preference()
+                self._save_preferences()
                 self.statusBar().showMessage(f'Audio output set to {device.description()}')
                 self.refresh_audio_output_menu()
                 return
 
         self.selected_audio_output_id = ''
         self.audio_output.setDevice(QtMultimedia.QMediaDevices.defaultAudioOutput())
+        self._apply_audio_buffer_preference()
+        self._save_preferences()
         self.refresh_audio_output_menu()
+
+    def set_audio_buffer_ms(self, value: int) -> None:
+        self.audio_buffer_ms = int(clamp(value, 20, 500))
+        self._apply_audio_buffer_preference()
+        self._save_preferences()
+        self.statusBar().showMessage(f'Playback audio buffer set to {self.audio_buffer_ms} ms')
+
+    def set_playback_ui_refresh_ms(self, value: int) -> None:
+        self.playback_ui_refresh_ms = int(clamp(value, 16, 200))
+        if hasattr(self, 'playback_timer'):
+            self.playback_timer.setInterval(self.playback_ui_refresh_ms)
+        self._save_preferences()
+        self.statusBar().showMessage(f'Playhead refresh set to every {self.playback_ui_refresh_ms} ms')
+
+    def set_prefer_gpu_rendering(self, enabled: bool) -> None:
+        self.prefer_gpu_rendering = bool(enabled)
+        self._save_preferences()
+        state = 'enabled' if self.prefer_gpu_rendering else 'disabled'
+        self.statusBar().showMessage(f'Prefer GPU rendering {state}. Restart the app to apply.')
+
+    def _apply_selected_audio_output(self) -> None:
+        if not self.selected_audio_output_id:
+            self.audio_output.setDevice(QtMultimedia.QMediaDevices.defaultAudioOutput())
+            return
+        for device in QtMultimedia.QMediaDevices.audioOutputs():
+            if bytes(device.id()).hex() == self.selected_audio_output_id:
+                self.audio_output.setDevice(device)
+                return
+        self.selected_audio_output_id = ''
+        self.audio_output.setDevice(QtMultimedia.QMediaDevices.defaultAudioOutput())
+
+    def _apply_audio_buffer_preference(self) -> None:
+        try:
+            fmt = self.audio_output.device().preferredFormat()
+            sample_rate = max(1, fmt.sampleRate())
+            channels = max(1, fmt.channelCount())
+            bytes_per_sample = max(1, fmt.bytesPerSample())
+            bytes_per_frame = max(1, channels * bytes_per_sample)
+            buffer_size = int((sample_rate * bytes_per_frame * self.audio_buffer_ms) / 1000)
+            self.audio_output.setBufferSize(max(4096, buffer_size))
+        except Exception:
+            return
 
     def _rack_vsti_path(self, rack_name: str) -> str:
         for vst in self.project.vsti_rack:
@@ -2368,15 +2458,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.on_notes_changed()
 
     def _load_preferences(self) -> None:
-        if not APP_PREFS_PATH.exists():
-            return
-        try:
-            payload = json.loads(APP_PREFS_PATH.read_text())
-        except Exception:
+        payload = load_startup_preferences()
+        if not payload:
             return
 
         self.project.vsti_paths = [p for p in payload.get('vsti_paths', []) if isinstance(p, str)]
         self.project.sample_paths = [p for p in payload.get('sample_paths', []) if isinstance(p, str)]
+        self.selected_audio_output_id = str(payload.get('selected_audio_output_id', '') or '')
+        self.audio_buffer_ms = int(clamp(float(payload.get('audio_buffer_ms', 80)), 20, 500))
+        self.playback_ui_refresh_ms = int(clamp(float(payload.get('playback_ui_refresh_ms', 33)), 16, 200))
+        self.prefer_gpu_rendering = bool(payload.get('prefer_gpu_rendering', True))
         rack_paths = [p for p in payload.get('vsti_rack_paths', []) if isinstance(p, str)]
         self.project.vsti_paths = [p for p in self.project.vsti_paths if Path(p).exists()]
         rack = []
@@ -2394,6 +2485,10 @@ class MainWindow(QtWidgets.QMainWindow):
             'vsti_paths': self.project.vsti_paths,
             'vsti_rack_paths': [v.path for v in self.project.vsti_rack],
             'sample_paths': self.project.sample_paths,
+            'selected_audio_output_id': self.selected_audio_output_id,
+            'audio_buffer_ms': self.audio_buffer_ms,
+            'playback_ui_refresh_ms': self.playback_ui_refresh_ms,
+            'prefer_gpu_rendering': self.prefer_gpu_rendering,
         }
         APP_PREFS_PATH.write_text(json.dumps(payload, indent=2))
 
@@ -3358,6 +3453,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 def main() -> int:
+    startup_prefs = load_startup_preferences()
+    if startup_prefs.get('prefer_gpu_rendering', True):
+        QtCore.QCoreApplication.setAttribute(QtCore.Qt.ApplicationAttribute.AA_UseDesktopOpenGL, True)
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
     palette = QtGui.QPalette()
