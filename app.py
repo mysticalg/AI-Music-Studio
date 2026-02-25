@@ -1403,6 +1403,7 @@ class InstrumentFxWidget(QtWidgets.QWidget):
         self.load_selected_vsti = load_selected_vsti_callable
         self.open_vsti_gui = open_vsti_gui_callable
         self.vsti_param_names_callable = vsti_param_names_callable
+        self._updating_ui = False
 
         root = QtWidgets.QVBoxLayout(self)
         form = QtWidgets.QFormLayout()
@@ -1467,6 +1468,7 @@ class InstrumentFxWidget(QtWidgets.QWidget):
 
     def reload_vsti_choices(self) -> None:
         current = self.vsti_selector.currentText()
+        self.vsti_selector.blockSignals(True)
         self.vsti_selector.clear()
         self.vsti_selector.addItem('None')
         for vst in self.project.vsti_rack:
@@ -1474,46 +1476,53 @@ class InstrumentFxWidget(QtWidgets.QWidget):
         idx = self.vsti_selector.findText(current)
         if idx >= 0:
             self.vsti_selector.setCurrentIndex(idx)
+        self.vsti_selector.blockSignals(False)
 
     def load_track(self) -> None:
-        self.reload_vsti_choices()
-        track = self.current_track_callable()
-        if track.track_type == 'instrument':
-            track.instrument_mode = 'General MIDI'
-            track.rack_vsti = ''
+        self._updating_ui = True
+        try:
+            self.reload_vsti_choices()
+            track = self.current_track_callable()
+            if track.track_type == 'instrument':
+                track.instrument_mode = 'General MIDI'
+                track.rack_vsti = ''
 
-        self.instrument_mode.blockSignals(True)
-        self.instrument.blockSignals(True)
-        self.vsti_selector.blockSignals(True)
-        self.midi_channel.blockSignals(True)
-        self.midi_program.blockSignals(True)
+            self.instrument_mode.blockSignals(True)
+            self.instrument.blockSignals(True)
+            self.vsti_selector.blockSignals(True)
+            self.midi_channel.blockSignals(True)
+            self.midi_program.blockSignals(True)
 
-        idx_mode = self.instrument_mode.findText(track.instrument_mode)
-        if idx_mode >= 0:
-            self.instrument_mode.setCurrentIndex(idx_mode)
+            idx_mode = self.instrument_mode.findText(track.instrument_mode)
+            if idx_mode >= 0:
+                self.instrument_mode.setCurrentIndex(idx_mode)
 
-        idx = self.instrument.findText(track.instrument)
-        if idx < 0 and track.instrument:
-            self.instrument.addItem(track.instrument)
             idx = self.instrument.findText(track.instrument)
-        if idx >= 0:
-            self.instrument.setCurrentIndex(idx)
+            if idx < 0 and track.instrument:
+                self.instrument.addItem(track.instrument)
+                idx = self.instrument.findText(track.instrument)
+            if idx >= 0:
+                self.instrument.setCurrentIndex(idx)
 
-        rack_idx = self.vsti_selector.findText(track.rack_vsti or 'None')
-        if rack_idx >= 0:
-            self.vsti_selector.setCurrentIndex(rack_idx)
+            rack_idx = self.vsti_selector.findText(track.rack_vsti or 'None')
+            if rack_idx >= 0:
+                self.vsti_selector.setCurrentIndex(rack_idx)
 
-        self.midi_channel.setValue(int(track.midi_channel) + 1)
-        self.midi_program.setValue(int(track.midi_program))
+            self.midi_channel.setValue(int(track.midi_channel) + 1)
+            self.midi_program.setValue(int(track.midi_program))
 
-        self.instrument_mode.blockSignals(False)
-        self.instrument.blockSignals(False)
-        self.vsti_selector.blockSignals(False)
-        self.midi_channel.blockSignals(False)
-        self.midi_program.blockSignals(False)
-        self.profile.setText(track.synth_profile)
+            self.instrument_mode.blockSignals(False)
+            self.instrument.blockSignals(False)
+            self.vsti_selector.blockSignals(False)
+            self.midi_channel.blockSignals(False)
+            self.midi_program.blockSignals(False)
+            self.profile.setText(track.synth_profile)
+        finally:
+            self._updating_ui = False
 
     def apply_changes(self) -> None:
+        if self._updating_ui:
+            return
         track = self.current_track_callable()
         if track.track_type == 'instrument':
             track.instrument_mode = 'General MIDI'
@@ -2661,7 +2670,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.openai_status_action.setText(self.ai_client.auth_status())
 
     def on_track_instrument_changed(self) -> None:
-        self._populate_track_list()
+        self._update_selected_track_list_item()
         self.timeline.refresh()
 
     def assign_instrument_to_selected_track(self) -> None:
@@ -3170,14 +3179,29 @@ class MainWindow(QtWidgets.QMainWindow):
     def current_track(self) -> TrackState:
         return self.project.tracks[self.current_track_index()]
 
+    @staticmethod
+    def _track_display_text(track: TrackState) -> str:
+        extra = track.instrument
+        ch = f"Ch {track.midi_channel + 1}" if track.track_type == 'instrument' else 'Sample'
+        return f"{track.name} • {track.track_type} • {ch} • {track.instrument_mode} • {extra}"
+
+    def _update_selected_track_list_item(self) -> None:
+        if not self.project.tracks:
+            return
+        row = self.current_track_index()
+        if row < 0 or row >= len(self.project.tracks):
+            return
+        item = self.track_list.item(row)
+        if item is None:
+            return
+        item.setText(self._track_display_text(self.project.tracks[row]))
+
     def _populate_track_list(self) -> None:
         selected = self.current_track_index() if self.project.tracks else 0
         self.track_list.blockSignals(True)
         self.track_list.clear()
         for track in self.project.tracks:
-            extra = track.instrument
-            ch = f"Ch {track.midi_channel + 1}" if track.track_type == 'instrument' else 'Sample'
-            self.track_list.addItem(f"{track.name} • {track.track_type} • {ch} • {track.instrument_mode} • {extra}")
+            self.track_list.addItem(self._track_display_text(track))
         if self.project.tracks:
             safe_index = max(0, min(selected, len(self.project.tracks) - 1))
             self._selected_track_index = safe_index
