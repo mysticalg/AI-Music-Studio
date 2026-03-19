@@ -5,6 +5,8 @@ A desktop MIDI editor DAW prototype with a GUI built in **PySide6**, with:
 - MIDI import split by channel/program with AI instrument assignment, and
 - sample workflow with **WAV/MP3 import/export** plus waveform timeline display.
 
+Live page: [mysticalg.github.io/AI-Music-Studio](https://mysticalg.github.io/AI-Music-Studio/)
+
 ## Implemented features
 
 - Track timeline panel for MIDI tracks
@@ -84,6 +86,18 @@ python app.py
 - `Delete` → Delete selected notes
 - `Z/X/C/V/B/N/M/,` → Trigger virtual piano notes
 
-## Experimental VST3 instrument scaffold
+## Experimental bundled VST3 instruments
 
-A JUCE-based instrument scaffold is available in `plugins/AdvancedVSTi` with core synthesis modules (multi-wave oscillator, unison, FM, sync, filter modes, ADSR + curved envelopes, LFO routing, arp, rhythm gate). See `plugins/AdvancedVSTi/README.md` for build steps. The project now includes a GitHub Actions workflow (`.github/workflows/build-vsti.yml`) that builds a Windows release artifact you can download from the Actions tab.
+A JUCE-based instrument scaffold is available in `plugins/AdvancedVSTi` with core synthesis modules (multi-wave oscillator, unison, FM, sync, filter modes, ADSR + curved envelopes, LFO routing, arp, rhythm gate). The shared source now builds multiple bundled VST3 instruments:
+
+- `AdvancedVSTi`
+- `AI Drum Machine`
+- `AI Bass Synth`
+- `AI String Synth`
+
+See `plugins/AdvancedVSTi/README.md` for build steps. The GitHub Actions workflow (`.github/workflows/build-vsti.yml`) packages the built `.vst3` bundles into a downloadable ZIP. If those bundles are copied into the app's local `vsti/` folder, AI Music Studio now auto-discovers and adds them to the VST rack on startup.
+
+## Support
+
+If you'd like to support this project, you can buy me a coffee:
+[buymeacoffee.com/dhooksterm](https://buymeacoffee.com/dhooksterm)
