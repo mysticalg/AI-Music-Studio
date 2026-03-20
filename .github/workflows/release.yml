@@ -32,7 +32,14 @@ jobs:
       - name: Package portable Windows build
         shell: pwsh
         run: |
-          $archivePath = ./scripts/build_windows_release.ps1 -RepoRoot $PWD -PythonExecutable "${{ env.pythonLocation }}\\python.exe" -ReleaseVersion "${{ github.ref_name }}" -SkipBundledVstBuild
+          $archiveOutput = ./scripts/build_windows_release.ps1 -RepoRoot $PWD -PythonExecutable "${{ env.pythonLocation }}\\python.exe" -ReleaseVersion "${{ github.ref_name }}" -SkipBundledVstBuild
+          $archivePath = ($archiveOutput | Select-Object -Last 1).ToString().Trim()
+          if (-not $archivePath) {
+            throw "Packaging step did not return an archive path."
+          }
+          if (-not (Test-Path $archivePath)) {
+            throw "Archive path not found: $archivePath"
+          }
           "ARCHIVE_PATH=$archivePath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Create SHA256 checksum
