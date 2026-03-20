@@ -36,7 +36,7 @@ if (-not (Test-Path $JuceDir)) {
 }
 
 $pluginRoot = Join-Path $RepoRoot "plugins\\AdvancedVSTi"
-cmake -S $pluginRoot -B $BuildDir -DJUCE_DIR=$JuceDir
+cmake -S $pluginRoot -B $BuildDir "-DJUCE_DIR=$JuceDir"
 if ($LASTEXITCODE -ne 0) {
     throw "CMake configure failed for bundled VST3 instruments."
 }
