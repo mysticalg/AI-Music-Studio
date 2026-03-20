@@ -53,9 +53,14 @@ jobs:
           if-no-files-found: error
 
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            ${{ env.ARCHIVE_PATH }}
-            ${{ env.CHECKSUM_PATH }}
-          generate_release_notes: true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          gh release view $tag --json tagName *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $env:ARCHIVE_PATH $env:CHECKSUM_PATH --clobber
+          } else {
+            gh release create $tag $env:ARCHIVE_PATH $env:CHECKSUM_PATH --title "AI Music Studio $tag" --generate-notes
+          }
