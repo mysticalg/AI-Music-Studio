@@ -1,0 +1,61 @@
+name: Build Windows Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  windows-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Build bundled VST3 instruments
+        shell: pwsh
+        run: |
+          ./scripts/build_bundled_vsti_windows.ps1 -RepoRoot $PWD -OutputDir (Join-Path $PWD "vsti")
+
+      - name: Package portable Windows build
+        shell: pwsh
+        run: |
+          $archivePath = ./scripts/build_windows_release.ps1 -RepoRoot $PWD -PythonExecutable "${{ env.pythonLocation }}\\python.exe" -ReleaseVersion "${{ github.ref_name }}" -SkipBundledVstBuild
+          "ARCHIVE_PATH=$archivePath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Create SHA256 checksum
+        shell: pwsh
+        run: |
+          $hash = Get-FileHash -Path $env:ARCHIVE_PATH -Algorithm SHA256
+          $checksumPath = "$env:ARCHIVE_PATH.sha256"
+          Set-Content -Path $checksumPath -Value "$($hash.Hash.ToLower())  $(Split-Path $env:ARCHIVE_PATH -Leaf)" -Encoding ASCII
+          "CHECKSUM_PATH=$checksumPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AI-Music-Studio-${{ github.ref_name }}-windows-x64
+          path: |
+            ${{ env.ARCHIVE_PATH }}
+            ${{ env.CHECKSUM_PATH }}
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.ARCHIVE_PATH }}
+            ${{ env.CHECKSUM_PATH }}
+          generate_release_notes: true

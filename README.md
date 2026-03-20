@@ -6,6 +6,7 @@ A desktop MIDI editor DAW prototype with a GUI built in **PySide6**, with:
 - sample workflow with **WAV/MP3 import/export** plus waveform timeline display.
 
 Live page: [mysticalg.github.io/AI-Music-Studio](https://mysticalg.github.io/AI-Music-Studio/)
+Releases: [github.com/mysticalg/AI-Music-Studio/releases](https://github.com/mysticalg/AI-Music-Studio/releases)
 
 ## Implemented features
 
@@ -63,6 +64,53 @@ source .venv/bin/activate
 pip install -r requirements.txt
 python app.py
 ```
+
+## Windows release packaging
+
+Local portable build:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_release.ps1 -ReleaseVersion v0.1.0
+```
+
+That script:
+- installs build-time dependencies into `.venv-release`
+- packages the app with PyInstaller
+- copies bundled `vsti/` content when present
+- writes a portable ZIP into `dist/`
+
+Automated GitHub release:
+
+```bash
+git tag v0.1.0
+git push origin main --tags
+```
+
+Pushing a `v*` tag triggers `.github/workflows/release.yml`, which builds the Windows release ZIP and publishes it to GitHub Releases.
+
+## GitHub Pages
+
+The project site is served from the `docs/` folder via `.github/workflows/deploy-pages.yml`. Any push to `main` that changes `docs/`, `README.md`, or the Pages workflow republishes the site.
+
+## macOS notes
+
+- The app now stores preferences, renders, and user-imported helper assets in a per-user app data folder instead of the current working directory.
+  - macOS: `~/Library/Application Support/AI Music Studio`
+  - Windows: `%APPDATA%\\AI Music Studio`
+  - Linux: `$XDG_DATA_HOME/ai-music-studio` or `~/.local/share/ai-music-studio`
+- Bundled VST3 instruments are discovered from the app-local `vsti/` directory. On a packaged macOS `.app`, that maps to the app's `Contents/Resources/vsti` folder.
+- Extra user-managed bundled VST3 files can also live in the per-user `vsti/` app data subfolder.
+- The VST browser now prefers common platform plugin folders automatically, including:
+  - macOS: `~/Library/Audio/Plug-Ins/VST3` and `/Library/Audio/Plug-Ins/VST3`
+  - Windows: common Steinberg and `Common Files/VST3` locations
+
+## macOS packaging outline
+
+1. Build or download macOS-native `.vst3` bundles for the bundled instruments. Windows `.vst3` builds will not load on macOS.
+2. Copy those bundles into `vsti/` before packaging, or into `AI Music Studio.app/Contents/Resources/vsti` after packaging.
+3. Package the Python app as a macOS `.app` with Qt for Python deployment tooling such as `pyside6-deploy`.
+4. Install runtime dependencies in the packaging environment, including `PySide6`, `numpy`, `mido`, `python-rtmidi`, and `pedalboard`.
+5. Test audio output enumeration, VST3 discovery, and plugin UI opening on both Apple Silicon and Intel macOS if you plan to distribute widely.
 
 ## Usage flow (samples)
 

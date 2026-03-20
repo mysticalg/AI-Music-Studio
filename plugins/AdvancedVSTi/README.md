@@ -1,4 +1,4 @@
-# AdvancedVSTi (JUCE VST3 Instrument)
+# AdvancedVSTi Bundled Instruments (JUCE VST3)
 
 This folder adds a JUCE-based VST instrument scaffold with these implemented blocks:
 
@@ -12,22 +12,31 @@ This folder adds a JUCE-based VST instrument scaffold with these implemented blo
 - Arpeggiator modes: up, down, up/down, random.
 - Rhythm gate and per-note oscillator length gate.
 
+The shared source now builds four VST3 products:
+
+- `AdvancedVSTi`
+- `AI Drum Machine`
+- `AI Bass Synth`
+- `AI String Synth`
+
+The packaged variants use flavor-specific defaults, and the drum machine variant also switches to one-shot drum synthesis behavior per MIDI note.
+
 ## Automated GitHub build + download
 
-The repository includes a GitHub Actions workflow at `.github/workflows/build-vsti.yml` that compiles the plugin on `windows-latest` and uploads a downloadable ZIP artifact.
+The repository includes a GitHub Actions workflow at `.github/workflows/build-vsti.yml` that compiles the bundled VST3 instruments on `windows-latest` and uploads a downloadable ZIP artifact.
 
 ### When it runs
 
 - Pushes affecting `plugins/AdvancedVSTi/**`
 - Pull requests affecting `plugins/AdvancedVSTi/**`
-- Manual runs from **Actions > Build AdvancedVSTi > Run workflow**
+- Manual runs from **Actions > Build Bundled VST3 Instruments > Run workflow**
 
 ### How to download
 
 1. Open the **Actions** tab in GitHub.
-2. Open a successful **Build AdvancedVSTi** run.
-3. Download the artifact named **AdvancedVSTi-windows-release**.
-4. Unzip it and load the contained `.vst3` plugin in your VST3 host.
+2. Open a successful **Build Bundled VST3 Instruments** run.
+3. Download the artifact named **AI-Music-Studio-bundled-vst3-windows-release**.
+4. Unzip it and copy the contained `.vst3` bundles into the app's `vsti` folder to make them auto-appear in the rack on startup.
 
 ## Build locally (Windows example)
 
@@ -44,7 +53,8 @@ cmake -S plugins/AdvancedVSTi -B plugins/AdvancedVSTi/build -DJUCE_DIR=C:/dev/JU
 cmake --build plugins/AdvancedVSTi/build --config Release
 ```
 
-4. The VST3 output is created by JUCE in the build artifacts and can be loaded by VST3 hosts.
+4. JUCE creates one `*.vst3` bundle per target in the build artifacts.
+5. Copy the desired `.vst3` bundles into `AI-Music-Studio/vsti/` to package them with the app.
 
 ## About `.dll`
 

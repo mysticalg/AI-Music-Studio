@@ -4,3 +4,13 @@ __pycache__/
 *.mid
 renders/
 *.wav
+.ai_music_studio_prefs.json
+.openai_auth.json
+build/
+dist/
+.venv-release/
+.cache/
+_site/
+plugins/AdvancedVSTi/build*/
+plugins/AdvancedVSTi/dist/
+vsti/
