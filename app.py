@@ -188,6 +188,25 @@ def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+def tick_to_sample_frame(tick: int, sample_rate: int, bpm: int) -> int:
+    tick_value = max(0, int(tick))
+    rate = max(1, int(sample_rate))
+    tempo = max(1, int(bpm))
+    numerator = tick_value * rate * 60
+    denominator = tempo * TICKS_PER_BEAT
+    return (numerator + (denominator // 2)) // denominator
+
+
+def sample_frame_to_seconds(frame: int, sample_rate: int) -> float:
+    return max(0, int(frame)) / float(max(1, int(sample_rate)))
+
+
+def seconds_to_sample_frame(sec: float, sample_rate: int) -> int:
+    rate = max(1, int(sample_rate))
+    value = max(0.0, float(sec)) * rate
+    return max(0, int(math.floor(value + 0.5)))
+
+
 def midi_to_hz(note: int) -> float:
     return 440.0 * (2.0 ** ((note - 69) / 12.0))
 
@@ -555,12 +574,14 @@ class MidiSection:
 
 class ProjectState:
     def __init__(self) -> None:
+        default_bar_sec = 4.0 * (60.0 / max(1, DEFAULT_BPM))
         self.tracks: list[TrackState] = [TrackState(name="Track 1")]
         self.bpm = DEFAULT_BPM
         self.quantize_enabled = True
-        self.quantize_div = 4
+        self.quantize_div = 16
         self.quantize_triplet = False
         self.loop_enabled = True
+        self.metronome_enabled = False
         self.vsti_paths: list[str] = []
         self.vsti_folder_paths: list[str] = []
         self.sample_paths: list[str] = []
@@ -568,8 +589,8 @@ class ProjectState:
         self.sample_assets: list[SampleAsset] = []
         self.sample_clips: list[SampleClip] = []
         self.midi_sections: list[MidiSection] = []
-        self.left_locator_sec = 0.0
-        self.right_locator_sec = 8.0
+        self.left_locator_sec = default_bar_sec
+        self.right_locator_sec = default_bar_sec * 2.0
         self.playhead_sec = 0.0
 
 
@@ -911,9 +932,8 @@ class AISynthRenderer:
         return (0.01, 0.1, 0.65, 0.12)
 
     def render_track_audio(self, track: TrackState, bpm: int) -> tuple[object, int]:
-        max_tick = max((n.start_tick + n.duration_tick for n in track.notes), default=0)
-        max_sec = (max_tick / TICKS_PER_BEAT) * (60.0 / max(1, bpm)) + 1.0
-        total_samples = int(max_sec * self.sample_rate)
+        max_frame = max((tick_to_sample_frame(n.start_tick + n.duration_tick, self.sample_rate, bpm) for n in track.notes), default=0)
+        total_samples = max(1, max_frame + self.sample_rate)
         if np is not None:
             data: object = np.zeros(max(1, total_samples), dtype=np.float32)
         else:
@@ -921,24 +941,24 @@ class AISynthRenderer:
 
         a, d, s, r = self._profile_envelope(track.synth_profile)
         for note in track.notes:
-            start_sec = (note.start_tick / TICKS_PER_BEAT) * (60.0 / max(1, bpm))
-            dur_sec = (note.duration_tick / TICKS_PER_BEAT) * (60.0 / max(1, bpm))
-            start_idx = int(start_sec * self.sample_rate)
-            note_samples = max(1, int(dur_sec * self.sample_rate))
+            start_idx = tick_to_sample_frame(note.start_tick, self.sample_rate, bpm)
+            end_idx = max(start_idx + 1, tick_to_sample_frame(note.start_tick + note.duration_tick, self.sample_rate, bpm))
+            note_samples = max(1, end_idx - start_idx)
+            dur_sec = note_samples / float(self.sample_rate)
             freq = midi_to_hz(note.pitch)
             amp = (note.velocity / 127.0) * track.volume * 0.4
 
-            end_idx = min(len(data), start_idx + note_samples)
-            if end_idx <= start_idx:
+            render_end = min(len(data), start_idx + note_samples)
+            if render_end <= start_idx:
                 continue
 
-            count = end_idx - start_idx
+            count = render_end - start_idx
             if np is not None and isinstance(data, np.ndarray):
                 t = np.arange(count, dtype=np.float32) / float(self.sample_rate)
                 phase = 2.0 * math.pi * freq * t
                 env = self._adsr_curve(t, dur_sec, a, d, s, r)
                 waveform = self._wave_curve(phase, track.synth_profile)
-                data[start_idx:end_idx] += (waveform * env * amp).astype(np.float32, copy=False)
+                data[start_idx:render_end] += (waveform * env * amp).astype(np.float32, copy=False)
                 continue
 
             for i in range(count):
@@ -960,28 +980,30 @@ class AISynthRenderer:
         if track.track_type != 'instrument' or not track.notes:
             return data, self.sample_rate
 
-        chunk_start = max(0.0, float(start_sec))
-        chunk_end = chunk_start + (total_samples / float(self.sample_rate))
-        sec_per_tick = 60.0 / max(1, bpm) / TICKS_PER_BEAT
+        chunk_start_frame = max(0, int(round(max(0.0, float(start_sec)) * self.sample_rate)))
+        chunk_end_frame = chunk_start_frame + total_samples
         a, d, s, r = self._profile_envelope(track.synth_profile)
 
         for note in track.notes:
-            note_start = note.start_tick * sec_per_tick
-            note_duration = note.duration_tick * sec_per_tick
-            note_end = note_start + note_duration
-            if note_end <= chunk_start or note_start >= chunk_end:
+            note_start_frame = tick_to_sample_frame(note.start_tick, self.sample_rate, bpm)
+            note_end_frame = max(
+                note_start_frame + 1,
+                tick_to_sample_frame(note.start_tick + note.duration_tick, self.sample_rate, bpm),
+            )
+            if note_end_frame <= chunk_start_frame or note_start_frame >= chunk_end_frame:
                 continue
 
-            overlap_start = max(note_start, chunk_start)
-            overlap_end = min(note_end, chunk_end)
-            dst_start = max(0, int(round((overlap_start - chunk_start) * self.sample_rate)))
-            dst_end = min(total_samples, int(round((overlap_end - chunk_start) * self.sample_rate)))
+            overlap_start_frame = max(note_start_frame, chunk_start_frame)
+            overlap_end_frame = min(note_end_frame, chunk_end_frame)
+            dst_start = max(0, overlap_start_frame - chunk_start_frame)
+            dst_end = min(total_samples, overlap_end_frame - chunk_start_frame)
             if dst_end <= dst_start:
                 continue
 
             amp = (note.velocity / 127.0) * track.volume * 0.4
             freq = midi_to_hz(note.pitch)
-            source_t = overlap_start - note_start
+            source_t = (overlap_start_frame - note_start_frame) / float(self.sample_rate)
+            note_duration = max(1, note_end_frame - note_start_frame) / float(self.sample_rate)
             count = dst_end - dst_start
 
             if np is not None and isinstance(data, np.ndarray):
@@ -1029,7 +1051,7 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         self.setDragMode(QtWidgets.QGraphicsView.DragMode.RubberBandDrag)
         self.setMouseTracking(True)
         self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
-        self.cell_w = 24
+        self.cell_w = 48
         self.cell_h = 14
         self.total_beats = 64
         self.tool = 'pencil'
@@ -1047,6 +1069,9 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         self._resize_anchor_end_tick = 0
         self._resize_anchor_duration = 0
         self._drag_playhead = False
+        self._drag_left_locator = False
+        self._drag_right_locator = False
+        self._suppress_ruler_context_menu = False
         self._interaction_dirty = False
         self._locator_ruler_height = 16
         self._left_locator_item: QtWidgets.QGraphicsLineItem | None = None
@@ -1219,7 +1244,8 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         self.note_length_div = max(1, div)
 
     def _set_headers(self) -> None:
-        locator_info = f"L {self.project.left_locator_sec:.2f}s  R {self.project.right_locator_sec:.2f}s"
+        bar_duration = 4.0 * (60.0 / max(1, self.project.bpm))
+        locator_info = f"L {self.project.left_locator_sec / bar_duration:.2f}b  R {self.project.right_locator_sec / bar_duration:.2f}b"
         self.setHorizontalHeaderLabels([
             f"Track ({locator_info})", "Type", "Instrument", "Mode", "Profile", "Mute", "Solo", "Notes"
         ])
@@ -1323,6 +1349,17 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         self._resize_anchor_end_tick = clicked.start_tick + clicked.duration_tick
         self._resize_anchor_duration = clicked.duration_tick
 
+    def _finish_left_mouse_interaction(self) -> bool:
+        commit_change = bool(self._interaction_dirty)
+        self._interaction_dirty = False
+        self._drag_playhead = False
+        self._drag_left_locator = False
+        self._pencil_note = None
+        self._drag_selected_snapshot = []
+        self._resize_note = None
+        self._resize_edge = 'right'
+        return commit_change
+
     def _update_hover_cursor(self, scene_pos: QtCore.QPointF | None = None) -> None:
         if scene_pos is None or self.tool not in {'pencil', 'select'}:
             self.unsetCursor()
@@ -1334,6 +1371,42 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
             self.setCursor(QtCore.Qt.CursorShape.OpenHandCursor)
         else:
             self.unsetCursor()
+
+    def _locator_hit_margin_px(self) -> float:
+        return 6.0
+
+    def _ruler_menu_zone_height(self) -> float:
+        return 6.0
+
+    def _is_in_ruler_menu_zone(self, viewport_y: float) -> bool:
+        return 0.0 <= float(viewport_y) <= self._ruler_menu_zone_height()
+
+    def _is_in_locator_ruler(self, viewport_y: float) -> bool:
+        y = float(viewport_y)
+        return self._ruler_menu_zone_height() < y <= self._locator_ruler_height
+
+    def _is_near_any_locator(self, scene_pos: QtCore.QPointF, viewport_y: float) -> bool:
+        if not self._is_in_locator_ruler(viewport_y):
+            return False
+        margin = self._locator_hit_margin_px()
+        left_x = self._locator_x(self.project.left_locator_sec)
+        right_x = self._locator_x(self.project.right_locator_sec)
+        return abs(scene_pos.x() - left_x) <= margin or abs(scene_pos.x() - right_x) <= margin
+
+    def _ruler_hit_target(self, scene_pos: QtCore.QPointF, button: QtCore.Qt.MouseButton, viewport_y: float) -> str | None:
+        if not self._is_in_locator_ruler(viewport_y):
+            return None
+        margin = self._locator_hit_margin_px()
+        left_x = self._locator_x(self.project.left_locator_sec)
+        right_x = self._locator_x(self.project.right_locator_sec)
+        playhead_x = self._locator_x(self.project.playhead_sec)
+        if button == QtCore.Qt.MouseButton.LeftButton and abs(scene_pos.x() - left_x) <= margin:
+            return 'left_locator'
+        if button == QtCore.Qt.MouseButton.RightButton and abs(scene_pos.x() - right_x) <= margin:
+            return 'right_locator'
+        if button == QtCore.Qt.MouseButton.LeftButton and abs(scene_pos.x() - playhead_x) <= margin:
+            return 'playhead'
+        return None
 
     def _update_note_item(self, note: MidiNote) -> None:
         item = self._note_items.get(id(note))
@@ -1445,7 +1518,7 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
                 self.cell_h = max(10, min(28, self.cell_h + step))
             else:
                 step = 2 if delta > 0 else -2
-                self.cell_w = max(8, min(96, self.cell_w + step))
+                self.cell_w = max(8, min(160, self.cell_w + step))
                 self.horizontalZoomChanged.emit(self.cell_w)
             self.refresh()
             event.accept()
@@ -1453,9 +1526,14 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         super().wheelEvent(event)
 
     def contextMenuEvent(self, event: QtGui.QContextMenuEvent) -> None:
+        if self._suppress_ruler_context_menu:
+            self._suppress_ruler_context_menu = False
+            event.accept()
+            return
         scene_pos = self.mapToScene(event.pos())
+        viewport_y = float(event.pos().y())
         menu = QtWidgets.QMenu(self)
-        if scene_pos.y() <= self._locator_ruler_height:
+        if self._is_in_ruler_menu_zone(viewport_y):
             ruler_menu = menu.addMenu('Ruler Display')
             ruler_group = QtGui.QActionGroup(menu)
             ruler_group.setExclusive(True)
@@ -1498,7 +1576,7 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         chosen = menu.exec(event.globalPos())
         if chosen is None:
             return
-        if scene_pos.y() <= self._locator_ruler_height:
+        if self._is_in_ruler_menu_zone(viewport_y):
             if chosen == seconds_action:
                 self.ruler_display_mode = 'seconds'
                 self.rulerDisplayModeChanged.emit(self.ruler_display_mode)
@@ -1565,18 +1643,37 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
         self.setFocus(QtCore.Qt.FocusReason.MouseFocusReason)
         scene_pos = self.mapToScene(event.position().toPoint())
+        viewport_y = float(event.position().y())
         sec = self._x_to_sec(scene_pos.x())
+        ruler_hit = self._ruler_hit_target(scene_pos, event.button(), viewport_y)
 
-        if scene_pos.y() <= self._locator_ruler_height and event.button() == QtCore.Qt.MouseButton.LeftButton:
+        if ruler_hit == 'left_locator':
+            self._drag_left_locator = True
+            self.set_left_locator(sec)
+            return
+        if ruler_hit == 'right_locator':
+            self._drag_right_locator = True
+            self._suppress_ruler_context_menu = True
+            self.set_right_locator(sec)
+            return
+        if ruler_hit == 'playhead':
+            self._drag_playhead = True
+            self.set_playhead(sec)
+            return
+        if self._is_near_any_locator(scene_pos, viewport_y):
+            if event.button() == QtCore.Qt.MouseButton.RightButton:
+                self._suppress_ruler_context_menu = True
+            return
+
+        if self._is_in_locator_ruler(viewport_y) and event.button() == QtCore.Qt.MouseButton.LeftButton:
             if bool(event.modifiers() & QtCore.Qt.KeyboardModifier.ShiftModifier):
                 self.set_right_locator(sec)
             else:
                 self.set_left_locator(sec)
             return
-
-        if abs(scene_pos.x() - self._locator_x(self.project.playhead_sec)) <= 6 and event.button() == QtCore.Qt.MouseButton.LeftButton:
-            self._drag_playhead = True
-            self.set_playhead(sec)
+        if self._is_in_locator_ruler(viewport_y) and event.button() == QtCore.Qt.MouseButton.RightButton:
+            self._suppress_ruler_context_menu = True
+            self.set_right_locator(sec)
             return
 
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
@@ -1616,6 +1713,30 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
         scene_pos = self.mapToScene(event.position().toPoint())
+        if (
+            self._drag_playhead
+            or self._drag_left_locator
+            or self._pencil_note is not None
+            or self._resize_note is not None
+            or self._drag_selected_snapshot
+        ) and not bool(event.buttons() & QtCore.Qt.MouseButton.LeftButton):
+            commit_change = self._finish_left_mouse_interaction()
+            if commit_change:
+                self.noteChanged.emit()
+            self._update_hover_cursor(scene_pos)
+            return
+        if self._drag_right_locator and not bool(event.buttons() & QtCore.Qt.MouseButton.RightButton):
+            self._drag_right_locator = False
+            self._update_hover_cursor(scene_pos)
+            return
+        if self._drag_left_locator:
+            sec = self._x_to_sec(scene_pos.x())
+            self.set_left_locator(sec)
+            return
+        if self._drag_right_locator:
+            sec = self._x_to_sec(scene_pos.x())
+            self.set_right_locator(sec)
+            return
         if self._drag_playhead:
             sec = self._x_to_sec(scene_pos.x())
             self.set_playhead(sec)
@@ -1706,13 +1827,9 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
             self._line_start = None
             commit_change = True
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
-            commit_change = commit_change or self._interaction_dirty
-            self._interaction_dirty = False
-            self._drag_playhead = False
-            self._pencil_note = None
-            self._drag_selected_snapshot = []
-            self._resize_note = None
-            self._resize_edge = 'right'
+            commit_change = commit_change or self._finish_left_mouse_interaction()
+        if event.button() == QtCore.Qt.MouseButton.RightButton:
+            self._drag_right_locator = False
         self._line_start = None
         super().mouseReleaseEvent(event)
         if event.button() == QtCore.Qt.MouseButton.LeftButton and self.tool == 'select' and not commit_change:
@@ -1841,7 +1958,7 @@ class VelocityEditorWidget(QtWidgets.QGraphicsView):
         self.setOptimizationFlag(QtWidgets.QGraphicsView.OptimizationFlag.DontSavePainterState, True)
         self.setOptimizationFlag(QtWidgets.QGraphicsView.OptimizationFlag.DontAdjustForAntialiasing, True)
         self.setFixedHeight(140)
-        self.cell_w = 24
+        self.cell_w = 48
         self.total_beats = 64
         self._drag_note: MidiNote | None = None
         self._drag_dirty = False
@@ -1872,6 +1989,12 @@ class VelocityEditorWidget(QtWidgets.QGraphicsView):
         if self._is_bar_ruler_mode():
             return sec * (max(1, self.project.bpm) / 60.0) * self.cell_w
         return sec * self.cell_w
+
+    def _x_to_sec(self, x: float) -> float:
+        x = max(0.0, float(x))
+        if self._is_bar_ruler_mode():
+            return x * (60.0 / max(1, self.project.bpm)) / max(1e-9, float(self.cell_w))
+        return x / max(1e-9, float(self.cell_w))
 
     def _seconds_per_tick(self) -> float:
         return 60.0 / max(1, self.project.bpm) / TICKS_PER_BEAT
@@ -2015,7 +2138,7 @@ class VelocityEditorWidget(QtWidgets.QGraphicsView):
         delta = event.angleDelta().y()
         if delta:
             step = 2 if delta > 0 else -2
-            self.cell_w = max(8, min(96, self.cell_w + step))
+            self.cell_w = max(8, min(160, self.cell_w + step))
             self.horizontalZoomChanged.emit(self.cell_w)
             self.refresh()
             event.accept()
@@ -2034,7 +2157,8 @@ class TimelineWidget(QtWidgets.QTableWidget):
         self.refresh()
 
     def _set_headers(self) -> None:
-        locator_info = f"L {self.project.left_locator_sec:.2f}s  R {self.project.right_locator_sec:.2f}s"
+        bar_duration = 4.0 * (60.0 / max(1, self.project.bpm))
+        locator_info = f"L {self.project.left_locator_sec / bar_duration:.2f}b  R {self.project.right_locator_sec / bar_duration:.2f}b"
         self.setHorizontalHeaderLabels([
             f"Track ({locator_info})", "Type", "Instrument", "Mode", "Profile", "Mute", "Solo", "Notes"
         ])
@@ -2228,6 +2352,8 @@ class ArrangementOverviewWidget(QtWidgets.QGraphicsView):
         self._drag_origin_track_index = 0
         self.arrangement_quantize_mode = "beat"
         self._drag_playhead = False
+        self._drag_left_locator = False
+        self._drag_right_locator = False
         self._locator_ruler_height = 16
         self.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
         self.setViewportUpdateMode(QtWidgets.QGraphicsView.ViewportUpdateMode.MinimalViewportUpdate)
@@ -2330,22 +2456,61 @@ class ArrangementOverviewWidget(QtWidgets.QGraphicsView):
         sec = max(0.0, self.mapToScene(event.position().toPoint()).x() / self.pixels_per_second)
         self.set_locator_callable(sec)
 
+    def _locator_hit_margin_px(self) -> float:
+        return 6.0
+
+    def _is_near_any_locator(self, scene_pos: QtCore.QPointF, viewport_y: float) -> bool:
+        if float(viewport_y) > self._locator_ruler_height:
+            return False
+        margin = self._locator_hit_margin_px()
+        left_x = self.project.left_locator_sec * self.pixels_per_second
+        right_x = self.project.right_locator_sec * self.pixels_per_second
+        return abs(scene_pos.x() - left_x) <= margin or abs(scene_pos.x() - right_x) <= margin
+
+    def _ruler_hit_target(self, scene_pos: QtCore.QPointF, button: QtCore.Qt.MouseButton, viewport_y: float) -> str | None:
+        if float(viewport_y) > self._locator_ruler_height:
+            return None
+        margin = self._locator_hit_margin_px()
+        left_x = self.project.left_locator_sec * self.pixels_per_second
+        right_x = self.project.right_locator_sec * self.pixels_per_second
+        playhead_x = self.project.playhead_sec * self.pixels_per_second
+        if button == QtCore.Qt.MouseButton.LeftButton and abs(scene_pos.x() - left_x) <= margin:
+            return 'left_locator'
+        if button == QtCore.Qt.MouseButton.RightButton and abs(scene_pos.x() - right_x) <= margin:
+            return 'right_locator'
+        if button == QtCore.Qt.MouseButton.LeftButton and abs(scene_pos.x() - playhead_x) <= margin:
+            return 'playhead'
+        return None
+
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
         scene_pos = self.mapToScene(event.position().toPoint())
+        viewport_y = float(event.position().y())
         sec = max(0.0, scene_pos.x() / self.pixels_per_second)
+        ruler_hit = self._ruler_hit_target(scene_pos, event.button(), viewport_y)
 
-        if scene_pos.y() <= self._locator_ruler_height and event.button() in (QtCore.Qt.MouseButton.LeftButton, QtCore.Qt.MouseButton.RightButton):
-            if event.button() == QtCore.Qt.MouseButton.RightButton or bool(event.modifiers() & QtCore.Qt.KeyboardModifier.ShiftModifier):
+        if ruler_hit == 'left_locator':
+            self._drag_left_locator = True
+            self.set_left_locator_callable(sec)
+            return
+        if ruler_hit == 'right_locator':
+            self._drag_right_locator = True
+            self.set_right_locator_callable(sec)
+            return
+        if ruler_hit == 'playhead':
+            self._drag_playhead = True
+            self.set_locator_callable(sec)
+            return
+        if self._is_near_any_locator(scene_pos, viewport_y):
+            return
+
+        if viewport_y <= self._locator_ruler_height and event.button() == QtCore.Qt.MouseButton.LeftButton:
+            if bool(event.modifiers() & QtCore.Qt.KeyboardModifier.ShiftModifier):
                 self.set_right_locator_callable(sec)
             else:
                 self.set_left_locator_callable(sec)
             return
 
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
-            if abs(scene_pos.x() - (self.project.playhead_sec * self.pixels_per_second)) <= 6:
-                self._drag_playhead = True
-                self.set_locator_callable(sec)
-                return
             item = self.itemAt(event.position().toPoint())
             if item is not None and item.data(0) is not None:
                 self._drag_index = int(item.data(0))
@@ -2360,6 +2525,14 @@ class ArrangementOverviewWidget(QtWidgets.QGraphicsView):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        if self._drag_left_locator:
+            sec = max(0.0, self.mapToScene(event.position().toPoint()).x() / self.pixels_per_second)
+            self.set_left_locator_callable(sec)
+            return
+        if self._drag_right_locator:
+            sec = max(0.0, self.mapToScene(event.position().toPoint()).x() / self.pixels_per_second)
+            self.set_right_locator_callable(sec)
+            return
         if self._drag_playhead:
             sec = max(0.0, self.mapToScene(event.position().toPoint()).x() / self.pixels_per_second)
             self.set_locator_callable(sec)
@@ -2380,6 +2553,8 @@ class ArrangementOverviewWidget(QtWidgets.QGraphicsView):
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
             if self._drag_playhead:
                 self._drag_playhead = False
+            if self._drag_left_locator:
+                self._drag_left_locator = False
             elif self._drag_index is None:
                 self._set_playhead_from_event(event)
             elif 0 <= self._drag_index < len(self.project.midi_sections):
@@ -2392,6 +2567,8 @@ class ArrangementOverviewWidget(QtWidgets.QGraphicsView):
                     section.track_index,
                 )
             self._drag_index = None
+        if event.button() == QtCore.Qt.MouseButton.RightButton:
+            self._drag_right_locator = False
         super().mouseReleaseEvent(event)
 
     def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
@@ -2461,76 +2638,312 @@ class KnobInput(QtWidgets.QWidget):
         self._on_value_changed(self.value())
 
 
+class MixerLevelMeterWidget(QtWidgets.QWidget):
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._level = 0.0
+        self.setFixedSize(16, 210)
+
+    def setLevel(self, level: float) -> None:
+        clamped = max(0.0, min(1.0, float(level)))
+        if abs(clamped - self._level) < 0.002:
+            return
+        self._level = clamped
+        self.update()
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
+        rect = self.rect().adjusted(1, 1, -1, -1)
+        painter.fillRect(rect, QtGui.QColor(8, 14, 18))
+        painter.setPen(QtGui.QPen(QtGui.QColor(56, 72, 88), 1))
+        painter.drawRect(rect)
+
+        if self._level <= 0.0:
+            return
+
+        fill_height = max(2, int(round(rect.height() * self._level)))
+        fill_rect = QtCore.QRect(rect.left() + 1, rect.bottom() - fill_height + 1, max(1, rect.width() - 1), fill_height)
+        gradient = QtGui.QLinearGradient(fill_rect.bottomLeft(), fill_rect.topLeft())
+        gradient.setColorAt(0.0, QtGui.QColor(48, 220, 122))
+        gradient.setColorAt(0.65, QtGui.QColor(232, 206, 64))
+        gradient.setColorAt(1.0, QtGui.QColor(255, 96, 96))
+        painter.fillRect(fill_rect, gradient)
+
+
+class MixerChannelStrip(QtWidgets.QFrame):
+    def __init__(self, row: int, on_change_callable=None, on_select_callable=None) -> None:
+        super().__init__()
+        self._row = int(row)
+        self._on_change = on_change_callable
+        self._on_select = on_select_callable
+        self._loading = False
+        self._selected = False
+        self._accent = QtGui.QColor('#4AB4FF')
+        self.setObjectName('mixerChannelStrip')
+        self.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
+        self.setMinimumWidth(134)
+        self.setMaximumWidth(158)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        self.accent_bar = QtWidgets.QFrame()
+        self.accent_bar.setFixedHeight(4)
+        layout.addWidget(self.accent_bar)
+
+        self.index_label = QtWidgets.QLabel()
+        self.index_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.index_label.setStyleSheet('font-size: 10px; color: #8DA2B8; letter-spacing: 0.6px;')
+        layout.addWidget(self.index_label)
+
+        self.name_label = QtWidgets.QLabel()
+        self.name_label.setWordWrap(True)
+        self.name_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.name_label.setStyleSheet('font-size: 12px; font-weight: 600; color: #E9EEF5;')
+        layout.addWidget(self.name_label)
+
+        self.subtitle_label = QtWidgets.QLabel()
+        self.subtitle_label.setWordWrap(True)
+        self.subtitle_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.subtitle_label.setStyleSheet('font-size: 10px; color: #92A0B1;')
+        layout.addWidget(self.subtitle_label)
+
+        button_row = QtWidgets.QHBoxLayout()
+        button_row.setContentsMargins(0, 0, 0, 0)
+        button_row.setSpacing(6)
+        self.mute_btn = QtWidgets.QToolButton()
+        self.mute_btn.setText('M')
+        self.mute_btn.setCheckable(True)
+        self.mute_btn.setFixedSize(32, 24)
+        self.solo_btn = QtWidgets.QToolButton()
+        self.solo_btn.setText('S')
+        self.solo_btn.setCheckable(True)
+        self.solo_btn.setFixedSize(32, 24)
+        button_row.addStretch(1)
+        button_row.addWidget(self.mute_btn)
+        button_row.addWidget(self.solo_btn)
+        button_row.addStretch(1)
+        layout.addLayout(button_row)
+
+        center_row = QtWidgets.QHBoxLayout()
+        center_row.setContentsMargins(0, 0, 0, 0)
+        center_row.setSpacing(8)
+        self.level_meter = MixerLevelMeterWidget()
+        center_row.addWidget(self.level_meter, 0, QtCore.Qt.AlignmentFlag.AlignHCenter)
+
+        self.volume = QtWidgets.QSlider(QtCore.Qt.Orientation.Vertical)
+        self.volume.setRange(0, 100)
+        self.volume.setTickPosition(QtWidgets.QSlider.TickPosition.TicksBothSides)
+        self.volume.setTickInterval(10)
+        self.volume.setSingleStep(1)
+        self.volume.setPageStep(5)
+        self.volume.setMinimumHeight(220)
+        self.volume.setStyleSheet(
+            'QSlider::groove:vertical { background: #1A2631; border: 1px solid #314456; width: 18px; border-radius: 4px; }'
+            'QSlider::sub-page:vertical { background: #C9D3DF; border-radius: 3px; }'
+            'QSlider::add-page:vertical { background: #10202B; border-radius: 3px; }'
+            'QSlider::handle:vertical { background: #E7F0FA; border: 1px solid #4C667F; height: 20px; margin: 0 -6px; border-radius: 6px; }'
+        )
+        center_row.addWidget(self.volume, 1)
+        layout.addLayout(center_row, 1)
+
+        self.volume_label = QtWidgets.QLabel()
+        self.volume_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.volume_label.setStyleSheet('font-size: 11px; color: #D7E1EC;')
+        layout.addWidget(self.volume_label)
+
+        pan_label = QtWidgets.QLabel('Pan')
+        pan_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        pan_label.setStyleSheet('font-size: 10px; color: #92A0B1;')
+        layout.addWidget(pan_label)
+
+        self.pan = KnobInput(-100, 100, 0, '', dial_size=34)
+        layout.addWidget(self.pan, 0, QtCore.Qt.AlignmentFlag.AlignCenter)
+
+        self.mode_label = QtWidgets.QLabel()
+        self.mode_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.mode_label.setStyleSheet('font-size: 10px; color: #AAB6C4;')
+        self.mode_label.setWordWrap(True)
+        layout.addWidget(self.mode_label)
+
+        layout.addStretch(1)
+
+        self.volume.valueChanged.connect(self._emit_change)
+        self.pan.valueChanged.connect(self._emit_change)
+        self.mute_btn.toggled.connect(self._emit_change)
+        self.solo_btn.toggled.connect(self._emit_change)
+        self._apply_style()
+
+    def _apply_style(self) -> None:
+        border = self._accent.name() if self._selected else '#2A3645'
+        background = '#2A3240' if self._selected else '#202732'
+        self.setStyleSheet(
+            f'QFrame#mixerChannelStrip {{ background: {background}; border: 1px solid {border}; border-radius: 8px; }}'
+            'QToolButton { background: #1A232E; border: 1px solid #3A4C60; border-radius: 5px; color: #E8EEF6; font-weight: 700; }'
+            'QToolButton:checked { background: #E8EEF6; color: #11161D; border-color: #A8BACF; }'
+        )
+        self.accent_bar.setStyleSheet(f'background: {self._accent.name()}; border-radius: 2px;')
+
+    def _emit_change(self, *_args) -> None:
+        if self._loading:
+            return
+        if callable(self._on_change):
+            self._on_change(self._row)
+        self.volume_label.setText(f'{int(self.volume.value())}%')
+
+    def set_track(self, track: TrackState, *, selected: bool, level: float, color: QtGui.QColor) -> None:
+        self._loading = True
+        try:
+            self._selected = bool(selected)
+            self._accent = QtGui.QColor(color)
+            self.index_label.setText(f'TRACK {self._row + 1:02d}')
+            self.name_label.setText(track.name)
+            subtitle = track.instrument if track.instrument_mode != 'Sample' else 'Sample Track'
+            self.subtitle_label.setText(subtitle)
+            self.volume.setValue(int(round(float(track.volume) * 100.0)))
+            self.pan.setValue(int(round(float(track.pan) * 100.0)))
+            self.mute_btn.setChecked(bool(track.mute))
+            self.solo_btn.setChecked(bool(track.solo))
+            self.level_meter.setLevel(level)
+            self.volume_label.setText(f'{int(self.volume.value())}%')
+            mode_text = track.instrument_mode
+            if track.track_type == 'sample':
+                mode_text = 'Sample'
+            self.mode_label.setText(mode_text)
+            self._apply_style()
+        finally:
+            self._loading = False
+
+    def set_level(self, level: float) -> None:
+        self.level_meter.setLevel(level)
+
+    def apply_to_track(self, track: TrackState) -> None:
+        track.volume = self.volume.value() / 100.0
+        track.pan = self.pan.value() / 100.0
+        track.mute = self.mute_btn.isChecked()
+        track.solo = self.solo_btn.isChecked()
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == QtCore.Qt.MouseButton.LeftButton and callable(self._on_select):
+            self._on_select(self._row)
+        super().mousePressEvent(event)
+
+
 class MixerWidget(QtWidgets.QWidget):
-    def __init__(self, project: ProjectState, current_track_callable, available_fx_callable, on_track_updated_callable=None) -> None:
+    def __init__(
+        self,
+        project: ProjectState,
+        current_track_callable,
+        available_fx_callable=None,
+        on_track_updated_callable=None,
+        select_track_callable=None,
+        meter_levels_callable=None,
+    ) -> None:
         super().__init__()
         self.project = project
         self.current_track_callable = current_track_callable
         self.available_fx = available_fx_callable
         self.on_track_updated = on_track_updated_callable
-        self._loading_ui = False
+        self.select_track_callable = select_track_callable
+        self.meter_levels_callable = meter_levels_callable or (lambda: {})
+        self._strips: list[MixerChannelStrip] = []
 
-        layout = QtWidgets.QFormLayout(self)
-        self.volume = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.volume.setRange(0, 100)
-        self.pan = KnobInput(-100, 100, 0)
-        self.mute = QtWidgets.QCheckBox('Mute')
-        self.solo = QtWidgets.QCheckBox('Solo')
-        self.rendered_path = QtWidgets.QLineEdit()
-        self.rendered_path.setReadOnly(True)
-        self.fx_slots: list[QtWidgets.QComboBox] = []
-        layout.addRow("Volume", self.volume)
-        layout.addRow("Pan", self.pan)
-        layout.addRow("Track state", self.mute)
-        layout.addRow("", self.solo)
-        for idx in range(3):
-            combo = QtWidgets.QComboBox()
-            combo.currentTextChanged.connect(self.apply_changes)
-            self.fx_slots.append(combo)
-            layout.addRow(f"VST FX {idx + 1}", combo)
-        layout.addRow("Rendered audio", self.rendered_path)
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
 
-        self.volume.valueChanged.connect(self.apply_changes)
-        self.pan.valueChanged.connect(self.apply_changes)
-        self.mute.toggled.connect(self.apply_changes)
-        self.solo.toggled.connect(self.apply_changes)
+        header = QtWidgets.QLabel('Mixer')
+        header.setStyleSheet('font-size: 16px; font-weight: 700; color: #E9EEF5;')
+        root.addWidget(header)
 
-    def _reload_fx_choices(self, selected_values: list[str]) -> None:
-        entries = list(self.available_fx() or [])
-        labels = ['None', *entries]
-        for idx, combo in enumerate(self.fx_slots):
-            current = selected_values[idx] if idx < len(selected_values) else 'None'
-            combo.blockSignals(True)
-            combo.clear()
-            combo.addItems(labels)
-            selected = current if current in labels else 'None'
-            combo.setCurrentText(selected)
-            combo.blockSignals(False)
+        subheader = QtWidgets.QLabel('All tracks are shown as channel strips with meter, fader, and pan.')
+        subheader.setStyleSheet('font-size: 11px; color: #94A4B7;')
+        root.addWidget(subheader)
+
+        self.scroll = QtWidgets.QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        self.strip_container = QtWidgets.QWidget()
+        self.strip_layout = QtWidgets.QHBoxLayout(self.strip_container)
+        self.strip_layout.setContentsMargins(0, 0, 0, 0)
+        self.strip_layout.setSpacing(10)
+        self.strip_layout.addStretch(1)
+        self.scroll.setWidget(self.strip_container)
+        root.addWidget(self.scroll, 1)
+
+        self._meter_timer = QtCore.QTimer(self)
+        self._meter_timer.setInterval(33)
+        self._meter_timer.timeout.connect(self.refresh_meters)
+        self._meter_timer.start()
+
+    def _selected_index(self) -> int:
+        if not self.project.tracks:
+            return -1
+        try:
+            selected_track = self.current_track_callable()
+        except Exception:
+            return -1
+        for idx, track in enumerate(self.project.tracks):
+            if track is selected_track:
+                return idx
+        return -1
+
+    def _meter_levels(self) -> dict[int, float]:
+        try:
+            raw = self.meter_levels_callable()
+        except Exception:
+            return {}
+        if isinstance(raw, dict):
+            return {int(key): max(0.0, min(1.0, float(value))) for key, value in raw.items()}
+        return {}
+
+    def _on_strip_changed(self, row: int) -> None:
+        if row < 0 or row >= len(self.project.tracks):
+            return
+        self._strips[row].apply_to_track(self.project.tracks[row])
+        if callable(self.on_track_updated):
+            self.on_track_updated(row)
+
+    def _select_track(self, row: int) -> None:
+        if callable(self.select_track_callable):
+            self.select_track_callable(int(row))
+        self.load_track()
+
+    def _ensure_strip_count(self, count: int) -> None:
+        while len(self._strips) < count:
+            row = len(self._strips)
+            strip = MixerChannelStrip(row, self._on_strip_changed, self._select_track)
+            self._strips.append(strip)
+            self.strip_layout.insertWidget(max(0, self.strip_layout.count() - 1), strip)
+        while len(self._strips) > count:
+            strip = self._strips.pop()
+            self.strip_layout.removeWidget(strip)
+            strip.deleteLater()
 
     def load_track(self) -> None:
-        self._loading_ui = True
-        try:
-            track = self.current_track_callable()
-            self._reload_fx_choices(track.vst_fx_chain)
-            self.volume.setValue(int(track.volume * 100))
-            self.pan.setValue(int(track.pan * 100))
-            self.mute.setChecked(track.mute)
-            self.solo.setChecked(track.solo)
-            self.rendered_path.setText(track.rendered_audio_path)
-        finally:
-            self._loading_ui = False
+        self._ensure_strip_count(len(self.project.tracks))
+        levels = self._meter_levels()
+        selected_index = self._selected_index()
+        for row, track in enumerate(self.project.tracks):
+            color = track_display_color(track, row)
+            level = levels.get(row, 0.0)
+            self._strips[row].set_track(track, selected=(row == selected_index), level=level, color=color)
 
-    def apply_changes(self) -> None:
-        if self._loading_ui:
+    def refresh_meters(self) -> None:
+        if not self._strips:
             return
-        track = self.current_track_callable()
-        track.volume = self.volume.value() / 100
-        track.pan = self.pan.value() / 100
-        track.mute = self.mute.isChecked()
-        track.solo = self.solo.isChecked()
-        track.vst_fx_chain = [combo.currentText() for combo in self.fx_slots if combo.currentText() != 'None']
-        if callable(self.on_track_updated):
-            self.on_track_updated()
+        levels = self._meter_levels()
+        for row, strip in enumerate(self._strips):
+            strip.set_level(levels.get(row, 0.0))
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        self.load_track()
 
 
 class InstrumentFxWidget(QtWidgets.QWidget):
@@ -2969,6 +3382,185 @@ class FloatingPanelWindow(QtWidgets.QMainWindow):
         self.visibilityChanged.emit(False)
 
 
+class VirtualPianoKeyboardWidget(QtWidgets.QWidget):
+    noteTriggered = QtCore.Signal(int)
+
+    _NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+
+    def __init__(self, key_specs: list[tuple[int, str, list[str]]], parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.setMouseTracking(True)
+        self._key_scale = 0.5
+        self._pressed_pitch: int | None = None
+        self._pressed_timer = QtCore.QTimer(self)
+        self._pressed_timer.setSingleShot(True)
+        self._pressed_timer.timeout.connect(self._clear_pressed_pitch)
+        self._key_specs: list[dict[str, object]] = [
+            {
+                'pitch': int(pitch),
+                'primary': str(primary),
+                'aliases': [str(alias) for alias in aliases],
+                'is_black': int(pitch) % 12 in BLACK_KEY_PITCH_CLASSES,
+                'rect': QtCore.QRectF(),
+            }
+            for pitch, primary, aliases in key_specs
+        ]
+        self._white_keys = [spec for spec in self._key_specs if not bool(spec['is_black'])]
+        self._black_keys = [spec for spec in self._key_specs if bool(spec['is_black'])]
+        self._update_widget_size()
+        self._rebuild_key_geometry()
+
+    def minimumSizeHint(self) -> QtCore.QSize:
+        return self._natural_size()
+
+    def sizeHint(self) -> QtCore.QSize:
+        return self._natural_size()
+
+    def key_scale(self) -> float:
+        return float(self._key_scale)
+
+    def set_key_scale(self, scale: float) -> None:
+        new_scale = max(0.35, min(1.75, float(scale)))
+        if abs(new_scale - self._key_scale) < 0.001:
+            return
+        self._key_scale = new_scale
+        self._update_widget_size()
+        self._rebuild_key_geometry()
+
+    def _natural_size(self) -> QtCore.QSize:
+        white_width = 54.0 * self._key_scale
+        white_height = 184.0 * self._key_scale
+        width = int(math.ceil((white_width * max(1, len(self._white_keys))) + 24.0))
+        height = int(math.ceil(white_height + 24.0))
+        return QtCore.QSize(max(280, width), max(96, height))
+
+    def _update_widget_size(self) -> None:
+        size = self._natural_size()
+        self.setMinimumSize(size)
+        self.resize(size)
+        self.updateGeometry()
+
+    def _note_name(self, pitch: int) -> str:
+        return self._NOTE_NAMES[int(pitch) % 12]
+
+    def _shortcut_text(self, spec: dict[str, object]) -> str:
+        labels = [str(spec['primary']), *[str(alias) for alias in spec['aliases']]]
+        return ' / '.join(label for label in labels if label)
+
+    def _rebuild_key_geometry(self) -> None:
+        rect = QtCore.QRectF(self.contentsRect()).adjusted(12, 12, -12, -12)
+        if rect.width() <= 0.0 or rect.height() <= 0.0 or not self._white_keys:
+            return
+        natural = self._natural_size()
+        natural_width = max(1.0, float(natural.width() - 24))
+        natural_height = max(1.0, float(natural.height() - 24))
+        left = rect.x() + max(0.0, (rect.width() - natural_width) / 2.0)
+        top = rect.y() + max(0.0, (rect.height() - natural_height) / 2.0)
+        white_width = natural_width / max(1, len(self._white_keys))
+        white_height = natural_height
+        black_width = white_width * 0.62
+        black_height = white_height * 0.62
+        white_cursor = 0
+        for spec in self._key_specs:
+            pitch = int(spec['pitch'])
+            if pitch % 12 in BLACK_KEY_PITCH_CLASSES:
+                x_center = left + (white_cursor * white_width)
+                spec['rect'] = QtCore.QRectF(x_center - (black_width / 2.0), top, black_width, black_height)
+            else:
+                spec['rect'] = QtCore.QRectF(left + (white_cursor * white_width), top, white_width + 0.5, white_height)
+                white_cursor += 1
+        self.update()
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._rebuild_key_geometry()
+
+    def _color_for_key(self, spec: dict[str, object]) -> QtGui.QLinearGradient:
+        rect = QtCore.QRectF(spec['rect'])
+        gradient = QtGui.QLinearGradient(rect.topLeft(), rect.bottomLeft())
+        is_black = bool(spec['is_black'])
+        pitch = int(spec['pitch'])
+        active = self._pressed_pitch == pitch
+        if is_black:
+            if active:
+                gradient.setColorAt(0.0, QtGui.QColor(78, 170, 255))
+                gradient.setColorAt(1.0, QtGui.QColor(20, 88, 180))
+            else:
+                gradient.setColorAt(0.0, QtGui.QColor(72, 82, 96))
+                gradient.setColorAt(1.0, QtGui.QColor(18, 22, 28))
+        else:
+            if active:
+                gradient.setColorAt(0.0, QtGui.QColor(202, 235, 255))
+                gradient.setColorAt(1.0, QtGui.QColor(112, 186, 255))
+            else:
+                gradient.setColorAt(0.0, QtGui.QColor(252, 252, 252))
+                gradient.setColorAt(1.0, QtGui.QColor(208, 214, 224))
+        return gradient
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        painter.fillRect(self.rect(), QtGui.QColor(20, 22, 28))
+
+        for spec in self._white_keys:
+            rect = QtCore.QRectF(spec['rect'])
+            painter.setPen(QtGui.QPen(QtGui.QColor(72, 78, 88), 1.0))
+            painter.setBrush(QtGui.QBrush(self._color_for_key(spec)))
+            painter.drawRoundedRect(rect, 4.0, 4.0)
+            painter.setPen(QtGui.QColor(44, 48, 56))
+            painter.setFont(QtGui.QFont('Segoe UI', max(6, int(round(8 * self._key_scale))), QtGui.QFont.Weight.Medium))
+            painter.drawText(rect.adjusted(0, rect.height() - (34 * self._key_scale), 0, -(16 * self._key_scale)), QtCore.Qt.AlignmentFlag.AlignCenter, self._note_name(int(spec['pitch'])))
+            painter.setPen(QtGui.QColor(96, 104, 118))
+            painter.setFont(QtGui.QFont('Segoe UI', max(6, int(round(7 * self._key_scale)))))
+            painter.drawText(rect.adjusted(0, rect.height() - (18 * self._key_scale), 0, -4), QtCore.Qt.AlignmentFlag.AlignCenter, str(spec['primary']))
+
+        for spec in self._black_keys:
+            rect = QtCore.QRectF(spec['rect'])
+            painter.setPen(QtGui.QPen(QtGui.QColor(12, 14, 18), 1.0))
+            painter.setBrush(QtGui.QBrush(self._color_for_key(spec)))
+            painter.drawRoundedRect(rect, 4.0, 4.0)
+            painter.setPen(QtGui.QColor(232, 240, 248))
+            painter.setFont(QtGui.QFont('Segoe UI', max(6, int(round(7 * self._key_scale))), QtGui.QFont.Weight.Medium))
+            painter.drawText(rect.adjusted(0, rect.height() - (26 * self._key_scale), 0, -(12 * self._key_scale)), QtCore.Qt.AlignmentFlag.AlignCenter, self._note_name(int(spec['pitch'])))
+            painter.setPen(QtGui.QColor(176, 188, 204))
+            painter.setFont(QtGui.QFont('Segoe UI', max(6, int(round(6 * self._key_scale)))))
+            painter.drawText(rect.adjusted(0, rect.height() - (14 * self._key_scale), 0, -3), QtCore.Qt.AlignmentFlag.AlignCenter, str(spec['primary']))
+
+    def _hit_test(self, pos: QtCore.QPointF) -> dict[str, object] | None:
+        for spec in self._black_keys:
+            if QtCore.QRectF(spec['rect']).contains(pos):
+                return spec
+        for spec in self._white_keys:
+            if QtCore.QRectF(spec['rect']).contains(pos):
+                return spec
+        return None
+
+    def _clear_pressed_pitch(self) -> None:
+        if self._pressed_pitch is None:
+            return
+        self._pressed_pitch = None
+        self.update()
+
+    def flash_pitch(self, pitch: int) -> None:
+        self._pressed_pitch = int(pitch)
+        self._pressed_timer.start(140)
+        self.update()
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() != QtCore.Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        spec = self._hit_test(event.position())
+        if spec is None:
+            super().mousePressEvent(event)
+            return
+        pitch = int(spec['pitch'])
+        self.flash_pitch(pitch)
+        self.noteTriggered.emit(pitch)
+        event.accept()
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -2997,8 +3589,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._note_editor_inner_sizes = [640, 160]
         self._tools_window_visible = True
         self._tools_window_geometry_b64 = ''
+        self._mixer_window_visible = True
+        self._mixer_window_geometry_b64 = ''
         self._transport_window_visible = True
         self._transport_window_geometry_b64 = ''
+        self._virtual_piano_window_visible = False
+        self._virtual_piano_window_geometry_b64 = ''
+        self._virtual_piano_key_scale_percent = 50
+        self._virtual_piano_shortcuts: list[QtGui.QShortcut] = []
         self._layout_save_timer = QtCore.QTimer(self)
         self._layout_save_timer.setSingleShot(True)
         self._layout_save_timer.timeout.connect(self._save_preferences)
@@ -3015,11 +3613,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._preview_resources: list[tuple[QtMultimedia.QAudioSink, QtCore.QBuffer]] = []
         self._playback_mix_wav_bytes = b''
         self._playback_frame_position = 0
+        self._playback_generated_total_frames = 0
+        self._playback_logical_origin_frame = 0
         self._playback_chunk_frames = 1024
         self._playback_sample_rate = 44100
         self._playback_channel_count = 2
         self._playback_active = False
+        self._realtime_mix_cache: object | None = None
+        self._realtime_mix_cache_start_frame = 0
+        self._realtime_mix_cache_frame_count = 0
         self._realtime_track_states: dict[int, RealtimeTrackPlaybackState] = {}
+        self._track_meter_levels: dict[int, float] = {}
         self._sample_audio_cache: dict[str, tuple[object, int, int]] = {}
         self._realtime_reset_pending = False
         self._playback_mix_cache_key = ''
@@ -3069,7 +3673,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.velocity_editor.velocityChanged.connect(self.on_velocity_editor_changed)
         self.velocity_editor.horizontalZoomChanged.connect(self.set_note_editor_zoom)
 
-        self.mixer = MixerWidget(self.project, self.current_track, self.available_fx_plugin_names, self.on_mixer_track_changed)
+        self.mixer = MixerWidget(
+            self.project,
+            self.current_track,
+            self.available_fx_plugin_names,
+            self.on_mixer_track_changed,
+            self.select_track_by_index,
+            self.track_meter_levels,
+        )
         self.instruments = InstrumentFxWidget(self.project, self.current_track, self.refresh_vsti_rack_ui, self.on_track_instrument_changed, self.load_vsti_binary_by_name, self.open_vsti_gui_by_name, self.vsti_parameter_names_for_rack)
         self.sample_timeline = SampleTimelineWidget(self.project, self.sample_track_indices, self.place_sample_asset_on_track, self.set_playhead_position)
         self.arrangement_overview = ArrangementOverviewWidget(self.project, self.set_playhead_position, self.set_left_locator_position, self.set_right_locator_position, self.apply_arrangement_section_move, lambda: self.project.bpm)
@@ -3080,7 +3691,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "Off", "1/1", "1/2", "1/2T", "1/4", "1/4T", "1/8", "1/8T", "1/16", "1/16T", "1/32", "1/32T", "1/64", "1/64T"
         ]
         self.quantize_box.addItems(quantize_values)
-        self.quantize_box.setCurrentText("1/4")
+        self.quantize_box.setCurrentText("1/16")
         self.quantize_box.currentTextChanged.connect(self.on_quantize_changed)
         self.quantize_snap_btn = QtWidgets.QPushButton("Snap")
         self.quantize_snap_btn.clicked.connect(self.piano_roll.quantize_selected)
@@ -3125,12 +3736,16 @@ class MainWindow(QtWidgets.QMainWindow):
         right_tabs.addTab(self.timeline, "Timeline")
         right_tabs.addTab(self.arrangement_overview, "Arrangement Overview")
         right_tabs.addTab(self.sample_timeline, "Sample Timeline")
-        right_tabs.addTab(self.mixer, "Mixer")
         right_tabs.addTab(self.instruments, "Instruments / FX")
         self.right_tabs = right_tabs
         self.tools_window = FloatingPanelWindow('Panels', self)
         self.tools_window.setCentralWidget(self.right_tabs)
         self.tools_window.visibilityChanged.connect(self._on_tools_window_visibility_changed)
+
+        self.mixer_window = FloatingPanelWindow('Mixer', self)
+        self.mixer_window.setCentralWidget(self.mixer)
+        self.mixer_window.resize(1100, 500)
+        self.mixer_window.visibilityChanged.connect(self._on_mixer_window_visibility_changed)
 
         note_editor = QtWidgets.QWidget()
         note_editor.setMinimumHeight(0)
@@ -3172,13 +3787,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(splitter_main)
         self._setup_menus()
         self._setup_floating_transport()
+        self._setup_virtual_piano_window()
         self._setup_shortcuts()
         self._populate_track_list()
         self.track_list.setCurrentRow(0)
-        self._setup_virtual_piano_dock()
         self.refresh_sample_library()
         self.scan_sample_paths()
         self._apply_tools_window_preferences()
+        self._apply_mixer_window_preferences()
         self._update_window_title()
 
     def _setup_menus(self) -> None:
@@ -3264,11 +3880,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.show_panels_window_action.setChecked(self._tools_window_visible)
         self.show_panels_window_action.toggled.connect(self.toggle_tools_window)
         windows_menu.addAction(self.show_panels_window_action)
+        self.show_mixer_window_action = QtGui.QAction('Show Mixer Window', self)
+        self.show_mixer_window_action.setCheckable(True)
+        self.show_mixer_window_action.setChecked(self._mixer_window_visible)
+        self.show_mixer_window_action.toggled.connect(self.toggle_mixer_window)
+        windows_menu.addAction(self.show_mixer_window_action)
         self.show_transport_window_action = QtGui.QAction('Show Transport Window', self)
         self.show_transport_window_action.setCheckable(True)
         self.show_transport_window_action.setChecked(self._transport_window_visible)
         self.show_transport_window_action.toggled.connect(self.toggle_transport_window)
         windows_menu.addAction(self.show_transport_window_action)
+        self.show_virtual_piano_window_action = QtGui.QAction('Show Virtual Piano Window', self)
+        self.show_virtual_piano_window_action.setCheckable(True)
+        self.show_virtual_piano_window_action.setChecked(self._virtual_piano_window_visible)
+        self.show_virtual_piano_window_action.toggled.connect(self.toggle_virtual_piano_window)
+        windows_menu.addAction(self.show_virtual_piano_window_action)
         self.toggle_transport_shortcut = QtGui.QShortcut(QtGui.QKeySequence('F2'), self)
         self.toggle_transport_shortcut.setContext(QtCore.Qt.ShortcutContext.ApplicationShortcut)
         self.toggle_transport_shortcut.activated.connect(self._toggle_transport_window_shortcut)
@@ -3398,6 +4024,15 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.transport_loop_btn.toggled.connect(self.set_loop_enabled)
 
+        self.transport_metronome_btn = QtWidgets.QToolButton()
+        configure_transport_button(
+            self.transport_metronome_btn,
+            tooltip='Toggle metronome click on every beat',
+            text='Click',
+            checkable=True,
+        )
+        self.transport_metronome_btn.toggled.connect(self.set_metronome_enabled)
+
         self.transport_play_btn.clicked.connect(self.start_playback)
         self.transport_stop_btn.clicked.connect(self.stop_playback)
         transport_layout.addWidget(self.transport_home_btn)
@@ -3406,6 +4041,7 @@ class MainWindow(QtWidgets.QMainWindow):
         transport_layout.addWidget(self.transport_stop_btn)
         transport_layout.addWidget(self.transport_forward_btn)
         transport_layout.addWidget(self.transport_loop_btn)
+        transport_layout.addWidget(self.transport_metronome_btn)
 
         self.playhead_spin = QtWidgets.QDoubleSpinBox()
         self.playhead_spin.setRange(0.0, 3600.0)
@@ -3416,17 +4052,19 @@ class MainWindow(QtWidgets.QMainWindow):
         transport_layout.addWidget(QtWidgets.QLabel('Playhead'))
         transport_layout.addWidget(self.playhead_spin)
         self.left_locator = QtWidgets.QDoubleSpinBox()
-        self.left_locator.setRange(0.0, 3600.0)
-        self.left_locator.setValue(self.project.left_locator_sec)
+        self.left_locator.setRange(0.0, 9999.0)
+        self.left_locator.setDecimals(2)
         self.right_locator = QtWidgets.QDoubleSpinBox()
-        self.right_locator.setRange(0.0, 3600.0)
-        self.right_locator.setValue(self.project.right_locator_sec)
+        self.right_locator.setRange(0.0, 9999.0)
+        self.right_locator.setDecimals(2)
         self.left_locator.valueChanged.connect(self.update_locators)
         self.right_locator.valueChanged.connect(self.update_locators)
         transport_layout.addWidget(QtWidgets.QLabel('L'))
         transport_layout.addWidget(self.left_locator)
         transport_layout.addWidget(QtWidgets.QLabel('R'))
         transport_layout.addWidget(self.right_locator)
+        self._refresh_locator_spin_configuration()
+        self._set_locator_spin_values(self.project.left_locator_sec, self.project.right_locator_sec)
         self.tempo_spin = QtWidgets.QSpinBox()
         self.tempo_spin.setRange(20, 300)
         self.tempo_spin.setValue(self.project.bpm)
@@ -3481,6 +4119,28 @@ class MainWindow(QtWidgets.QMainWindow):
         div = max(1, int(self.project.quantize_div))
         return f"1/{div}{'T' if self.project.quantize_triplet else ''}"
 
+    def _seconds_to_locator_bars(self, sec: float) -> float:
+        return max(0.0, float(sec) / max(1e-9, self._bar_duration_seconds()))
+
+    def _locator_bars_to_seconds(self, bars: float) -> float:
+        return max(0.0, float(bars)) * self._bar_duration_seconds()
+
+    def _locator_step_bars(self) -> float:
+        if not getattr(self.project, 'quantize_enabled', True):
+            return 0.01
+        beats = 4.0 / max(1, int(self.project.quantize_div))
+        if getattr(self.project, 'quantize_triplet', False):
+            beats *= 2.0 / 3.0
+        return max(0.01, beats / 4.0)
+
+    def _refresh_locator_spin_configuration(self) -> None:
+        if hasattr(self, 'left_locator'):
+            self.left_locator.setSingleStep(self._locator_step_bars())
+            self.left_locator.setToolTip('Left locator position in bars')
+        if hasattr(self, 'right_locator'):
+            self.right_locator.setSingleStep(self._locator_step_bars())
+            self.right_locator.setToolTip('Right locator position in bars')
+
     @staticmethod
     def _decode_project_blob(value: object) -> bytes:
         if not value:
@@ -3519,7 +4179,9 @@ class MainWindow(QtWidgets.QMainWindow):
             'arrangement_pixels_per_second': int(self.arrangement_overview.pixels_per_second),
             'panels_tab_index': int(self.right_tabs.currentIndex()),
             'panels_visible': bool(self.tools_window.isVisible()),
+            'mixer_visible': bool(self.mixer_window.isVisible()) if hasattr(self, 'mixer_window') else True,
             'transport_visible': bool(self.transport_window.isVisible()),
+            'virtual_piano_visible': bool(self.virtual_piano_window.isVisible()) if hasattr(self, 'virtual_piano_window') else True,
         }
 
     def _project_payload(self) -> dict[str, object]:
@@ -3539,6 +4201,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 'quantize_div': int(self.project.quantize_div),
                 'quantize_triplet': bool(self.project.quantize_triplet),
                 'loop_enabled': bool(self.project.loop_enabled),
+                'metronome_enabled': bool(self.project.metronome_enabled),
                 'left_locator_sec': float(self.project.left_locator_sec),
                 'right_locator_sec': float(self.project.right_locator_sec),
                 'playhead_sec': float(self.project.playhead_sec),
@@ -3562,13 +4225,15 @@ class MainWindow(QtWidgets.QMainWindow):
         project = ProjectState()
         project.bpm = self._coerce_int(project_root.get('bpm'), DEFAULT_BPM, 20, 300)
         project.quantize_enabled = bool(project_root.get('quantize_enabled', True))
-        project.quantize_div = self._coerce_int(project_root.get('quantize_div'), 4, 1, 64)
+        project.quantize_div = self._coerce_int(project_root.get('quantize_div'), 16, 1, 64)
         project.quantize_triplet = bool(project_root.get('quantize_triplet', False))
         project.loop_enabled = bool(project_root.get('loop_enabled', True))
-        project.left_locator_sec = self._coerce_float(project_root.get('left_locator_sec'), 0.0, 0.0, 3600.0)
-        project.right_locator_sec = self._coerce_float(project_root.get('right_locator_sec'), 8.0, 0.0, 3600.0)
+        project.metronome_enabled = bool(project_root.get('metronome_enabled', False))
+        default_bar_sec = 4.0 * (60.0 / max(1, project.bpm))
+        project.left_locator_sec = self._coerce_float(project_root.get('left_locator_sec'), default_bar_sec, 0.0, 3600.0)
+        project.right_locator_sec = self._coerce_float(project_root.get('right_locator_sec'), default_bar_sec * 2.0, 0.0, 3600.0)
         if project.right_locator_sec <= project.left_locator_sec:
-            project.right_locator_sec = project.left_locator_sec + 8.0
+            project.right_locator_sec = project.left_locator_sec + default_bar_sec
         project.playhead_sec = self._coerce_float(project_root.get('playhead_sec'), 0.0, 0.0, project.right_locator_sec)
 
         track_state_blobs: dict[int, bytes] = {}
@@ -3721,6 +4386,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.arrangement_overview.project = project
         self.mixer.project = project
         self.instruments.project = project
+        self._track_meter_levels = {}
 
     def _reset_project_runtime_state(self) -> None:
         self._deferred_note_refresh_timer.stop()
@@ -3761,21 +4427,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tempo_spin.blockSignals(True)
         self.tempo_spin.setValue(int(self.project.bpm))
         self.tempo_spin.blockSignals(False)
-        self.left_locator.blockSignals(True)
-        self.left_locator.setValue(float(self.project.left_locator_sec))
-        self.left_locator.blockSignals(False)
-        self.right_locator.blockSignals(True)
-        self.right_locator.setValue(float(self.project.right_locator_sec))
-        self.right_locator.blockSignals(False)
+        self._refresh_locator_spin_configuration()
+        self._set_locator_spin_values(self.project.left_locator_sec, self.project.right_locator_sec)
         self._refresh_transport_controls()
 
         self.piano_roll.tool = str((ui_state or {}).get('piano_roll_tool') or self.piano_roll.tool)
         self.piano_roll.note_length_div = self._coerce_int((ui_state or {}).get('piano_roll_note_length_div'), self.piano_roll.note_length_div, 1, 64)
         ruler_mode = str((ui_state or {}).get('piano_roll_ruler_mode') or self.piano_roll.ruler_display_mode).strip().lower()
         self.piano_roll.ruler_display_mode = ruler_mode if ruler_mode in {'seconds', 'bars'} else 'bars'
-        self.piano_roll.cell_w = self._coerce_int((ui_state or {}).get('piano_roll_cell_w'), self.piano_roll.cell_w, 8, 96)
+        self.piano_roll.cell_w = self._coerce_int((ui_state or {}).get('piano_roll_cell_w'), self.piano_roll.cell_w, 8, 160)
         self.piano_roll.cell_h = self._coerce_int((ui_state or {}).get('piano_roll_cell_h'), self.piano_roll.cell_h, 10, 28)
-        self.velocity_editor.cell_w = self._coerce_int((ui_state or {}).get('velocity_cell_w'), self.velocity_editor.cell_w, 8, 96)
+        self.velocity_editor.cell_w = self._coerce_int((ui_state or {}).get('velocity_cell_w'), self.velocity_editor.cell_w, 8, 160)
         self.sample_timeline.pixels_per_second = self._coerce_int((ui_state or {}).get('sample_timeline_pixels_per_second'), self.sample_timeline.pixels_per_second, 20, 320)
         self.arrangement_overview.pixels_per_second = self._coerce_int((ui_state or {}).get('arrangement_pixels_per_second'), self.arrangement_overview.pixels_per_second, 20, 320)
         self.right_tabs.setCurrentIndex(self._coerce_int((ui_state or {}).get('panels_tab_index'), self.right_tabs.currentIndex(), 0, max(0, self.right_tabs.count() - 1)))
@@ -3800,12 +4462,24 @@ class MainWindow(QtWidgets.QMainWindow):
             self.show_panels_window_action.setChecked(panels_visible)
             self.show_panels_window_action.blockSignals(False)
             self.toggle_tools_window(panels_visible)
+        if hasattr(self, 'show_mixer_window_action'):
+            mixer_visible = bool((ui_state or {}).get('mixer_visible', self._mixer_window_visible))
+            self.show_mixer_window_action.blockSignals(True)
+            self.show_mixer_window_action.setChecked(mixer_visible)
+            self.show_mixer_window_action.blockSignals(False)
+            self.toggle_mixer_window(mixer_visible)
         if hasattr(self, 'show_transport_window_action'):
             transport_visible = bool((ui_state or {}).get('transport_visible', self._transport_window_visible))
             self.show_transport_window_action.blockSignals(True)
             self.show_transport_window_action.setChecked(transport_visible)
             self.show_transport_window_action.blockSignals(False)
             self.toggle_transport_window(transport_visible)
+        if hasattr(self, 'show_virtual_piano_window_action'):
+            piano_visible = bool((ui_state or {}).get('virtual_piano_visible', self._virtual_piano_window_visible))
+            self.show_virtual_piano_window_action.blockSignals(True)
+            self.show_virtual_piano_window_action.setChecked(piano_visible)
+            self.show_virtual_piano_window_action.blockSignals(False)
+            self.toggle_virtual_piano_window(piano_visible)
 
         self._update_window_title()
 
@@ -3813,6 +4487,7 @@ class MainWindow(QtWidgets.QMainWindow):
         value = text.strip().upper()
         if value == 'OFF':
             self.project.quantize_enabled = False
+            self._refresh_locator_spin_configuration()
             self.piano_roll.refresh()
             self.statusBar().showMessage('Quantize disabled')
             return
@@ -3827,6 +4502,7 @@ class MainWindow(QtWidgets.QMainWindow):
             triplet = False
         self.project.quantize_div = max(1, div)
         self.project.quantize_triplet = triplet
+        self._refresh_locator_spin_configuration()
         self.piano_roll.quantize_selected()
         self.piano_roll.refresh()
 
@@ -3850,27 +4526,73 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_locator_spin_values(self, left: float, right: float) -> None:
         self.left_locator.blockSignals(True)
-        self.left_locator.setValue(float(left))
+        self.left_locator.setValue(self._seconds_to_locator_bars(left))
         self.left_locator.blockSignals(False)
         self.right_locator.blockSignals(True)
-        self.right_locator.setValue(float(right))
+        self.right_locator.setValue(self._seconds_to_locator_bars(right))
         self.right_locator.blockSignals(False)
+
+    def _scene_pos_from_global_cursor(self, view: QtWidgets.QGraphicsView, global_pos: QtCore.QPoint) -> QtCore.QPointF | None:
+        if view is None or not view.isVisible():
+            return None
+        viewport = view.viewport()
+        if viewport is None or not viewport.isVisible():
+            return None
+        local_pos = viewport.mapFromGlobal(global_pos)
+        if not viewport.rect().contains(local_pos):
+            return None
+        return view.mapToScene(local_pos)
+
+    def _locator_seconds_from_global_pos(self, global_pos: QtCore.QPoint | None = None) -> float | None:
+        cursor_pos = global_pos or QtGui.QCursor.pos()
+
+        scene_pos = self._scene_pos_from_global_cursor(self.piano_roll, cursor_pos)
+        if scene_pos is not None:
+            return self.piano_roll._x_to_sec(scene_pos.x())
+
+        scene_pos = self._scene_pos_from_global_cursor(self.velocity_editor, cursor_pos)
+        if scene_pos is not None:
+            return self.velocity_editor._x_to_sec(scene_pos.x())
+
+        scene_pos = self._scene_pos_from_global_cursor(self.arrangement_overview, cursor_pos)
+        if scene_pos is not None:
+            return max(0.0, scene_pos.x() / max(1e-9, float(self.arrangement_overview.pixels_per_second)))
+
+        scene_pos = self._scene_pos_from_global_cursor(self.sample_timeline, cursor_pos)
+        if scene_pos is not None:
+            return max(0.0, scene_pos.x() / max(1e-9, float(self.sample_timeline.pixels_per_second)))
+
+        return None
+
+    def set_left_locator_from_mouse(self) -> None:
+        sec = self._locator_seconds_from_global_pos()
+        if sec is None:
+            self.statusBar().showMessage('Hover over the piano roll or timeline to set the left locator')
+            return
+        self.set_left_locator_position(sec)
+
+    def set_right_locator_from_mouse(self) -> None:
+        sec = self._locator_seconds_from_global_pos()
+        if sec is None:
+            self.statusBar().showMessage('Hover over the piano roll or timeline to set the right locator')
+            return
+        self.set_right_locator_position(sec)
 
     def set_left_locator_position(self, sec: float) -> None:
         snapped = self._snap_locator_seconds(sec)
         self.project.left_locator_sec = min(max(0.0, snapped), self.project.right_locator_sec)
-        self._set_locator_spin_values(self.project.left_locator_sec, self.right_locator.value())
+        self._set_locator_spin_values(self.project.left_locator_sec, self.project.right_locator_sec)
         self.update_locators()
 
     def set_right_locator_position(self, sec: float) -> None:
         snapped = self._snap_locator_seconds(sec)
         self.project.right_locator_sec = max(max(0.0, snapped), self.project.left_locator_sec)
-        self._set_locator_spin_values(self.left_locator.value(), self.project.right_locator_sec)
+        self._set_locator_spin_values(self.project.left_locator_sec, self.project.right_locator_sec)
         self.update_locators()
 
     def update_locators(self) -> None:
-        snapped_left = self._snap_locator_seconds(self.left_locator.value())
-        snapped_right = self._snap_locator_seconds(self.right_locator.value())
+        snapped_left = self._snap_locator_seconds(self._locator_bars_to_seconds(self.left_locator.value()))
+        snapped_right = self._snap_locator_seconds(self._locator_bars_to_seconds(self.right_locator.value()))
         self.project.left_locator_sec = min(snapped_left, snapped_right)
         self.project.right_locator_sec = max(snapped_left, snapped_right)
         self._set_locator_spin_values(self.project.left_locator_sec, self.project.right_locator_sec)
@@ -3910,6 +4632,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._track_playback_audio_cache.clear()
         if reset_realtime:
             self._realtime_reset_pending = True
+            self._clear_realtime_mix_cache()
 
     def _cleanup_legacy_playback_files(self) -> None:
         transient_files = [
@@ -3933,6 +4656,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     candidate.unlink(missing_ok=True)
                 except Exception:
                     continue
+
+    def _clear_realtime_mix_cache(self) -> None:
+        self._realtime_mix_cache = None
+        self._realtime_mix_cache_start_frame = 0
+        self._realtime_mix_cache_frame_count = 0
 
     def _selected_audio_device(self) -> QtMultimedia.QAudioDevice:
         if self.selected_audio_output_id:
@@ -4023,9 +4751,6 @@ class MainWindow(QtWidgets.QMainWindow):
         buffer.setData(QtCore.QByteArray(pcm_bytes))
         buffer.open(QtCore.QIODevice.OpenModeFlag.ReadOnly)
         sink = self._create_audio_sink()
-        sink.stateChanged.connect(
-            lambda state, current_sink=sink, current_buffer=buffer: self._on_preview_sink_state_changed(current_sink, current_buffer, state)
-        )
         sink.start(buffer)
         self._preview_buffer_device = buffer
         self._preview_sink = sink
@@ -4035,6 +4760,79 @@ class MainWindow(QtWidgets.QMainWindow):
         left = float(self.project.left_locator_sec)
         right = max(left + 0.001, float(self.project.right_locator_sec))
         self._playback_loop_ms = max(1, int((right - left) * 1000)) if self.project.loop_enabled else 0
+
+    def _loop_frame_bounds(self) -> tuple[int, int]:
+        left_frame = seconds_to_sample_frame(self.project.left_locator_sec, self._playback_sample_rate)
+        right_frame = max(left_frame + 1, seconds_to_sample_frame(self.project.right_locator_sec, self._playback_sample_rate))
+        return left_frame, right_frame
+
+    def _beat_sample_frame(self, beat_index: int) -> int:
+        return tick_to_sample_frame(max(0, int(beat_index)) * TICKS_PER_BEAT, self._playback_sample_rate, self.project.bpm)
+
+    def _mix_metronome_click(self, buffer: object, offset_frame: int, *, accented: bool) -> None:
+        sample_rate = max(1, int(self._playback_sample_rate))
+        click_frames = max(8, int(sample_rate * (0.032 if accented else 0.022)))
+        available = 0
+        if np is not None and isinstance(buffer, np.ndarray):
+            available = max(0, int(buffer.shape[-1]) - int(offset_frame))
+        else:
+            available = max(0, len(buffer[0]) - int(offset_frame))
+        count = min(click_frames, available)
+        if count <= 0:
+            return
+
+        freq = 1760.0 if accented else 1320.0
+        gain = 0.22 if accented else 0.14
+        decay_rate = 78.0 if accented else 96.0
+        harmonic = 0.28 if accented else 0.18
+        start = int(offset_frame)
+
+        if np is not None and isinstance(buffer, np.ndarray):
+            t = np.arange(count, dtype=np.float32) / float(sample_rate)
+            env = np.exp(-t * decay_rate).astype(np.float32, copy=False)
+            wave = np.sin(2.0 * math.pi * freq * t) + (harmonic * np.sin(2.0 * math.pi * freq * 2.0 * t))
+            click = (wave * env * gain).astype(np.float32, copy=False)
+            buffer[0, start:start + count] += click
+            buffer[1, start:start + count] += click
+            return
+
+        for index in range(count):
+            t = index / float(sample_rate)
+            env = math.exp(-t * decay_rate)
+            value = (math.sin(2.0 * math.pi * freq * t) + (harmonic * math.sin(2.0 * math.pi * freq * 2.0 * t))) * env * gain
+            buffer[0][start + index] += value
+            buffer[1][start + index] += value
+
+    def _render_metronome_segment(self, start_frame: int, frame_count: int) -> object:
+        if np is not None:
+            click_mix: object = np.zeros((2, frame_count), dtype=np.float32)
+        else:
+            click_mix = [[0.0] * frame_count, [0.0] * frame_count]
+
+        if frame_count <= 0:
+            return click_mix
+
+        sample_rate = max(1, int(self._playback_sample_rate))
+        bpm = max(1, int(self.project.bpm))
+        samples_per_beat_numerator = sample_rate * 60
+        start = max(0, int(start_frame))
+        segment_end = start + max(1, int(frame_count))
+        beat_index = max(0, ((start * bpm) // samples_per_beat_numerator) - 1)
+
+        while self._beat_sample_frame(beat_index + 1) <= start:
+            beat_index += 1
+        while beat_index > 0 and self._beat_sample_frame(beat_index) > start:
+            beat_index -= 1
+
+        while True:
+            beat_frame = self._beat_sample_frame(beat_index)
+            if beat_frame >= segment_end:
+                break
+            if beat_frame >= start:
+                self._mix_metronome_click(click_mix, beat_frame - start, accented=(beat_index % 4) == 0)
+            beat_index += 1
+
+        return click_mix
 
     def _bar_duration_seconds(self) -> float:
         return 4.0 * (60.0 / max(1, self.project.bpm))
@@ -4075,6 +4873,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _mark_realtime_track_states_for_reset(self) -> None:
         for state in self._realtime_track_states.values():
             state.reset_pending = True
+        self._clear_realtime_mix_cache()
 
     def _schedule_tempo_ui_refresh(self, *, seconds_layout_changed: bool, arrangement_changed: bool = True, timeline_changed: bool = True) -> None:
         self._tempo_refresh_seconds_layout = self._tempo_refresh_seconds_layout or bool(seconds_layout_changed)
@@ -4135,6 +4934,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.transport_loop_btn.blockSignals(True)
             self.transport_loop_btn.setChecked(bool(self.project.loop_enabled))
             self.transport_loop_btn.blockSignals(False)
+        if hasattr(self, 'transport_metronome_btn'):
+            self.transport_metronome_btn.blockSignals(True)
+            self.transport_metronome_btn.setChecked(bool(getattr(self.project, 'metronome_enabled', False)))
+            self.transport_metronome_btn.blockSignals(False)
         is_playing = bool(getattr(self, '_playback_active', False))
         if hasattr(self, 'transport_play_btn'):
             self.transport_play_btn.setEnabled(not is_playing)
@@ -4165,12 +4968,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_transport_controls()
         self.statusBar().showMessage('Looping between locators enabled' if self.project.loop_enabled else 'Looping between locators disabled')
 
+    def set_metronome_enabled(self, enabled: bool) -> None:
+        self.project.metronome_enabled = bool(enabled)
+        self._clear_realtime_mix_cache()
+        self._refresh_transport_controls()
+        self.statusBar().showMessage('Metronome enabled' if self.project.metronome_enabled else 'Metronome disabled')
+
     def _seek_media_to_project_time(self, sec: float) -> None:
         target_sec = max(0.0, float(sec))
         if self.project.loop_enabled and self.project.right_locator_sec > self.project.left_locator_sec:
             target_sec = min(target_sec, max(self.project.left_locator_sec, self.project.right_locator_sec - (1.0 / self._playback_sample_rate)))
-        self._playback_frame_position = max(0, int(round(target_sec * self._playback_sample_rate)))
+        self._playback_frame_position = seconds_to_sample_frame(target_sec, self._playback_sample_rate)
+        self._playback_logical_origin_frame = self._playback_frame_position
+        self._playback_generated_total_frames = 0
         self._realtime_reset_pending = True
+        self._clear_realtime_mix_cache()
 
     def _update_locator_playback_state(self) -> None:
         if not hasattr(self, 'playback_timer') or not self.playback_timer.isActive():
@@ -4224,6 +5036,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not hasattr(self, 'playback_timer') or not self.playback_timer.isActive():
             return
         self._realtime_reset_pending = True
+        self._clear_realtime_mix_cache()
 
     def _schedule_deferred_note_refresh(
         self,
@@ -4306,6 +5119,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._playback_sink = None
         self._playback_sink_device = None
         self._playback_active = False
+        self._track_meter_levels = {idx: 0.0 for idx in range(len(self.project.tracks))}
+        if hasattr(self, 'mixer'):
+            self.mixer.refresh_meters()
+        self._clear_realtime_mix_cache()
 
     def _reset_realtime_track_states(self, *, clear_plugins: bool = False) -> None:
         for state in self._realtime_track_states.values():
@@ -4313,6 +5130,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if clear_plugins:
                 state.instrument_plugin = None
                 state.fx_plugins = []
+        self._clear_realtime_mix_cache()
 
     def _prepare_realtime_playback(self, start_sec: float) -> bool:
         self._stop_realtime_audio_sink()
@@ -4361,31 +5179,41 @@ class MainWindow(QtWidgets.QMainWindow):
     def _collect_chunk_midi_messages(
         self,
         track: TrackState,
-        start_sec: float,
-        duration_sec: float,
+        start_frame: int,
+        frame_count: int,
         *,
         bootstrap_active: bool,
     ) -> list[mido.Message]:
-        end_sec = start_sec + duration_sec
-        messages: list[mido.Message] = []
+        chunk_start_frame = max(0, int(start_frame))
+        chunk_frame_count = max(1, int(frame_count))
+        chunk_end_frame = chunk_start_frame + chunk_frame_count
+        sample_rate = max(1, int(self._playback_sample_rate))
+        events: list[tuple[int, int, mido.Message]] = []
         if bootstrap_active:
-            messages.append(
+            events.append((
+                0,
+                0,
                 mido.Message(
                     'program_change',
                     channel=int(clamp(track.midi_channel, 0, 15)),
                     program=int(clamp(track.midi_program, 0, 127)),
                     time=0.0,
                 )
-            )
+            ))
 
-        sec_per_tick = 60.0 / max(1, self.project.bpm) / TICKS_PER_BEAT
         for note in track.notes:
-            note_start = note.start_tick * sec_per_tick
-            note_end = (note.start_tick + note.duration_tick) * sec_per_tick
-            if note_end <= start_sec or note_start >= end_sec:
+            note_start_frame = tick_to_sample_frame(note.start_tick, sample_rate, self.project.bpm)
+            note_end_frame = max(
+                note_start_frame + 1,
+                tick_to_sample_frame(note.start_tick + note.duration_tick, sample_rate, self.project.bpm),
+            )
+            if note_end_frame <= chunk_start_frame or note_start_frame >= chunk_end_frame:
                 continue
-            if bootstrap_active and note_start < start_sec < note_end:
-                messages.append(
+
+            if bootstrap_active and note_start_frame < chunk_start_frame < note_end_frame:
+                events.append((
+                    0,
+                    2,
                     mido.Message(
                         'note_on',
                         channel=int(clamp(track.midi_channel, 0, 15)),
@@ -4393,31 +5221,36 @@ class MainWindow(QtWidgets.QMainWindow):
                         velocity=int(clamp(note.velocity, 1, 127)),
                         time=0.0,
                     )
-                )
-            elif start_sec <= note_start < end_sec:
-                messages.append(
+                ))
+            elif chunk_start_frame <= note_start_frame < chunk_end_frame:
+                note_on_offset = note_start_frame - chunk_start_frame
+                events.append((
+                    note_on_offset,
+                    2,
                     mido.Message(
                         'note_on',
                         channel=int(clamp(track.midi_channel, 0, 15)),
                         note=int(clamp(note.pitch, 0, 127)),
                         velocity=int(clamp(note.velocity, 1, 127)),
-                        time=float(note_start - start_sec),
+                        time=sample_frame_to_seconds(note_on_offset, sample_rate),
                     )
-                )
-            if start_sec < note_end <= end_sec:
-                messages.append(
+                ))
+            if chunk_start_frame < note_end_frame <= chunk_end_frame:
+                note_off_offset = note_end_frame - chunk_start_frame
+                events.append((
+                    note_off_offset,
+                    1,
                     mido.Message(
                         'note_off',
                         channel=int(clamp(track.midi_channel, 0, 15)),
                         note=int(clamp(note.pitch, 0, 127)),
                         velocity=0,
-                        time=float(max(0.0, note_end - start_sec)),
+                        time=sample_frame_to_seconds(note_off_offset, sample_rate),
                     )
-                )
+                ))
 
-        order = {'program_change': 0, 'note_off': 1, 'note_on': 2}
-        messages.sort(key=lambda msg: (float(msg.time), order.get(msg.type, 3)))
-        return messages
+        events.sort(key=lambda item: (item[0], item[1]))
+        return [msg for _offset, _order, msg in events]
 
     def _apply_track_pan(self, data: object, pan: float) -> object:
         pan_value = float(clamp(float(pan), -1.0, 1.0))
@@ -4430,6 +5263,26 @@ class MainWindow(QtWidgets.QMainWindow):
         left = [float(sample) * left_gain for sample in data]
         right = [float(sample) * right_gain for sample in data]
         return [left, right]
+
+    def _audio_peak_level(self, data: object) -> float:
+        if np is not None:
+            try:
+                audio = np.asarray(data, dtype=np.float32)
+                if audio.size == 0:
+                    return 0.0
+                return max(0.0, min(1.0, float(np.max(np.abs(audio)))))
+            except Exception:
+                return 0.0
+        if isinstance(data, (list, tuple)) and data and isinstance(data[0], (list, tuple)):
+            maximum = 0.0
+            for channel in data:
+                for sample in channel:
+                    maximum = max(maximum, abs(float(sample)))
+            return max(0.0, min(1.0, maximum))
+        if isinstance(data, (list, tuple)):
+            maximum = max((abs(float(sample)) for sample in data), default=0.0)
+            return max(0.0, min(1.0, maximum))
+        return 0.0
 
     def _realtime_track_state(self, idx: int, track: TrackState) -> RealtimeTrackPlaybackState:
         state = self._realtime_track_states.get(idx)
@@ -4493,8 +5346,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 audio = audio[None, :]
         return self._as_mono_audio(audio)
 
-    def _render_sample_track_chunk(self, idx: int, track: TrackState, start_sec: float, duration_sec: float) -> tuple[object, int]:
-        total_samples = max(1, int(round(duration_sec * self._playback_sample_rate)))
+    def _render_sample_track_chunk(self, idx: int, track: TrackState, start_frame: int, frame_count: int) -> tuple[object, int]:
+        total_samples = max(1, int(frame_count))
+        start_sec = sample_frame_to_seconds(start_frame, self._playback_sample_rate)
+        duration_sec = total_samples / float(self._playback_sample_rate)
         if np is not None:
             data: object = np.zeros(total_samples, dtype=np.float32)
         else:
@@ -4530,10 +5385,12 @@ class MainWindow(QtWidgets.QMainWindow):
         state.reset_pending = False
         return processed, self._playback_sample_rate
 
-    def _render_instrument_track_chunk(self, idx: int, track: TrackState, start_sec: float, duration_sec: float) -> tuple[object, int]:
+    def _render_instrument_track_chunk(self, idx: int, track: TrackState, start_frame: int, frame_count: int) -> tuple[object, int]:
         state = self._realtime_track_state(idx, track)
         entry = self._rack_vsti_entry(track.rack_vsti) if track.rack_vsti else None
         sample_rate = self._playback_sample_rate
+        start_sec = sample_frame_to_seconds(start_frame, sample_rate)
+        duration_sec = max(frame_count, 1) / float(sample_rate)
 
         if track.instrument_mode == 'VSTI Rack' and entry is not None and entry.is_instrument and entry.host_supported and PEDALBOARD_AVAILABLE and np is not None:
             try:
@@ -4544,13 +5401,13 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._load_saved_vsti_plugin_state(plugin, track, entry)
                     self._apply_saved_plugin_parameters(plugin, track.vsti_parameters)
                     state.instrument_plugin = plugin
-                midi_messages = self._collect_chunk_midi_messages(track, start_sec, duration_sec, bootstrap_active=state.reset_pending)
+                midi_messages = self._collect_chunk_midi_messages(track, start_frame, frame_count, bootstrap_active=state.reset_pending)
                 rendered = state.instrument_plugin(
                     midi_messages,
                     duration=max(duration_sec, 1.0 / sample_rate),
                     sample_rate=sample_rate,
                     num_channels=2,
-                    buffer_size=max(64, int(round(duration_sec * sample_rate))),
+                    buffer_size=max(64, int(frame_count)),
                     reset=state.reset_pending,
                 )
                 audio = self._as_mono_audio(rendered)
@@ -4574,22 +5431,110 @@ class MainWindow(QtWidgets.QMainWindow):
         state.reset_pending = False
         return data, sample_rate
 
-    def _render_track_chunk_realtime(self, idx: int, track: TrackState, start_sec: float, duration_sec: float) -> object:
-        expected_samples = max(1, int(round(duration_sec * self._playback_sample_rate)))
+    def _render_track_chunk_realtime(self, idx: int, track: TrackState, start_frame: int, frame_count: int) -> object:
+        expected_samples = max(1, int(frame_count))
         if track.track_type == 'sample':
-            data, _sample_rate = self._render_sample_track_chunk(idx, track, start_sec, duration_sec)
+            data, _sample_rate = self._render_sample_track_chunk(idx, track, start_frame, expected_samples)
         else:
-            data, _sample_rate = self._render_instrument_track_chunk(idx, track, start_sec, duration_sec)
+            data, _sample_rate = self._render_instrument_track_chunk(idx, track, start_frame, expected_samples)
         mono = self._ensure_mono_sample_count(data, expected_samples)
         stereo = self._apply_track_pan(mono, track.pan)
         return self._ensure_stereo_sample_count(stereo, expected_samples)
 
-    def _render_realtime_segment(self, start_sec: float, frame_count: int) -> object:
-        duration_sec = frame_count / float(self._playback_sample_rate)
+    def _active_realtime_vsti_track_count(self) -> int:
+        solo_tracks = self._active_solo_track_indices()
+        count = 0
+        for idx, track in enumerate(self.project.tracks):
+            if not self._track_is_audible(idx, solo_tracks):
+                continue
+            if track.track_type != 'instrument' or not track.notes:
+                continue
+            entry = self._rack_vsti_entry(track.rack_vsti) if track.rack_vsti else None
+            if track.instrument_mode == 'VSTI Rack' and entry is not None and entry.is_instrument and entry.host_supported:
+                count += 1
+        return count
+
+    def _realtime_render_ahead_frames(self) -> int:
+        base = max(self._playback_chunk_frames * 4, 4096)
+        extra = max(0, self._active_realtime_vsti_track_count() - 1) * 1024
+        return min(16384, base + extra)
+
+    def _estimated_queued_output_frames(self) -> int:
+        sink = getattr(self, '_playback_sink', None)
+        if sink is None:
+            return 0
+        bytes_per_frame = max(1, self._playback_channel_count * 2)
+        try:
+            buffer_frames = int(max(0, sink.bufferFrameCount()))
+        except Exception:
+            buffer_frames = 0
+        try:
+            free_frames = int(max(0, sink.bytesFree()) // bytes_per_frame)
+        except Exception:
+            free_frames = 0
+        if buffer_frames <= 0:
+            return 0
+        return max(0, buffer_frames - free_frames)
+
+    def _current_audible_playback_sec(self) -> float:
+        if not getattr(self, '_playback_active', False):
+            return float(self.project.playhead_sec)
+        audible_generated = max(0, int(self._playback_generated_total_frames) - self._estimated_queued_output_frames())
+        if not self.project.loop_enabled:
+            logical_frame = int(self._playback_logical_origin_frame) + audible_generated
+            return sample_frame_to_seconds(logical_frame, self._playback_sample_rate)
+
+        loop_start_frame, loop_end_frame = self._loop_frame_bounds()
+        loop_length = max(1, loop_end_frame - loop_start_frame)
+        origin_frame = int(self._playback_logical_origin_frame)
+        origin_frame = min(max(origin_frame, loop_start_frame), loop_end_frame - 1)
+        origin_offset = origin_frame - loop_start_frame
+        logical_frame = loop_start_frame + ((origin_offset + audible_generated) % loop_length)
+        return sample_frame_to_seconds(logical_frame, self._playback_sample_rate)
+
+    def _slice_stereo_audio(self, data: object, start_frame: int, frame_count: int) -> object:
+        start = max(0, int(start_frame))
+        count = max(1, int(frame_count))
+        if np is not None and isinstance(data, np.ndarray):
+            audio = self._ensure_stereo_sample_count(data, max(start + count, data.shape[-1] if data.ndim >= 2 else count))
+            return audio[:, start:start + count].astype(np.float32, copy=False)
+        stereo = self._ensure_stereo_sample_count(data, start + count)
+        return [stereo[0][start:start + count], stereo[1][start:start + count]]
+
+    def _render_realtime_segment_cached(self, start_frame: int, frame_count: int, *, available_frames: int | None = None) -> object:
+        requested_start = max(0, int(start_frame))
+        requested_count = max(1, int(frame_count))
+        cache = self._realtime_mix_cache
+        cache_start = int(self._realtime_mix_cache_start_frame)
+        cache_end = cache_start + int(self._realtime_mix_cache_frame_count)
+        if cache is not None and requested_start >= cache_start and (requested_start + requested_count) <= cache_end:
+            return self._slice_stereo_audio(cache, requested_start - cache_start, requested_count)
+
+        render_count = max(requested_count, self._realtime_render_ahead_frames())
+        if available_frames is not None:
+            render_count = min(render_count, max(requested_count, int(available_frames)))
+        segment = self._render_realtime_segment(requested_start, render_count)
+        segment = self._ensure_stereo_sample_count(segment, render_count)
+        self._realtime_mix_cache = segment
+        self._realtime_mix_cache_start_frame = requested_start
+        self._realtime_mix_cache_frame_count = render_count
+        return self._slice_stereo_audio(segment, 0, requested_count)
+
+    def _render_realtime_segment(self, start_frame: int, frame_count: int) -> object:
         if np is not None:
             mix = np.zeros((2, frame_count), dtype=np.float32)
         else:
             mix = [[0.0] * frame_count, [0.0] * frame_count]
+        meter_levels: dict[int, float] = {}
+
+        if bool(getattr(self.project, 'metronome_enabled', False)):
+            metronome = self._render_metronome_segment(start_frame, frame_count)
+            if np is not None and isinstance(mix, np.ndarray) and isinstance(metronome, np.ndarray):
+                mix += metronome
+            else:
+                for channel in range(2):
+                    for pos in range(frame_count):
+                        mix[channel][pos] += metronome[channel][pos]
 
         solo_tracks = self._active_solo_track_indices()
         for idx, track in enumerate(self.project.tracks):
@@ -4599,8 +5544,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             if track.track_type == 'sample' and not any(clip.track_index == idx for clip in self.project.sample_clips):
                 continue
-            stereo = self._render_track_chunk_realtime(idx, track, start_sec, duration_sec)
+            stereo = self._render_track_chunk_realtime(idx, track, start_frame, frame_count)
             stereo = self._ensure_stereo_sample_count(stereo, frame_count)
+            meter_levels[idx] = self._audio_peak_level(stereo)
             if np is not None and isinstance(mix, np.ndarray) and isinstance(stereo, np.ndarray):
                 mix += stereo
             else:
@@ -4608,6 +5554,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 for pos in range(frame_count):
                     mix[0][pos] += left[pos]
                     mix[1][pos] += right[pos]
+        if meter_levels or self._track_meter_levels:
+            decayed_levels: dict[int, float] = {}
+            for idx in range(len(self.project.tracks)):
+                previous = float(self._track_meter_levels.get(idx, 0.0)) * 0.72
+                current = float(meter_levels.get(idx, 0.0))
+                level = max(previous, current)
+                if level > 0.001:
+                    decayed_levels[idx] = level
+            self._track_meter_levels = decayed_levels
         if np is not None and isinstance(mix, np.ndarray):
             return np.clip(mix, -1.0, 1.0).astype(np.float32, copy=False)
         return [
@@ -4624,10 +5579,9 @@ class MainWindow(QtWidgets.QMainWindow):
             mix = [[0.0] * frame_count, [0.0] * frame_count]
 
         if not self.project.loop_enabled:
-            segment_start_sec = self._playback_frame_position / float(self._playback_sample_rate)
             if self._realtime_reset_pending:
                 self._reset_realtime_track_states()
-            segment = self._render_realtime_segment(segment_start_sec, frame_count)
+            segment = self._render_realtime_segment_cached(self._playback_frame_position, frame_count)
             if np is not None and isinstance(mix, np.ndarray) and isinstance(segment, np.ndarray):
                 mix[:, :frame_count] = segment
             else:
@@ -4639,8 +5593,7 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             remaining = frame_count
             offset = 0
-            loop_start_frame = max(0, int(round(self.project.left_locator_sec * self._playback_sample_rate)))
-            loop_end_frame = max(loop_start_frame + 1, int(round(self.project.right_locator_sec * self._playback_sample_rate)))
+            loop_start_frame, loop_end_frame = self._loop_frame_bounds()
             if self._playback_frame_position < loop_start_frame or self._playback_frame_position >= loop_end_frame:
                 self._playback_frame_position = loop_start_frame
                 self._realtime_reset_pending = True
@@ -4650,10 +5603,13 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._playback_frame_position = loop_start_frame
                     self._realtime_reset_pending = True
                 segment_frames = min(remaining, max(1, loop_end_frame - self._playback_frame_position))
-                segment_start_sec = self._playback_frame_position / float(self._playback_sample_rate)
                 if self._realtime_reset_pending:
                     self._reset_realtime_track_states()
-                segment = self._render_realtime_segment(segment_start_sec, segment_frames)
+                segment = self._render_realtime_segment_cached(
+                    self._playback_frame_position,
+                    segment_frames,
+                    available_frames=max(1, loop_end_frame - self._playback_frame_position),
+                )
                 if np is not None and isinstance(mix, np.ndarray) and isinstance(segment, np.ndarray):
                     mix[:, offset:offset + segment_frames] = segment
                 else:
@@ -4668,7 +5624,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._playback_frame_position = loop_start_frame
                     self._realtime_reset_pending = True
 
-        self.project.playhead_sec = self._playback_frame_position / float(self._playback_sample_rate)
+        self._playback_generated_total_frames += frame_count
+        self.project.playhead_sec = sample_frame_to_seconds(self._playback_frame_position, self._playback_sample_rate)
         return encode_pcm16_stereo_samples(mix)
 
     def _pump_realtime_audio(self) -> None:
@@ -4676,9 +5633,14 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         bytes_per_frame = self._playback_channel_count * 2
         minimum_bytes = max(bytes_per_frame, self._playback_chunk_frames * bytes_per_frame)
+        try:
+            buffer_frames = int(max(self._playback_chunk_frames, self._playback_sink.bufferFrameCount()))
+        except Exception:
+            buffer_frames = self._playback_chunk_frames * 4
+        max_writes = max(8, int(math.ceil(buffer_frames / max(1, self._playback_chunk_frames))) + 2)
         writes = 0
         try:
-            while self._playback_sink.bytesFree() >= minimum_bytes and writes < 8:
+            while self._playback_sink.bytesFree() >= minimum_bytes and writes < max_writes:
                 chunk = self._generate_realtime_chunk_bytes(self._playback_chunk_frames)
                 if not chunk:
                     break
@@ -4724,7 +5686,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _tick_playback(self) -> None:
         if not self._playback_active:
             return
-        self.set_playhead_position(self._playback_frame_position / float(self._playback_sample_rate), playback_tick=True)
+        self.set_playhead_position(self._current_audible_playback_sec(), playback_tick=True)
 
     def update_tempo(self, bpm: int) -> None:
         new_bpm = int(clamp(int(bpm), 20, 300))
@@ -4734,22 +5696,24 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         was_playing = bool(hasattr(self, 'playback_timer') and self.playback_timer.isActive())
-        keep_musical_transport = self._ruler_uses_bar_positions()
+        keep_musical_transport = True
         if keep_musical_transport:
             self._rescale_transport_for_tempo_change(old_bpm, new_bpm)
         self.project.bpm = new_bpm
         self._invalidate_playback_caches(reset_realtime=False)
         self._sync_playback_loop_state()
         self._update_locator_overlays()
+        self._refresh_locator_spin_configuration()
+        self._clear_realtime_mix_cache()
         if hasattr(self, 'tempo_spin') and self.tempo_spin.value() != new_bpm:
             self.tempo_spin.blockSignals(True)
             self.tempo_spin.setValue(new_bpm)
             self.tempo_spin.blockSignals(False)
         if was_playing:
             if keep_musical_transport:
-                self._playback_frame_position = max(0, int(round(self.project.playhead_sec * self._playback_sample_rate)))
+                self._seek_media_to_project_time(self.project.playhead_sec)
             self._mark_realtime_track_states_for_reset()
-        self._schedule_tempo_ui_refresh(seconds_layout_changed=not keep_musical_transport)
+        self._schedule_tempo_ui_refresh(seconds_layout_changed=not self._ruler_uses_bar_positions())
         self.statusBar().showMessage(f'Tempo set to {self.project.bpm} BPM')
 
     def refresh_audio_output_menu(self) -> None:
@@ -5516,6 +6480,7 @@ class MainWindow(QtWidgets.QMainWindow):
             body_layout = QtWidgets.QVBoxLayout(body)
             body_layout.setContentsMargins(8, 8, 8, 8)
             body_layout.setSpacing(14)
+            bundled_knob_size = 64
             intro = QtWidgets.QLabel('Turn the knobs, shape the patch, and press OK to commit the sound to the current track.')
             intro.setObjectName('vstiCardHint')
             intro.setWordWrap(True)
@@ -5591,7 +6556,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         dial.setRange(0, 1000)
                         dial.setNotchesVisible(True)
                         dial.setWrapping(False)
-                        dial.setFixedSize(96, 96)
+                        dial.setFixedSize(bundled_knob_size, bundled_knob_size)
                         dial.setValue(int(round(raw_value * 1000.0)))
 
                         spin = QtWidgets.QDoubleSpinBox()
@@ -5634,7 +6599,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     dial.setValue(int(round(raw_value * 100.0)))
                     dial.setNotchesVisible(True)
                     dial.setWrapping(False)
-                    dial.setFixedSize(96, 96)
+                    dial.setFixedSize(bundled_knob_size, bundled_knob_size)
                     value_label = QtWidgets.QLabel(f'{dial.value()}%')
                     value_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
                     dial.valueChanged.connect(lambda v, label=value_label: label.setText(f'{v}%'))
@@ -5658,7 +6623,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     dial.setValue(int(track.vsti_parameters.get(key, 50)))
                     dial.setNotchesVisible(True)
                     dial.setWrapping(False)
-                    dial.setFixedSize(96, 96)
+                    dial.setFixedSize(bundled_knob_size, bundled_knob_size)
                     value_label = QtWidgets.QLabel(f'{dial.value()}%')
                     value_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
                     dial.valueChanged.connect(lambda v, label=value_label: label.setText(f'{v}%'))
@@ -5799,17 +6764,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 time=0.0,
             )
         ]
-        sec_per_tick = 60.0 / max(1, self.project.bpm) / TICKS_PER_BEAT
         for note in track.notes:
-            start_sec = note.start_tick * sec_per_tick
-            end_sec = (note.start_tick + note.duration_tick) * sec_per_tick
+            start_frame = tick_to_sample_frame(note.start_tick, self._playback_sample_rate, self.project.bpm)
+            end_frame = max(
+                start_frame + 1,
+                tick_to_sample_frame(note.start_tick + note.duration_tick, self._playback_sample_rate, self.project.bpm),
+            )
             messages.append(
                 mido.Message(
                     'note_on',
                     channel=int(clamp(track.midi_channel, 0, 15)),
                     note=int(clamp(note.pitch, 0, 127)),
                     velocity=int(clamp(note.velocity, 1, 127)),
-                    time=float(start_sec),
+                    time=sample_frame_to_seconds(start_frame, self._playback_sample_rate),
                 )
             )
             messages.append(
@@ -5818,7 +6785,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     channel=int(clamp(track.midi_channel, 0, 15)),
                     note=int(clamp(note.pitch, 0, 127)),
                     velocity=0,
-                    time=float(end_sec),
+                    time=sample_frame_to_seconds(end_frame, self._playback_sample_rate),
                 )
             )
         order = {'program_change': 0, 'note_off': 1, 'note_on': 2}
@@ -6171,8 +7138,13 @@ class MainWindow(QtWidgets.QMainWindow):
         note_editor_sizes = payload.get('note_editor_inner_sizes', self._note_editor_inner_sizes)
         self._tools_window_visible = bool(payload.get('tools_window_visible', True))
         self._tools_window_geometry_b64 = str(payload.get('tools_window_geometry_b64', '') or '')
+        self._mixer_window_visible = bool(payload.get('mixer_window_visible', True))
+        self._mixer_window_geometry_b64 = str(payload.get('mixer_window_geometry_b64', '') or '')
         self._transport_window_visible = bool(payload.get('transport_window_visible', True))
         self._transport_window_geometry_b64 = str(payload.get('transport_window_geometry_b64', '') or '')
+        self._virtual_piano_window_visible = bool(payload.get('virtual_piano_window_visible', False))
+        self._virtual_piano_window_geometry_b64 = str(payload.get('virtual_piano_window_geometry_b64', '') or '')
+        self._virtual_piano_key_scale_percent = self._coerce_int(payload.get('virtual_piano_key_scale_percent', 50), 50, 35, 175)
         if isinstance(main_sizes, list) and len(main_sizes) == 2:
             try:
                 self._main_splitter_sizes = [max(120, int(main_sizes[0])), max(240, int(main_sizes[1]))]
@@ -6265,9 +7237,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, 'tools_window'):
             self._tools_window_visible = self.tools_window.isVisible()
             self._tools_window_geometry_b64 = bytes(self.tools_window.saveGeometry().toBase64()).decode('ascii')
+        if hasattr(self, 'mixer_window'):
+            self._mixer_window_visible = self.mixer_window.isVisible()
+            self._mixer_window_geometry_b64 = bytes(self.mixer_window.saveGeometry().toBase64()).decode('ascii')
         if hasattr(self, 'transport_window'):
             self._transport_window_visible = self.transport_window.isVisible()
             self._transport_window_geometry_b64 = bytes(self.transport_window.saveGeometry().toBase64()).decode('ascii')
+        if hasattr(self, 'virtual_piano_window'):
+            self._virtual_piano_window_visible = self.virtual_piano_window.isVisible()
+            self._virtual_piano_window_geometry_b64 = bytes(self.virtual_piano_window.saveGeometry().toBase64()).decode('ascii')
+        if hasattr(self, 'virtual_piano_scale_combo'):
+            self._virtual_piano_key_scale_percent = self._coerce_int(self.virtual_piano_scale_combo.currentData(), self._virtual_piano_key_scale_percent, 35, 175)
         payload = {
             'vsti_paths': self.project.vsti_paths,
             'vsti_folder_paths': self.project.vsti_folder_paths,
@@ -6294,8 +7274,13 @@ class MainWindow(QtWidgets.QMainWindow):
             'note_editor_inner_sizes': self._note_editor_inner_sizes,
             'tools_window_visible': self._tools_window_visible,
             'tools_window_geometry_b64': self._tools_window_geometry_b64,
+            'mixer_window_visible': self._mixer_window_visible,
+            'mixer_window_geometry_b64': self._mixer_window_geometry_b64,
             'transport_window_visible': self._transport_window_visible,
             'transport_window_geometry_b64': self._transport_window_geometry_b64,
+            'virtual_piano_window_visible': self._virtual_piano_window_visible,
+            'virtual_piano_window_geometry_b64': self._virtual_piano_window_geometry_b64,
+            'virtual_piano_key_scale_percent': self._virtual_piano_key_scale_percent,
         }
         APP_PREFS_PATH.parent.mkdir(parents=True, exist_ok=True)
         APP_PREFS_PATH.write_text(json.dumps(payload, indent=2))
@@ -6615,11 +7600,31 @@ class MainWindow(QtWidgets.QMainWindow):
     def _start_vsti_background_warmup(self) -> None:
         return
 
+    def _temporarily_stop_playback_for_vsti_load(self) -> tuple[bool, float]:
+        was_playing = bool(hasattr(self, 'playback_timer') and self.playback_timer.isActive())
+        resume_sec = float(self.project.playhead_sec)
+        if not was_playing:
+            return False, resume_sec
+        self.stop_playback()
+        self._reset_realtime_track_states(clear_plugins=True)
+        self._realtime_reset_pending = True
+        return True, resume_sec
+
+    def _resume_playback_after_vsti_load(self, was_playing: bool, resume_sec: float) -> None:
+        if not was_playing:
+            return
+        self.set_playhead_position(resume_sec)
+        QtCore.QTimer.singleShot(0, self.start_playback)
+
     def _load_vsti_binary_path(self, path: str, show_message: bool = True) -> bool:
         normalized = self._normalized_vsti_path(path)
-        ok, detail = self.vsti_binary_loader.load(normalized)
-        if ok:
-            self._capture_vsti_metadata(normalized)
+        paused_playback, resume_sec = self._temporarily_stop_playback_for_vsti_load()
+        try:
+            ok, detail = self.vsti_binary_loader.load(normalized)
+            if ok:
+                self._capture_vsti_metadata(normalized, self.vsti_binary_loader.handle(normalized))
+        finally:
+            self._resume_playback_after_vsti_load(paused_playback, resume_sec)
         if show_message:
             name = Path(normalized).name
             if ok:
@@ -6756,6 +7761,28 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.tools_window.hide()
 
+    def _apply_mixer_window_preferences(self) -> None:
+        if not hasattr(self, 'mixer_window'):
+            return
+        if self._mixer_window_geometry_b64:
+            try:
+                geometry = QtCore.QByteArray.fromBase64(self._mixer_window_geometry_b64.encode('ascii'))
+                if not geometry.isEmpty():
+                    self.mixer_window.restoreGeometry(geometry)
+            except Exception:
+                pass
+        else:
+            self._position_mixer_window_default()
+        if hasattr(self, 'show_mixer_window_action'):
+            self.show_mixer_window_action.blockSignals(True)
+            self.show_mixer_window_action.setChecked(self._mixer_window_visible)
+            self.show_mixer_window_action.blockSignals(False)
+        if self._mixer_window_visible:
+            self.mixer_window.show()
+            self.mixer_window.raise_()
+        else:
+            self.mixer_window.hide()
+
     def _apply_transport_window_preferences(self) -> None:
         if not hasattr(self, 'transport_window'):
             return
@@ -6778,6 +7805,30 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.transport_window.hide()
 
+    def _apply_virtual_piano_window_preferences(self) -> None:
+        if not hasattr(self, 'virtual_piano_window'):
+            return
+        if hasattr(self, 'virtual_piano_scale_combo'):
+            self._set_virtual_piano_key_scale_percent(self._virtual_piano_key_scale_percent)
+        if self._virtual_piano_window_geometry_b64:
+            try:
+                geometry = QtCore.QByteArray.fromBase64(self._virtual_piano_window_geometry_b64.encode('ascii'))
+                if not geometry.isEmpty():
+                    self.virtual_piano_window.restoreGeometry(geometry)
+            except Exception:
+                pass
+        else:
+            self._position_virtual_piano_window_default()
+        if hasattr(self, 'show_virtual_piano_window_action'):
+            self.show_virtual_piano_window_action.blockSignals(True)
+            self.show_virtual_piano_window_action.setChecked(self._virtual_piano_window_visible)
+            self.show_virtual_piano_window_action.blockSignals(False)
+        if self._virtual_piano_window_visible:
+            self.virtual_piano_window.show()
+            self.virtual_piano_window.raise_()
+        else:
+            self.virtual_piano_window.hide()
+
     def _on_tools_window_visibility_changed(self, visible: bool) -> None:
         self._tools_window_visible = bool(visible)
         if hasattr(self, 'show_panels_window_action'):
@@ -6786,12 +7837,28 @@ class MainWindow(QtWidgets.QMainWindow):
             self.show_panels_window_action.blockSignals(False)
         self._save_preferences()
 
+    def _on_mixer_window_visibility_changed(self, visible: bool) -> None:
+        self._mixer_window_visible = bool(visible)
+        if hasattr(self, 'show_mixer_window_action'):
+            self.show_mixer_window_action.blockSignals(True)
+            self.show_mixer_window_action.setChecked(self._mixer_window_visible)
+            self.show_mixer_window_action.blockSignals(False)
+        self._save_preferences()
+
     def _on_transport_window_visibility_changed(self, visible: bool) -> None:
         self._transport_window_visible = bool(visible)
         if hasattr(self, 'show_transport_window_action'):
             self.show_transport_window_action.blockSignals(True)
             self.show_transport_window_action.setChecked(self._transport_window_visible)
             self.show_transport_window_action.blockSignals(False)
+        self._save_preferences()
+
+    def _on_virtual_piano_window_visibility_changed(self, visible: bool) -> None:
+        self._virtual_piano_window_visible = bool(visible)
+        if hasattr(self, 'show_virtual_piano_window_action'):
+            self.show_virtual_piano_window_action.blockSignals(True)
+            self.show_virtual_piano_window_action.setChecked(self._virtual_piano_window_visible)
+            self.show_virtual_piano_window_action.blockSignals(False)
         self._save_preferences()
 
     def toggle_tools_window(self, checked: bool) -> None:
@@ -6805,6 +7872,18 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.tools_window.hide()
 
+    def toggle_mixer_window(self, checked: bool) -> None:
+        self._mixer_window_visible = bool(checked)
+        if not hasattr(self, 'mixer_window'):
+            return
+        if checked:
+            self.mixer.load_track()
+            self.mixer_window.show()
+            self.mixer_window.raise_()
+            self.mixer_window.activateWindow()
+        else:
+            self.mixer_window.hide()
+
     def toggle_transport_window(self, checked: bool) -> None:
         self._transport_window_visible = bool(checked)
         if not hasattr(self, 'transport_window'):
@@ -6815,6 +7894,30 @@ class MainWindow(QtWidgets.QMainWindow):
             self.transport_window.activateWindow()
         else:
             self.transport_window.hide()
+
+    def toggle_virtual_piano_window(self, checked: bool) -> None:
+        self._virtual_piano_window_visible = bool(checked)
+        if not hasattr(self, 'virtual_piano_window'):
+            return
+        if checked:
+            self.virtual_piano_window.show()
+            self.virtual_piano_window.raise_()
+            self.virtual_piano_window.activateWindow()
+        else:
+            self.virtual_piano_window.hide()
+
+    def _set_virtual_piano_key_scale_percent(self, percent: int) -> None:
+        value = self._coerce_int(percent, self._virtual_piano_key_scale_percent, 35, 175)
+        self._virtual_piano_key_scale_percent = value
+        if hasattr(self, 'virtual_piano_scale_combo'):
+            index = self.virtual_piano_scale_combo.findData(value)
+            if index >= 0 and self.virtual_piano_scale_combo.currentIndex() != index:
+                self.virtual_piano_scale_combo.blockSignals(True)
+                self.virtual_piano_scale_combo.setCurrentIndex(index)
+                self.virtual_piano_scale_combo.blockSignals(False)
+        if hasattr(self, 'virtual_piano_keyboard'):
+            self.virtual_piano_keyboard.set_key_scale(value / 100.0)
+        self._save_preferences()
 
     def _toggle_transport_window_shortcut(self) -> None:
         next_visible = not bool(self._transport_window_visible)
@@ -6854,14 +7957,43 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tools_window.raise_()
             self._tools_window_visible = True
 
+        if hasattr(self, 'mixer_window'):
+            mixer_width = min(available.width() - 120, max(980, (available.width() * 3) // 5))
+            mixer_height = min(available.height() - 220, max(420, available.height() // 2))
+            mixer_x = available.x() + spacing
+            mixer_y = available.y() + spacing + 96
+            self.mixer_window.setGeometry(mixer_x, mixer_y, mixer_width, mixer_height)
+            self.mixer.load_track()
+            self.mixer_window.show()
+            self.mixer_window.raise_()
+            self._mixer_window_visible = True
+
+        if hasattr(self, 'virtual_piano_window'):
+            piano_width = min(760, max(520, available.width() - 280))
+            piano_height = min(220, max(160, available.height() // 5))
+            piano_x = available.x() + max(0, (available.width() - piano_width) // 2)
+            piano_y = available.y() + max(available.height() - piano_height - spacing, spacing + 120)
+            self.virtual_piano_window.setGeometry(piano_x, piano_y, piano_width, piano_height)
+            self.virtual_piano_window.show()
+            self.virtual_piano_window.raise_()
+            self._virtual_piano_window_visible = True
+
         if hasattr(self, 'show_panels_window_action'):
             self.show_panels_window_action.blockSignals(True)
             self.show_panels_window_action.setChecked(True)
             self.show_panels_window_action.blockSignals(False)
+        if hasattr(self, 'show_mixer_window_action'):
+            self.show_mixer_window_action.blockSignals(True)
+            self.show_mixer_window_action.setChecked(True)
+            self.show_mixer_window_action.blockSignals(False)
         if hasattr(self, 'show_transport_window_action'):
             self.show_transport_window_action.blockSignals(True)
             self.show_transport_window_action.setChecked(True)
             self.show_transport_window_action.blockSignals(False)
+        if hasattr(self, 'show_virtual_piano_window_action'):
+            self.show_virtual_piano_window_action.blockSignals(True)
+            self.show_virtual_piano_window_action.setChecked(True)
+            self.show_virtual_piano_window_action.blockSignals(False)
         self._save_preferences()
 
     def _position_transport_window_default(self) -> None:
@@ -6885,6 +8017,31 @@ class MainWindow(QtWidgets.QMainWindow):
         height = min(available.height() - 160, max(480, (available.height() * 2) // 5))
         self._center_widget_on_screen(self.tools_window, width=width, height=height)
         self.tools_window.move(available.x() + max(0, available.width() - width - 24), available.y() + 120)
+
+    def _position_mixer_window_default(self) -> None:
+        if not hasattr(self, 'mixer_window'):
+            return
+        available = self._screen_available_geometry()
+        if available is None:
+            return
+        width = min(available.width() - 120, max(980, (available.width() * 3) // 5))
+        height = min(available.height() - 220, max(420, available.height() // 2))
+        self._center_widget_on_screen(self.mixer_window, width=width, height=height)
+        self.mixer_window.move(available.x() + 24, available.y() + 120)
+
+    def _position_virtual_piano_window_default(self) -> None:
+        if not hasattr(self, 'virtual_piano_window'):
+            return
+        available = self._screen_available_geometry()
+        if available is None:
+            return
+        width = min(760, max(520, available.width() - 280))
+        height = min(220, max(160, available.height() // 5))
+        self._center_widget_on_screen(self.virtual_piano_window, width=width, height=height)
+        self.virtual_piano_window.move(
+            available.x() + max(0, (available.width() - width) // 2),
+            available.y() + max(available.height() - height - 28, 120),
+        )
 
     def refresh_vsti_rack_ui(self) -> None:
         if hasattr(self, 'vsti_menu'):
@@ -6927,7 +8084,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._invalidate_playback_caches()
         self._reload_playback_mix_if_running()
 
-    def on_mixer_track_changed(self) -> None:
+    def on_mixer_track_changed(self, row: int | None = None) -> None:
+        if row is not None:
+            self._update_track_list_item(int(row))
         self._update_selected_track_list_item()
         self._invalidate_playback_caches()
         self._reload_playback_mix_if_running()
@@ -7180,18 +8339,118 @@ class MainWindow(QtWidgets.QMainWindow):
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+G"), self, self.compose_with_ai)
         QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Delete), self, self.piano_roll.delete_selected)
         QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Space), self, lambda: self.stop_playback() if self.playback_timer.isActive() else self.start_playback())
+        left_locator_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+1"), self)
+        left_locator_shortcut.setContext(QtCore.Qt.ShortcutContext.ApplicationShortcut)
+        left_locator_shortcut.activated.connect(self.set_left_locator_from_mouse)
+        right_locator_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+2"), self)
+        right_locator_shortcut.setContext(QtCore.Qt.ShortcutContext.ApplicationShortcut)
+        right_locator_shortcut.activated.connect(self.set_right_locator_from_mouse)
 
-    def _setup_virtual_piano_dock(self) -> None:
-        key_map = {"Z": 60, "X": 62, "C": 64, "V": 65, "B": 67, "N": 69, "M": 71, ",": 72}
-        dock = QtWidgets.QDockWidget("Virtual Piano Input")
-        panel = QtWidgets.QWidget()
-        layout = QtWidgets.QHBoxLayout(panel)
-        layout.addWidget(QtWidgets.QLabel("Use keys Z X C V B N M , to input notes"))
-        dock.setWidget(panel)
-        self.addDockWidget(QtCore.Qt.DockWidgetArea.BottomDockWidgetArea, dock)
+    def _virtual_piano_key_specs(self) -> list[tuple[int, str, list[str]]]:
+        return [
+            (60, 'Z', []),
+            (61, 'S', []),
+            (62, 'X', []),
+            (63, 'D', []),
+            (64, 'C', []),
+            (65, 'V', []),
+            (66, 'G', []),
+            (67, 'B', []),
+            (68, 'H', []),
+            (69, 'N', []),
+            (70, 'J', []),
+            (71, 'M', []),
+            (72, 'Q', [',']),
+            (73, '2', ['L']),
+            (74, 'W', ['.']),
+            (75, '3', [';']),
+            (76, 'E', ['/']),
+            (77, 'R', []),
+            (78, '5', []),
+            (79, 'T', []),
+            (80, '6', []),
+            (81, 'Y', []),
+            (82, '7', []),
+            (83, 'U', []),
+        ]
+
+    def _virtual_piano_shortcuts_enabled(self) -> bool:
+        widget = QtWidgets.QApplication.focusWidget()
+        while isinstance(widget, QtWidgets.QWidget):
+            if isinstance(widget, (QtWidgets.QLineEdit, QtWidgets.QTextEdit, QtWidgets.QPlainTextEdit, QtWidgets.QAbstractSpinBox, QtWidgets.QComboBox)):
+                return False
+            widget = widget.parentWidget()
+        return True
+
+    def _trigger_virtual_piano_pitch(self, pitch: int, *, from_shortcut: bool = False) -> None:
+        if from_shortcut and not self._virtual_piano_shortcuts_enabled():
+            return
+        self.insert_live_note(int(pitch))
+        if hasattr(self, 'virtual_piano_keyboard'):
+            self.virtual_piano_keyboard.flash_pitch(int(pitch))
+
+    def _register_virtual_piano_shortcuts(self) -> None:
+        self._virtual_piano_shortcuts.clear()
+        key_map: dict[str, int] = {}
+        for pitch, primary, aliases in self._virtual_piano_key_specs():
+            key_map[primary] = int(pitch)
+            for alias in aliases:
+                key_map[str(alias)] = int(pitch)
 
         for key, pitch in key_map.items():
-            QtGui.QShortcut(QtGui.QKeySequence(key), self, lambda p=pitch: self.insert_live_note(p))
+            shortcut = QtGui.QShortcut(QtGui.QKeySequence(key), self)
+            shortcut.setContext(QtCore.Qt.ShortcutContext.ApplicationShortcut)
+            shortcut.activated.connect(lambda p=pitch: self._trigger_virtual_piano_pitch(p, from_shortcut=True))
+            self._virtual_piano_shortcuts.append(shortcut)
+
+    def _setup_virtual_piano_window(self) -> None:
+        self.virtual_piano_window = FloatingPanelWindow('Virtual Piano', self)
+        self.virtual_piano_window.resize(760, 220)
+        self.virtual_piano_window.visibilityChanged.connect(self._on_virtual_piano_window_visibility_changed)
+
+        root = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(root)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(8)
+
+        control_row = QtWidgets.QHBoxLayout()
+        control_row.setContentsMargins(0, 0, 0, 0)
+        control_row.setSpacing(8)
+        control_row.addWidget(QtWidgets.QLabel('Key Scale'))
+        self.virtual_piano_scale_combo = QtWidgets.QComboBox()
+        for percent in (50, 75, 100, 125, 150):
+            self.virtual_piano_scale_combo.addItem(f'{percent}%', percent)
+        self.virtual_piano_scale_combo.currentIndexChanged.connect(
+            lambda _index: self._set_virtual_piano_key_scale_percent(self.virtual_piano_scale_combo.currentData())
+        )
+        control_row.addWidget(self.virtual_piano_scale_combo)
+        control_row.addStretch(1)
+        layout.addLayout(control_row)
+
+        hint = QtWidgets.QLabel(
+            'Click the keys or play from the computer keyboard. '
+            'Lower octave: Z S X D C V G B H N J M. '
+            'Upper octave: Q 2 W 3 E R 5 T 6 Y 7 U. '
+            'Aliases: , L . ; /.'
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet('color: #C7D0DC; font-size: 11px;')
+        layout.addWidget(hint)
+
+        self.virtual_piano_keyboard = VirtualPianoKeyboardWidget(self._virtual_piano_key_specs())
+        self.virtual_piano_keyboard.noteTriggered.connect(self._trigger_virtual_piano_pitch)
+        keyboard_scroll = QtWidgets.QScrollArea()
+        keyboard_scroll.setWidgetResizable(False)
+        keyboard_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        keyboard_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        keyboard_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        keyboard_scroll.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        keyboard_scroll.setWidget(self.virtual_piano_keyboard)
+        layout.addWidget(keyboard_scroll, 1)
+
+        self.virtual_piano_window.setCentralWidget(root)
+        self._register_virtual_piano_shortcuts()
+        self._apply_virtual_piano_window_preferences()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         try:
@@ -7494,7 +8753,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.project.midi_sections = sections
 
     def set_note_editor_zoom(self, cell_w: int) -> None:
-        clamped = max(8, min(96, int(cell_w)))
+        clamped = max(8, min(160, int(cell_w)))
         if self.piano_roll.cell_w != clamped:
             self.piano_roll.cell_w = clamped
             self.piano_roll.refresh()
@@ -7556,6 +8815,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def current_track(self) -> TrackState:
         return self.project.tracks[self.current_track_index()]
+
+    def select_track_by_index(self, row: int) -> None:
+        if row < 0 or row >= len(self.project.tracks):
+            return
+        self.track_list.setCurrentRow(int(row))
+
+    def track_meter_levels(self) -> dict[int, float]:
+        return dict(self._track_meter_levels)
 
     def _track_display_text(self, track: TrackState) -> str:
         extra = track.instrument
@@ -7821,11 +9088,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sync_bundled_vsti_directory()
         self._set_project_references(self.project)
         self.current_project_path = None
+        if hasattr(self, 'quantize_box'):
+            self.quantize_box.blockSignals(True)
+            self.quantize_box.setCurrentText(self._project_quantize_text())
+            self.quantize_box.blockSignals(False)
         if hasattr(self, 'tempo_spin'):
             self.tempo_spin.setValue(self.project.bpm)
         if hasattr(self, 'left_locator'):
-            self.left_locator.setValue(self.project.left_locator_sec)
-            self.right_locator.setValue(self.project.right_locator_sec)
+            self._set_locator_spin_values(self.project.left_locator_sec, self.project.right_locator_sec)
         self._refresh_transport_controls()
         self.set_playhead_position(self.project.playhead_sec)
         self.sample_timeline.refresh()
