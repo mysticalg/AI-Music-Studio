@@ -12,14 +12,20 @@ This folder adds a JUCE-based VST instrument scaffold with these implemented blo
 - Arpeggiator modes: up, down, up/down, random.
 - Rhythm gate and per-note oscillator length gate.
 
-The shared source now builds four VST3 products:
+The shared source now builds ten VST3 products:
 
 - `AdvancedVSTi`
 - `AI Drum Machine`
+- `AI 808 Machine`
 - `AI Bass Synth`
+- `AI TB303`
 - `AI String Synth`
+- `AI Lead Synth`
+- `AI Pad Synth`
+- `AI Pluck Synth`
+- `AI Sampler`
 
-The packaged variants use flavor-specific defaults, and the drum machine variant also switches to one-shot drum synthesis behavior per MIDI note.
+The packaged variants use flavor-specific defaults. `AI Drum Machine` is now voiced as a punchier 909-style kit, `AI 808 Machine` adds longer analogue-style low-end drums, and `AI TB303` adds a more resonant acid-bass flavor. The sampler variant adds internal sample-bank playback with loop-window controls, so it behaves like a compact ROMpler/sampler without depending on external content.
 
 ## Automated GitHub build + download
 

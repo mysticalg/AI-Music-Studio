@@ -47,6 +47,9 @@ BLACK_KEY_PITCH_CLASSES = {1, 3, 6, 8, 10}
 OPENAI_API_URL = "https://api.openai.com/v1/responses"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-codex")
 APP_NAME = "AI Music Studio"
+PROJECT_FILE_EXTENSION = ".aims"
+PROJECT_FILE_FILTER = "AI Music Studio Project (*.aims);;JSON files (*.json);;All files (*)"
+PROJECT_FILE_VERSION = 1
 TRACK_COLOR_PALETTE = [
     "#4AB4FF",
     "#FF8A65",
@@ -2127,20 +2130,21 @@ class ArrangementOverviewWidget(QtWidgets.QGraphicsView):
 class KnobInput(QtWidgets.QWidget):
     valueChanged = QtCore.Signal(int)
 
-    def __init__(self, minimum: int = 0, maximum: int = 100, value: int = 0, suffix: str = '') -> None:
+    def __init__(self, minimum: int = 0, maximum: int = 100, value: int = 0, suffix: str = '', dial_size: int = 68) -> None:
         super().__init__()
         self._suffix = suffix
+        self._dial_size = max(24, int(dial_size))
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        layout.setSpacing(2 if self._dial_size <= 40 else 4)
         self.dial = QtWidgets.QDial()
         self.dial.setNotchesVisible(True)
         self.dial.setWrapping(False)
-        self.dial.setFixedSize(68, 68)
+        self.dial.setFixedSize(self._dial_size, self._dial_size)
         self.dial.setRange(int(minimum), int(maximum))
         self.value_label = QtWidgets.QLabel()
         self.value_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.value_label.setMinimumWidth(54)
+        self.value_label.setMinimumWidth(max(32, self._dial_size))
         layout.addWidget(self.dial, 0, QtCore.Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.value_label, 0, QtCore.Qt.AlignmentFlag.AlignCenter)
         self.dial.valueChanged.connect(self._on_value_changed)
@@ -2269,10 +2273,25 @@ class InstrumentFxWidget(QtWidgets.QWidget):
         form.addRow("MIDI program", self.midi_program)
 
         self.fx_controls: dict[str, KnobInput] = {}
+        fx_row_widget = QtWidgets.QWidget()
+        fx_row_layout = QtWidgets.QHBoxLayout(fx_row_widget)
+        fx_row_layout.setContentsMargins(0, 0, 0, 0)
+        fx_row_layout.setSpacing(10)
         for fx in ["EQ", "Compression", "Distortion", "Phaser", "Flanger", "Delay", "Reverb"]:
-            knob = KnobInput(0, 100, 30, '%')
-            form.addRow(fx, knob)
+            knob = KnobInput(0, 100, 30, '%', dial_size=34)
             self.fx_controls[fx] = knob
+            fx_cell = QtWidgets.QWidget()
+            fx_cell_layout = QtWidgets.QVBoxLayout(fx_cell)
+            fx_cell_layout.setContentsMargins(0, 0, 0, 0)
+            fx_cell_layout.setSpacing(4)
+            fx_label = QtWidgets.QLabel(fx)
+            fx_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            fx_label.setStyleSheet('font-size: 11px;')
+            fx_cell_layout.addWidget(fx_label)
+            fx_cell_layout.addWidget(knob, 0, QtCore.Qt.AlignmentFlag.AlignCenter)
+            fx_row_layout.addWidget(fx_cell)
+        fx_row_layout.addStretch(1)
+        form.addRow("Built-in FX", fx_row_widget)
 
         root.addLayout(form)
 
@@ -2632,6 +2651,31 @@ class OpenAIConnectDialog(QtWidgets.QDialog):
         }
 
 
+class FloatingPanelWindow(QtWidgets.QMainWindow):
+    visibilityChanged = QtCore.Signal(bool)
+
+    def __init__(self, title: str, parent: QtWidgets.QWidget | None = None, *, always_on_top: bool = False) -> None:
+        flags = QtCore.Qt.WindowType.Tool
+        if always_on_top:
+            flags |= QtCore.Qt.WindowType.WindowStaysOnTopHint
+        super().__init__(parent, flags)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        self.setWindowTitle(title)
+        self.resize(1180, 520)
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        event.ignore()
+        self.hide()
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        self.visibilityChanged.emit(True)
+
+    def hideEvent(self, event: QtGui.QHideEvent) -> None:
+        super().hideEvent(event)
+        self.visibilityChanged.emit(False)
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -2656,6 +2700,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.audio_buffer_ms = 80
         self.playback_ui_refresh_ms = 16
         self.prefer_gpu_rendering = True
+        self._main_splitter_sizes = [320, 1180]
+        self._note_editor_inner_sizes = [640, 160]
+        self._tools_window_visible = True
+        self._tools_window_geometry_b64 = ''
+        self._transport_window_visible = True
+        self._transport_window_geometry_b64 = ''
+        self._layout_save_timer = QtCore.QTimer(self)
+        self._layout_save_timer.setSingleShot(True)
+        self._layout_save_timer.timeout.connect(self._save_preferences)
         self._load_preferences()
         self._sync_bundled_vsti_directory()
         self._apply_selected_audio_output()
@@ -2693,7 +2746,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._audio_pump_timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
         self._audio_pump_timer.setInterval(5)
         self._audio_pump_timer.timeout.connect(self._pump_realtime_audio)
-        self.setWindowTitle("AI Music Studio")
+        self.current_project_path: Path | None = None
+        self.setWindowTitle(APP_NAME)
         self.resize(1500, 900)
 
         self.track_list = QtWidgets.QListWidget()
@@ -2766,29 +2820,54 @@ class MainWindow(QtWidgets.QMainWindow):
         left_layout.addStretch()
 
         right_tabs = QtWidgets.QTabWidget()
+        right_tabs.setMinimumHeight(0)
+        right_tabs.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
         right_tabs.addTab(self.timeline, "Timeline")
         right_tabs.addTab(self.arrangement_overview, "Arrangement Overview")
         right_tabs.addTab(self.sample_timeline, "Sample Timeline")
         right_tabs.addTab(self.mixer, "Mixer")
         right_tabs.addTab(self.instruments, "Instruments / FX")
+        self.right_tabs = right_tabs
+        self.tools_window = FloatingPanelWindow('Panels', self)
+        self.tools_window.setCentralWidget(self.right_tabs)
+        self.tools_window.visibilityChanged.connect(self._on_tools_window_visibility_changed)
 
         note_editor = QtWidgets.QWidget()
+        note_editor.setMinimumHeight(0)
         note_editor_layout = QtWidgets.QVBoxLayout(note_editor)
         note_editor_layout.setContentsMargins(0, 0, 0, 0)
-        note_editor_layout.setSpacing(4)
-        note_editor_layout.addWidget(self.piano_roll)
-        note_editor_layout.addWidget(QtWidgets.QLabel('Velocity Editor'))
-        note_editor_layout.addWidget(self.velocity_editor)
+        note_editor_layout.setSpacing(0)
 
-        splitter_vertical = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
-        splitter_vertical.addWidget(note_editor)
-        splitter_vertical.addWidget(right_tabs)
-        splitter_vertical.setSizes([600, 320])
+        velocity_panel = QtWidgets.QWidget()
+        velocity_panel.setMinimumHeight(0)
+        velocity_panel_layout = QtWidgets.QVBoxLayout(velocity_panel)
+        velocity_panel_layout.setContentsMargins(0, 4, 0, 0)
+        velocity_panel_layout.setSpacing(4)
+        velocity_panel_layout.addWidget(QtWidgets.QLabel('Velocity Editor'))
+        velocity_panel_layout.addWidget(self.velocity_editor)
+
+        self.piano_roll.setMinimumHeight(0)
+        self.velocity_editor.setMinimumHeight(0)
+        self.piano_roll.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
+        self.velocity_editor.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
+        note_editor_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        note_editor_splitter.setHandleWidth(10)
+        note_editor_splitter.addWidget(self.piano_roll)
+        note_editor_splitter.addWidget(velocity_panel)
+        note_editor_splitter.setChildrenCollapsible(False)
+        note_editor_splitter.setStretchFactor(0, 4)
+        note_editor_splitter.setStretchFactor(1, 1)
+        note_editor_splitter.setSizes(self._note_editor_inner_sizes)
+        note_editor_splitter.splitterMoved.connect(self._on_layout_splitter_moved)
+        self.note_editor_splitter = note_editor_splitter
+        note_editor_layout.addWidget(note_editor_splitter)
 
         splitter_main = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
         splitter_main.addWidget(left_panel)
-        splitter_main.addWidget(splitter_vertical)
-        splitter_main.setSizes([320, 1180])
+        splitter_main.addWidget(note_editor)
+        splitter_main.setSizes(self._main_splitter_sizes)
+        splitter_main.splitterMoved.connect(self._on_layout_splitter_moved)
+        self.splitter_main = splitter_main
 
         self.setCentralWidget(splitter_main)
         self._setup_menus()
@@ -2799,17 +2878,35 @@ class MainWindow(QtWidgets.QMainWindow):
         self._setup_virtual_piano_dock()
         self.refresh_sample_library()
         self.scan_sample_paths()
+        self._apply_tools_window_preferences()
+        self._update_window_title()
 
     def _setup_menus(self) -> None:
         file_menu = self.menuBar().addMenu('File')
+        new_project_action = QtGui.QAction('New Project', self)
+        new_project_action.triggered.connect(self.new_project)
+        open_project_action = QtGui.QAction('Open Project...', self)
+        open_project_action.triggered.connect(self.load_project)
+        save_project_action = QtGui.QAction('Save Project', self)
+        save_project_action.triggered.connect(self.save_project)
+        save_project_as_action = QtGui.QAction('Save Project As...', self)
+        save_project_as_action.triggered.connect(self.save_project_as)
         import_midi_action = QtGui.QAction('Import MIDI + AI Instrument Render', self)
         import_midi_action.triggered.connect(self.import_midi)
         export_midi_action = QtGui.QAction('Export MIDI', self)
         export_midi_action.triggered.connect(self.export_midi)
+        export_sequence_wav_action = QtGui.QAction('Export Sequence as WAV...', self)
+        export_sequence_wav_action.triggered.connect(self.export_sequence_wav)
         export_audio_action = QtGui.QAction('Export Sample Timeline Audio (WAV/MP3)', self)
         export_audio_action.triggered.connect(self.export_sample_timeline_audio)
+        file_menu.addAction(new_project_action)
+        file_menu.addAction(open_project_action)
+        file_menu.addAction(save_project_action)
+        file_menu.addAction(save_project_as_action)
+        file_menu.addSeparator()
         file_menu.addAction(import_midi_action)
         file_menu.addSeparator()
+        file_menu.addAction(export_sequence_wav_action)
         file_menu.addAction(export_midi_action)
         file_menu.addAction(export_audio_action)
 
@@ -2861,6 +2958,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.audio_output_menu = settings.addMenu('Audio Output')
         self.refresh_audio_output_menu()
 
+        windows_menu = self.menuBar().addMenu('Windows')
+        self.show_panels_window_action = QtGui.QAction('Show Panels Window', self)
+        self.show_panels_window_action.setCheckable(True)
+        self.show_panels_window_action.setChecked(self._tools_window_visible)
+        self.show_panels_window_action.toggled.connect(self.toggle_tools_window)
+        windows_menu.addAction(self.show_panels_window_action)
+        self.show_transport_window_action = QtGui.QAction('Show Transport Window', self)
+        self.show_transport_window_action.setCheckable(True)
+        self.show_transport_window_action.setChecked(self._transport_window_visible)
+        self.show_transport_window_action.toggled.connect(self.toggle_transport_window)
+        windows_menu.addAction(self.show_transport_window_action)
+        windows_menu.addSeparator()
+        tile_windows_action = QtGui.QAction('Tile Windows', self)
+        tile_windows_action.triggered.connect(self.tile_floating_windows)
+        windows_menu.addAction(tile_windows_action)
+
         performance_menu = settings.addMenu('Playback Performance')
         self.gpu_rendering_action = QtGui.QAction('Prefer GPU Rendering (restart required)', self)
         self.gpu_rendering_action.setCheckable(True)
@@ -2903,23 +3016,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_playhead_ui_refresh = 0.0
         self._playhead_ui_refresh_interval = max(0.001, self.playback_ui_refresh_ms / 1000.0)
 
-        transport = QtWidgets.QToolBar('Transport', self)
-        transport.setFloatable(True)
-        transport.setMovable(True)
-        self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, transport)
-        play_action = transport.addAction('Play')
-        stop_action = transport.addAction('Stop')
-        play_action.triggered.connect(self.start_playback)
-        stop_action.triggered.connect(self.stop_playback)
-        transport.addSeparator()
+        self.transport_window = FloatingPanelWindow('Transport', self, always_on_top=True)
+        self.transport_window.resize(760, 88)
+        self.transport_window.visibilityChanged.connect(self._on_transport_window_visibility_changed)
+        transport_widget = QtWidgets.QWidget()
+        transport_layout = QtWidgets.QHBoxLayout(transport_widget)
+        transport_layout.setContentsMargins(10, 10, 10, 10)
+        transport_layout.setSpacing(8)
+
+        self.transport_play_btn = QtWidgets.QPushButton('Play')
+        self.transport_stop_btn = QtWidgets.QPushButton('Stop')
+        self.transport_play_btn.clicked.connect(self.start_playback)
+        self.transport_stop_btn.clicked.connect(self.stop_playback)
+        transport_layout.addWidget(self.transport_play_btn)
+        transport_layout.addWidget(self.transport_stop_btn)
+
         self.playhead_spin = QtWidgets.QDoubleSpinBox()
         self.playhead_spin.setRange(0.0, 3600.0)
         self.playhead_spin.setDecimals(2)
         self.playhead_spin.setSingleStep(0.1)
         self.playhead_spin.setValue(self.project.playhead_sec)
         self.playhead_spin.valueChanged.connect(self.set_playhead_position)
-        transport.addWidget(QtWidgets.QLabel('Playhead'))
-        transport.addWidget(self.playhead_spin)
+        transport_layout.addWidget(QtWidgets.QLabel('Playhead'))
+        transport_layout.addWidget(self.playhead_spin)
         self.left_locator = QtWidgets.QDoubleSpinBox()
         self.left_locator.setRange(0.0, 3600.0)
         self.left_locator.setValue(self.project.left_locator_sec)
@@ -2928,17 +3047,375 @@ class MainWindow(QtWidgets.QMainWindow):
         self.right_locator.setValue(self.project.right_locator_sec)
         self.left_locator.valueChanged.connect(self.update_locators)
         self.right_locator.valueChanged.connect(self.update_locators)
-        transport.addWidget(QtWidgets.QLabel('L'))
-        transport.addWidget(self.left_locator)
-        transport.addWidget(QtWidgets.QLabel('R'))
-        transport.addWidget(self.right_locator)
-        transport.addSeparator()
+        transport_layout.addWidget(QtWidgets.QLabel('L'))
+        transport_layout.addWidget(self.left_locator)
+        transport_layout.addWidget(QtWidgets.QLabel('R'))
+        transport_layout.addWidget(self.right_locator)
         self.tempo_spin = QtWidgets.QSpinBox()
         self.tempo_spin.setRange(20, 300)
         self.tempo_spin.setValue(self.project.bpm)
         self.tempo_spin.valueChanged.connect(self.update_tempo)
-        transport.addWidget(QtWidgets.QLabel('Tempo'))
-        transport.addWidget(self.tempo_spin)
+        transport_layout.addWidget(QtWidgets.QLabel('Tempo'))
+        transport_layout.addWidget(self.tempo_spin)
+        transport_layout.addStretch(1)
+        self.transport_window.setCentralWidget(transport_widget)
+        self._apply_transport_window_preferences()
+
+    def _update_window_title(self) -> None:
+        if self.current_project_path is not None:
+            self.setWindowTitle(f"{APP_NAME} - {self.current_project_path.name}")
+            return
+        self.setWindowTitle(APP_NAME)
+
+    @staticmethod
+    def _ensure_project_file_suffix(path: str | Path) -> Path:
+        target = Path(path).expanduser()
+        if target.suffix:
+            return target
+        return target.with_suffix(PROJECT_FILE_EXTENSION)
+
+    @staticmethod
+    def _coerce_int(value: object, default: int, minimum: int | None = None, maximum: int | None = None) -> int:
+        try:
+            result = int(value)
+        except Exception:
+            result = int(default)
+        if minimum is not None:
+            result = max(minimum, result)
+        if maximum is not None:
+            result = min(maximum, result)
+        return result
+
+    @staticmethod
+    def _coerce_float(value: object, default: float, minimum: float | None = None, maximum: float | None = None) -> float:
+        try:
+            result = float(value)
+        except Exception:
+            result = float(default)
+        if minimum is not None:
+            result = max(minimum, result)
+        if maximum is not None:
+            result = min(maximum, result)
+        return result
+
+    def _project_quantize_text(self) -> str:
+        div = max(1, int(self.project.quantize_div))
+        return f"1/{div}{'T' if self.project.quantize_triplet else ''}"
+
+    @staticmethod
+    def _decode_project_blob(value: object) -> bytes:
+        if not value:
+            return b''
+        try:
+            return base64.b64decode(str(value).encode('ascii'))
+        except Exception:
+            return b''
+
+    @staticmethod
+    def _encode_track_vsti_state(track: TrackState) -> str:
+        if not track.vsti_state_path:
+            return ''
+        state_path = Path(track.vsti_state_path)
+        if not state_path.exists():
+            return ''
+        try:
+            raw_state = state_path.read_bytes()
+        except Exception:
+            return ''
+        if not raw_state:
+            return ''
+        return base64.b64encode(raw_state).decode('ascii')
+
+    def _project_ui_payload(self) -> dict[str, object]:
+        return {
+            'selected_track_index': self.current_track_index(),
+            'quantize_text': self.quantize_box.currentText().strip() or self._project_quantize_text(),
+            'piano_roll_tool': self.piano_roll.tool,
+            'piano_roll_note_length_div': int(self.piano_roll.note_length_div),
+            'piano_roll_cell_w': int(self.piano_roll.cell_w),
+            'piano_roll_cell_h': int(self.piano_roll.cell_h),
+            'velocity_cell_w': int(self.velocity_editor.cell_w),
+            'sample_timeline_pixels_per_second': int(self.sample_timeline.pixels_per_second),
+            'arrangement_pixels_per_second': int(self.arrangement_overview.pixels_per_second),
+            'panels_tab_index': int(self.right_tabs.currentIndex()),
+            'panels_visible': bool(self.tools_window.isVisible()),
+            'transport_visible': bool(self.transport_window.isVisible()),
+        }
+
+    def _project_payload(self) -> dict[str, object]:
+        track_payload: list[dict[str, object]] = []
+        for track in self.project.tracks:
+            serialized = dataclasses.asdict(track)
+            serialized['vsti_state_b64'] = self._encode_track_vsti_state(track)
+            track_payload.append(serialized)
+
+        return {
+            'format': 'ai_music_studio_project',
+            'version': PROJECT_FILE_VERSION,
+            'saved_at_unix': int(time.time()),
+            'project': {
+                'bpm': int(self.project.bpm),
+                'quantize_div': int(self.project.quantize_div),
+                'quantize_triplet': bool(self.project.quantize_triplet),
+                'left_locator_sec': float(self.project.left_locator_sec),
+                'right_locator_sec': float(self.project.right_locator_sec),
+                'playhead_sec': float(self.project.playhead_sec),
+                'tracks': track_payload,
+                'vsti_paths': list(self.project.vsti_paths),
+                'vsti_folder_paths': list(self.project.vsti_folder_paths),
+                'sample_paths': list(self.project.sample_paths),
+                'vsti_rack': [dataclasses.asdict(vst) for vst in self.project.vsti_rack],
+                'sample_assets': [dataclasses.asdict(asset) for asset in self.project.sample_assets],
+                'sample_clips': [dataclasses.asdict(clip) for clip in self.project.sample_clips],
+                'midi_sections': [dataclasses.asdict(section) for section in self.project.midi_sections],
+            },
+            'ui': self._project_ui_payload(),
+        }
+
+    def _project_from_payload(self, payload: dict[str, object]) -> tuple[ProjectState, dict[int, bytes], dict[str, object]]:
+        project_root = payload.get('project', payload)
+        if not isinstance(project_root, dict):
+            raise ValueError('The selected file does not contain a valid project payload.')
+
+        project = ProjectState()
+        project.bpm = self._coerce_int(project_root.get('bpm'), DEFAULT_BPM, 20, 300)
+        project.quantize_div = self._coerce_int(project_root.get('quantize_div'), 4, 1, 64)
+        project.quantize_triplet = bool(project_root.get('quantize_triplet', False))
+        project.left_locator_sec = self._coerce_float(project_root.get('left_locator_sec'), 0.0, 0.0, 3600.0)
+        project.right_locator_sec = self._coerce_float(project_root.get('right_locator_sec'), 8.0, 0.0, 3600.0)
+        if project.right_locator_sec <= project.left_locator_sec:
+            project.right_locator_sec = project.left_locator_sec + 8.0
+        project.playhead_sec = self._coerce_float(project_root.get('playhead_sec'), 0.0, 0.0, project.right_locator_sec)
+
+        track_state_blobs: dict[int, bytes] = {}
+        tracks: list[TrackState] = []
+        for index, raw_track in enumerate(project_root.get('tracks', [])):
+            if not isinstance(raw_track, dict):
+                continue
+            track = TrackState(name=str(raw_track.get('name') or f'Track {index + 1}'))
+            track.track_type = 'sample' if str(raw_track.get('track_type') or '').lower() == 'sample' else 'instrument'
+            track.notes = []
+            for raw_note in raw_track.get('notes', []):
+                if not isinstance(raw_note, dict):
+                    continue
+                track.notes.append(
+                    MidiNote(
+                        start_tick=self._coerce_int(raw_note.get('start_tick'), 0, 0),
+                        duration_tick=self._coerce_int(raw_note.get('duration_tick'), TICKS_PER_BEAT // 2, 1),
+                        pitch=self._coerce_int(raw_note.get('pitch'), 60, 0, 127),
+                        velocity=self._coerce_int(raw_note.get('velocity'), 100, 1, 127),
+                        selected=bool(raw_note.get('selected', False)),
+                    )
+                )
+            track.volume = self._coerce_float(raw_track.get('volume'), 0.8, 0.0, 2.0)
+            track.pan = self._coerce_float(raw_track.get('pan'), 0.0, -1.0, 1.0)
+            track.instrument = str(raw_track.get('instrument') or track.instrument)
+            track.instrument_mode = str(raw_track.get('instrument_mode') or track.instrument_mode)
+            track.rack_vsti = str(raw_track.get('rack_vsti') or '')
+            track.plugins = [str(item) for item in raw_track.get('plugins', []) if isinstance(item, str)]
+            if isinstance(raw_track.get('vsti_parameters'), dict):
+                track.vsti_parameters = {
+                    str(key): self._coerce_float(value, 0.0, 0.0, 100.0)
+                    for key, value in raw_track.get('vsti_parameters', {}).items()
+                }
+            track.vsti_state_path = str(raw_track.get('vsti_state_path') or '')
+            track.vsti_output_gain_db = self._coerce_float(raw_track.get('vsti_output_gain_db'), 0.0, -48.0, 24.0)
+            track.vsti_wet_mix = self._coerce_float(raw_track.get('vsti_wet_mix'), 100.0, 0.0, 100.0)
+            track.vst_fx_chain = [str(item) for item in raw_track.get('vst_fx_chain', []) if isinstance(item, str)]
+            track.midi_program = self._coerce_int(raw_track.get('midi_program'), 0, 0, 127)
+            track.midi_channel = self._coerce_int(raw_track.get('midi_channel'), index % 16, 0, 15)
+            track.synth_profile = str(raw_track.get('synth_profile') or track.synth_profile)
+            track.rendered_audio_path = str(raw_track.get('rendered_audio_path') or '')
+            track.mute = bool(raw_track.get('mute', False))
+            track.solo = bool(raw_track.get('solo', False))
+            track.color_hex = str(raw_track.get('color_hex') or '')
+            tracks.append(track)
+            blob = self._decode_project_blob(raw_track.get('vsti_state_b64'))
+            if blob:
+                track_state_blobs[index] = blob
+        project.tracks = tracks or [TrackState(name='Track 1')]
+
+        project.vsti_paths = [str(item) for item in project_root.get('vsti_paths', []) if isinstance(item, str)]
+        project.vsti_folder_paths = [str(item) for item in project_root.get('vsti_folder_paths', []) if isinstance(item, str)]
+        project.sample_paths = [str(item) for item in project_root.get('sample_paths', []) if isinstance(item, str)]
+
+        project.vsti_rack = []
+        for raw_vst in project_root.get('vsti_rack', []):
+            if not isinstance(raw_vst, dict):
+                continue
+            project.vsti_rack.append(
+                VSTInstrument(
+                    name=str(raw_vst.get('name') or Path(str(raw_vst.get('path') or '')).stem or 'VSTI'),
+                    path=str(raw_vst.get('path') or ''),
+                    plugin_name=str(raw_vst.get('plugin_name') or raw_vst.get('name') or ''),
+                    is_instrument=bool(raw_vst.get('is_instrument', False)),
+                    is_effect=bool(raw_vst.get('is_effect', False)),
+                    category=str(raw_vst.get('category') or ''),
+                    host_supported=bool(raw_vst.get('host_supported', True)),
+                    host_error=str(raw_vst.get('host_error') or ''),
+                )
+            )
+
+        project.sample_assets = []
+        for raw_asset in project_root.get('sample_assets', []):
+            if not isinstance(raw_asset, dict):
+                continue
+            project.sample_assets.append(
+                SampleAsset(
+                    path=str(raw_asset.get('path') or ''),
+                    duration_sec=self._coerce_float(raw_asset.get('duration_sec'), 0.0, 0.0),
+                    sample_rate=self._coerce_int(raw_asset.get('sample_rate'), 44100, 1000, 384000),
+                    waveform_preview=[
+                        self._coerce_float(value, 0.0, -1.0, 1.0)
+                        for value in raw_asset.get('waveform_preview', [])
+                        if isinstance(value, (int, float))
+                    ],
+                )
+            )
+
+        project.sample_clips = []
+        for raw_clip in project_root.get('sample_clips', []):
+            if not isinstance(raw_clip, dict):
+                continue
+            project.sample_clips.append(
+                SampleClip(
+                    path=str(raw_clip.get('path') or ''),
+                    track_index=self._coerce_int(raw_clip.get('track_index'), 0, 0),
+                    start_sec=self._coerce_float(raw_clip.get('start_sec'), 0.0, 0.0),
+                    duration_sec=self._coerce_float(raw_clip.get('duration_sec'), 0.0, 0.0),
+                    sample_rate=self._coerce_int(raw_clip.get('sample_rate'), 44100, 1000, 384000),
+                    waveform_preview=[
+                        self._coerce_float(value, 0.0, -1.0, 1.0)
+                        for value in raw_clip.get('waveform_preview', [])
+                        if isinstance(value, (int, float))
+                    ],
+                )
+            )
+
+        project.midi_sections = []
+        for raw_section in project_root.get('midi_sections', []):
+            if not isinstance(raw_section, dict):
+                continue
+            project.midi_sections.append(
+                MidiSection(
+                    track_index=self._coerce_int(raw_section.get('track_index'), 0, 0),
+                    start_sec=self._coerce_float(raw_section.get('start_sec'), 0.0, 0.0),
+                    duration_sec=self._coerce_float(raw_section.get('duration_sec'), 0.0, 0.0),
+                    name=str(raw_section.get('name') or 'MIDI Part'),
+                )
+            )
+
+        ui_state = payload.get('ui', {})
+        return project, track_state_blobs, ui_state if isinstance(ui_state, dict) else {}
+
+    def _materialize_project_vsti_states(self, project: ProjectState, track_state_blobs: dict[int, bytes]) -> None:
+        if not track_state_blobs:
+            return
+        for index, raw_state in track_state_blobs.items():
+            if not raw_state or not (0 <= index < len(project.tracks)):
+                continue
+            track = project.tracks[index]
+            entry = next((item for item in project.vsti_rack if item.name == track.rack_vsti), None)
+            if entry is not None:
+                target_path = self._default_vsti_state_cache_path(track, entry)
+            else:
+                track_key = hashlib.sha1(f'{track.name}:{track.rack_vsti}:{index}'.encode('utf-8')).hexdigest()[:16]
+                target_path = RENDER_DIR / '_vsti_state' / f'{track_key}.bin'
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                target_path.write_bytes(raw_state)
+                track.vsti_state_path = str(target_path)
+            except Exception:
+                continue
+
+    def _set_project_references(self, project: ProjectState) -> None:
+        self.project = project
+        self.timeline.project = project
+        self.piano_roll.project = project
+        self.velocity_editor.project = project
+        self.sample_timeline.project = project
+        self.arrangement_overview.project = project
+        self.mixer.project = project
+        self.instruments.project = project
+
+    def _reset_project_runtime_state(self) -> None:
+        self._deferred_note_refresh_timer.stop()
+        self._deferred_refresh_velocity = False
+        self._deferred_refresh_timeline = False
+        self._deferred_rebuild_sections = False
+        self._deferred_refresh_arrangement = False
+        self._deferred_reload_mix = False
+        self.stop_playback()
+        self._close_preview_audio()
+        self._track_playback_audio_cache = {}
+        self._sample_audio_cache = {}
+        self._realtime_track_states = {}
+        self._playback_mix_wav_bytes = b''
+        self._playback_mix_cache_key = ''
+        self._playback_mix_duration_sec = 0.0
+        self._cleanup_legacy_playback_files()
+
+    def _apply_project_to_ui(self, project: ProjectState, ui_state: dict[str, object] | None = None, project_path: Path | None = None) -> None:
+        self._reset_project_runtime_state()
+        self._set_project_references(project)
+        self._dedupe_and_filter_vsti_state()
+        self._sync_bundled_vsti_directory()
+        self.current_project_path = project_path.resolve() if project_path is not None else None
+
+        quantize_text = str((ui_state or {}).get('quantize_text') or self._project_quantize_text()).strip()
+        if self.quantize_box.findText(quantize_text) < 0:
+            quantize_text = self._project_quantize_text()
+        self.quantize_box.blockSignals(True)
+        self.quantize_box.setCurrentText(quantize_text)
+        self.quantize_box.blockSignals(False)
+
+        self.tempo_spin.blockSignals(True)
+        self.tempo_spin.setValue(int(self.project.bpm))
+        self.tempo_spin.blockSignals(False)
+        self.left_locator.blockSignals(True)
+        self.left_locator.setValue(float(self.project.left_locator_sec))
+        self.left_locator.blockSignals(False)
+        self.right_locator.blockSignals(True)
+        self.right_locator.setValue(float(self.project.right_locator_sec))
+        self.right_locator.blockSignals(False)
+
+        self.piano_roll.tool = str((ui_state or {}).get('piano_roll_tool') or self.piano_roll.tool)
+        self.piano_roll.note_length_div = self._coerce_int((ui_state or {}).get('piano_roll_note_length_div'), self.piano_roll.note_length_div, 1, 64)
+        self.piano_roll.cell_w = self._coerce_int((ui_state or {}).get('piano_roll_cell_w'), self.piano_roll.cell_w, 8, 96)
+        self.piano_roll.cell_h = self._coerce_int((ui_state or {}).get('piano_roll_cell_h'), self.piano_roll.cell_h, 10, 28)
+        self.velocity_editor.cell_w = self._coerce_int((ui_state or {}).get('velocity_cell_w'), self.velocity_editor.cell_w, 8, 96)
+        self.sample_timeline.pixels_per_second = self._coerce_int((ui_state or {}).get('sample_timeline_pixels_per_second'), self.sample_timeline.pixels_per_second, 20, 320)
+        self.arrangement_overview.pixels_per_second = self._coerce_int((ui_state or {}).get('arrangement_pixels_per_second'), self.arrangement_overview.pixels_per_second, 20, 320)
+        self.right_tabs.setCurrentIndex(self._coerce_int((ui_state or {}).get('panels_tab_index'), self.right_tabs.currentIndex(), 0, max(0, self.right_tabs.count() - 1)))
+
+        self.refresh_sample_library()
+        self.sample_timeline.refresh()
+        self.arrangement_overview.refresh()
+        self.piano_roll.refresh()
+        self.velocity_editor.refresh()
+        self.refresh_vsti_rack_ui()
+
+        selected_track = self._coerce_int((ui_state or {}).get('selected_track_index'), 0, 0, max(0, len(self.project.tracks) - 1))
+        self._populate_track_list()
+        if self.project.tracks:
+            self.track_list.setCurrentRow(selected_track)
+        self.timeline.refresh()
+        self.set_playhead_position(float(self.project.playhead_sec))
+
+        if hasattr(self, 'show_panels_window_action'):
+            panels_visible = bool((ui_state or {}).get('panels_visible', self._tools_window_visible))
+            self.show_panels_window_action.blockSignals(True)
+            self.show_panels_window_action.setChecked(panels_visible)
+            self.show_panels_window_action.blockSignals(False)
+            self.toggle_tools_window(panels_visible)
+        if hasattr(self, 'show_transport_window_action'):
+            transport_visible = bool((ui_state or {}).get('transport_visible', self._transport_window_visible))
+            self.show_transport_window_action.blockSignals(True)
+            self.show_transport_window_action.setChecked(transport_visible)
+            self.show_transport_window_action.blockSignals(False)
+            self.toggle_transport_window(transport_visible)
+
+        self._update_window_title()
 
     def on_quantize_changed(self, text: str) -> None:
         value = text.strip().upper()
@@ -3594,9 +4071,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.statusBar().showMessage(f'Playback audio stopped: {error}')
 
     def start_playback(self) -> None:
-        if not self._has_realtime_playable_audio():
-            QtWidgets.QMessageBox.information(self, 'Nothing to play', 'No playable audio was found. Add notes or sample clips first.')
-            return
         self._sync_playback_loop_state()
         start_sec = self.project.playhead_sec
         if start_sec < self.project.left_locator_sec or start_sec > self.project.right_locator_sec:
@@ -4013,28 +4487,110 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             return False
 
-    def _center_dialog(self, dialog: QtWidgets.QDialog) -> None:
+    def _screen_available_geometry(self) -> QtCore.QRect | None:
         screen = None
         if self.windowHandle() is not None:
             screen = self.windowHandle().screen()
         if screen is None:
             screen = QtGui.QGuiApplication.primaryScreen()
         if screen is None:
+            return None
+        return screen.availableGeometry()
+
+    def _center_widget_on_screen(self, widget: QtWidgets.QWidget, *, width: int | None = None, height: int | None = None) -> None:
+        available = self._screen_available_geometry()
+        if available is None:
             return
-        available = screen.availableGeometry()
+        if width is not None or height is not None:
+            target_width = width if width is not None else widget.width()
+            target_height = height if height is not None else widget.height()
+            widget.resize(target_width, target_height)
+        frame = widget.frameGeometry()
+        frame.moveCenter(available.center())
+        widget.move(frame.topLeft())
+
+    def _center_dialog(self, dialog: QtWidgets.QDialog) -> None:
+        available = self._screen_available_geometry()
+        if available is None:
+            return
         width = min(max(dialog.width(), 760), max(640, available.width() - 80))
         height = min(max(dialog.height(), 620), max(480, available.height() - 80))
-        dialog.resize(width, height)
-        frame = dialog.frameGeometry()
-        frame.moveCenter(available.center())
-        dialog.move(frame.topLeft())
+        self._center_widget_on_screen(dialog, width=width, height=height)
+
+    def _center_foreground_native_window_async(self, *, delay_sec: float = 0.12, retries: int = 12) -> None:
+        if os.name != 'nt':
+            return
+
+        def worker() -> None:
+            user32 = ctypes.windll.user32
+
+            class RECT(ctypes.Structure):
+                _fields_ = [('left', ctypes.c_long), ('top', ctypes.c_long), ('right', ctypes.c_long), ('bottom', ctypes.c_long)]
+
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [('cbSize', ctypes.c_ulong), ('rcMonitor', RECT), ('rcWork', RECT), ('dwFlags', ctypes.c_ulong)]
+
+            try:
+                main_hwnd = int(self.winId()) if self.winId() else 0
+            except Exception:
+                main_hwnd = 0
+
+            time.sleep(max(0.0, float(delay_sec)))
+            for _attempt in range(max(1, int(retries))):
+                try:
+                    hwnd = user32.GetForegroundWindow()
+                    if not hwnd or hwnd == main_hwnd:
+                        time.sleep(0.08)
+                        continue
+                    rect = RECT()
+                    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                        time.sleep(0.08)
+                        continue
+                    width = max(1, rect.right - rect.left)
+                    height = max(1, rect.bottom - rect.top)
+                    monitor = user32.MonitorFromWindow(hwnd, 2)
+                    monitor_info = MONITORINFO()
+                    monitor_info.cbSize = ctypes.sizeof(MONITORINFO)
+                    if monitor and user32.GetMonitorInfoW(monitor, ctypes.byref(monitor_info)):
+                        work = monitor_info.rcWork
+                    else:
+                        work = RECT()
+                        user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(work), 0)
+                    x = int(work.left + max(0, ((work.right - work.left) - width) // 2))
+                    y = int(work.top + max(0, ((work.bottom - work.top) - height) // 2))
+                    user32.SetWindowPos(hwnd, None, x, y, 0, 0, 0x0001 | 0x0004 | 0x0010)
+                    return
+                except Exception:
+                    time.sleep(0.08)
+
+        threading.Thread(target=worker, name='center-native-vst-window', daemon=True).start()
 
     def _bundled_vsti_theme(self, vst_name: str) -> dict[str, str]:
         normalized = vst_name.strip().lower()
+        if '808' in normalized:
+            return {
+                'title': '808 Circuit',
+                'subtitle': 'Longer subs, softer metallic hats, and warmer analogue body for classic 808-style drum patterns.',
+                'accent': '#FFAA52',
+                'accent_soft': '#5A2E11',
+                'panel': '#171513',
+                'hero_a': '#4A2A12',
+                'hero_b': '#11161C',
+            }
+        if '303' in normalized:
+            return {
+                'title': 'Acid Lane',
+                'subtitle': 'Resonant cutoff sweeps, squelch, and tighter decay in a more polished acid-bass control room.',
+                'accent': '#74F0A8',
+                'accent_soft': '#143826',
+                'panel': '#121A16',
+                'hero_a': '#103222',
+                'hero_b': '#10161C',
+            }
         if 'drum' in normalized:
             return {
-                'title': 'Drum Lab',
-                'subtitle': 'Punchy one-shots, transient shaping, and quick groove sculpting.',
+                'title': '909 Lab',
+                'subtitle': 'Punchier 909-style hits, sharper hats, and quicker transient shaping for classic drum-machine grooves.',
                 'accent': '#FF8A3D',
                 'accent_soft': '#5E2B12',
                 'panel': '#151A20',
@@ -4051,6 +4607,36 @@ class MainWindow(QtWidgets.QMainWindow):
                 'hero_a': '#113224',
                 'hero_b': '#0F171E',
             }
+        if 'lead' in normalized:
+            return {
+                'title': 'Lead Arc',
+                'subtitle': 'Sharper attack, brighter harmonics, and more forward motion for hook lines.',
+                'accent': '#FF7676',
+                'accent_soft': '#4C1D20',
+                'panel': '#18171B',
+                'hero_a': '#4A1E26',
+                'hero_b': '#11151C',
+            }
+        if 'pad' in normalized:
+            return {
+                'title': 'Pad Atlas',
+                'subtitle': 'Slow blooms, wide stereo drift, and softer harmonic clouds for beds and lifts.',
+                'accent': '#8DD7FF',
+                'accent_soft': '#193B4D',
+                'panel': '#131A20',
+                'hero_a': '#173B4C',
+                'hero_b': '#10171E',
+            }
+        if 'pluck' in normalized:
+            return {
+                'title': 'Pluck Deck',
+                'subtitle': 'Tight transients, short tails, and clear bite for rhythmic hooks.',
+                'accent': '#FFB26B',
+                'accent_soft': '#4B2D14',
+                'panel': '#191813',
+                'hero_a': '#4A2F16',
+                'hero_b': '#12171D',
+            }
         if 'string' in normalized:
             return {
                 'title': 'String Bloom',
@@ -4060,6 +4646,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 'panel': '#171922',
                 'hero_a': '#46371A',
                 'hero_b': '#11161D',
+            }
+        if 'sampler' in normalized:
+            return {
+                'title': 'Sampler Deck',
+                'subtitle': 'Switch sample banks, trim the playback window, and shape a more sample-forward voice.',
+                'accent': '#C694FF',
+                'accent_soft': '#3B2352',
+                'panel': '#171422',
+                'hero_a': '#322044',
+                'hero_b': '#10141B',
             }
         return {
             'title': 'Control Room',
@@ -4174,7 +4770,7 @@ class MainWindow(QtWidgets.QMainWindow):
             badge.setObjectName('vstiHeroBadge')
             badge.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter)
             hero_layout.addWidget(badge, 0, QtCore.Qt.AlignmentFlag.AlignLeft)
-            title = QtWidgets.QLabel('Bundled Instrument Panel')
+            title = QtWidgets.QLabel(theme['title'])
             title.setObjectName('vstiHeroTitle')
             hero_layout.addWidget(title)
             subtitle = QtWidgets.QLabel(theme['subtitle'])
@@ -4621,6 +5217,8 @@ class MainWindow(QtWidgets.QMainWindow):
             'volume': round(float(track.volume), 6),
             'pan': round(float(track.pan), 6),
             'vsti_parameters': sorted((key, round(float(value), 6)) for key, value in track.vsti_parameters.items()),
+            'vsti_state_path': track.vsti_state_path,
+            'vsti_state_mtime_ns': self._path_mtime_ns(Path(track.vsti_state_path)) if track.vsti_state_path else 0,
             'vsti_output_gain_db': round(float(track.vsti_output_gain_db), 6),
             'vsti_wet_mix': round(float(track.vsti_wet_mix), 6),
             'vst_fx_chain': list(track.vst_fx_chain),
@@ -4847,6 +5445,23 @@ class MainWindow(QtWidgets.QMainWindow):
         if not payload:
             return
 
+        main_sizes = payload.get('main_splitter_sizes', self._main_splitter_sizes)
+        note_editor_sizes = payload.get('note_editor_inner_sizes', self._note_editor_inner_sizes)
+        self._tools_window_visible = bool(payload.get('tools_window_visible', True))
+        self._tools_window_geometry_b64 = str(payload.get('tools_window_geometry_b64', '') or '')
+        self._transport_window_visible = bool(payload.get('transport_window_visible', True))
+        self._transport_window_geometry_b64 = str(payload.get('transport_window_geometry_b64', '') or '')
+        if isinstance(main_sizes, list) and len(main_sizes) == 2:
+            try:
+                self._main_splitter_sizes = [max(120, int(main_sizes[0])), max(240, int(main_sizes[1]))]
+            except Exception:
+                pass
+        if isinstance(note_editor_sizes, list) and len(note_editor_sizes) == 2:
+            try:
+                self._note_editor_inner_sizes = [max(180, int(note_editor_sizes[0])), max(60, int(note_editor_sizes[1]))]
+            except Exception:
+                pass
+
         self.project.vsti_paths = [p for p in payload.get('vsti_paths', []) if isinstance(p, str)]
         self.project.vsti_folder_paths = [p for p in payload.get('vsti_folder_paths', []) if isinstance(p, str)]
         self.project.sample_paths = [p for p in payload.get('sample_paths', []) if isinstance(p, str)]
@@ -4921,6 +5536,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self._save_preferences()
 
     def _save_preferences(self) -> None:
+        if hasattr(self, 'splitter_main'):
+            self._main_splitter_sizes = [int(size) for size in self.splitter_main.sizes()]
+        if hasattr(self, 'note_editor_splitter'):
+            self._note_editor_inner_sizes = [int(size) for size in self.note_editor_splitter.sizes()]
+        if hasattr(self, 'tools_window'):
+            self._tools_window_visible = self.tools_window.isVisible()
+            self._tools_window_geometry_b64 = bytes(self.tools_window.saveGeometry().toBase64()).decode('ascii')
+        if hasattr(self, 'transport_window'):
+            self._transport_window_visible = self.transport_window.isVisible()
+            self._transport_window_geometry_b64 = bytes(self.transport_window.saveGeometry().toBase64()).decode('ascii')
         payload = {
             'vsti_paths': self.project.vsti_paths,
             'vsti_folder_paths': self.project.vsti_folder_paths,
@@ -4943,6 +5568,12 @@ class MainWindow(QtWidgets.QMainWindow):
             'audio_buffer_ms': self.audio_buffer_ms,
             'playback_ui_refresh_ms': self.playback_ui_refresh_ms,
             'prefer_gpu_rendering': self.prefer_gpu_rendering,
+            'main_splitter_sizes': self._main_splitter_sizes,
+            'note_editor_inner_sizes': self._note_editor_inner_sizes,
+            'tools_window_visible': self._tools_window_visible,
+            'tools_window_geometry_b64': self._tools_window_geometry_b64,
+            'transport_window_visible': self._transport_window_visible,
+            'transport_window_geometry_b64': self._transport_window_geometry_b64,
         }
         APP_PREFS_PATH.parent.mkdir(parents=True, exist_ok=True)
         APP_PREFS_PATH.write_text(json.dumps(payload, indent=2))
@@ -5302,6 +5933,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         self._load_saved_vsti_plugin_state(plugin, track, vst)
                         self._apply_saved_plugin_parameters(plugin, track.vsti_parameters)
                         self.statusBar().showMessage(f'Opening native VST editor: {vst.name}')
+                        self._center_foreground_native_window_async()
                         plugin.show_editor()
                         snapshot = self._plugin_parameter_snapshot(plugin)
                         if snapshot:
@@ -5372,6 +6004,158 @@ class MainWindow(QtWidgets.QMainWindow):
         self._save_preferences()
         self.refresh_vsti_rack_ui()
         self.statusBar().showMessage(f'Added VSTI to rack: {Path(path).name}')
+
+    def _on_layout_splitter_moved(self, _pos: int, _index: int) -> None:
+        if hasattr(self, 'splitter_main'):
+            self._main_splitter_sizes = [int(size) for size in self.splitter_main.sizes()]
+        if hasattr(self, 'note_editor_splitter'):
+            self._note_editor_inner_sizes = [int(size) for size in self.note_editor_splitter.sizes()]
+        self._layout_save_timer.start(150)
+
+    def _apply_tools_window_preferences(self) -> None:
+        if not hasattr(self, 'tools_window'):
+            return
+        if self._tools_window_geometry_b64:
+            try:
+                geometry = QtCore.QByteArray.fromBase64(self._tools_window_geometry_b64.encode('ascii'))
+                if not geometry.isEmpty():
+                    self.tools_window.restoreGeometry(geometry)
+            except Exception:
+                pass
+        else:
+            self._position_tools_window_default()
+        if hasattr(self, 'show_panels_window_action'):
+            self.show_panels_window_action.blockSignals(True)
+            self.show_panels_window_action.setChecked(self._tools_window_visible)
+            self.show_panels_window_action.blockSignals(False)
+        if self._tools_window_visible:
+            self.tools_window.show()
+            self.tools_window.raise_()
+        else:
+            self.tools_window.hide()
+
+    def _apply_transport_window_preferences(self) -> None:
+        if not hasattr(self, 'transport_window'):
+            return
+        if self._transport_window_geometry_b64:
+            try:
+                geometry = QtCore.QByteArray.fromBase64(self._transport_window_geometry_b64.encode('ascii'))
+                if not geometry.isEmpty():
+                    self.transport_window.restoreGeometry(geometry)
+            except Exception:
+                pass
+        else:
+            self._position_transport_window_default()
+        if hasattr(self, 'show_transport_window_action'):
+            self.show_transport_window_action.blockSignals(True)
+            self.show_transport_window_action.setChecked(self._transport_window_visible)
+            self.show_transport_window_action.blockSignals(False)
+        if self._transport_window_visible:
+            self.transport_window.show()
+            self.transport_window.raise_()
+        else:
+            self.transport_window.hide()
+
+    def _on_tools_window_visibility_changed(self, visible: bool) -> None:
+        self._tools_window_visible = bool(visible)
+        if hasattr(self, 'show_panels_window_action'):
+            self.show_panels_window_action.blockSignals(True)
+            self.show_panels_window_action.setChecked(self._tools_window_visible)
+            self.show_panels_window_action.blockSignals(False)
+        self._save_preferences()
+
+    def _on_transport_window_visibility_changed(self, visible: bool) -> None:
+        self._transport_window_visible = bool(visible)
+        if hasattr(self, 'show_transport_window_action'):
+            self.show_transport_window_action.blockSignals(True)
+            self.show_transport_window_action.setChecked(self._transport_window_visible)
+            self.show_transport_window_action.blockSignals(False)
+        self._save_preferences()
+
+    def toggle_tools_window(self, checked: bool) -> None:
+        self._tools_window_visible = bool(checked)
+        if not hasattr(self, 'tools_window'):
+            return
+        if checked:
+            self.tools_window.show()
+            self.tools_window.raise_()
+            self.tools_window.activateWindow()
+        else:
+            self.tools_window.hide()
+
+    def toggle_transport_window(self, checked: bool) -> None:
+        self._transport_window_visible = bool(checked)
+        if not hasattr(self, 'transport_window'):
+            return
+        if checked:
+            self.transport_window.show()
+            self.transport_window.raise_()
+            self.transport_window.activateWindow()
+        else:
+            self.transport_window.hide()
+
+    def tile_floating_windows(self) -> None:
+        screen = None
+        if self.windowHandle() is not None:
+            screen = self.windowHandle().screen()
+        if screen is None:
+            screen = QtGui.QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        spacing = 16
+
+        if hasattr(self, 'transport_window'):
+            transport_width = min(900, max(620, available.width() - 120))
+            transport_height = max(88, min(120, available.height() // 8))
+            transport_x = available.x() + max(0, (available.width() - transport_width) // 2)
+            transport_y = available.y() + spacing
+            self.transport_window.setGeometry(transport_x, transport_y, transport_width, transport_height)
+            self.transport_window.show()
+            self.transport_window.raise_()
+            self._transport_window_visible = True
+
+        if hasattr(self, 'tools_window'):
+            tools_width = min(available.width() - 80, max(960, available.width() // 2))
+            tools_height = min(available.height() - 180, max(460, (available.height() * 2) // 5))
+            tools_x = available.x() + max(0, available.width() - tools_width - spacing)
+            tools_y = available.y() + spacing + 96
+            self.tools_window.setGeometry(tools_x, tools_y, tools_width, tools_height)
+            self.tools_window.show()
+            self.tools_window.raise_()
+            self._tools_window_visible = True
+
+        if hasattr(self, 'show_panels_window_action'):
+            self.show_panels_window_action.blockSignals(True)
+            self.show_panels_window_action.setChecked(True)
+            self.show_panels_window_action.blockSignals(False)
+        if hasattr(self, 'show_transport_window_action'):
+            self.show_transport_window_action.blockSignals(True)
+            self.show_transport_window_action.setChecked(True)
+            self.show_transport_window_action.blockSignals(False)
+        self._save_preferences()
+
+    def _position_transport_window_default(self) -> None:
+        if not hasattr(self, 'transport_window'):
+            return
+        available = self._screen_available_geometry()
+        if available is None:
+            return
+        width = min(900, max(620, available.width() - 120))
+        height = 88
+        self._center_widget_on_screen(self.transport_window, width=width, height=height)
+        self.transport_window.move(self.transport_window.x(), available.y() + 16)
+
+    def _position_tools_window_default(self) -> None:
+        if not hasattr(self, 'tools_window'):
+            return
+        available = self._screen_available_geometry()
+        if available is None:
+            return
+        width = min(available.width() - 80, max(980, available.width() // 2))
+        height = min(available.height() - 160, max(480, (available.height() * 2) // 5))
+        self._center_widget_on_screen(self.tools_window, width=width, height=height)
+        self.tools_window.move(available.x() + max(0, available.width() - width - 24), available.y() + 120)
 
     def refresh_vsti_rack_ui(self) -> None:
         if hasattr(self, 'vsti_menu'):
@@ -5654,10 +6438,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _setup_shortcuts(self) -> None:
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+N"), self, self.new_project)
-        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+O"), self, self.import_midi)
-        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+S"), self, self.export_midi)
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+O"), self, self.load_project)
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+S"), self, self.save_project)
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Shift+S"), self, self.save_project_as)
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Shift+I"), self, self.import_midi)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Shift+O"), self, self.import_sample)
-        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+E"), self, self.export_sample_timeline_audio)
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+E"), self, self.export_sequence_wav)
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Alt+E"), self, self.export_sample_timeline_audio)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+R"), self, self.render_all_tracks)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Q"), self, self.piano_roll.quantize_selected)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+D"), self, self.piano_roll.duplicate_selected_by_grid)
@@ -5676,6 +6463,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         for key, pitch in key_map.items():
             QtGui.QShortcut(QtGui.QKeySequence(key), self, lambda p=pitch: self.insert_live_note(p))
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        try:
+            self._save_preferences()
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     def compose_with_ai(self) -> None:
         prompt, ok = QtWidgets.QInputDialog.getText(self, "AI Composition Prompt", "Describe the song/arrangement:")
@@ -6292,29 +7086,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.arrangement_overview.refresh()
 
     def new_project(self) -> None:
-        self._deferred_note_refresh_timer.stop()
-        self._deferred_refresh_velocity = False
-        self._deferred_refresh_timeline = False
-        self._deferred_rebuild_sections = False
-        self._deferred_refresh_arrangement = False
-        self._deferred_reload_mix = False
-        self.stop_playback()
-        self._close_preview_audio()
+        self._reset_project_runtime_state()
         self.project = ProjectState()
-        self._track_playback_audio_cache = {}
-        self._sample_audio_cache = {}
-        self._realtime_track_states = {}
-        self._playback_mix_wav_bytes = b''
-        self._playback_mix_cache_key = ''
-        self._playback_mix_duration_sec = 0.0
-        self._cleanup_legacy_playback_files()
         self._load_preferences()
         self._sync_bundled_vsti_directory()
-        self.timeline.project = self.project
-        self.piano_roll.project = self.project
-        self.velocity_editor.project = self.project
-        self.sample_timeline.project = self.project
-        self.arrangement_overview.project = self.project
+        self._set_project_references(self.project)
+        self.current_project_path = None
         if hasattr(self, 'tempo_spin'):
             self.tempo_spin.setValue(self.project.bpm)
         if hasattr(self, 'left_locator'):
@@ -6327,6 +7104,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_vsti_rack_ui()
         self.scan_sample_paths()
         self.on_notes_changed()
+        self._update_window_title()
 
     def on_notes_changed(self) -> None:
         self._deferred_note_refresh_timer.stop()
@@ -6342,6 +7120,160 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rebuild_midi_sections()
         self.arrangement_overview.refresh()
         self._reload_playback_mix_if_running()
+
+    def save_project(self) -> None:
+        if self.current_project_path is None:
+            self.save_project_as()
+            return
+        self._save_project_to_path(self.current_project_path)
+
+    def save_project_as(self) -> None:
+        default_name = self.current_project_path.name if self.current_project_path is not None else f"project{PROJECT_FILE_EXTENSION}"
+        default_dir = self.current_project_path.parent if self.current_project_path is not None else DEFAULT_USER_FILES_DIR
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            'Save project',
+            str(default_dir / default_name),
+            PROJECT_FILE_FILTER,
+        )
+        if not path:
+            return
+        self._save_project_to_path(self._ensure_project_file_suffix(path))
+
+    def _save_project_to_path(self, path: Path) -> None:
+        payload = self._project_payload()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2), encoding='utf-8')
+        self.current_project_path = path.resolve()
+        self._update_window_title()
+        self.statusBar().showMessage(f'Saved project: {self.current_project_path.name}')
+
+    def load_project(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            'Open project',
+            str(self.current_project_path.parent if self.current_project_path is not None else DEFAULT_USER_FILES_DIR),
+            PROJECT_FILE_FILTER,
+        )
+        if not path:
+            return
+
+        project_path = Path(path).expanduser()
+        try:
+            payload = json.loads(project_path.read_text(encoding='utf-8'))
+            project, track_state_blobs, ui_state = self._project_from_payload(payload)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, 'Project load failed', str(exc))
+            return
+
+        self._materialize_project_vsti_states(project, track_state_blobs)
+        self._apply_project_to_ui(project, ui_state, project_path)
+        self.statusBar().showMessage(f'Loaded project: {project_path.name}')
+
+    def _render_sequence_mix(self, left_sec: float, right_sec: float) -> tuple[object, int]:
+        sample_rate = 44100
+        mix_length = max(1, int(max(0.0, right_sec - left_sec) * sample_rate))
+        if np is not None:
+            mix: object = np.zeros(mix_length, dtype=np.float32)
+        else:
+            mix = [0.0] * mix_length
+
+        solo_tracks = {idx for idx, track in enumerate(self.project.tracks) if track.solo}
+
+        for idx, track in enumerate(self.project.tracks):
+            if track.track_type != 'instrument':
+                continue
+            if solo_tracks and idx not in solo_tracks:
+                continue
+            if track.mute:
+                continue
+
+            data, sr = self._get_track_playback_audio(idx, track)
+            if sr != sample_rate:
+                data = resample_samples(data, sr, sample_rate)
+            source_start = max(0, int(left_sec * sample_rate))
+            source_end = min(source_start + mix_length, data.shape[0] if np is not None and isinstance(data, np.ndarray) else len(data))
+            if source_end <= source_start:
+                continue
+
+            if np is not None and isinstance(mix, np.ndarray) and isinstance(data, np.ndarray):
+                count = min(mix.shape[0], source_end - source_start)
+                if count > 0:
+                    mix[:count] += data[source_start:source_start + count]
+            else:
+                source = list(data)[source_start:source_end]
+                count = min(len(mix), len(source))
+                for i in range(count):
+                    mix[i] += source[i]
+
+        for clip in self.project.sample_clips:
+            if clip.track_index < 0 or clip.track_index >= len(self.project.tracks):
+                continue
+            clip_track = self.project.tracks[clip.track_index]
+            if solo_tracks and clip.track_index not in solo_tracks:
+                continue
+            if clip_track.mute:
+                continue
+
+            wav_path = Path(clip.path)
+            if wav_path.suffix.lower() == '.mp3':
+                converted = RENDER_DIR / f'{wav_path.stem}_sequence_export.wav'
+                convert_audio(wav_path, converted)
+                wav_path = converted
+            data, sr = load_wav_samples(wav_path)
+            if sr != sample_rate:
+                data = resample_samples(data, sr, sample_rate)
+                sr = sample_rate
+            data = self._apply_vst_fx_chain(clip_track, data, sr)
+
+            clip_start = float(clip.start_sec)
+            clip_end = clip_start + ((data.shape[0] if np is not None and isinstance(data, np.ndarray) else len(data)) / sample_rate)
+            if clip_end <= left_sec or clip_start >= right_sec:
+                continue
+
+            overlap_start = max(left_sec, clip_start)
+            overlap_end = min(right_sec, clip_end)
+            src_start = int((overlap_start - clip_start) * sample_rate)
+            dst_start = int((overlap_start - left_sec) * sample_rate)
+            count = int((overlap_end - overlap_start) * sample_rate)
+            if count <= 0:
+                continue
+
+            if np is not None and isinstance(mix, np.ndarray) and isinstance(data, np.ndarray):
+                mix[dst_start:dst_start + count] += data[src_start:src_start + count] * 0.7 * float(clip_track.volume)
+            else:
+                source = list(data)[src_start:src_start + count]
+                for i, sample in enumerate(source):
+                    target = dst_start + i
+                    if target >= len(mix):
+                        break
+                    mix[target] += sample * 0.7 * float(clip_track.volume)
+
+        if np is not None and isinstance(mix, np.ndarray):
+            return np.clip(mix, -1.0, 1.0).astype(np.float32, copy=False), sample_rate
+        return [clamp(value, -1.0, 1.0) for value in mix], sample_rate
+
+    def export_sequence_wav(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            'Export sequence as WAV',
+            str(DEFAULT_USER_FILES_DIR / 'sequence.wav'),
+            'WAV files (*.wav)',
+        )
+        if not path:
+            return
+
+        left_sec = float(self.project.left_locator_sec)
+        right_sec = float(self.project.right_locator_sec)
+        if right_sec <= left_sec:
+            QtWidgets.QMessageBox.warning(self, 'Invalid locators', 'Right locator must be greater than left locator for export.')
+            return
+
+        data, sample_rate = self._render_sequence_mix(left_sec, right_sec)
+        output_path = Path(path).expanduser().with_suffix('.wav')
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        write_wav_samples(output_path, data, sample_rate)
+        self.statusBar().showMessage(f'Exported sequence WAV: {output_path.name}')
 
     def import_midi(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Import MIDI", str(DEFAULT_USER_FILES_DIR), "MIDI files (*.mid *.midi)")

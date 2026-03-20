@@ -140,8 +140,14 @@ A JUCE-based instrument scaffold is available in `plugins/AdvancedVSTi` with cor
 
 - `AdvancedVSTi`
 - `AI Drum Machine`
+- `AI 808 Machine`
 - `AI Bass Synth`
+- `AI TB303`
 - `AI String Synth`
+- `AI Lead Synth`
+- `AI Pad Synth`
+- `AI Pluck Synth`
+- `AI Sampler`
 
 See `plugins/AdvancedVSTi/README.md` for build steps. The GitHub Actions workflow (`.github/workflows/build-vsti.yml`) packages the built `.vst3` bundles into a downloadable ZIP. If those bundles are copied into the app's local `vsti/` folder, AI Music Studio now auto-discovers and adds them to the VST rack on startup.
 

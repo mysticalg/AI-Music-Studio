@@ -90,6 +90,7 @@ AdvancedVSTiAudioProcessor::AdvancedVSTiAudioProcessor()
 void AdvancedVSTiAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 {
     currentSampleRate = sampleRate;
+    loadedSampleBank = -1;
 
     juce::dsp::ProcessSpec spec { sampleRate, static_cast<juce::uint32> (samplesPerBlock), 1 };
     leftFilter.prepare (spec);
@@ -106,10 +107,159 @@ void AdvancedVSTiAudioProcessor::prepareToPlay (double sampleRate, int samplesPe
     }
 
     updateRenderParameters();
+    refreshSampleBank();
     applyEnvelopeSettings();
 }
 
 void AdvancedVSTiAudioProcessor::releaseResources() {}
+
+juce::StringArray AdvancedVSTiAudioProcessor::sampleBankChoices()
+{
+    return { "Dusty Keys", "Tape Choir", "Velvet Pluck", "Vox Chop", "Sub Stab", "Glass Bell" };
+}
+
+void AdvancedVSTiAudioProcessor::refreshSampleBank()
+{
+    const auto banks = sampleBankChoices();
+    const auto targetBank = juce::jlimit (0, juce::jmax (0, banks.size() - 1), renderParams.sampleBank);
+    if (loadedSampleBank == targetBank && loadedSample.getNumSamples() > 1)
+        return;
+
+    buildGeneratedSampleBank (targetBank);
+    loadedSampleBank = targetBank;
+}
+
+void AdvancedVSTiAudioProcessor::buildGeneratedSampleBank (int bankIndex)
+{
+    const auto sampleRateF = static_cast<float> (currentSampleRate);
+    if (sampleRateF <= 1000.0f)
+    {
+        loadedSample.setSize (1, 1);
+        loadedSample.clear();
+        return;
+    }
+
+    float lengthSec = 1.8f;
+    switch (bankIndex)
+    {
+        case 1: lengthSec = 2.6f; break;
+        case 2: lengthSec = 1.4f; break;
+        case 3: lengthSec = 1.1f; break;
+        case 4: lengthSec = 1.2f; break;
+        case 5: lengthSec = 2.8f; break;
+        default: break;
+    }
+
+    const auto numSamples = juce::jmax (256, juce::roundToInt (lengthSec * sampleRateF));
+    loadedSample.setSize (1, numSamples);
+    loadedSample.clear();
+
+    auto* dst = loadedSample.getWritePointer (0);
+    float phaseA = 0.0f;
+    float phaseB = 0.0f;
+    float phaseC = 0.0f;
+    float phaseD = 0.0f;
+    float stateA = 0.0f;
+
+    for (int i = 0; i < numSamples; ++i)
+    {
+        const auto t = static_cast<float> (i) / sampleRateF;
+        const auto noise = random.nextFloat() * 2.0f - 1.0f;
+        float sample = 0.0f;
+
+        switch (bankIndex)
+        {
+            case 1:
+            {
+                phaseA = std::fmod (phaseA + (261.6256f / sampleRateF), 1.0f);
+                phaseB = std::fmod (phaseB + (523.2511f / sampleRateF), 1.0f);
+                phaseC = std::fmod (phaseC + (130.8128f / sampleRateF), 1.0f);
+                phaseD = std::fmod (phaseD + (0.33f / sampleRateF), 1.0f);
+                const auto swell = juce::jlimit (0.0f, 1.0f, t / 0.18f);
+                const auto env = swell * std::exp (-t * 0.55f);
+                const auto saw = (2.0f * phaseA) - 1.0f;
+                const auto tri = 1.0f - (4.0f * std::abs (phaseB - 0.5f));
+                sample = (saw * 0.46f) + (tri * 0.2f) + (std::sin (twoPi * phaseC) * 0.24f) + (noise * 0.01f);
+                sample = smoothTowards (sample, 0.04f, stateA);
+                sample += std::sin (twoPi * phaseD) * 0.07f * env;
+                sample *= env;
+                break;
+            }
+            case 2:
+            {
+                phaseA = std::fmod (phaseA + (261.6256f / sampleRateF), 1.0f);
+                phaseB = std::fmod (phaseB + (527.0f / sampleRateF), 1.0f);
+                const auto env = std::exp (-t * 5.4f);
+                const auto click = std::exp (-t * 55.0f);
+                sample = ((std::sin (twoPi * phaseA) * 0.7f) + (std::sin (twoPi * phaseB) * 0.28f)) * env;
+                sample += noise * 0.17f * click;
+                sample = softSaturate (sample * 1.22f);
+                break;
+            }
+            case 3:
+            {
+                phaseA = std::fmod (phaseA + (220.0f / sampleRateF), 1.0f);
+                phaseB = std::fmod (phaseB + (660.0f / sampleRateF), 1.0f);
+                phaseC = std::fmod (phaseC + (1210.0f / sampleRateF), 1.0f);
+                phaseD = std::fmod (phaseD + (330.0f / sampleRateF), 1.0f);
+                const auto attack = juce::jlimit (0.0f, 1.0f, t / 0.03f);
+                const auto env = attack * std::exp (-t * 1.9f);
+                const auto vowel = (std::sin (twoPi * phaseA) * 0.4f) + (std::sin (twoPi * phaseB) * 0.22f) + (std::sin (twoPi * phaseC) * 0.13f);
+                sample = smoothTowards (vowel + (noise * 0.05f), 0.09f, stateA);
+                sample += std::sin (twoPi * phaseD) * 0.08f * std::exp (-std::pow ((t - 0.24f) * 4.2f, 2.0f));
+                sample *= env;
+                break;
+            }
+            case 4:
+            {
+                phaseA = std::fmod (phaseA + (65.4064f / sampleRateF), 1.0f);
+                phaseB = std::fmod (phaseB + (130.8128f / sampleRateF), 1.0f);
+                const auto attack = juce::jlimit (0.0f, 1.0f, t * 28.0f);
+                const auto env = attack * std::exp (-t * 3.4f);
+                const auto square = phaseB < 0.5f ? 1.0f : -1.0f;
+                sample = ((std::sin (twoPi * phaseA) * 0.78f) + (square * 0.14f)) * env;
+                sample += noise * 0.04f * std::exp (-t * 44.0f);
+                sample = softSaturate (sample * 1.35f);
+                break;
+            }
+            case 5:
+            {
+                phaseA = std::fmod (phaseA + (261.6256f / sampleRateF), 1.0f);
+                phaseB = std::fmod (phaseB + ((261.6256f * 2.76f) / sampleRateF), 1.0f);
+                phaseC = std::fmod (phaseC + ((261.6256f * 4.17f) / sampleRateF), 1.0f);
+                const auto env = std::exp (-t * 1.55f);
+                const auto mod = std::sin (twoPi * phaseB) * (1.8f * std::exp (-t * 2.4f));
+                const auto bell = std::sin ((twoPi * phaseA) + mod);
+                const auto sparkle = std::sin (twoPi * phaseC) * std::exp (-t * 3.0f);
+                sample = (bell * env) + (sparkle * 0.32f) + (noise * 0.012f * std::exp (-t * 7.0f));
+                break;
+            }
+            case 0:
+            default:
+            {
+                phaseA = std::fmod (phaseA + (261.6256f / sampleRateF), 1.0f);
+                phaseB = std::fmod (phaseB + (523.2511f / sampleRateF), 1.0f);
+                phaseC = std::fmod (phaseC + (784.8768f / sampleRateF), 1.0f);
+                const auto env = std::exp (-t * 2.9f);
+                const auto hammer = std::exp (-t * 38.0f);
+                sample = ((std::sin (twoPi * phaseA) * 0.72f) + (std::sin (twoPi * phaseB) * 0.22f) + (std::sin (twoPi * phaseC) * 0.08f)) * env;
+                sample += noise * (0.026f * env + 0.11f * hammer);
+                sample = smoothTowards (sample, 0.08f, stateA);
+                sample += std::sin (twoPi * std::fmod (phaseA * 0.5f, 1.0f)) * 0.05f * env;
+                break;
+            }
+        }
+
+        dst[i] = sample;
+    }
+
+    float peak = 0.0f;
+    for (int i = 0; i < numSamples; ++i)
+        peak = juce::jmax (peak, std::abs (dst[i]));
+
+    if (peak > 0.0001f)
+        juce::FloatVectorOperations::multiply (dst, 0.92f / peak, numSamples);
+}
 
 void AdvancedVSTiAudioProcessor::handleMidi (const juce::MidiBuffer& midiMessages, int)
 {
@@ -148,7 +298,7 @@ void AdvancedVSTiAudioProcessor::handleMidi (const juce::MidiBuffer& midiMessage
         }
         else if (msg.isNoteOff())
         {
-            if constexpr (buildFlavor() == InstrumentFlavor::drumMachine)
+            if constexpr (isDrumFlavor())
                 continue;
 
             const auto note = msg.getNoteNumber();
@@ -199,12 +349,20 @@ float AdvancedVSTiAudioProcessor::oscSample (VoiceState& voice, float baseFreq, 
         case OscType::sample:
         {
             if (loadedSample.getNumSamples() <= 1)
+                refreshSampleBank();
+            if (loadedSample.getNumSamples() <= 1)
                 return 0.0f;
-            const auto idx = static_cast<int> (voice.samplePos);
-            const auto sample = loadedSample.getSample (0, juce::jlimit (0, loadedSample.getNumSamples() - 1, idx));
-            voice.samplePos += (baseFreq / 261.6256f);
-            if (voice.samplePos >= static_cast<float> (loadedSample.getNumSamples()))
-                voice.samplePos = 0.0f;
+            const auto totalSamples = loadedSample.getNumSamples();
+            const auto loopStart = juce::jlimit (0, totalSamples - 1, juce::roundToInt (renderParams.sampleStart * static_cast<float> (totalSamples - 1)));
+            const auto loopEnd = juce::jlimit (loopStart + 1, totalSamples, juce::roundToInt (renderParams.sampleEnd * static_cast<float> (totalSamples)));
+            if (voice.samplePos < static_cast<float> (loopStart) || voice.samplePos >= static_cast<float> (loopEnd))
+                voice.samplePos = static_cast<float> (loopStart);
+            const auto idx = juce::jlimit (loopStart, loopEnd - 1, static_cast<int> (voice.samplePos));
+            const auto sample = loadedSample.getSample (0, idx);
+            const auto playbackRatio = juce::jlimit (0.125f, 8.0f, baseFreq / 261.6256f);
+            voice.samplePos += playbackRatio;
+            if (voice.samplePos >= static_cast<float> (loopEnd))
+                voice.samplePos = static_cast<float> (loopStart);
             return sample;
         }
         case OscType::sine:
@@ -222,78 +380,170 @@ float AdvancedVSTiAudioProcessor::renderDrumVoiceSample (VoiceState& voice)
     const auto dt = 1.0f / static_cast<float> (currentSampleRate);
     const auto noise = random.nextFloat() * 2.0f - 1.0f;
     const auto kind = drumKindForMidi (voice.midiNote);
+    const auto punch = juce::jlimit (0.0f, 1.0f, renderParams.fmAmount / 1000.0f);
+    const auto snap = juce::jlimit (0.0f, 1.0f, renderParams.syncAmount / 4.0f);
+    const auto brightness = juce::jlimit (0.0f, 1.0f, (renderParams.cutoff - 20.0f) / (20000.0f - 20.0f));
+    const auto ring = juce::jlimit (0.0f, 1.0f, (renderParams.resonance - 0.1f) / 1.1f);
 
     float output = 0.0f;
     float duration = 0.4f;
 
-    switch (kind)
+    if constexpr (buildFlavor() == InstrumentFlavor::drum808)
     {
-        case DrumVoiceKind::kick:
+        switch (kind)
         {
-            duration = 1.0f;
-            const auto pitch = 42.0f + 120.0f * std::exp (-age * 10.0f);
-            voice.auxPhase = std::fmod (voice.auxPhase + pitch * dt, 1.0f);
-            const auto tone = std::sin (twoPi * voice.auxPhase) * std::exp (-age * 4.8f);
-            const auto click = noise * 0.18f * std::exp (-age * 70.0f);
-            output = tone + click;
-            break;
+            case DrumVoiceKind::kick:
+            {
+                duration = 1.45f + (renderParams.gateLength * 0.18f);
+                const auto pitch = 34.0f + (82.0f + (punch * 26.0f)) * std::exp (-age * (7.5f + snap * 4.0f));
+                voice.auxPhase = std::fmod (voice.auxPhase + pitch * dt, 1.0f);
+                const auto body = std::sin (twoPi * voice.auxPhase) * std::exp (-age * (2.2f + ring * 0.6f));
+                const auto sub = std::sin (twoPi * std::fmod (voice.auxPhase * 0.5f, 1.0f)) * std::exp (-age * 1.8f);
+                const auto beater = noise * (0.03f + punch * 0.06f) * std::exp (-age * 95.0f);
+                output = (body * 0.92f) + (sub * 0.42f) + beater;
+                break;
+            }
+            case DrumVoiceKind::snare:
+            {
+                duration = 0.62f;
+                voice.phase = std::fmod (voice.phase + 182.0f * dt, 1.0f);
+                voice.fmPhase = std::fmod (voice.fmPhase + 331.0f * dt, 1.0f);
+                const auto body = ((std::sin (twoPi * voice.phase) * 0.6f) + (std::sin (twoPi * voice.fmPhase) * 0.38f)) * std::exp (-age * 8.0f);
+                const auto rattle = noise * std::exp (-age * (13.0f - brightness * 2.0f));
+                output = (body * 0.58f) + (rattle * 0.82f);
+                break;
+            }
+            case DrumVoiceKind::closedHat:
+            case DrumVoiceKind::openHat:
+            {
+                duration = kind == DrumVoiceKind::closedHat ? 0.16f : 0.72f;
+                voice.phase = std::fmod (voice.phase + 412.0f * dt, 1.0f);
+                const auto metallic =
+                    std::sin (twoPi * voice.phase * 2.0f)
+                    + std::sin (twoPi * voice.phase * 3.97f)
+                    + std::sin (twoPi * voice.phase * 5.11f);
+                const auto env = std::exp (-age * (kind == DrumVoiceKind::closedHat ? 34.0f : 10.5f));
+                const auto airy = noise * std::exp (-age * (kind == DrumVoiceKind::closedHat ? 42.0f : 12.5f));
+                output = (metallic * 0.16f + airy * 0.78f) * env;
+                break;
+            }
+            case DrumVoiceKind::clap:
+            {
+                duration = 0.5f;
+                const auto pulseA = std::exp (-std::pow ((age - 0.00f) * 38.0f, 2.0f));
+                const auto pulseB = std::exp (-std::pow ((age - 0.034f) * 34.0f, 2.0f));
+                const auto pulseC = std::exp (-std::pow ((age - 0.072f) * 30.0f, 2.0f));
+                const auto tail = std::exp (-age * 7.6f);
+                output = noise * ((0.82f * pulseA) + (0.78f * pulseB) + (0.66f * pulseC) + (0.4f * tail));
+                break;
+            }
+            case DrumVoiceKind::tom:
+            {
+                duration = 0.95f;
+                const auto pitch = juce::jlimit (72.0f, 215.0f, midiToHz (voice.midiNote) * 0.9f);
+                const auto sweep = 1.0f + 0.42f * std::exp (-age * 5.4f);
+                voice.auxPhase = std::fmod (voice.auxPhase + (pitch * sweep) * dt, 1.0f);
+                output = std::sin (twoPi * voice.auxPhase) * std::exp (-age * 3.6f);
+                output += std::sin (twoPi * std::fmod (voice.auxPhase * 0.5f, 1.0f)) * 0.22f * std::exp (-age * 2.7f);
+                break;
+            }
+            case DrumVoiceKind::perc:
+            default:
+            {
+                duration = 0.38f;
+                voice.phase = std::fmod (voice.phase + 540.0f * dt, 1.0f);
+                voice.fmPhase = std::fmod (voice.fmPhase + 846.0f * dt, 1.0f);
+                const auto squareA = voice.phase < 0.5f ? 1.0f : -1.0f;
+                const auto squareB = voice.fmPhase < 0.5f ? 1.0f : -1.0f;
+                output = (squareA * 0.42f + squareB * 0.34f) * std::exp (-age * 9.4f);
+                output += noise * 0.08f * std::exp (-age * 20.0f);
+                break;
+            }
         }
-        case DrumVoiceKind::snare:
+        output = softSaturate (output * (1.16f + punch * 0.2f)) * 0.94f;
+    }
+    else
+    {
+        switch (kind)
         {
-            duration = 0.45f;
-            voice.auxPhase = std::fmod (voice.auxPhase + 190.0f * dt, 1.0f);
-            const auto body = std::sin (twoPi * voice.auxPhase) * std::exp (-age * 11.0f);
-            const auto sizzle = noise * std::exp (-age * 16.0f);
-            output = body * 0.35f + sizzle * 0.85f;
-            break;
+            case DrumVoiceKind::kick:
+            {
+                duration = 1.0f + (renderParams.gateLength * 0.08f);
+                const auto pitch = 46.0f + (126.0f + (punch * 40.0f)) * std::exp (-age * (10.5f + snap * 4.2f));
+                voice.auxPhase = std::fmod (voice.auxPhase + pitch * dt, 1.0f);
+                const auto tone = std::sin (twoPi * voice.auxPhase) * std::exp (-age * (4.7f + ring * 1.3f));
+                const auto thump = std::sin (twoPi * std::fmod (voice.auxPhase * 0.5f, 1.0f)) * 0.22f * std::exp (-age * 3.6f);
+                const auto click = noise * (0.13f + punch * 0.11f) * std::exp (-age * 85.0f);
+                output = tone + thump + click;
+                break;
+            }
+            case DrumVoiceKind::snare:
+            {
+                duration = 0.48f;
+                voice.phase = std::fmod (voice.phase + 186.0f * dt, 1.0f);
+                voice.fmPhase = std::fmod (voice.fmPhase + 329.0f * dt, 1.0f);
+                const auto body = ((std::sin (twoPi * voice.phase) * 0.56f) + (std::sin (twoPi * voice.fmPhase) * 0.31f)) * std::exp (-age * 10.6f);
+                const auto sizzle = noise * std::exp (-age * (17.0f - brightness * 4.0f));
+                output = (body * 0.58f) + (sizzle * 0.88f);
+                break;
+            }
+            case DrumVoiceKind::closedHat:
+            case DrumVoiceKind::openHat:
+            {
+                duration = kind == DrumVoiceKind::closedHat ? 0.13f : 0.56f;
+                voice.phase = std::fmod (voice.phase + 442.0f * dt, 1.0f);
+                const auto metallic =
+                    std::sin (twoPi * voice.phase * 2.0f)
+                    + std::sin (twoPi * voice.phase * 3.18f)
+                    + std::sin (twoPi * voice.phase * 4.27f)
+                    + std::sin (twoPi * voice.phase * 5.12f);
+                const auto body = metallic * 0.11f;
+                const auto air = noise * (0.74f + brightness * 0.14f);
+                const auto env = std::exp (-age * (kind == DrumVoiceKind::closedHat ? 44.0f : 12.8f));
+                output = (body + air) * env;
+                break;
+            }
+            case DrumVoiceKind::clap:
+            {
+                duration = 0.36f;
+                const auto pulseA = std::exp (-std::pow ((age - 0.00f) * 44.0f, 2.0f));
+                const auto pulseB = std::exp (-std::pow ((age - 0.032f) * 42.0f, 2.0f));
+                const auto pulseC = std::exp (-std::pow ((age - 0.068f) * 36.0f, 2.0f));
+                const auto tail = std::exp (-age * 9.4f);
+                output = noise * ((0.86f * pulseA) + (0.74f * pulseB) + (0.58f * pulseC) + (0.32f * tail));
+                break;
+            }
+            case DrumVoiceKind::tom:
+            {
+                duration = 0.76f;
+                const auto pitch = juce::jlimit (90.0f, 245.0f, midiToHz (voice.midiNote));
+                const auto sweep = 0.84f + 0.31f * std::exp (-age * 6.2f);
+                voice.auxPhase = std::fmod (voice.auxPhase + (pitch * sweep) * dt, 1.0f);
+                const auto ringTone = std::sin (twoPi * voice.auxPhase) * std::exp (-age * 5.1f);
+                output = ringTone + noise * 0.06f * std::exp (-age * 24.0f);
+                break;
+            }
+            case DrumVoiceKind::perc:
+            default:
+            {
+                duration = 0.28f;
+                voice.phase = std::fmod (voice.phase + 460.0f * dt, 1.0f);
+                voice.fmPhase = std::fmod (voice.fmPhase + 744.0f * dt, 1.0f);
+                const auto metallic = (std::sin (twoPi * voice.phase) * 0.52f) + (std::sin (twoPi * voice.fmPhase) * 0.31f);
+                const auto chop = voice.phase < 0.5f ? 1.0f : -1.0f;
+                output = (metallic + chop * 0.16f) * std::exp (-age * 13.0f);
+                output += noise * 0.11f * std::exp (-age * 26.0f);
+                break;
+            }
         }
-        case DrumVoiceKind::closedHat:
-        {
-            duration = 0.14f;
-            output = noise * std::exp (-age * 48.0f);
-            break;
-        }
-        case DrumVoiceKind::openHat:
-        {
-            duration = 0.55f;
-            output = noise * std::exp (-age * 12.5f);
-            break;
-        }
-        case DrumVoiceKind::clap:
-        {
-            duration = 0.35f;
-            const auto pulseA = std::exp (-std::pow ((age - 0.00f) * 45.0f, 2.0f));
-            const auto pulseB = std::exp (-std::pow ((age - 0.04f) * 40.0f, 2.0f));
-            const auto pulseC = std::exp (-std::pow ((age - 0.09f) * 35.0f, 2.0f));
-            const auto tail = std::exp (-age * 9.0f);
-            output = noise * (0.8f * pulseA + 0.7f * pulseB + 0.6f * pulseC + 0.35f * tail);
-            break;
-        }
-        case DrumVoiceKind::tom:
-        {
-            duration = 0.7f;
-            const auto pitch = juce::jlimit (85.0f, 240.0f, midiToHz (voice.midiNote));
-            const auto sweep = 0.65f + 0.35f * std::exp (-age * 6.0f);
-            voice.auxPhase = std::fmod (voice.auxPhase + (pitch * sweep) * dt, 1.0f);
-            output = std::sin (twoPi * voice.auxPhase) * std::exp (-age * 5.6f);
-            break;
-        }
-        case DrumVoiceKind::perc:
-        default:
-        {
-            duration = 0.3f;
-            voice.auxPhase = std::fmod (voice.auxPhase + 320.0f * dt, 1.0f);
-            const auto tone = std::sin (twoPi * voice.auxPhase * 1.7f) * std::exp (-age * 14.0f);
-            output = tone * 0.45f + noise * 0.45f * std::exp (-age * 24.0f);
-            break;
-        }
+        output = softSaturate (output * (1.28f + punch * 0.28f)) * 0.92f;
     }
 
     voice.noteAge += dt;
     if (voice.noteAge >= duration)
         voice.active = false;
 
-    return softSaturate (output * 1.3f) * 0.88f * voice.velocity;
+    return output * voice.velocity;
 }
 
 float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice)
@@ -301,7 +551,7 @@ float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice)
     if (! voice.active)
         return 0.0f;
 
-    if constexpr (buildFlavor() == InstrumentFlavor::drumMachine)
+    if constexpr (isDrumFlavor())
         return renderDrumVoiceSample (voice);
 
     const auto& params = renderParams;
@@ -343,6 +593,58 @@ float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice)
         s = (s * 0.72f) + (ensemble * 0.2f) + (octaveShimmer * 0.11f * bloom);
         s = smoothTowards (s + airy, 0.07f, voice.toneState);
         s = softSaturate (s * 1.22f) * 0.9f;
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::leadSynth)
+    {
+        voice.auxPhase = std::fmod (voice.auxPhase + 5.8f / static_cast<float> (currentSampleRate), 1.0f);
+        const auto vibrato = std::sin (twoPi * voice.auxPhase) * 0.018f;
+        const auto octave = std::sin (twoPi * std::fmod ((voice.phase * 2.0f) + vibrato, 1.0f));
+        const auto edge = std::sin (twoPi * std::fmod ((voice.phase * 3.01f) + (voice.fmPhase * 0.13f), 1.0f));
+        const auto bite = std::exp (-voice.noteAge * 5.0f);
+        s = (s * 0.68f) + (octave * 0.18f) + (edge * 0.15f * bite);
+        s = softSaturate (s * 1.55f) * 0.92f;
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::padSynth)
+    {
+        voice.auxPhase = std::fmod (voice.auxPhase + 0.11f / static_cast<float> (currentSampleRate), 1.0f);
+        const auto driftA = std::sin (twoPi * voice.auxPhase) * 0.011f;
+        const auto driftB = std::sin (twoPi * std::fmod (voice.auxPhase + 0.31f, 1.0f)) * 0.016f;
+        const auto wideA = std::sin (twoPi * std::fmod (voice.phase + driftA, 1.0f));
+        const auto wideB = std::sin (twoPi * std::fmod ((voice.phase * 0.5f) + driftB, 1.0f));
+        const auto shimmer = (random.nextFloat() * 2.0f - 1.0f) * 0.012f;
+        const auto bloom = juce::jlimit (0.0f, 1.0f, voice.noteAge * 1.4f);
+        s = (s * 0.58f) + (wideA * 0.2f) + (wideB * 0.16f) + (shimmer * bloom);
+        s = smoothTowards (s, 0.045f, voice.toneState);
+        s = softSaturate (s * 1.12f) * 0.88f;
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::pluckSynth)
+    {
+        const auto attackNoise = (random.nextFloat() * 2.0f - 1.0f) * std::exp (-voice.noteAge * 72.0f);
+        const auto body = std::sin (twoPi * std::fmod ((voice.phase * 1.01f) + 0.13f, 1.0f)) * std::exp (-voice.noteAge * 2.2f);
+        s = (s * 0.62f) + (body * 0.2f) + (attackNoise * 0.18f);
+        s = smoothTowards (s, 0.18f, voice.toneState);
+        s = softSaturate (s * 1.35f) * 0.9f;
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::sampler)
+    {
+        const auto glue = smoothTowards (s, 0.09f, voice.toneState);
+        const auto body = std::sin (twoPi * std::fmod (voice.phase * 0.5f, 1.0f)) * 0.08f;
+        s = (s * 0.88f) + (glue * 0.1f) + body;
+        s = softSaturate (s * 1.08f) * 0.95f;
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::acid303)
+    {
+        const auto saw = (2.0f * voice.phase) - 1.0f;
+        const auto square = voice.phase < 0.5f ? 1.0f : -1.0f;
+        const auto waveform = params.oscType == OscType::square ? square : saw;
+        const auto squelch = std::sin (twoPi * std::fmod ((voice.phase * 2.05f) + (voice.fmPhase * 0.07f), 1.0f));
+        const auto accent = juce::jlimit (0.75f, 1.35f, 0.75f + (voice.velocity * 0.85f));
+        const auto notePush = std::exp (-voice.noteAge * 7.2f);
+        const auto grip = juce::jmap (juce::jlimit (0.0f, 1.0f, params.fmAmount / 1000.0f), 0.14f, 0.62f);
+        s = (waveform * 0.86f) + (squelch * grip * notePush);
+        s += std::sin (twoPi * std::fmod (voice.phase * 0.5f, 1.0f)) * 0.05f;
+        s = smoothTowards (s, 0.14f, voice.toneState);
+        s = softSaturate (s * (1.45f + (params.resonance * 0.42f))) * 0.92f * accent;
     }
     else
     {
@@ -417,6 +719,11 @@ void AdvancedVSTiAudioProcessor::updateRenderParameters()
     renderParams.cutoff = paramValue (apvts, "CUTOFF");
     renderParams.resonance = paramValue (apvts, "RESONANCE");
     renderParams.filterEnvAmount = paramValue (apvts, "FILTERENVAMOUNT");
+    renderParams.sampleBank = paramIndex (apvts, "SAMPLEBANK");
+    renderParams.sampleStart = paramValue (apvts, "SAMPLESTART");
+    renderParams.sampleEnd = juce::jlimit (0.02f, 1.0f, paramValue (apvts, "SAMPLEEND"));
+    if (renderParams.sampleEnd <= renderParams.sampleStart)
+        renderParams.sampleEnd = juce::jlimit (0.02f, 1.0f, renderParams.sampleStart + 0.02f);
     renderParams.lfo1Rate = paramValue (apvts, "LFO1RATE");
     renderParams.lfo1Pitch = paramValue (apvts, "LFO1PITCH");
     renderParams.lfo2Rate = paramValue (apvts, "LFO2RATE");
@@ -434,6 +741,8 @@ void AdvancedVSTiAudioProcessor::updateRenderParameters()
     renderParams.filterEnv.decay = paramValue (apvts, "FILTDECAY");
     renderParams.filterEnv.sustain = paramValue (apvts, "FILTSUSTAIN");
     renderParams.filterEnv.release = paramValue (apvts, "FILTRELEASE");
+
+    refreshSampleBank();
 }
 
 void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages)
@@ -543,6 +852,9 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
     float cutoffDefault = 1200.0f;
     float resonanceDefault = 0.4f;
     float filterEnvAmountDefault = 0.5f;
+    int sampleBankDefault = 0;
+    float sampleStartDefault = 0.0f;
+    float sampleEndDefault = 1.0f;
 
     float lfo1RateDefault = 2.0f;
     int lfo1ShapeDefault = 0;
@@ -560,18 +872,40 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
     if constexpr (buildFlavor() == InstrumentFlavor::drumMachine)
     {
         oscDefault = 3;
-        gateDefault = 0.18f;
+        gateDefault = 0.42f;
         ampAttackDefault = 0.001f;
-        ampDecayDefault = 0.08f;
+        ampDecayDefault = 0.18f;
         ampSustainDefault = 0.0f;
-        ampReleaseDefault = 0.05f;
+        ampReleaseDefault = 0.08f;
         filtAttackDefault = 0.001f;
-        filtDecayDefault = 0.05f;
+        filtDecayDefault = 0.09f;
         filtSustainDefault = 0.0f;
-        filtReleaseDefault = 0.05f;
+        filtReleaseDefault = 0.08f;
+        fmDefault = 180.0f;
+        syncDefault = 0.38f;
         cutoffDefault = 14000.0f;
-        resonanceDefault = 0.2f;
-        filterEnvAmountDefault = 0.0f;
+        resonanceDefault = 0.34f;
+        filterEnvAmountDefault = 0.18f;
+        rhythmRateDefault = 16.0f;
+        rhythmDepthDefault = 0.08f;
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::drum808)
+    {
+        oscDefault = 0;
+        gateDefault = 0.95f;
+        ampAttackDefault = 0.001f;
+        ampDecayDefault = 0.34f;
+        ampSustainDefault = 0.0f;
+        ampReleaseDefault = 0.12f;
+        filtAttackDefault = 0.001f;
+        filtDecayDefault = 0.16f;
+        filtSustainDefault = 0.0f;
+        filtReleaseDefault = 0.1f;
+        fmDefault = 120.0f;
+        syncDefault = 0.12f;
+        cutoffDefault = 9200.0f;
+        resonanceDefault = 0.22f;
+        filterEnvAmountDefault = 0.08f;
         rhythmRateDefault = 16.0f;
     }
     else if constexpr (buildFlavor() == InstrumentFlavor::bassSynth)
@@ -620,8 +954,134 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
         lfo2FilterDefault = 0.18f;
         rhythmDepthDefault = 0.05f;
     }
+    else if constexpr (buildFlavor() == InstrumentFlavor::leadSynth)
+    {
+        oscDefault = 1;
+        unisonDefault = 3;
+        detuneDefault = 0.08f;
+        fmDefault = 24.0f;
+        syncDefault = 0.55f;
+        ampAttackDefault = 0.002f;
+        ampDecayDefault = 0.16f;
+        ampSustainDefault = 0.68f;
+        ampReleaseDefault = 0.22f;
+        filtAttackDefault = 0.001f;
+        filtDecayDefault = 0.18f;
+        filtSustainDefault = 0.22f;
+        filtReleaseDefault = 0.16f;
+        envCurveDefault = 0.28f;
+        cutoffDefault = 3200.0f;
+        resonanceDefault = 0.48f;
+        filterEnvAmountDefault = 0.54f;
+        lfo1RateDefault = 5.8f;
+        lfo1PitchDefault = 0.25f;
+        lfo2RateDefault = 0.9f;
+        lfo2FilterDefault = 0.14f;
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::padSynth)
+    {
+        oscDefault = 1;
+        unisonDefault = 6;
+        detuneDefault = 0.3f;
+        gateDefault = 8.0f;
+        ampAttackDefault = 0.65f;
+        ampDecayDefault = 1.5f;
+        ampSustainDefault = 0.9f;
+        ampReleaseDefault = 2.9f;
+        filtAttackDefault = 0.28f;
+        filtDecayDefault = 1.2f;
+        filtSustainDefault = 0.84f;
+        filtReleaseDefault = 2.1f;
+        envCurveDefault = -0.28f;
+        cutoffDefault = 6200.0f;
+        resonanceDefault = 0.16f;
+        filterEnvAmountDefault = 0.18f;
+        lfo1RateDefault = 0.11f;
+        lfo1PitchDefault = 0.08f;
+        lfo2RateDefault = 0.19f;
+        lfo2FilterDefault = 0.2f;
+        rhythmDepthDefault = 0.03f;
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::pluckSynth)
+    {
+        oscDefault = 2;
+        unisonDefault = 2;
+        detuneDefault = 0.03f;
+        fmDefault = 10.0f;
+        syncDefault = 0.18f;
+        gateDefault = 0.75f;
+        ampAttackDefault = 0.001f;
+        ampDecayDefault = 0.19f;
+        ampSustainDefault = 0.12f;
+        ampReleaseDefault = 0.16f;
+        filtAttackDefault = 0.001f;
+        filtDecayDefault = 0.16f;
+        filtSustainDefault = 0.08f;
+        filtReleaseDefault = 0.14f;
+        envCurveDefault = 0.38f;
+        cutoffDefault = 2600.0f;
+        resonanceDefault = 0.34f;
+        filterEnvAmountDefault = 0.9f;
+        lfo1RateDefault = 0.2f;
+        lfo2RateDefault = 0.35f;
+        lfo2FilterDefault = 0.08f;
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::sampler)
+    {
+        oscDefault = 4;
+        unisonDefault = 1;
+        detuneDefault = 0.0f;
+        fmDefault = 0.0f;
+        syncDefault = 0.0f;
+        gateDefault = 8.0f;
+        ampAttackDefault = 0.001f;
+        ampDecayDefault = 0.55f;
+        ampSustainDefault = 0.86f;
+        ampReleaseDefault = 0.42f;
+        filtAttackDefault = 0.001f;
+        filtDecayDefault = 0.3f;
+        filtSustainDefault = 0.76f;
+        filtReleaseDefault = 0.32f;
+        envCurveDefault = 0.04f;
+        cutoffDefault = 6800.0f;
+        resonanceDefault = 0.22f;
+        filterEnvAmountDefault = 0.16f;
+        sampleBankDefault = 0;
+        sampleStartDefault = 0.0f;
+        sampleEndDefault = 0.92f;
+        lfo1RateDefault = 0.18f;
+        lfo2RateDefault = 0.12f;
+        lfo2FilterDefault = 0.06f;
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::acid303)
+    {
+        oscDefault = 1;
+        unisonDefault = 1;
+        detuneDefault = 0.0f;
+        fmDefault = 460.0f;
+        syncDefault = 0.08f;
+        gateDefault = 0.55f;
+        ampAttackDefault = 0.001f;
+        ampDecayDefault = 0.32f;
+        ampSustainDefault = 0.0f;
+        ampReleaseDefault = 0.14f;
+        filtAttackDefault = 0.001f;
+        filtDecayDefault = 0.36f;
+        filtSustainDefault = 0.0f;
+        filtReleaseDefault = 0.12f;
+        envCurveDefault = 0.45f;
+        cutoffDefault = 540.0f;
+        resonanceDefault = 0.82f;
+        filterEnvAmountDefault = 0.94f;
+        lfo1RateDefault = 0.14f;
+        lfo2RateDefault = 0.22f;
+        lfo2FilterDefault = 0.06f;
+    }
 
     params.push_back (std::make_unique<juce::AudioParameterChoice> ("OSCTYPE", "Osc Type", juce::StringArray { "Sine", "Saw", "Square", "Noise", "Sample" }, oscDefault));
+    params.push_back (std::make_unique<juce::AudioParameterChoice> ("SAMPLEBANK", "Sample Bank", sampleBankChoices(), sampleBankDefault));
+    params.push_back (std::make_unique<juce::AudioParameterFloat> ("SAMPLESTART", "Sample Start", 0.0f, 0.95f, sampleStartDefault));
+    params.push_back (std::make_unique<juce::AudioParameterFloat> ("SAMPLEEND", "Sample End", 0.05f, 1.0f, sampleEndDefault));
     params.push_back (std::make_unique<juce::AudioParameterInt> ("UNISON", "Unison", 1, 8, unisonDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("DETUNE", "Detune", 0.0f, 1.0f, detuneDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("FMAMOUNT", "FM Amount", 0.0f, 1000.0f, fmDefault));

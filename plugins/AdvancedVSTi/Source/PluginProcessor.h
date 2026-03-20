@@ -44,7 +44,13 @@ private:
         advanced = 0,
         drumMachine,
         bassSynth,
-        stringSynth
+        stringSynth,
+        leadSynth,
+        padSynth,
+        pluckSynth,
+        sampler,
+        drum808,
+        acid303
     };
 
     enum class OscType
@@ -98,6 +104,9 @@ private:
         float arpRate = 4.0f;
         float rhythmGateRate = 8.0f;
         float rhythmGateDepth = 0.0f;
+        int sampleBank = 0;
+        float sampleStart = 0.0f;
+        float sampleEnd = 1.0f;
 
         juce::ADSR::Parameters ampEnv;
         juce::ADSR::Parameters filterEnv;
@@ -110,6 +119,7 @@ private:
     double currentSampleRate = 44100.0;
     juce::Random random;
     juce::AudioBuffer<float> loadedSample;
+    int loadedSampleBank = -1;
 
     juce::dsp::StateVariableTPTFilter<float> leftFilter;
     juce::dsp::StateVariableTPTFilter<float> rightFilter;
@@ -127,9 +137,26 @@ private:
         return InstrumentFlavor::bassSynth;
 #elif AIMS_INSTRUMENT_FLAVOR == 3
         return InstrumentFlavor::stringSynth;
+#elif AIMS_INSTRUMENT_FLAVOR == 4
+        return InstrumentFlavor::leadSynth;
+#elif AIMS_INSTRUMENT_FLAVOR == 5
+        return InstrumentFlavor::padSynth;
+#elif AIMS_INSTRUMENT_FLAVOR == 6
+        return InstrumentFlavor::pluckSynth;
+#elif AIMS_INSTRUMENT_FLAVOR == 7
+        return InstrumentFlavor::sampler;
+#elif AIMS_INSTRUMENT_FLAVOR == 8
+        return InstrumentFlavor::drum808;
+#elif AIMS_INSTRUMENT_FLAVOR == 9
+        return InstrumentFlavor::acid303;
 #else
         return InstrumentFlavor::advanced;
 #endif
+    }
+
+    [[nodiscard]] static constexpr bool isDrumFlavor() noexcept
+    {
+        return buildFlavor() == InstrumentFlavor::drumMachine || buildFlavor() == InstrumentFlavor::drum808;
     }
 
     void handleMidi (const juce::MidiBuffer& midiMessages, int numSamples);
@@ -138,6 +165,9 @@ private:
     float oscSample (VoiceState& voice, float baseFreq, OscType type, float syncAmount);
     float fmOperator (VoiceState& voice, float baseFreq, float amount);
     float lfoValue (int shape, float phase) const;
+    void refreshSampleBank();
+    void buildGeneratedSampleBank (int bankIndex);
+    [[nodiscard]] static juce::StringArray sampleBankChoices();
 
     void updateRenderParameters();
     void applyEnvelopeSettings();
