@@ -4155,6 +4155,236 @@ class OpenAIConnectDialog(QtWidgets.QDialog):
         }
 
 
+class AudioSettingsDialog(QtWidgets.QDialog):
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle('Audio Settings')
+        self.setModal(False)
+        self.setWindowFlag(QtCore.Qt.WindowType.Tool, True)
+        self.resize(760, 640)
+        self.setSizeGripEnabled(True)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(12)
+
+        intro = QtWidgets.QLabel(
+            'All playback and output settings live here so device, buffering, and timing preferences can be adjusted in one place.'
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        self.output_summary_label = QtWidgets.QLabel()
+        self.output_summary_label.setWordWrap(True)
+        self.output_summary_label.setStyleSheet('font-weight: 600;')
+        layout.addWidget(self.output_summary_label)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        layout.addWidget(scroll, 1)
+
+        body = QtWidgets.QWidget()
+        scroll.setWidget(body)
+        body_layout = QtWidgets.QVBoxLayout(body)
+        body_layout.setContentsMargins(4, 4, 4, 4)
+        body_layout.setSpacing(12)
+
+        output_group = QtWidgets.QGroupBox('Output Device')
+        output_form = QtWidgets.QFormLayout(output_group)
+        output_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.output_device_combo = QtWidgets.QComboBox()
+        self.refresh_devices_btn = QtWidgets.QPushButton('Refresh Devices')
+        device_row = QtWidgets.QHBoxLayout()
+        device_row.setContentsMargins(0, 0, 0, 0)
+        device_row.addWidget(self.output_device_combo, 1)
+        device_row.addWidget(self.refresh_devices_btn)
+        device_widget = QtWidgets.QWidget()
+        device_widget.setLayout(device_row)
+        self.output_sample_rate_combo = QtWidgets.QComboBox()
+        self.output_sample_format_combo = QtWidgets.QComboBox()
+        self.output_latency_label = QtWidgets.QLabel()
+        self.output_buffer_frames_label = QtWidgets.QLabel()
+        output_form.addRow('Device', device_widget)
+        output_form.addRow('Sample rate', self.output_sample_rate_combo)
+        output_form.addRow('Bit depth / format', self.output_sample_format_combo)
+        output_form.addRow('Estimated latency', self.output_latency_label)
+        output_form.addRow('Output buffer', self.output_buffer_frames_label)
+        body_layout.addWidget(output_group)
+
+        playback_group = QtWidgets.QGroupBox('Playback')
+        playback_form = QtWidgets.QFormLayout(playback_group)
+        playback_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.audio_buffer_combo = QtWidgets.QComboBox()
+        self.playhead_refresh_combo = QtWidgets.QComboBox()
+        self.note_length_offset_spin = QtWidgets.QSpinBox()
+        self.note_length_offset_spin.setRange(-480, 480)
+        self.note_length_offset_spin.setSingleStep(1)
+        self.note_length_offset_spin.setSuffix(' ticks')
+        playback_form.addRow('Audio buffer', self.audio_buffer_combo)
+        playback_form.addRow('Playhead refresh', self.playhead_refresh_combo)
+        playback_form.addRow('Note length offset', self.note_length_offset_spin)
+        body_layout.addWidget(playback_group)
+
+        native_group = QtWidgets.QGroupBox('Native VST Host')
+        native_form = QtWidgets.QFormLayout(native_group)
+        native_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.native_host_summary_label = QtWidgets.QLabel()
+        self.native_host_summary_label.setWordWrap(True)
+        self.native_host_rate_combo = QtWidgets.QComboBox()
+        self.native_host_buffer_combo = QtWidgets.QComboBox()
+        native_form.addRow('Startup format', self.native_host_summary_label)
+        native_form.addRow('Sample rate', self.native_host_rate_combo)
+        native_form.addRow('Buffer size', self.native_host_buffer_combo)
+        body_layout.addWidget(native_group)
+        body_layout.addStretch(1)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.close)
+        layout.addWidget(buttons)
+
+        self.output_device_combo.currentIndexChanged.connect(self._on_output_device_changed)
+        self.refresh_devices_btn.clicked.connect(self._on_refresh_devices_clicked)
+        self.output_sample_rate_combo.currentIndexChanged.connect(self._on_output_sample_rate_changed)
+        self.output_sample_format_combo.currentIndexChanged.connect(self._on_output_sample_format_changed)
+        self.audio_buffer_combo.currentIndexChanged.connect(self._on_audio_buffer_changed)
+        self.playhead_refresh_combo.currentIndexChanged.connect(self._on_playhead_refresh_changed)
+        self.note_length_offset_spin.valueChanged.connect(self._on_note_length_offset_changed)
+        self.native_host_rate_combo.currentIndexChanged.connect(self._on_native_host_rate_changed)
+        self.native_host_buffer_combo.currentIndexChanged.connect(self._on_native_host_buffer_changed)
+
+    def _main_window(self):
+        return self.parent() if isinstance(self.parent(), MainWindow) else None
+
+    def _set_combo_items(self, combo: QtWidgets.QComboBox, items: list[tuple[str, object]], current_value: object) -> None:
+        blocker = QtCore.QSignalBlocker(combo)
+        combo.clear()
+        active_index = 0
+        current_key = '' if current_value is None else str(current_value)
+        for index, (label, value) in enumerate(items):
+            combo.addItem(label, value)
+            if str(value) == current_key:
+                active_index = index
+        combo.setCurrentIndex(active_index)
+        del blocker
+
+    def refresh_from_mainwindow(self) -> None:
+        main_window = self._main_window()
+        if main_window is None:
+            return
+        current_device = main_window._selected_audio_device()
+        preferred = current_device.preferredFormat()
+        latency_ms = (main_window._desired_audio_buffer_frames() / float(max(1, main_window._playback_sample_rate))) * 1000.0
+        self.output_summary_label.setText(main_window._audio_output_summary())
+        self.output_latency_label.setText(f'{latency_ms:.1f} ms')
+        self.output_buffer_frames_label.setText(f'{main_window._desired_audio_buffer_frames()} samples')
+        self.native_host_summary_label.setText(
+            f'{main_window._native_vst_host_target_sample_rate()} Hz, {main_window._native_vst_host_target_buffer_size()} samples'
+        )
+
+        device_items = [('System Default Soundcard', '')]
+        for device in QtMultimedia.QMediaDevices.audioOutputs():
+            device_items.append((device.description(), bytes(device.id()).hex()))
+        self._set_combo_items(self.output_device_combo, device_items, main_window.selected_audio_output_id)
+
+        sample_rate_items: list[tuple[str, object]] = [(f'Auto (Preferred {preferred.sampleRate()} Hz)', 0)]
+        sample_rate_items.extend((f'{rate} Hz', int(rate)) for rate in main_window._available_audio_sample_rates(current_device))
+        self._set_combo_items(self.output_sample_rate_combo, sample_rate_items, int(main_window.selected_audio_sample_rate))
+
+        sample_format_items: list[tuple[str, object]] = [
+            (f'Auto (Preferred {qaudio_sample_format_label(preferred.sampleFormat())})', 'Auto'),
+        ]
+        for sample_format in main_window._available_audio_sample_formats(current_device):
+            sample_format_items.append((qaudio_sample_format_label(sample_format), getattr(sample_format, 'name', 'Int16')))
+        self._set_combo_items(
+            self.output_sample_format_combo,
+            sample_format_items,
+            str(main_window.selected_audio_sample_format_name or 'Auto'),
+        )
+
+        audio_buffer_values = {8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, int(main_window.audio_buffer_ms)}
+        audio_buffer_items = [(f'{value} ms', int(value)) for value in sorted(v for v in audio_buffer_values if int(v) > 0)]
+        self._set_combo_items(self.audio_buffer_combo, audio_buffer_items, int(main_window.audio_buffer_ms))
+
+        playhead_values = {16, 33, 50, 66, int(main_window.playback_ui_refresh_ms)}
+        playhead_items = [(f'{value} ms', int(value)) for value in sorted(v for v in playhead_values if int(v) > 0)]
+        self._set_combo_items(self.playhead_refresh_combo, playhead_items, int(main_window.playback_ui_refresh_ms))
+
+        blocker = QtCore.QSignalBlocker(self.note_length_offset_spin)
+        self.note_length_offset_spin.setValue(int(main_window.note_length_offset_ticks))
+        del blocker
+
+        native_rate_values = set(main_window._available_audio_sample_rates(current_device))
+        native_rate_values.add(int(main_window._playback_sample_rate))
+        if int(main_window.native_vst_host_sample_rate) > 0:
+            native_rate_values.add(int(main_window.native_vst_host_sample_rate))
+        native_rate_items: list[tuple[str, object]] = [(f'Follow Output ({main_window._playback_sample_rate} Hz)', 0)]
+        native_rate_items.extend((f'{rate} Hz', int(rate)) for rate in sorted(v for v in native_rate_values if int(v) > 0))
+        self._set_combo_items(self.native_host_rate_combo, native_rate_items, int(main_window.native_vst_host_sample_rate))
+
+        native_buffer_values = {
+            10, 16, 32, 64, 96, 128, 192, 240, 256, 384, 480, 512, 768, 960, 1024,
+            1536, 1920, 2048, 3072, 4096, int(main_window._native_vst_host_target_buffer_size()),
+        }
+        if int(main_window.native_vst_host_buffer_size) > 0:
+            native_buffer_values.add(int(main_window.native_vst_host_buffer_size))
+        native_buffer_items: list[tuple[str, object]] = [(f'Auto ({main_window._native_vst_host_target_buffer_size()} samples)', 0)]
+        native_buffer_items.extend(
+            (f'{size} samples', int(size)) for size in sorted(v for v in native_buffer_values if int(v) > 0)
+        )
+        self._set_combo_items(self.native_host_buffer_combo, native_buffer_items, int(main_window.native_vst_host_buffer_size))
+
+    def _on_refresh_devices_clicked(self) -> None:
+        self.refresh_from_mainwindow()
+
+    def _on_output_device_changed(self, _index: int) -> None:
+        main_window = self._main_window()
+        if main_window is None:
+            return
+        main_window.set_audio_output_device(str(self.output_device_combo.currentData() or ''))
+
+    def _on_output_sample_rate_changed(self, _index: int) -> None:
+        main_window = self._main_window()
+        if main_window is None:
+            return
+        main_window.set_audio_sample_rate(int(self.output_sample_rate_combo.currentData() or 0))
+
+    def _on_output_sample_format_changed(self, _index: int) -> None:
+        main_window = self._main_window()
+        if main_window is None:
+            return
+        main_window.set_audio_sample_format(str(self.output_sample_format_combo.currentData() or 'Auto'))
+
+    def _on_audio_buffer_changed(self, _index: int) -> None:
+        main_window = self._main_window()
+        if main_window is None:
+            return
+        main_window.set_audio_buffer_ms(int(self.audio_buffer_combo.currentData() or 80))
+
+    def _on_playhead_refresh_changed(self, _index: int) -> None:
+        main_window = self._main_window()
+        if main_window is None:
+            return
+        main_window.set_playback_ui_refresh_ms(int(self.playhead_refresh_combo.currentData() or 16))
+
+    def _on_note_length_offset_changed(self, value: int) -> None:
+        main_window = self._main_window()
+        if main_window is None:
+            return
+        main_window.set_playback_note_length_offset_ticks(int(value))
+
+    def _on_native_host_rate_changed(self, _index: int) -> None:
+        main_window = self._main_window()
+        if main_window is None:
+            return
+        main_window.set_native_vst_host_sample_rate(int(self.native_host_rate_combo.currentData() or 0))
+
+    def _on_native_host_buffer_changed(self, _index: int) -> None:
+        main_window = self._main_window()
+        if main_window is None:
+            return
+        main_window.set_native_vst_host_buffer_size(int(self.native_host_buffer_combo.currentData() or 0))
+
+
 class FloatingPanelWindow(QtWidgets.QMainWindow):
     visibilityChanged = QtCore.Signal(bool)
 
@@ -4451,6 +4681,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._realtime_mix_cache_frame_count = 0
         self._realtime_track_states: dict[int, RealtimeTrackPlaybackState] = {}
         self._live_midi_states: dict[int, LiveMidiHostState] = {}
+        self._audio_settings_dialog: AudioSettingsDialog | None = None
         self._track_vsti_windows: dict[int, QtWidgets.QDialog] = {}
         self._track_native_vsti_close_events: dict[int, threading.Event] = {}
         self._track_native_vsti_hwnds: dict[int, int] = {}
@@ -4734,8 +4965,9 @@ class MainWindow(QtWidgets.QMainWindow):
         samples_menu.addAction(add_sample_path)
         samples_menu.addAction(scan_sample_paths)
 
-        self.audio_output_menu = settings.addMenu('Audio Output')
-        self.refresh_audio_output_menu()
+        open_audio_settings = QtGui.QAction('Audio Settings...', self)
+        open_audio_settings.triggered.connect(self.open_audio_settings_dialog)
+        settings.addAction(open_audio_settings)
 
         windows_menu = self.menuBar().addMenu('Windows')
         self.show_panels_window_action = QtGui.QAction('Show Panels Window', self)
@@ -4766,50 +4998,11 @@ class MainWindow(QtWidgets.QMainWindow):
         tile_windows_action.triggered.connect(self.tile_floating_windows)
         windows_menu.addAction(tile_windows_action)
 
-        performance_menu = settings.addMenu('Playback Performance')
         self.gpu_rendering_action = QtGui.QAction('Prefer GPU Rendering (restart required)', self)
         self.gpu_rendering_action.setCheckable(True)
         self.gpu_rendering_action.setChecked(self.prefer_gpu_rendering)
         self.gpu_rendering_action.triggered.connect(self.set_prefer_gpu_rendering)
-        performance_menu.addAction(self.gpu_rendering_action)
-
-        buffer_menu = performance_menu.addMenu('Audio Buffer')
-        self.audio_buffer_group = QtGui.QActionGroup(buffer_menu)
-        self.audio_buffer_group.setExclusive(True)
-        audio_buffer_values = {8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, int(self.audio_buffer_ms)}
-        for value in sorted(v for v in audio_buffer_values if int(v) > 0):
-            action = buffer_menu.addAction(f'{value} ms')
-            action.setCheckable(True)
-            action.setChecked(value == self.audio_buffer_ms)
-            action.triggered.connect(lambda _checked=False, v=value: self.set_audio_buffer_ms(v))
-            self.audio_buffer_group.addAction(action)
-
-        refresh_menu = performance_menu.addMenu('Playhead Refresh')
-        self.playhead_refresh_group = QtGui.QActionGroup(refresh_menu)
-        self.playhead_refresh_group.setExclusive(True)
-        for value in (16, 33, 50, 66):
-            action = refresh_menu.addAction(f'{value} ms')
-            action.setCheckable(True)
-            action.setChecked(value == self.playback_ui_refresh_ms)
-            action.triggered.connect(lambda _checked=False, v=value: self.set_playback_ui_refresh_ms(v))
-            self.playhead_refresh_group.addAction(action)
-
-        note_length_offset_menu = performance_menu.addMenu('Playback Note Length Offset')
-        self.note_length_offset_group = QtGui.QActionGroup(note_length_offset_menu)
-        self.note_length_offset_group.setExclusive(True)
-        self._playback_note_length_offset_menu_values = {
-            -24, -16, -11, -8, -4, 0, 4, 8, 11, 16, 24, int(self.note_length_offset_ticks)
-        }
-        for value in sorted(self._playback_note_length_offset_menu_values):
-            label = f'{value:+d} ticks' if int(value) != 0 else '0 ticks'
-            action = note_length_offset_menu.addAction(label)
-            action.setCheckable(True)
-            action.setChecked(int(value) == int(self.note_length_offset_ticks))
-            action.triggered.connect(lambda _checked=False, v=value: self.set_playback_note_length_offset_ticks(v))
-            self.note_length_offset_group.addAction(action)
-        note_length_offset_menu.addSeparator()
-        custom_note_length_offset = note_length_offset_menu.addAction('Custom...')
-        custom_note_length_offset.triggered.connect(self.prompt_playback_note_length_offset_ticks)
+        settings.addAction(self.gpu_rendering_action)
 
         self.refresh_vsti_rack_ui()
         self.refresh_openai_status()
@@ -7955,8 +8148,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(f'Tempo set to {self.project.bpm} BPM')
 
     def refresh_audio_output_menu(self) -> None:
-        if not hasattr(self, 'audio_output_menu'):
-            return
+        dialog = getattr(self, '_audio_settings_dialog', None)
+        if dialog is not None:
+            dialog.refresh_from_mainwindow()
+        return
         self.audio_output_menu.clear()
         summary_action = self.audio_output_menu.addAction(self._audio_output_summary())
         summary_action.setEnabled(False)
@@ -8072,6 +8267,18 @@ class MainWindow(QtWidgets.QMainWindow):
         buffer_action = self.audio_output_menu.addAction(f'Buffer Length: {self._desired_audio_buffer_frames()} samples')
         buffer_action.setEnabled(False)
 
+    def open_audio_settings_dialog(self) -> None:
+        dialog = self._audio_settings_dialog
+        if dialog is None:
+            dialog = AudioSettingsDialog(self)
+            dialog.destroyed.connect(lambda *_args: setattr(self, '_audio_settings_dialog', None))
+            self._audio_settings_dialog = dialog
+        dialog.refresh_from_mainwindow()
+        self._center_dialog(dialog)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
     def set_audio_output_device(self, device_id: str) -> None:
         self.selected_audio_output_id = device_id
         device_name = 'system default soundcard'
@@ -8129,6 +8336,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._save_preferences()
         self._mark_realtime_track_states_for_reset()
         self._clear_realtime_mix_cache()
+        self.refresh_audio_output_menu()
         direction = f'{self.note_length_offset_ticks:+d}' if self.note_length_offset_ticks else '0'
         self.statusBar().showMessage(f'Playback note length offset set to {direction} ticks')
 
@@ -8168,6 +8376,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, 'playback_timer'):
             self.playback_timer.setInterval(self.playback_ui_refresh_ms)
         self._save_preferences()
+        self.refresh_audio_output_menu()
         self.statusBar().showMessage(f'Playhead refresh set to every {self.playback_ui_refresh_ms} ms')
 
     def set_prefer_gpu_rendering(self, enabled: bool) -> None:
