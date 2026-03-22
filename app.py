@@ -4386,6 +4386,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.selected_audio_sample_format_name = 'Auto'
         self.native_vst_host_sample_rate = 0
         self.native_vst_host_buffer_size = 0
+        self.note_length_offset_ticks = 0
         self.playback_ui_refresh_ms = 16
         self.prefer_gpu_rendering = True
         self._main_splitter_sizes = [170, 1330]
@@ -4793,6 +4794,23 @@ class MainWindow(QtWidgets.QMainWindow):
             action.triggered.connect(lambda _checked=False, v=value: self.set_playback_ui_refresh_ms(v))
             self.playhead_refresh_group.addAction(action)
 
+        note_length_offset_menu = performance_menu.addMenu('Playback Note Length Offset')
+        self.note_length_offset_group = QtGui.QActionGroup(note_length_offset_menu)
+        self.note_length_offset_group.setExclusive(True)
+        self._playback_note_length_offset_menu_values = {
+            -24, -16, -11, -8, -4, 0, 4, 8, 11, 16, 24, int(self.note_length_offset_ticks)
+        }
+        for value in sorted(self._playback_note_length_offset_menu_values):
+            label = f'{value:+d} ticks' if int(value) != 0 else '0 ticks'
+            action = note_length_offset_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(int(value) == int(self.note_length_offset_ticks))
+            action.triggered.connect(lambda _checked=False, v=value: self.set_playback_note_length_offset_ticks(v))
+            self.note_length_offset_group.addAction(action)
+        note_length_offset_menu.addSeparator()
+        custom_note_length_offset = note_length_offset_menu.addAction('Custom...')
+        custom_note_length_offset.triggered.connect(self.prompt_playback_note_length_offset_ticks)
+
         self.refresh_vsti_rack_ui()
         self.refresh_openai_status()
         QtCore.QTimer.singleShot(350, self._start_vsti_background_warmup)
@@ -5116,6 +5134,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _transport_seconds_to_tick(self, sec: float, *, bpm: int | None = None) -> int:
         return seconds_to_tick(sec, self.project.bpm if bpm is None else bpm)
+
+    def _playback_note_end_tick(self, note: MidiNote) -> int:
+        start_tick = max(0, int(note.start_tick))
+        base_end_tick = start_tick + max(1, int(note.duration_tick))
+        return max(start_tick + 1, base_end_tick + int(getattr(self, 'note_length_offset_ticks', 0)))
 
     def _ticks_to_locator_bars(self, tick: int) -> float:
         return max(0.0, float(max(0, int(tick))) / float(TICKS_PER_BAR))
@@ -7205,7 +7228,7 @@ class MainWindow(QtWidgets.QMainWindow):
             note_start_frame = tick_to_sample_frame(note.start_tick, sample_rate, self.project.bpm)
             note_end_frame = max(
                 note_start_frame + 1,
-                tick_to_sample_frame(note.start_tick + note.duration_tick, sample_rate, self.project.bpm),
+                tick_to_sample_frame(self._playback_note_end_tick(note), sample_rate, self.project.bpm),
             )
             if loop_end_frame is not None and note_start_frame < loop_end_frame < note_end_frame:
                 note_end_frame = loop_end_frame
@@ -8100,6 +8123,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_live_midi_host()
         self.refresh_audio_output_menu()
         self.statusBar().showMessage(f'Playback audio buffer set to {self.audio_buffer_ms} ms ({self._audio_output_summary()})')
+
+    def set_playback_note_length_offset_ticks(self, value: int) -> None:
+        self.note_length_offset_ticks = int(clamp(int(value), -480, 480))
+        self._save_preferences()
+        self._mark_realtime_track_states_for_reset()
+        self._clear_realtime_mix_cache()
+        direction = f'{self.note_length_offset_ticks:+d}' if self.note_length_offset_ticks else '0'
+        self.statusBar().showMessage(f'Playback note length offset set to {direction} ticks')
+
+    def prompt_playback_note_length_offset_ticks(self) -> None:
+        current_value = int(getattr(self, 'note_length_offset_ticks', 0))
+        value, ok = QtWidgets.QInputDialog.getInt(
+            self,
+            'Playback Note Length Offset',
+            'Ticks to add to note lengths during playback/render:',
+            current_value,
+            -480,
+            480,
+            1,
+        )
+        if ok:
+            self.set_playback_note_length_offset_ticks(int(value))
 
     def set_native_vst_host_sample_rate(self, value: int) -> None:
         self.native_vst_host_sample_rate = max(0, int(value))
@@ -9492,7 +9537,7 @@ class MainWindow(QtWidgets.QMainWindow):
             start_frame = tick_to_sample_frame(note.start_tick, self._playback_sample_rate, self.project.bpm)
             end_frame = max(
                 start_frame + 1,
-                tick_to_sample_frame(note.start_tick + note.duration_tick, self._playback_sample_rate, self.project.bpm),
+                tick_to_sample_frame(self._playback_note_end_tick(note), self._playback_sample_rate, self.project.bpm),
             )
             messages.append(
                 mido.Message(
@@ -9804,7 +9849,7 @@ class MainWindow(QtWidgets.QMainWindow):
         events: list[tuple[int, int, object]] = []
         for note in track.notes:
             start_frame = tick_to_sample_frame(note.start_tick, sample_rate, self.project.bpm)
-            end_tick = note.start_tick + max(1, int(note.duration_tick))
+            end_tick = self._playback_note_end_tick(note)
             end_frame = max(start_frame + 1, tick_to_sample_frame(end_tick, sample_rate, self.project.bpm))
             events.append((start_frame, order['note_on'], mido.Message('note_on', channel=channel, note=int(clamp(note.pitch, 0, 127)), velocity=int(clamp(note.velocity, 0, 127)))))
             events.append((end_frame, order['note_off'], mido.Message('note_off', channel=channel, note=int(clamp(note.pitch, 0, 127)), velocity=0)))
@@ -10219,6 +10264,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.audio_buffer_ms = int(clamp(float(payload.get('audio_buffer_ms', 80)), 8, 4096))
         self.native_vst_host_sample_rate = self._coerce_int(payload.get('native_vst_host_sample_rate', 0), 0, 0, 384000)
         self.native_vst_host_buffer_size = self._coerce_int(payload.get('native_vst_host_buffer_size', 0), 0, 0, 4096)
+        self.note_length_offset_ticks = self._coerce_int(payload.get('note_length_offset_ticks', 0), 0, -480, 480)
         refresh_pref = payload.get('playback_ui_refresh_ms', 16)
         try:
             refresh_value = float(refresh_pref)
@@ -10333,6 +10379,7 @@ class MainWindow(QtWidgets.QMainWindow):
             'audio_buffer_ms': self.audio_buffer_ms,
             'native_vst_host_sample_rate': self.native_vst_host_sample_rate,
             'native_vst_host_buffer_size': self.native_vst_host_buffer_size,
+            'note_length_offset_ticks': self.note_length_offset_ticks,
             'playback_ui_refresh_ms': self.playback_ui_refresh_ms,
             'prefer_gpu_rendering': self.prefer_gpu_rendering,
             'main_splitter_sizes': self._main_splitter_sizes,
