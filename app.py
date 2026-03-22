@@ -1658,6 +1658,7 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         self._drag_anchor_pitch = 0
         self._drag_selected_snapshot: list[tuple[MidiNote, int, int]] = []
         self._resize_note: MidiNote | None = None
+        self._resize_selected_snapshot: list[tuple[MidiNote, int, int]] = []
         self._resize_edge = 'right'
         self._resize_anchor_start_tick = 0
         self._resize_anchor_end_tick = 0
@@ -1981,6 +1982,9 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         if not clicked.selected:
             self._set_single_selected_note(clicked)
         self._resize_note = clicked
+        self._resize_selected_snapshot = [
+            (note, note.start_tick, note.duration_tick) for note in self.current_track().notes if note.selected
+        ]
         self._resize_edge = edge if edge in {'left', 'right'} else 'right'
         self._resize_anchor_start_tick = clicked.start_tick
         self._resize_anchor_end_tick = clicked.start_tick + clicked.duration_tick
@@ -1996,6 +2000,7 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         self._pencil_resize_started = False
         self._drag_selected_snapshot = []
         self._resize_note = None
+        self._resize_selected_snapshot = []
         self._resize_edge = 'right'
         return commit_change
 
@@ -2509,22 +2514,39 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
 
         if self._resize_note is not None:
             grid = self._grid_tick()
+            resize_targets = self._resize_selected_snapshot or [
+                (self._resize_note, self._resize_anchor_start_tick, self._resize_anchor_duration)
+            ]
             if self._resize_edge == 'left':
                 edge_tick = self._scene_x_to_grid_start_tick(scene_pos.x())
                 max_start_tick = max(0, self._resize_anchor_end_tick - grid)
                 new_start_tick = max(0, min(edge_tick, max_start_tick))
-                new_duration = max(grid, self._resize_anchor_end_tick - new_start_tick)
-                if new_start_tick != self._resize_note.start_tick or new_duration != self._resize_note.duration_tick:
-                    self._resize_note.start_tick = new_start_tick
-                    self._resize_note.duration_tick = new_duration
-                    self._update_note_item(self._resize_note)
+                delta_tick = new_start_tick - self._resize_anchor_start_tick
+                changed = False
+                for note, start_tick, duration_tick in resize_targets:
+                    note_end_tick = start_tick + duration_tick
+                    note_max_start_tick = max(0, note_end_tick - grid)
+                    applied_start_tick = max(0, min(start_tick + delta_tick, note_max_start_tick))
+                    applied_duration_tick = max(grid, note_end_tick - applied_start_tick)
+                    if applied_start_tick != note.start_tick or applied_duration_tick != note.duration_tick:
+                        note.start_tick = applied_start_tick
+                        note.duration_tick = applied_duration_tick
+                        self._update_note_item(note)
+                        changed = True
+                if changed:
                     self._interaction_dirty = True
             else:
                 edge_tick = self._scene_x_to_grid_end_tick(scene_pos.x())
-                new_duration = max(grid, edge_tick - self._resize_note.start_tick)
-                if new_duration != self._resize_note.duration_tick:
-                    self._resize_note.duration_tick = new_duration
-                    self._update_note_item(self._resize_note)
+                new_duration = max(grid, edge_tick - self._resize_anchor_start_tick)
+                delta_duration_tick = new_duration - self._resize_anchor_duration
+                changed = False
+                for note, _start_tick, duration_tick in resize_targets:
+                    applied_duration_tick = max(grid, duration_tick + delta_duration_tick)
+                    if applied_duration_tick != note.duration_tick:
+                        note.duration_tick = applied_duration_tick
+                        self._update_note_item(note)
+                        changed = True
+                if changed:
                     self._interaction_dirty = True
             return
 
@@ -6285,10 +6307,11 @@ class MainWindow(QtWidgets.QMainWindow):
             _APP_LOGGER.exception("Failed scheduling native VST host MIDI batch row=%s", row)
             return False
 
-    def _native_vst_host_pending_output_frames(self) -> int:
-        bytes_per_frame = max(1, int(self._playback_bytes_per_frame()))
-        pending_frames = int(len(getattr(self, '_playback_pending_bytes', b'')) // bytes_per_frame)
-        return max(0, int(self._estimated_queued_output_frames()) + pending_frames)
+    def _native_vst_host_scheduling_lead_frames(self) -> int:
+        # Third-party VSTs are still rendered by the native host, not by the Qt sink.
+        # Using the full Qt output queue here makes larger app buffers delay note-offs.
+        host_buffer = max(1, int(self._native_vst_host_target_buffer_size()))
+        return max(host_buffer, int(self._playback_chunk_frames))
 
     def _schedule_native_vst_track_chunk(
         self,
@@ -6318,7 +6341,7 @@ class MainWindow(QtWidgets.QMainWindow):
             frame_count,
             bootstrap_active=bool(state.instrument_reset_pending),
         )
-        queued_output_frames = self._native_vst_host_pending_output_frames() + max(0, int(output_offset_frames))
+        queued_output_frames = self._native_vst_host_scheduling_lead_frames() + max(0, int(output_offset_frames))
         reset_channels = [int(clamp(track.midi_channel, 0, 15)) + 1] if state.instrument_reset_pending else None
         clear_channels = [int(clamp(track.midi_channel, 0, 15)) + 1] if state.native_host_epoch_flush_pending and not state.instrument_reset_pending else None
         if not self._schedule_native_vst_host_messages(
@@ -6885,7 +6908,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_transport_cpu_meter(usage)
 
     def jump_playhead_to_start(self) -> None:
-        self.set_playhead_position(0.0)
+        self._set_playhead_tick_position(0)
         self.statusBar().showMessage('Playhead moved to project start')
 
     def skip_to_previous_bar(self) -> None:
@@ -6983,6 +7006,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def set_playhead_position(self, sec: float, playback_tick: bool = False) -> None:
         self._set_playhead_tick_position(self._transport_seconds_to_tick(sec), playback_tick=playback_tick)
+
+    def _restart_playback_preserving_tick(self) -> None:
+        if not self.playback_timer.isActive():
+            return
+        current_tick = int(self.project.playhead_tick)
+        self.stop_playback()
+        self._set_playhead_tick_position(current_tick)
+        self.start_playback()
 
     def _reload_playback_mix_if_running(self) -> None:
         if not hasattr(self, 'playback_timer') or not self.playback_timer.isActive():
@@ -7105,7 +7136,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 state.last_error = ""
         self._clear_realtime_mix_cache()
 
-    def _prepare_realtime_playback(self, start_sec: float) -> bool:
+    def _prepare_realtime_playback(self, start_tick: int) -> bool:
         self._cancel_deferred_realtime_gc()
         self._stop_realtime_audio_sink()
         self._discard_realtime_track_states(schedule_gc=False)
@@ -7118,7 +7149,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._playback_active = True
         self._realtime_reset_pending = True
         self._reset_realtime_track_states()
-        self._seek_media_to_project_tick(self._transport_seconds_to_tick(start_sec))
+        self._seek_media_to_project_tick(int(start_tick))
         self._audio_pump_timer.start()
         QtCore.QTimer.singleShot(0, lambda generation=self._realtime_pump_generation: self._pump_realtime_audio(generation))
         return True
@@ -7819,8 +7850,7 @@ class MainWindow(QtWidgets.QMainWindow):
             loop_start_tick, loop_end_tick = self._loop_tick_bounds()
             if start_tick < loop_start_tick or start_tick >= loop_end_tick:
                 start_tick = loop_start_tick
-        start_sec = self._transport_tick_to_seconds(start_tick)
-        if not self._prepare_realtime_playback(start_sec):
+        if not self._prepare_realtime_playback(start_tick):
             QtWidgets.QMessageBox.warning(self, 'Playback unavailable', 'Could not start the realtime audio output stream.')
             return
         self._set_playhead_tick_position(start_tick)
@@ -7828,7 +7858,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_transport_controls()
         _APP_LOGGER.info(
             "Playback started playhead=%.6f bpm=%s loop=%s audio=%s",
-            start_sec,
+            self._transport_tick_to_seconds(start_tick),
             self.project.bpm,
             bool(self.project.loop_enabled),
             self._audio_output_summary(),
@@ -7863,7 +7893,7 @@ class MainWindow(QtWidgets.QMainWindow):
             bool(should_reset),
         )
         if should_reset:
-            self.set_playhead_position(0.0)
+            self._set_playhead_tick_position(0)
             self.statusBar().showMessage('Playback reset to 0.00s')
             return
         self.statusBar().showMessage('Playback stopped')
@@ -8033,11 +8063,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._save_preferences()
         self._release_live_midi_host()
         self._refresh_live_midi_host()
-        if self.playback_timer.isActive():
-            current_sec = self.project.playhead_sec
-            self.stop_playback()
-            self.set_playhead_position(current_sec)
-            self.start_playback()
+        self._restart_playback_preserving_tick()
         self.refresh_audio_output_menu()
         self.statusBar().showMessage(f'Audio output set to {self._audio_output_summary()}')
 
@@ -8048,11 +8074,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._save_preferences()
         self._release_live_midi_host()
         self._refresh_live_midi_host()
-        if self.playback_timer.isActive():
-            current_sec = self.project.playhead_sec
-            self.stop_playback()
-            self.set_playhead_position(current_sec)
-            self.start_playback()
+        self._restart_playback_preserving_tick()
         self.refresh_audio_output_menu()
         self.statusBar().showMessage(f'Output sample rate set to {self._audio_output_summary()}')
 
@@ -8066,11 +8088,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._save_preferences()
         self._release_live_midi_host()
         self._refresh_live_midi_host()
-        if self.playback_timer.isActive():
-            current_sec = self.project.playhead_sec
-            self.stop_playback()
-            self.set_playhead_position(current_sec)
-            self.start_playback()
+        self._restart_playback_preserving_tick()
         self.refresh_audio_output_menu()
         self.statusBar().showMessage(f'Output format set to {self._audio_output_summary()}')
 
@@ -10654,20 +10672,20 @@ class MainWindow(QtWidgets.QMainWindow):
     def _start_vsti_background_warmup(self) -> None:
         return
 
-    def _temporarily_stop_playback_for_vsti_load(self) -> tuple[bool, float]:
+    def _temporarily_stop_playback_for_vsti_load(self) -> tuple[bool, int]:
         was_playing = bool(hasattr(self, 'playback_timer') and self.playback_timer.isActive())
-        resume_sec = float(self.project.playhead_sec)
+        resume_tick = int(self.project.playhead_tick)
         if not was_playing:
-            return False, resume_sec
+            return False, resume_tick
         self.stop_playback()
         self._reset_realtime_track_states(clear_plugins=True)
         self._realtime_reset_pending = True
-        return True, resume_sec
+        return True, resume_tick
 
-    def _resume_playback_after_vsti_load(self, was_playing: bool, resume_sec: float) -> None:
+    def _resume_playback_after_vsti_load(self, was_playing: bool, resume_tick: int) -> None:
         if not was_playing:
             return
-        self.set_playhead_position(resume_sec)
+        self._set_playhead_tick_position(int(resume_tick))
         QtCore.QTimer.singleShot(0, self.start_playback)
 
     def _load_vsti_binary_path(self, path: str, show_message: bool = True) -> bool:
@@ -10678,13 +10696,13 @@ class MainWindow(QtWidgets.QMainWindow):
             bool(show_message),
             bool(hasattr(self, 'playback_timer') and self.playback_timer.isActive()),
         )
-        paused_playback, resume_sec = self._temporarily_stop_playback_for_vsti_load()
+        paused_playback, resume_tick = self._temporarily_stop_playback_for_vsti_load()
         try:
             ok, detail = self.vsti_binary_loader.load(normalized)
             if ok:
                 self._capture_vsti_metadata(normalized, self.vsti_binary_loader.handle(normalized))
         finally:
-            self._resume_playback_after_vsti_load(paused_playback, resume_sec)
+            self._resume_playback_after_vsti_load(paused_playback, resume_tick)
         if ok:
             _APP_LOGGER.info("Loaded VST3 path=%s detail=%s", normalized, detail)
         else:
