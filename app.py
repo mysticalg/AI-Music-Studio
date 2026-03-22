@@ -4333,6 +4333,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.audio_buffer_ms = 80
         self.selected_audio_sample_rate = 0
         self.selected_audio_sample_format_name = 'Auto'
+        self.native_vst_host_sample_rate = 0
+        self.native_vst_host_buffer_size = 0
         self.playback_ui_refresh_ms = 16
         self.prefer_gpu_rendering = True
         self._main_splitter_sizes = [170, 1330]
@@ -5672,6 +5674,18 @@ class MainWindow(QtWidgets.QMainWindow):
             f'{qaudio_sample_format_label(self._playback_sample_format)} • '
             f'{self._playback_channel_count} ch • {latency_ms:.1f} ms'
         )
+
+    def _native_vst_host_target_sample_rate(self) -> int:
+        selected = int(getattr(self, 'native_vst_host_sample_rate', 0) or 0)
+        if selected > 0:
+            return selected
+        return max(1, int(getattr(self, '_playback_sample_rate', 44100)))
+
+    def _native_vst_host_target_buffer_size(self) -> int:
+        selected = int(getattr(self, 'native_vst_host_buffer_size', 0) or 0)
+        if selected > 0:
+            return selected
+        return max(64, int(self._desired_audio_buffer_frames()))
 
     def _available_audio_sample_rates(self, device: QtMultimedia.QAudioDevice | None = None) -> list[int]:
         target = device or self._selected_audio_device()
@@ -7732,6 +7746,55 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             sample_format_group.addAction(action)
 
+        native_host_menu = self.audio_output_menu.addMenu('Native VST Host')
+        native_host_summary = native_host_menu.addAction(
+            f'Startup Format: {self._native_vst_host_target_sample_rate()} Hz • {self._native_vst_host_target_buffer_size()} samples'
+        )
+        native_host_summary.setEnabled(False)
+        native_host_menu.addSeparator()
+
+        native_rate_menu = native_host_menu.addMenu('Sample Rate')
+        native_rate_group = QtGui.QActionGroup(native_rate_menu)
+        native_rate_group.setExclusive(True)
+        follow_output_rate = native_rate_menu.addAction(f'Follow Output ({self._playback_sample_rate} Hz)')
+        follow_output_rate.setCheckable(True)
+        follow_output_rate.setChecked(int(self.native_vst_host_sample_rate) <= 0)
+        follow_output_rate.triggered.connect(lambda _checked=False: self.set_native_vst_host_sample_rate(0))
+        native_rate_group.addAction(follow_output_rate)
+        native_sample_rates = set(self._available_audio_sample_rates(current_device))
+        native_sample_rates.add(int(self._playback_sample_rate))
+        if int(self.native_vst_host_sample_rate) > 0:
+            native_sample_rates.add(int(self.native_vst_host_sample_rate))
+        for rate in sorted(rate for rate in native_sample_rates if int(rate) > 0):
+            action = native_rate_menu.addAction(f'{rate} Hz')
+            action.setCheckable(True)
+            action.setChecked(int(self.native_vst_host_sample_rate) == int(rate))
+            action.triggered.connect(lambda _checked=False, r=rate: self.set_native_vst_host_sample_rate(r))
+            native_rate_group.addAction(action)
+
+        native_buffer_menu = native_host_menu.addMenu('Buffer Size')
+        native_buffer_group = QtGui.QActionGroup(native_buffer_menu)
+        native_buffer_group.setExclusive(True)
+        follow_output_buffer = native_buffer_menu.addAction(
+            f'Follow Playback Buffer ({self._desired_audio_buffer_frames()} samples)'
+        )
+        follow_output_buffer.setCheckable(True)
+        follow_output_buffer.setChecked(int(self.native_vst_host_buffer_size) <= 0)
+        follow_output_buffer.triggered.connect(lambda _checked=False: self.set_native_vst_host_buffer_size(0))
+        native_buffer_group.addAction(follow_output_buffer)
+        native_buffer_sizes = {
+            128, 192, 240, 256, 384, 480, 512, 768, 960, 1024, 1536, 1920, 2048,
+            int(self._desired_audio_buffer_frames()),
+        }
+        if int(self.native_vst_host_buffer_size) > 0:
+            native_buffer_sizes.add(int(self.native_vst_host_buffer_size))
+        for size in sorted(size for size in native_buffer_sizes if int(size) > 0):
+            action = native_buffer_menu.addAction(f'{size} samples')
+            action.setCheckable(True)
+            action.setChecked(int(self.native_vst_host_buffer_size) == int(size))
+            action.triggered.connect(lambda _checked=False, s=size: self.set_native_vst_host_buffer_size(s))
+            native_buffer_group.addAction(action)
+
         latency_action = self.audio_output_menu.addAction(
             f'Estimated Output Latency: {(self._desired_audio_buffer_frames() / float(max(1, self._playback_sample_rate))) * 1000.0:.1f} ms'
         )
@@ -7802,6 +7865,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_live_midi_host()
         self.refresh_audio_output_menu()
         self.statusBar().showMessage(f'Playback audio buffer set to {self.audio_buffer_ms} ms ({self._audio_output_summary()})')
+
+    def set_native_vst_host_sample_rate(self, value: int) -> None:
+        self.native_vst_host_sample_rate = max(0, int(value))
+        self._save_preferences()
+        self.refresh_audio_output_menu()
+        self.statusBar().showMessage(
+            f'Native VST host sample rate set to {self._native_vst_host_target_sample_rate()} Hz for new or restarted plugin hosts'
+        )
+
+    def set_native_vst_host_buffer_size(self, value: int) -> None:
+        self.native_vst_host_buffer_size = int(clamp(int(value), 0, 8192))
+        self._save_preferences()
+        self.refresh_audio_output_menu()
+        self.statusBar().showMessage(
+            f'Native VST host buffer set to {self._native_vst_host_target_buffer_size()} samples for new or restarted plugin hosts'
+        )
 
     def set_playback_ui_refresh_ms(self, value: int) -> None:
         self.playback_ui_refresh_ms = int(clamp(value, 16, 200))
@@ -9404,11 +9483,18 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._can_use_native_vst_host(entry):
             return False
         row = int(row)
+        desired_sample_rate = self._native_vst_host_target_sample_rate()
+        desired_buffer_size = self._native_vst_host_target_buffer_size()
         existing = self._track_native_vst_host_bridges.get(row)
         existing_path = str(getattr(existing, 'plugin_path', '') or '')
+        existing_sample_rate = int(getattr(existing, 'sample_rate', 0) or 0)
+        existing_buffer_size = int(getattr(existing, 'buffer_size', 0) or 0)
         if existing is not None and self._native_vst_host_bridge_alive(row):
             try:
                 if self._normalized_vsti_path(existing_path) != self._normalized_vsti_path(entry.path):
+                    self._stop_native_vst_host_bridge(row)
+                    existing = None
+                elif existing_sample_rate != desired_sample_rate or existing_buffer_size != desired_buffer_size:
                     self._stop_native_vst_host_bridge(row)
                     existing = None
                 elif open_editor:
@@ -9425,7 +9511,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 existing = None
         if existing is None:
             try:
-                bridge = NativeVstHostBridge(plugin_path=entry.path, open_editor=open_editor)
+                bridge = NativeVstHostBridge(
+                    plugin_path=entry.path,
+                    open_editor=open_editor,
+                    sample_rate=desired_sample_rate,
+                    buffer_size=desired_buffer_size,
+                )
                 bridge.start()
                 self._track_native_vst_host_bridges[row] = bridge
                 self.statusBar().showMessage(f'Opened native VST host: {entry.name}')
@@ -9488,7 +9579,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._track_native_vsti_hwnds.pop(int(row), None)
                 self._track_native_vsti_close_events.pop(int(row), None)
                 return False
+            HWND_TOPMOST = -1
+            SWP_NOMOVE = 0x0002
+            SWP_NOSIZE = 0x0001
+            SWP_SHOWWINDOW = 0x0040
             user32.ShowWindow(hwnd, 9)
+            user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
             user32.BringWindowToTop(hwnd)
             user32.SetForegroundWindow(hwnd)
             return True
@@ -9774,6 +9870,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.selected_audio_sample_rate = self._coerce_int(payload.get('selected_audio_sample_rate', 0), 0, 0, 384000)
         self.selected_audio_sample_format_name = str(payload.get('selected_audio_sample_format_name', 'Auto') or 'Auto')
         self.audio_buffer_ms = int(clamp(float(payload.get('audio_buffer_ms', 80)), 20, 500))
+        self.native_vst_host_sample_rate = self._coerce_int(payload.get('native_vst_host_sample_rate', 0), 0, 0, 384000)
+        self.native_vst_host_buffer_size = self._coerce_int(payload.get('native_vst_host_buffer_size', 0), 0, 0, 8192)
         refresh_pref = payload.get('playback_ui_refresh_ms', 16)
         try:
             refresh_value = float(refresh_pref)
@@ -9886,6 +9984,8 @@ class MainWindow(QtWidgets.QMainWindow):
             'selected_audio_sample_rate': self.selected_audio_sample_rate,
             'selected_audio_sample_format_name': self.selected_audio_sample_format_name,
             'audio_buffer_ms': self.audio_buffer_ms,
+            'native_vst_host_sample_rate': self.native_vst_host_sample_rate,
+            'native_vst_host_buffer_size': self.native_vst_host_buffer_size,
             'playback_ui_refresh_ms': self.playback_ui_refresh_ms,
             'prefer_gpu_rendering': self.prefer_gpu_rendering,
             'main_splitter_sizes': self._main_splitter_sizes,
