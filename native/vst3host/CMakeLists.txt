@@ -17,8 +17,6 @@ juce_add_gui_app(AIMusicStudioVSTHost
     BUNDLE_ID "com.aimusicstudio.vsthost"
 )
 
-juce_generate_juce_header(AIMusicStudioVSTHost)
-
 target_sources(AIMusicStudioVSTHost
     PRIVATE
         Source/Main.cpp
@@ -26,6 +24,7 @@ target_sources(AIMusicStudioVSTHost
 
 target_compile_definitions(AIMusicStudioVSTHost
     PRIVATE
+        AIMS_VST_HOST_BUILD_APP=1
         JUCE_DIRECTSOUND=1
         JUCE_DISABLE_CAUTIOUS_PARAMETER_ID_CHECKING=1
         JUCE_PLUGINHOST_AU=0
@@ -48,4 +47,43 @@ target_link_libraries(AIMusicStudioVSTHost
         juce::juce_recommended_config_flags
         juce::juce_recommended_lto_flags
         juce::juce_recommended_warning_flags
+)
+
+add_library(AIMusicStudioVSTHostLib SHARED)
+
+target_sources(AIMusicStudioVSTHostLib
+    PRIVATE
+        Source/Main.cpp
+)
+
+target_compile_definitions(AIMusicStudioVSTHostLib
+    PRIVATE
+        AIMS_VST_HOST_BUILD_LIBRARY=1
+        JUCE_DIRECTSOUND=1
+        JUCE_DISABLE_CAUTIOUS_PARAMETER_ID_CHECKING=1
+        JUCE_PLUGINHOST_AU=0
+        JUCE_PLUGINHOST_LADSPA=0
+        JUCE_PLUGINHOST_LV2=0
+        JUCE_PLUGINHOST_VST=0
+        JUCE_PLUGINHOST_VST3=1
+        JUCE_USE_CURL=0
+        JUCE_VST3_HOST_CROSS_PLATFORM_UID=1
+        JUCE_WASAPI=1
+        JUCE_WEB_BROWSER=0
+)
+
+target_link_libraries(AIMusicStudioVSTHostLib
+    PRIVATE
+        juce::juce_audio_devices
+        juce::juce_audio_processors
+        juce::juce_audio_utils
+        juce::juce_gui_extra
+        juce::juce_recommended_config_flags
+        juce::juce_recommended_lto_flags
+        juce::juce_recommended_warning_flags
+)
+
+set_target_properties(AIMusicStudioVSTHostLib
+    PROPERTIES
+        OUTPUT_NAME "AIMusicStudioVSTHostLib"
 )
