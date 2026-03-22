@@ -18,7 +18,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "CMake configure failed with exit code $LASTEXITCODE"
 }
 
-cmake --build $BuildDir --config $Configuration --target AIMusicStudioVSTHost
+cmake --build $BuildDir --config $Configuration --target AIMusicStudioVSTHost AIMusicStudioVSTHostLib
 if ($LASTEXITCODE -ne 0) {
     throw "CMake build failed with exit code $LASTEXITCODE"
 }

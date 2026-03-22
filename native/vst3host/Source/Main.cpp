@@ -1,7 +1,14 @@
-#include <JuceHeader.h>
+#include <juce_audio_devices/juce_audio_devices.h>
+#include <juce_audio_processors/juce_audio_processors.h>
+#include <juce_audio_utils/juce_audio_utils.h>
+#include <juce_gui_extra/juce_gui_extra.h>
 #if JUCE_WINDOWS
 #include <windows.h>
 #endif
+#include <algorithm>
+#include <cstring>
+#include <mutex>
+#include <utility>
 
 namespace
 {
@@ -148,8 +155,13 @@ private:
     void closeButtonPressed() override
     {
         saveBounds();
-        if (onWindowClosed != nullptr)
-            onWindowClosed();
+        setVisible(false);
+        auto safeThis = juce::Component::SafePointer<PluginEditorWindow>(this);
+        juce::MessageManager::callAsync([safeThis]
+        {
+            if (safeThis != nullptr && safeThis->onWindowClosed != nullptr)
+                safeThis->onWindowClosed();
+        });
     }
 
     void moved() override
@@ -300,9 +312,10 @@ public:
     ~HostComponent() override
     {
         commandServer.reset();
+        deviceManager.removeAudioCallback(this);
+        deviceManager.closeAudioDevice();
         closeEditorWindow();
         unloadPlugin();
-        deviceManager.removeAudioCallback(this);
     }
 
     void paint(juce::Graphics& g) override
@@ -367,6 +380,15 @@ public:
     }
 
 private:
+    struct ScheduledMidiEvent
+    {
+        int64_t frame = 0;
+        int priority = 0;
+        int64_t sequence = 0;
+        int64_t loopEpoch = 0;
+        juce::MidiMessage message;
+    };
+
     juce::var handleRemoteCommand(const juce::var& request)
     {
         auto* object = request.getDynamicObject();
@@ -413,6 +435,47 @@ private:
             return response;
         }
 
+        if (command == "load_state")
+        {
+            if (pluginInstance == nullptr)
+                return makeResponse(false, "No plugin loaded");
+
+            const auto path = object->getProperty("path").toString().trim();
+            if (path.isEmpty())
+                return makeResponse(false, "Missing state path");
+
+            const auto stateFile = juce::File(path);
+            if (!stateFile.existsAsFile())
+                return makeResponse(false, "State file not found");
+
+            if (!loadPluginStateFromFile(stateFile))
+                return makeResponse(false, "Could not load plugin state");
+
+            auto response = makeResponse(true, "Plugin state loaded");
+            appendStatusFields(response);
+            setResponseField(response, "state_path", stateFile.getFullPathName());
+            return response;
+        }
+
+        if (command == "save_state")
+        {
+            if (pluginInstance == nullptr)
+                return makeResponse(false, "No plugin loaded");
+
+            const auto path = object->getProperty("path").toString().trim();
+            if (path.isEmpty())
+                return makeResponse(false, "Missing state path");
+
+            const auto stateFile = juce::File(path);
+            if (!savePluginStateToFile(stateFile))
+                return makeResponse(false, "Could not save plugin state");
+
+            auto response = makeResponse(true, "Plugin state saved");
+            appendStatusFields(response);
+            setResponseField(response, "state_path", stateFile.getFullPathName());
+            return response;
+        }
+
         if (command == "open_editor")
         {
             if (pluginInstance == nullptr)
@@ -442,7 +505,7 @@ private:
                                                                           ? static_cast<double>(object->getProperty("velocity"))
                                                                           : 1.0));
 
-            keyboardState.noteOn(channel, note, velocity);
+            enqueueMidiMessage(juce::MidiMessage::noteOn(channel, note, velocity));
             auto response = makeResponse(true, "Note on");
             appendStatusFields(response);
             setResponseField(response, "note", note);
@@ -460,7 +523,7 @@ private:
                                                                           ? static_cast<double>(object->getProperty("velocity"))
                                                                           : 0.0));
 
-            keyboardState.noteOff(channel, note, velocity);
+            enqueueMidiMessage(juce::MidiMessage::noteOff(channel, note, velocity));
             auto response = makeResponse(true, "Note off");
             appendStatusFields(response);
             setResponseField(response, "note", note);
@@ -473,10 +536,162 @@ private:
             const auto channel = object->hasProperty("channel")
                 ? clampMidiChannel(static_cast<int>(object->getProperty("channel")))
                 : 0;
-            keyboardState.allNotesOff(channel);
+            clearScheduledMidiEvents(channel);
+            enqueuePanicMessages(channel);
             auto response = makeResponse(true, "All notes off");
             appendStatusFields(response);
             setResponseField(response, "channel", channel);
+            return response;
+        }
+
+        if (command == "panic")
+        {
+            clearScheduledMidiEvents();
+            enqueuePanicMessages(0);
+            {
+                juce::ScopedLock lock(pluginLock);
+                if (pluginInstance != nullptr)
+                    pluginInstance->reset();
+            }
+            auto response = makeResponse(true, "Panic sent");
+            appendStatusFields(response);
+            return response;
+        }
+
+        if (command == "schedule_midi")
+        {
+            const auto baseOffsetFrames = juce::jmax<int64_t>(
+                0,
+                static_cast<int64_t>(object->hasProperty("base_offset_frames")
+                    ? static_cast<double>(object->getProperty("base_offset_frames"))
+                    : 0.0)
+            );
+            const auto loopEpoch = juce::jmax<int64_t>(
+                0,
+                static_cast<int64_t>(object->hasProperty("loop_epoch")
+                    ? static_cast<double>(object->getProperty("loop_epoch"))
+                    : 0.0)
+            );
+            const auto clearChannelsVar = object->getProperty("clear_channels");
+            const auto resetChannelsVar = object->getProperty("reset_channels");
+            const auto eventsVar = object->getProperty("events");
+            if (!eventsVar.isArray())
+                return makeResponse(false, "schedule_midi requires an events array");
+
+            if (clearChannelsVar.isArray())
+            {
+                if (auto* clearArray = clearChannelsVar.getArray())
+                {
+                    for (const auto& channelVar : *clearArray)
+                    {
+                        const auto channel = clampMidiChannel(static_cast<int>(channelVar));
+                        clearScheduledMidiEvents(channel, loopEpoch);
+                    }
+                }
+            }
+
+            if (resetChannelsVar.isArray())
+            {
+                if (auto* resetArray = resetChannelsVar.getArray())
+                {
+                    for (const auto& channelVar : *resetArray)
+                    {
+                        const auto channel = clampMidiChannel(static_cast<int>(channelVar));
+                        clearScheduledMidiEvents(channel, loopEpoch);
+                        enqueuePanicMessages(channel);
+                    }
+                }
+            }
+
+            const auto currentFrame = renderedSampleFrames.load();
+            int scheduledCount = 0;
+            if (auto* array = eventsVar.getArray())
+            {
+                juce::ScopedLock lock(scheduledMidiLock);
+                for (const auto& eventVar : *array)
+                {
+                    auto* eventObject = eventVar.getDynamicObject();
+                    if (eventObject == nullptr)
+                        continue;
+
+                    const auto type = eventObject->getProperty("type").toString().trim().toLowerCase();
+                    const auto channel = clampMidiChannel(static_cast<int>(eventObject->hasProperty("channel")
+                                                                               ? eventObject->getProperty("channel")
+                                                                               : juce::var(kDefaultMidiChannel)));
+                    const auto note = clampMidiNote(static_cast<int>(eventObject->hasProperty("note")
+                                                                         ? eventObject->getProperty("note")
+                                                                         : juce::var(60)));
+                    const auto velocity = clampMidiVelocity(static_cast<float>(eventObject->hasProperty("velocity")
+                                                                                  ? static_cast<double>(eventObject->getProperty("velocity"))
+                                                                                  : 0.0));
+                    const auto sampleOffset = juce::jmax<int64_t>(
+                        0,
+                        static_cast<int64_t>(eventObject->hasProperty("sample_offset")
+                            ? static_cast<double>(eventObject->getProperty("sample_offset"))
+                            : 0.0)
+                    );
+                    const auto priority = static_cast<int>(eventObject->hasProperty("priority")
+                        ? eventObject->getProperty("priority")
+                        : juce::var(0));
+
+                    juce::MidiMessage message;
+                    if (type == "note_on")
+                        message = juce::MidiMessage::noteOn(channel, note, velocity);
+                    else if (type == "note_off")
+                        message = juce::MidiMessage::noteOff(channel, note, velocity);
+                    else
+                        continue;
+
+                    const auto targetFrame = currentFrame + baseOffsetFrames + sampleOffset;
+                    const auto isDuplicate = std::any_of(
+                        scheduledMidiEvents.begin(),
+                        scheduledMidiEvents.end(),
+                        [&](const ScheduledMidiEvent& existing)
+                        {
+                            if (existing.loopEpoch != loopEpoch || existing.frame != targetFrame)
+                                return false;
+                            if (existing.message.getChannel() != message.getChannel())
+                                return false;
+                            if (existing.message.isNoteOn() && message.isNoteOn())
+                                return existing.message.getNoteNumber() == message.getNoteNumber();
+                            if (existing.message.isNoteOff() && message.isNoteOff())
+                                return existing.message.getNoteNumber() == message.getNoteNumber();
+                            return false;
+                        }
+                    );
+                    if (isDuplicate)
+                        continue;
+
+                    scheduledMidiEvents.add({
+                        targetFrame,
+                        priority,
+                        scheduledMidiSequence.fetch_add(1),
+                        loopEpoch,
+                        message,
+                    });
+                    ++scheduledCount;
+                }
+            }
+
+            auto response = makeResponse(true, "Scheduled MIDI events");
+            appendStatusFields(response);
+            setResponseField(response, "scheduled_count", scheduledCount);
+            setResponseField(response, "base_offset_frames", static_cast<double>(baseOffsetFrames));
+            return response;
+        }
+
+        if (command == "render_audio")
+        {
+            if (pluginInstance == nullptr)
+                return makeResponse(false, "No plugin loaded");
+
+            const auto requestedFrames = static_cast<int>(object->hasProperty("frames")
+                ? object->getProperty("frames")
+                : juce::var(currentBlockSize));
+            const auto frames = juce::jlimit(1, 4096, requestedFrames);
+            auto response = renderOfflineAudioBlock(frames);
+            appendStatusFields(response);
+            setResponseField(response, "frames", frames);
             return response;
         }
 
@@ -714,7 +929,124 @@ private:
         juce::ScopedLock lock(pluginLock);
         juce::MidiBuffer midi;
         keyboardState.processNextMidiBuffer(midi, 0, numSamples, true);
+        appendPendingMidiMessages(midi);
+        appendScheduledMidiMessages(midi, numSamples);
         plugin->processBlock(buffer, midi);
+        renderedSampleFrames.fetch_add(numSamples);
+    }
+
+    void enqueueMidiMessage(const juce::MidiMessage& message)
+    {
+        juce::ScopedLock lock(pendingMidiLock);
+        pendingMidiMessages.addEvent(message, 0);
+    }
+
+    void appendPendingMidiMessages(juce::MidiBuffer& destination)
+    {
+        juce::MidiBuffer pending;
+        {
+            juce::ScopedLock lock(pendingMidiLock);
+            if (pendingMidiMessages.isEmpty())
+                return;
+            std::swap(pending, pendingMidiMessages);
+        }
+
+        for (const auto metadata : pending)
+            destination.addEvent(metadata.getMessage(), metadata.samplePosition);
+    }
+
+    void enqueuePanicMessages(int channel)
+    {
+        const auto enqueueChannel = [this](int midiChannel)
+        {
+            enqueueMidiMessage(juce::MidiMessage::controllerEvent(midiChannel, 64, 0));
+            enqueueMidiMessage(juce::MidiMessage::controllerEvent(midiChannel, 66, 0));
+            enqueueMidiMessage(juce::MidiMessage::controllerEvent(midiChannel, 67, 0));
+            enqueueMidiMessage(juce::MidiMessage::controllerEvent(midiChannel, 120, 0));
+            enqueueMidiMessage(juce::MidiMessage::controllerEvent(midiChannel, 123, 0));
+            for (int note = 0; note < 128; ++note)
+                enqueueMidiMessage(juce::MidiMessage::noteOff(midiChannel, note, 0.0f));
+        };
+
+        if (channel <= 0)
+        {
+            for (int midiChannel = 1; midiChannel <= 16; ++midiChannel)
+                enqueueChannel(midiChannel);
+            keyboardState.reset();
+            return;
+        }
+
+        enqueueChannel(clampMidiChannel(channel));
+        keyboardState.allNotesOff(clampMidiChannel(channel));
+    }
+
+    void appendScheduledMidiMessages(juce::MidiBuffer& destination, int numSamples)
+    {
+        const auto blockStart = renderedSampleFrames.load();
+        const auto blockEnd = blockStart + juce::jmax(1, numSamples);
+        juce::Array<ScheduledMidiEvent> keep;
+        juce::Array<ScheduledMidiEvent> ready;
+
+        juce::ScopedLock lock(scheduledMidiLock);
+        for (const auto& event : scheduledMidiEvents)
+        {
+            if (event.frame < blockStart)
+            {
+                if (event.message.isNoteOff())
+                {
+                    auto lateEvent = event;
+                    lateEvent.frame = blockStart;
+                    ready.add(lateEvent);
+                }
+            }
+            else if (event.frame < blockEnd)
+            {
+                ready.add(event);
+            }
+            else
+            {
+                keep.add(event);
+            }
+        }
+        scheduledMidiEvents.swapWith(keep);
+
+        std::sort(ready.begin(), ready.end(), [](const ScheduledMidiEvent& a, const ScheduledMidiEvent& b)
+        {
+            if (a.frame != b.frame)
+                return a.frame < b.frame;
+            if (a.priority != b.priority)
+                return a.priority < b.priority;
+            return a.sequence < b.sequence;
+        });
+
+        for (const auto& event : ready)
+        {
+            const auto samplePosition = static_cast<int>(
+                juce::jlimit<int64_t>(0, juce::jmax(0, numSamples - 1), event.frame - blockStart)
+            );
+            destination.addEvent(event.message, samplePosition);
+        }
+    }
+
+    void clearScheduledMidiEvents(int channel = 0, int64_t beforeLoopEpoch = -1)
+    {
+        juce::ScopedLock lock(scheduledMidiLock);
+        if (channel <= 0)
+        {
+            scheduledMidiEvents.clear();
+            renderedSampleFrames.store(0);
+            scheduledMidiSequence.store(0);
+            return;
+        }
+
+        juce::Array<ScheduledMidiEvent> keep;
+        const auto targetChannel = clampMidiChannel(channel);
+        for (const auto& event : scheduledMidiEvents)
+        {
+            if (event.message.getChannel() != targetChannel || (beforeLoopEpoch >= 0 && event.loopEpoch >= beforeLoopEpoch))
+                keep.add(event);
+        }
+        scheduledMidiEvents.swapWith(keep);
     }
 
     void loadPlugin(const juce::String& pluginPath)
@@ -728,6 +1060,7 @@ private:
         }
 
         unloadPlugin();
+        clearScheduledMidiEvents();
 
         auto descriptions = describePlugin(pluginFile);
         if (descriptions.isEmpty())
@@ -768,6 +1101,7 @@ private:
     void unloadPlugin()
     {
         closeEditorWindow();
+        clearScheduledMidiEvents();
         releasePluginResources();
         {
             juce::ScopedLock lock(pluginLock);
@@ -780,6 +1114,7 @@ private:
 
     void preparePluginForPlayback()
     {
+        clearScheduledMidiEvents();
         juce::ScopedLock lock(pluginLock);
         if (pluginInstance == nullptr)
             return;
@@ -793,6 +1128,75 @@ private:
         juce::ScopedLock lock(pluginLock);
         if (pluginInstance != nullptr)
             pluginInstance->releaseResources();
+    }
+
+    bool loadPluginStateFromFile(const juce::File& stateFile)
+    {
+        juce::MemoryBlock rawState;
+        if (!stateFile.loadFileAsData(rawState) || rawState.getSize() == 0)
+            return false;
+
+        clearScheduledMidiEvents();
+        keyboardState.reset();
+        juce::ScopedLock lock(pluginLock);
+        if (pluginInstance == nullptr)
+            return false;
+        pluginInstance->setStateInformation(rawState.getData(), static_cast<int>(rawState.getSize()));
+        pluginInstance->reset();
+        return true;
+    }
+
+    bool savePluginStateToFile(const juce::File& stateFile)
+    {
+        juce::MemoryBlock rawState;
+        {
+            juce::ScopedLock lock(pluginLock);
+            if (pluginInstance == nullptr)
+                return false;
+            pluginInstance->getStateInformation(rawState);
+        }
+        if (rawState.getSize() == 0)
+            return false;
+        const auto parentDir = stateFile.getParentDirectory();
+        if (!parentDir.exists() && !parentDir.createDirectory())
+            return false;
+        return stateFile.replaceWithData(rawState.getData(), rawState.getSize());
+    }
+
+    juce::var renderOfflineAudioBlock(int numSamples)
+    {
+        auto response = makeResponse(true, "Rendered audio");
+        juce::AudioBuffer<float> buffer(juce::jmax(2, pluginInstance != nullptr ? pluginInstance->getTotalNumOutputChannels() : 2),
+                                        juce::jmax(1, numSamples));
+        buffer.clear();
+
+        {
+            juce::ScopedLock lock(pluginLock);
+            if (pluginInstance == nullptr)
+                return makeResponse(false, "No plugin loaded");
+
+            juce::MidiBuffer midi;
+            keyboardState.processNextMidiBuffer(midi, 0, numSamples, true);
+            appendPendingMidiMessages(midi);
+            appendScheduledMidiMessages(midi, numSamples);
+            pluginInstance->processBlock(buffer, midi);
+            renderedSampleFrames.fetch_add(numSamples);
+        }
+
+        juce::MemoryOutputStream stream;
+        const auto channelCount = buffer.getNumChannels();
+        for (int sample = 0; sample < numSamples; ++sample)
+        {
+            const auto left = buffer.getSample(0, sample);
+            const auto right = channelCount > 1 ? buffer.getSample(1, sample) : left;
+            stream.write(&left, sizeof(left));
+            stream.write(&right, sizeof(right));
+        }
+
+        setResponseField(response, "audio_b64", juce::Base64::toBase64(stream.getData(), stream.getDataSize()));
+        setResponseField(response, "channels", 2);
+        setResponseField(response, "format", "f32le-interleaved");
+        return response;
     }
 
     void openEditorWindow()
@@ -855,6 +1259,12 @@ private:
     juce::AudioDeviceManager deviceManager;
     juce::MidiKeyboardState keyboardState;
     juce::CriticalSection pluginLock;
+    juce::CriticalSection pendingMidiLock;
+    juce::MidiBuffer pendingMidiMessages;
+    juce::CriticalSection scheduledMidiLock;
+    juce::Array<ScheduledMidiEvent> scheduledMidiEvents;
+    std::atomic<int64_t> renderedSampleFrames { 0 };
+    std::atomic<int64_t> scheduledMidiSequence { 0 };
 
     juce::Label pathLabel;
     juce::TextEditor pathEditor;
@@ -1059,6 +1469,133 @@ private:
     bool hiddenOnStartup = false;
 };
 
+#if defined(AIMS_VST_HOST_BUILD_LIBRARY)
+namespace
+{
+   #if JUCE_WINDOWS
+    #define AIMS_VST_HOST_API extern "C" __declspec(dllexport)
+   #else
+    #define AIMS_VST_HOST_API extern "C"
+   #endif
+
+    juce::PropertiesFile::Options hostSettingsOptions()
+    {
+        juce::PropertiesFile::Options options;
+        options.applicationName = "AI Music Studio VST Host";
+        options.filenameSuffix = "settings";
+        options.osxLibrarySubFolder = "Application Support";
+        return options;
+    }
+
+    void copyUtf8ToBuffer(const juce::String& text, char* destination, int destinationBytes)
+    {
+        if (destination == nullptr || destinationBytes <= 0)
+            return;
+        const auto utf8 = text.toRawUTF8();
+        const auto sourceBytes = std::strlen(utf8);
+        const auto copyBytes = static_cast<size_t>(juce::jmax(0, destinationBytes - 1));
+        const auto bytes = juce::jmin(copyBytes, sourceBytes);
+        std::memcpy(destination, utf8, bytes);
+        destination[bytes] = '\0';
+    }
+
+    class LibraryHostInstance final
+    {
+    public:
+        LibraryHostInstance(const juce::String& pluginPath,
+                            bool shouldOpenEditorOnStartup,
+                            double startupSampleRate,
+                            int startupBufferSize)
+            : guiInitializer(std::make_unique<juce::ScopedJuceInitialiser_GUI>())
+        {
+            appProperties = std::make_unique<juce::ApplicationProperties>();
+            appProperties->setStorageParameters(hostSettingsOptions());
+            component = std::make_unique<HostComponent>(*appProperties->getUserSettings(),
+                                                        pluginPath,
+                                                        shouldOpenEditorOnStartup,
+                                                        0,
+                                                        true,
+                                                        startupSampleRate,
+                                                        startupBufferSize);
+        }
+
+        juce::String command(const juce::String& requestLine)
+        {
+            return component != nullptr ? component->handleRemoteCommandLine(requestLine)
+                                        : juce::JSON::toString(makeResponse(false, "Host component unavailable"));
+        }
+
+    private:
+        std::unique_ptr<juce::ScopedJuceInitialiser_GUI> guiInitializer;
+        std::unique_ptr<juce::ApplicationProperties> appProperties;
+        std::unique_ptr<HostComponent> component;
+    };
+}
+
+AIMS_VST_HOST_API void* aims_vst_host_create(const char* pluginPath,
+                                             int openEditor,
+                                             double sampleRate,
+                                             int bufferSize,
+                                             char* errorBuffer,
+                                             int errorBufferBytes)
+{
+    try
+    {
+        auto instance = std::make_unique<LibraryHostInstance>(juce::String::fromUTF8(pluginPath != nullptr ? pluginPath : ""),
+                                                              openEditor != 0,
+                                                              sampleRate,
+                                                              bufferSize);
+        copyUtf8ToBuffer("", errorBuffer, errorBufferBytes);
+        return instance.release();
+    }
+    catch (const std::exception& exc)
+    {
+        copyUtf8ToBuffer(juce::String(exc.what()), errorBuffer, errorBufferBytes);
+    }
+    catch (...)
+    {
+        copyUtf8ToBuffer("Unknown error creating in-process VST host", errorBuffer, errorBufferBytes);
+    }
+    return nullptr;
+}
+
+AIMS_VST_HOST_API int aims_vst_host_command(void* handle,
+                                            const char* requestLine,
+                                            char* responseBuffer,
+                                            int responseBufferBytes)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr)
+    {
+        copyUtf8ToBuffer(juce::JSON::toString(makeResponse(false, "Invalid host handle")), responseBuffer, responseBufferBytes);
+        return 0;
+    }
+    const auto response = instance->command(juce::String::fromUTF8(requestLine != nullptr ? requestLine : ""));
+    copyUtf8ToBuffer(response, responseBuffer, responseBufferBytes);
+    return 1;
+}
+
+AIMS_VST_HOST_API void aims_vst_host_destroy(void* handle)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr)
+        return;
+
+    if (auto* messageManager = juce::MessageManager::getInstanceWithoutCreating())
+    {
+        if (!messageManager->isThisTheMessageThread())
+        {
+            juce::MessageManager::callSync([instance]
+            {
+                delete instance;
+            });
+            return;
+        }
+    }
+
+    delete instance;
+}
+#else
 class HostApplication final : public juce::JUCEApplication
 {
 public:
@@ -1165,3 +1702,4 @@ private:
 };
 
 START_JUCE_APPLICATION(HostApplication)
+#endif
