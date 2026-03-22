@@ -349,28 +349,35 @@ AdvancedVSTiAudioProcessorEditor::Theme AdvancedVSTiAudioProcessorEditor::buildT
 std::vector<AdvancedVSTiAudioProcessorEditor::ChoiceSpec> AdvancedVSTiAudioProcessorEditor::buildChoiceSpecs() const
 {
     const auto name = normalizedPluginName (audioProcessor);
+    std::vector<ChoiceSpec> specs;
+
+    const auto presetNames = audioProcessor.presetNames();
+    if (! presetNames.isEmpty())
+        specs.push_back ({ "PRESET", "Preset", "Classic bundled patch", presetNames });
 
     if (name.contains ("303"))
-        return {
-            { "OSCTYPE", "Waveform", "Switch the acid core source", { "Sine", "Saw", "Square", "Noise", "Sample" } },
-            { "FILTERTYPE", "Filter Mode", "Tribute panel with modern filter options", { "LP", "BP", "HP", "Notch" } },
-        };
+    {
+        specs.push_back ({ "OSCTYPE", "Waveform", "Switch the acid core source", { "Sine", "Saw", "Square", "Noise", "Sample" } });
+        specs.push_back ({ "FILTERTYPE", "Filter Mode", "Tribute panel with modern filter options", { "LP", "BP", "HP", "Notch" } });
+        return specs;
+    }
 
     if (name.contains ("sampler"))
-        return {
-            { "SAMPLEBANK", "Source", "Generated sample bank", { "Dusty Keys", "Tape Choir", "Velvet Pluck", "Vox Chop", "Sub Stab", "Glass Bell" } },
-            { "FILTERTYPE", "Filter", "Playback filter curve", { "LP", "BP", "HP", "Notch" } },
-        };
+    {
+        specs.push_back ({ "SAMPLEBANK", "Source", "Generated sample bank", { "Dusty Keys", "Tape Choir", "Velvet Pluck", "Vox Chop", "Sub Stab", "Glass Bell" } });
+        specs.push_back ({ "FILTERTYPE", "Filter", "Playback filter curve", { "LP", "BP", "HP", "Notch" } });
+        return specs;
+    }
 
     if (name.contains ("drum") || name.contains ("808"))
-        return {
-            { "FILTERTYPE", "Tone Filter", "Top-end response", { "LP", "BP", "HP", "Notch" } },
-        };
+    {
+        specs.push_back ({ "FILTERTYPE", "Tone Filter", "Top-end response", { "LP", "BP", "HP", "Notch" } });
+        return specs;
+    }
 
-    return {
-        { "OSCTYPE", "Oscillator", "Core harmonic source", { "Sine", "Saw", "Square", "Noise", "Sample" } },
-        { "FILTERTYPE", "Filter", "Main timbre curve", { "LP", "BP", "HP", "Notch" } },
-    };
+    specs.push_back ({ "OSCTYPE", "Oscillator", "Core harmonic source", { "Sine", "Saw", "Square", "Noise", "Sample" } });
+    specs.push_back ({ "FILTERTYPE", "Filter", "Main timbre curve", { "LP", "BP", "HP", "Notch" } });
+    return specs;
 }
 
 std::vector<AdvancedVSTiAudioProcessorEditor::KnobSpec> AdvancedVSTiAudioProcessorEditor::buildKnobSpecs() const

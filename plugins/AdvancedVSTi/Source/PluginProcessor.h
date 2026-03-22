@@ -6,11 +6,13 @@
 #define AIMS_INSTRUMENT_FLAVOR 0
 #endif
 
-class AdvancedVSTiAudioProcessor final : public juce::AudioProcessor
+class AdvancedVSTiAudioProcessor final : public juce::AudioProcessor,
+                                         private juce::AudioProcessorValueTreeState::Listener,
+                                         private juce::AsyncUpdater
 {
 public:
     AdvancedVSTiAudioProcessor();
-    ~AdvancedVSTiAudioProcessor() override = default;
+    ~AdvancedVSTiAudioProcessor() override;
 
     void prepareToPlay (double sampleRate, int samplesPerBlock) override;
     void releaseResources() override;
@@ -26,16 +28,17 @@ public:
     [[nodiscard]] bool isMidiEffect() const override { return false; }
     [[nodiscard]] double getTailLengthSeconds() const override { return 0.0; }
 
-    int getNumPrograms() override { return 1; }
-    int getCurrentProgram() override { return 0; }
-    void setCurrentProgram (int) override {}
-    const juce::String getProgramName (int) override { return {}; }
+    int getNumPrograms() override;
+    int getCurrentProgram() override;
+    void setCurrentProgram (int) override;
+    const juce::String getProgramName (int) override;
     void changeProgramName (int, const juce::String&) override {}
 
     void getStateInformation (juce::MemoryBlock& destData) override;
     void setStateInformation (const void* data, int sizeInBytes) override;
 
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
+    [[nodiscard]] juce::StringArray presetNames() const;
 
     juce::AudioProcessorValueTreeState apvts;
 
@@ -129,6 +132,9 @@ private:
     float lfo2Phase = 0.0f;
     int arpStep = 0;
     juce::Array<int> heldNotes;
+    std::atomic<int> pendingPresetIndex { -1 };
+    int currentProgramIndex = 0;
+    bool suppressPresetCallback = false;
 
     [[nodiscard]] static constexpr InstrumentFlavor buildFlavor() noexcept
     {
@@ -217,11 +223,16 @@ private:
     void refreshSampleBank();
     void buildGeneratedSampleBank (int bankIndex);
     [[nodiscard]] static juce::StringArray sampleBankChoices();
+    [[nodiscard]] static juce::StringArray presetChoicesForFlavor();
 
     void updateRenderParameters();
     void applyEnvelopeSettings();
     void advanceArpIfNeeded();
     int getArpNote() const;
+    void applyPresetByIndex (int presetIndex);
+    void setParameterActual (const char* paramId, float value);
+    void parameterChanged (const juce::String& parameterID, float newValue) override;
+    void handleAsyncUpdate() override;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AdvancedVSTiAudioProcessor)
 };
