@@ -6,7 +6,7 @@
     <title>AI Music Studio</title>
     <meta
       name="description"
-      content="AI Music Studio is a desktop MIDI editor with piano-roll editing, bundled VST3 instruments, realtime playback, and AI-assisted composition."
+      content="AI Music Studio is a desktop MIDI editor with piano-roll editing, bundled VST3 instruments, live rack assignment, a unified audio settings window, and AI-assisted composition."
     />
     <link rel="stylesheet" href="styles.css" />
   </head>
@@ -26,8 +26,8 @@
           </div>
           <ul class="hero-points">
             <li>Portable Windows release with bundled VST3 instruments</li>
-            <li>Piano roll note editing, locators, mixer, samples, and track colors</li>
-            <li>VST3-only hosting path for cleaner compatibility and release support</li>
+            <li>Piano roll note editing, locators, mixer, samples, track colors, and floating panels</li>
+            <li>Bundled VST editors plus one unified audio settings window for output and playback tuning</li>
           </ul>
         </div>
         <div class="hero-card">
@@ -50,15 +50,19 @@
           <div class="shot-grid">
             <figure class="shot shot-wide">
               <img src="assets/screenshots/main-window.png" alt="AI Music Studio main editor window" />
-              <figcaption>Main arrange and piano-roll workspace with locators, tracks, mixer, and bundled VST3 instruments.</figcaption>
+              <figcaption>Main editor with a bundled VST loaded on the selected track, loop locators, piano roll, and velocity lane.</figcaption>
             </figure>
             <figure class="shot">
-              <img src="assets/screenshots/piano-roll-detail.png" alt="Close-up of the piano roll and note editing area" />
-              <figcaption>Focused piano-roll editing with darker black-note rows, note auditioning, and resize handles.</figcaption>
+              <img src="assets/screenshots/instrument-panel.png" alt="Panels window showing the Instruments and FX tab with a loaded rack VST" />
+              <figcaption>Instruments and FX panel with the track switched to VSTI Rack and a bundled synth selected from the rack.</figcaption>
             </figure>
             <figure class="shot">
-              <img src="assets/screenshots/instrument-panel.png" alt="Instrument and VST panel inside AI Music Studio" />
-              <figcaption>Track instrument routing, rack assignment, and bundled synth controls.</figcaption>
+              <img src="assets/screenshots/vst-editor.png" alt="Bundled AI Bass Synth editor window inside AI Music Studio" />
+              <figcaption>Bundled VST editor window for AI Bass Synth with preset, oscillator, filter, and envelope controls ready for live tweaking.</figcaption>
+            </figure>
+            <figure class="shot">
+              <img src="assets/screenshots/audio-settings.png" alt="Audio settings window for playback output and native host configuration" />
+              <figcaption>Unified audio settings window for output device, sample format, playback buffer, refresh timing, and native VST host startup options.</figcaption>
             </figure>
           </div>
         </section>
@@ -79,7 +83,7 @@
             </article>
             <article class="guide-card">
               <h3>3. Pick a sound</h3>
-              <p>Set <strong>Instrument type</strong> to <strong>VSTI Rack</strong>, choose a supported VST3, and use <strong>Open VST GUI</strong> for the bundled synth editor.</p>
+              <p>Set <strong>Instrument type</strong> to <strong>VSTI Rack</strong>, choose a supported VST3, then open the bundled editor or wrapper to shape the patch live.</p>
             </article>
             <article class="guide-card">
               <h3>4. Loop and play</h3>
@@ -127,8 +131,12 @@ git push origin main --tags</code></pre>
               <p>The shipping host path targets <strong>VST3</strong>. Unsupported plugins are filtered out of the rack UI so the playable list stays clean.</p>
             </div>
             <div class="note-card">
+              <h3>Audio control</h3>
+              <p>The new <strong>Audio Settings</strong> window keeps output selection, buffer length, sample format, and native VST host startup settings together in one place.</p>
+            </div>
+            <div class="note-card">
               <h3>Bundled instruments</h3>
-              <p>The portable build includes the bundled <strong>AI Bass Synth</strong>, <strong>AI Drum Machine</strong>, and <strong>AI String Synth</strong> VST3 instruments.</p>
+              <p>The portable build includes bundled <strong>AI Bass Synth</strong>, <strong>AI Drum Machine</strong>, and <strong>AI String Synth</strong> VST3 instruments with themed in-app editors.</p>
             </div>
             <div class="note-card">
               <h3>More docs</h3>
