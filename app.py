@@ -4301,9 +4301,15 @@ class AudioSettingsDialog(QtWidgets.QDialog):
             str(main_window.selected_audio_sample_format_name or 'Auto'),
         )
 
-        audio_buffer_values = {8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, int(main_window.audio_buffer_ms)}
-        audio_buffer_items = [(f'{value} ms', int(value)) for value in sorted(v for v in audio_buffer_values if int(v) > 0)]
-        self._set_combo_items(self.audio_buffer_combo, audio_buffer_items, int(main_window.audio_buffer_ms))
+        audio_buffer_values = {64, 128, 256, 512, 1024, 2048, 4096, int(main_window.audio_buffer_frames)}
+        audio_buffer_items = [
+            (
+                f'{value} samples ({(int(value) / float(max(1, main_window._playback_sample_rate))) * 1000.0:.1f} ms)',
+                int(value),
+            )
+            for value in sorted(v for v in audio_buffer_values if int(v) > 0)
+        ]
+        self._set_combo_items(self.audio_buffer_combo, audio_buffer_items, int(main_window.audio_buffer_frames))
 
         playhead_values = {16, 33, 50, 66, int(main_window.playback_ui_refresh_ms)}
         playhead_items = [(f'{value} ms', int(value)) for value in sorted(v for v in playhead_values if int(v) > 0)]
@@ -4322,7 +4328,7 @@ class AudioSettingsDialog(QtWidgets.QDialog):
         self._set_combo_items(self.native_host_rate_combo, native_rate_items, int(main_window.native_vst_host_sample_rate))
 
         native_buffer_values = {
-            10, 16, 32, 64, 96, 128, 192, 240, 256, 384, 480, 512, 768, 960, 1024,
+            16, 24, 32, 48, 64, 96, 128, 192, 240, 256, 384, 480, 512, 768, 960, 1024,
             1536, 1920, 2048, 3072, 4096, int(main_window._native_vst_host_target_buffer_size()),
         }
         if int(main_window.native_vst_host_buffer_size) > 0:
@@ -4358,7 +4364,7 @@ class AudioSettingsDialog(QtWidgets.QDialog):
         main_window = self._main_window()
         if main_window is None:
             return
-        main_window.set_audio_buffer_ms(int(self.audio_buffer_combo.currentData() or 80))
+        main_window.set_audio_buffer_frames(int(self.audio_buffer_combo.currentData() or 512))
 
     def _on_playhead_refresh_changed(self, _index: int) -> None:
         main_window = self._main_window()
@@ -4611,7 +4617,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not getattr(sys, "frozen", False):
             self.vsti_directory.mkdir(parents=True, exist_ok=True)
         self.selected_audio_output_id = ''
-        self.audio_buffer_ms = 80
+        self.audio_buffer_frames = 512
         self.selected_audio_sample_rate = 0
         self.selected_audio_sample_format_name = 'Auto'
         self.native_vst_host_sample_rate = 0
@@ -4642,7 +4648,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._load_preferences()
         self._sync_bundled_vsti_directory()
         self._apply_selected_audio_output()
-        self._apply_audio_buffer_preference()
         self.playback_mix_path = RENDER_DIR / "_playback_mix.wav"
         self.note_preview_path = RENDER_DIR / "_preview" / "note_preview.wav"
         self._playback_sink: QtMultimedia.QAudioSink | None = None
@@ -4658,8 +4663,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._playback_committed_total_bytes = 0
         self._playback_pending_bytes = bytearray()
         self._playback_logical_origin_frame = 0
-        self._playback_chunk_frames = 1024
-        self._live_midi_chunk_frames = 512
+        self._playback_chunk_frames = 256
+        self._live_midi_chunk_frames = 128
         self._playback_sample_rate = int(getattr(self, '_playback_sample_rate', 44100))
         self._playback_channel_count = int(getattr(self, '_playback_channel_count', 2))
         self._playback_sample_format = getattr(
@@ -4667,6 +4672,7 @@ class MainWindow(QtWidgets.QMainWindow):
             '_playback_sample_format',
             QtMultimedia.QAudioFormat.SampleFormat.Int16,
         )
+        self._apply_audio_buffer_preference()
         _APP_LOGGER.info(
             "MainWindow init: bpm=%s sample_rate=%s channels=%s sample_format=%s",
             self.project.bpm,
@@ -5999,8 +6005,21 @@ class MainWindow(QtWidgets.QMainWindow):
     def _native_vst_host_target_buffer_size(self) -> int:
         selected = int(getattr(self, 'native_vst_host_buffer_size', 0) or 0)
         if selected > 0:
-            return int(clamp(selected, 10, 4096))
-        return int(clamp(self._playback_chunk_frames, 10, 4096))
+            return int(clamp(selected, 16, 4096))
+        return int(clamp(self._desired_audio_buffer_frames(), 16, 4096))
+
+    def _buffer_frames_latency_ms(self, frame_count: int) -> float:
+        return (max(1, int(frame_count)) / float(max(1, self._playback_sample_rate))) * 1000.0
+
+    def _preferred_playback_chunk_frames(self) -> int:
+        desired = max(64, int(self._desired_audio_buffer_frames()))
+        if desired <= 64:
+            return 64
+        if desired <= 128:
+            return 128
+        if desired <= 256:
+            return 256
+        return 512
 
     def _available_audio_sample_rates(self, device: QtMultimedia.QAudioDevice | None = None) -> list[int]:
         target = device or self._selected_audio_device()
@@ -6069,8 +6088,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return preferred
 
     def _desired_audio_buffer_frames(self) -> int:
-        requested_frames = int(round((self._playback_sample_rate * float(self.audio_buffer_ms)) / 1000.0))
-        return max(self._playback_chunk_frames, requested_frames)
+        return max(self._playback_chunk_frames, int(clamp(int(self.audio_buffer_frames), 64, 4096)))
 
     def _playback_audio_format(self) -> QtMultimedia.QAudioFormat:
         fmt = QtMultimedia.QAudioFormat()
@@ -6524,10 +6542,17 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
 
     def _native_vst_host_scheduling_lead_frames(self) -> int:
-        # Third-party VSTs are still rendered by the native host, not by the Qt sink.
-        # Using the full Qt output queue here makes larger app buffers delay note-offs.
         host_buffer = max(1, int(self._native_vst_host_target_buffer_size()))
-        return max(host_buffer, int(self._playback_chunk_frames))
+        output_buffer = max(1, int(self._desired_audio_buffer_frames()))
+        sink = getattr(self, '_playback_sink', None)
+        if sink is not None:
+            try:
+                output_buffer = max(output_buffer, int(max(0, sink.bufferFrameCount())))
+            except Exception:
+                pass
+        # Keep native-host playback aligned with the same configured output latency
+        # used by the Qt sink for the metronome and General MIDI path.
+        return max(host_buffer, output_buffer)
 
     def _schedule_native_vst_track_chunk(
         self,
@@ -7312,8 +7337,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._realtime_pump_generation += 1
         self._audio_pump_timer.stop()
         if self._playback_sink is not None:
+            sink = self._playback_sink
             try:
-                self._playback_sink.stop()
+                # `reset()` drops any queued audio immediately, which keeps
+                # pre-rendered General MIDI output from audibly trailing after Stop.
+                reset = getattr(sink, 'reset', None)
+                if callable(reset):
+                    reset()
+            except Exception:
+                pass
+            try:
+                sink.stop()
             except Exception:
                 pass
         self._playback_sink = None
@@ -8322,14 +8356,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_audio_output_menu()
         self.statusBar().showMessage(f'Output format set to {self._audio_output_summary()}')
 
-    def set_audio_buffer_ms(self, value: int) -> None:
-        self.audio_buffer_ms = int(clamp(value, 8, 4096))
+    def set_audio_buffer_frames(self, value: int) -> None:
+        self.audio_buffer_frames = int(clamp(value, 64, 4096))
         self._apply_audio_buffer_preference()
         self._save_preferences()
         self._release_live_midi_host()
         self._refresh_live_midi_host()
         self.refresh_audio_output_menu()
-        self.statusBar().showMessage(f'Playback audio buffer set to {self.audio_buffer_ms} ms ({self._audio_output_summary()})')
+        latency_ms = self._buffer_frames_latency_ms(self.audio_buffer_frames)
+        self.statusBar().showMessage(
+            f'Playback audio buffer set to {self.audio_buffer_frames} samples ({latency_ms:.1f} ms, {self._audio_output_summary()})'
+        )
 
     def set_playback_note_length_offset_ticks(self, value: int) -> None:
         self.note_length_offset_ticks = int(clamp(int(value), -480, 480))
@@ -8401,6 +8438,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._clear_realtime_mix_cache()
 
     def _apply_audio_buffer_preference(self) -> None:
+        self._playback_chunk_frames = self._preferred_playback_chunk_frames()
+        self._live_midi_chunk_frames = max(64, min(256, self._playback_chunk_frames))
         if getattr(self, '_playback_sink', None) is not None:
             try:
                 self._playback_sink.setBufferFrameCount(self._desired_audio_buffer_frames())
@@ -10470,7 +10509,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.selected_audio_output_id = str(payload.get('selected_audio_output_id', '') or '')
         self.selected_audio_sample_rate = self._coerce_int(payload.get('selected_audio_sample_rate', 0), 0, 0, 384000)
         self.selected_audio_sample_format_name = str(payload.get('selected_audio_sample_format_name', 'Auto') or 'Auto')
-        self.audio_buffer_ms = int(clamp(float(payload.get('audio_buffer_ms', 80)), 8, 4096))
+        raw_buffer_frames = payload.get('audio_buffer_frames', None)
+        if raw_buffer_frames is not None:
+            self.audio_buffer_frames = self._coerce_int(raw_buffer_frames, 512, 64, 4096)
+        else:
+            legacy_buffer_value = self._coerce_int(payload.get('audio_buffer_ms', 80), 80, 8, 4096)
+            legacy_sample_choices = {8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096}
+            if legacy_buffer_value in legacy_sample_choices:
+                self.audio_buffer_frames = int(clamp(legacy_buffer_value, 64, 4096))
+            else:
+                converted_frames = int(round((44100.0 * float(legacy_buffer_value)) / 1000.0))
+                self.audio_buffer_frames = int(clamp(converted_frames, 64, 4096))
         self.native_vst_host_sample_rate = self._coerce_int(payload.get('native_vst_host_sample_rate', 0), 0, 0, 384000)
         self.native_vst_host_buffer_size = self._coerce_int(payload.get('native_vst_host_buffer_size', 0), 0, 0, 4096)
         self.note_length_offset_ticks = self._coerce_int(payload.get('note_length_offset_ticks', 0), 0, -480, 480)
@@ -10585,7 +10634,7 @@ class MainWindow(QtWidgets.QMainWindow):
             'selected_audio_output_id': self.selected_audio_output_id,
             'selected_audio_sample_rate': self.selected_audio_sample_rate,
             'selected_audio_sample_format_name': self.selected_audio_sample_format_name,
-            'audio_buffer_ms': self.audio_buffer_ms,
+            'audio_buffer_frames': self.audio_buffer_frames,
             'native_vst_host_sample_rate': self.native_vst_host_sample_rate,
             'native_vst_host_buffer_size': self.native_vst_host_buffer_size,
             'note_length_offset_ticks': self.note_length_offset_ticks,
