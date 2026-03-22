@@ -26,11 +26,17 @@ class NativeVstHostBridge:
         port: int | None = None,
         open_editor: bool = False,
         bridge_mode: bool = True,
+        hidden: bool = True,
+        sample_rate: int | None = None,
+        buffer_size: int | None = None,
     ) -> None:
         self.plugin_path = plugin_path
         self.port = port or _find_free_port()
         self.open_editor = open_editor
         self.bridge_mode = bool(bridge_mode)
+        self.hidden = bool(hidden)
+        self.sample_rate = int(sample_rate) if sample_rate else 0
+        self.buffer_size = int(buffer_size) if buffer_size else 0
         self.process: subprocess.Popen[str] | None = None
 
     def start(self, startup_timeout: float = 10.0) -> None:
@@ -40,8 +46,14 @@ class NativeVstHostBridge:
         args = [str(HOST_EXE), "--port", str(self.port)]
         if self.bridge_mode:
             args.append("--bridge-mode")
+        if self.hidden:
+            args.append("--hidden")
         if self.plugin_path:
             args.extend(["--plugin", self.plugin_path])
+        if self.sample_rate > 0:
+            args.extend(["--sample-rate", str(self.sample_rate)])
+        if self.buffer_size > 0:
+            args.extend(["--buffer-size", str(self.buffer_size)])
         if self.open_editor:
             args.append("--open-editor")
 

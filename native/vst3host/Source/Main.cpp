@@ -1,4 +1,7 @@
 #include <JuceHeader.h>
+#if JUCE_WINDOWS
+#include <windows.h>
+#endif
 
 namespace
 {
@@ -71,7 +74,8 @@ private:
     std::unique_ptr<juce::StreamingSocket> listener;
 };
 
-class PluginEditorWindow final : public juce::DocumentWindow
+class PluginEditorWindow final : public juce::DocumentWindow,
+                                 private juce::Timer
 {
 public:
     PluginEditorWindow(juce::AudioProcessor& processor,
@@ -105,10 +109,40 @@ public:
 
     ~PluginEditorWindow() override
     {
+        stopTimer();
         saveBounds();
     }
 
     std::function<void()> onWindowClosed;
+
+    void forceTopmostFront()
+    {
+        setAlwaysOnTop(true);
+        setMinimised(false);
+        setVisible(true);
+        toFront(true);
+        grabKeyboardFocus();
+
+       #if JUCE_WINDOWS
+        if (auto* peer = getPeer())
+        {
+            if (auto hwnd = static_cast<HWND>(peer->getNativeHandle()))
+            {
+                ShowWindow(hwnd, IsIconic(hwnd) ? SW_RESTORE : SW_SHOWNORMAL);
+                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+                BringWindowToTop(hwnd);
+                SetForegroundWindow(hwnd);
+            }
+        }
+       #endif
+    }
+
+    void beginTopmostWarmup()
+    {
+        topmostWarmupPassesRemaining = 12;
+        startTimer(150);
+    }
 
 private:
     void closeButtonPressed() override
@@ -128,6 +162,28 @@ private:
     {
         juce::DocumentWindow::resized();
         saveBounds();
+    }
+
+    void activeWindowStatusChanged() override
+    {
+        juce::DocumentWindow::activeWindowStatusChanged();
+        if (isVisible())
+            forceTopmostFront();
+    }
+
+    void timerCallback() override
+    {
+        if (!isVisible())
+        {
+            stopTimer();
+            return;
+        }
+
+        forceTopmostFront();
+
+        --topmostWarmupPassesRemaining;
+        if (topmostWarmupPassesRemaining <= 0)
+            stopTimer();
     }
 
     void restoreBounds()
@@ -157,6 +213,7 @@ private:
 
     juce::String editorKey;
     juce::PropertiesFile& appSettings;
+    int topmostWarmupPassesRemaining = 0;
 };
 
 class HostComponent final : public juce::Component,
@@ -169,7 +226,9 @@ public:
                   const juce::String& startupPluginPath,
                   bool shouldOpenEditorOnStartup,
                   int requestedCommandPort,
-                  bool bridgeModeEnabled)
+                  bool bridgeModeEnabled,
+                  double startupSampleRate,
+                  int startupBufferSize)
         : appSettings(settings),
           bridgeMode(bridgeModeEnabled),
           keyboardComponent(keyboardState, juce::MidiKeyboardComponent::horizontalKeyboard)
@@ -213,7 +272,7 @@ public:
         setOpaque(true);
 
         initialiseAudio();
-        restoreAudioPreferences();
+        restoreAudioPreferences(startupSampleRate, startupBufferSize);
         updateDeviceBoxes();
         updateDeviceLabel();
         updateButtons();
@@ -455,10 +514,14 @@ private:
         deviceManager.addAudioCallback(this);
     }
 
-    void restoreAudioPreferences()
+    void restoreAudioPreferences(double startupSampleRate, int startupBufferSize)
     {
-        const auto wantedRate = appSettings.getDoubleValue("audio_sample_rate", 0.0);
-        const auto wantedBuffer = appSettings.getIntValue("audio_buffer_size", 0);
+        const auto wantedRate = startupSampleRate > 0.0
+            ? startupSampleRate
+            : appSettings.getDoubleValue("audio_sample_rate", 0.0);
+        const auto wantedBuffer = startupBufferSize > 0
+            ? startupBufferSize
+            : appSettings.getIntValue("audio_buffer_size", 0);
         if (auto* device = deviceManager.getCurrentAudioDevice())
         {
             auto setup = deviceManager.getAudioDeviceSetup();
@@ -493,6 +556,11 @@ private:
             if (changed)
                 deviceManager.setAudioDeviceSetup(setup, true);
         }
+
+        if (startupSampleRate > 0.0)
+            appSettings.setValue("audio_sample_rate", startupSampleRate);
+        if (startupBufferSize > 0)
+            appSettings.setValue("audio_buffer_size", startupBufferSize);
     }
 
     void updateDeviceBoxes()
@@ -734,7 +802,7 @@ private:
 
         if (editorWindow != nullptr)
         {
-            editorWindow->toFront(true);
+            editorWindow->forceTopmostFront();
             return;
         }
 
@@ -750,14 +818,15 @@ private:
             editorWindow.reset();
             updateButtons();
         };
-        editorWindow->setAlwaysOnTop(true);
-        editorWindow->setVisible(true);
-        editorWindow->toFront(true);
-        editorWindow->grabKeyboardFocus();
+        editorWindow->forceTopmostFront();
+        editorWindow->beginTopmostWarmup();
         juce::MessageManager::callAsync([this]
         {
             if (editorWindow != nullptr)
-                editorWindow->toFront(true);
+            {
+                editorWindow->forceTopmostFront();
+                editorWindow->beginTopmostWarmup();
+            }
         });
     }
 
@@ -910,12 +979,16 @@ public:
                const juce::String& startupPluginPath,
                bool shouldOpenEditorOnStartup,
                int requestedCommandPort,
-               bool bridgeModeEnabled)
+               bool bridgeModeEnabled,
+               bool startHidden,
+               double startupSampleRate,
+               int startupBufferSize)
         : juce::DocumentWindow("AI Music Studio VST Host",
                                juce::Colour::fromRGB(20, 24, 31),
                                juce::DocumentWindow::allButtons),
           appSettings(settings),
-          bridgeMode(bridgeModeEnabled)
+          bridgeMode(bridgeModeEnabled),
+          hiddenOnStartup(startHidden)
     {
         setUsingNativeTitleBar(true);
         setResizable(true, true);
@@ -924,10 +997,13 @@ public:
                                           startupPluginPath,
                                           shouldOpenEditorOnStartup,
                                           requestedCommandPort,
-                                          bridgeMode),
+                                          bridgeMode,
+                                          startupSampleRate,
+                                          startupBufferSize),
                         true);
         restoreBounds();
-        setVisible(true);
+        if (!hiddenOnStartup)
+            setVisible(true);
     }
 
     ~HostWindow() override
@@ -980,6 +1056,7 @@ private:
 
     juce::PropertiesFile& appSettings;
     bool bridgeMode = false;
+    bool hiddenOnStartup = false;
 };
 
 class HostApplication final : public juce::JUCEApplication
@@ -1002,7 +1079,10 @@ public:
                                                   parseStartupPluginPath(),
                                                   shouldOpenEditorOnStartup(),
                                                   parseCommandPort(),
-                                                  isBridgeModeEnabled());
+                                                  isBridgeModeEnabled(),
+                                                  shouldStartHidden(),
+                                                  parseStartupSampleRate(),
+                                                  parseStartupBufferSize());
     }
 
     void shutdown() override
@@ -1046,9 +1126,38 @@ private:
         return 0;
     }
 
+    double parseStartupSampleRate() const
+    {
+        const auto args = getCommandLineParameterArray();
+        for (int i = 0; i < args.size(); ++i)
+        {
+            if (args[i] == "--sample-rate" && i + 1 < args.size())
+                return juce::jmax(0.0, args[i + 1].getDoubleValue());
+        }
+
+        return 0.0;
+    }
+
+    int parseStartupBufferSize() const
+    {
+        const auto args = getCommandLineParameterArray();
+        for (int i = 0; i < args.size(); ++i)
+        {
+            if (args[i] == "--buffer-size" && i + 1 < args.size())
+                return juce::jmax(0, args[i + 1].getIntValue());
+        }
+
+        return 0;
+    }
+
     bool isBridgeModeEnabled() const
     {
         return getCommandLineParameterArray().contains("--bridge-mode");
+    }
+
+    bool shouldStartHidden() const
+    {
+        return getCommandLineParameterArray().contains("--hidden");
     }
 
     std::unique_ptr<juce::ApplicationProperties> appProperties;

@@ -1,0 +1,13 @@
+[  488936ms] [ERROR] ErrorUtils caught an error:
+
+Missing cryptedUid for successful web login
+
+Subsequent non-fatal errors won't be logged; see https://fburl.com/debugjs. {column: 17870, clientTime: 1774146275, extra: Object, guardList: Array(1), hash: avd5it} @ https://static.xx.fbcdn.net/rsrc.php/v4/y9/r/XTTbkH9A15N.js:78
+[  490279ms] [ERROR] ErrorUtils caught an error:
+
+terminate stream because StartStreamFailure with msg : UNAUTHENTICATED [Caught in: Subscription error in preprocessResponse]
+
+Subsequent non-fatal errors won't be logged; see https://fburl.com/debugjs. {column: 180, clientTime: 1774146277, extra: Object, guardList: Array(0), hash: 24gzmc} @ https://static.xx.fbcdn.net/rsrc.php/v4/y9/r/XTTbkH9A15N.js:78
+[  490492ms] [ERROR] Permissions policy violation: unload is not allowed in this document. @ https://static.xx.fbcdn.net/rsrc.php/v4/y0/r/FkDjuvZjYby.js:335
+[  502975ms] [ERROR] Permissions policy violation: unload is not allowed in this document. @ https://static.xx.fbcdn.net/rsrc.php/v4/y0/r/FkDjuvZjYby.js:335
+[  510830ms] [ERROR] Applying inline speculation rules violates the following Content Security Policy directive 'script-src *.facebook.com *.fbcdn.net *.facebook.net 127.0.0.1:* blob: 'self' 'inline-speculation-rules' 'nonce-saSQEvZy' 'wasm-unsafe-eval' https://*.google-analytics.com *.google.com'. Either the 'unsafe-inline' keyword, a hash ('sha256-Tt9+QWZwWpQPB4UxRb9NqY0NVqZyNmkG9AOSpgbLjAQ='), or a nonce ('nonce-...') is required to enable inline execution. The action has been blocked. @ https://static.xx.fbcdn.net/rsrc.php/v4iZfm4/yc/l/en_GB-j/5FAzmf0AAHNnevWYCqBInj7Wmao-0tC2Ioprqu2DptCZTfLA5xBfJxx5UDGer7aQx17JssBiqhi1TmrtMxV-hZ208-lk6aZg2PRUejMKrHpyLo6L0_iNwm9PT9JEkqANPaBvt7myLmk-eGCDOK44dfhKkjwx3Kb_eVK6upenugnyotGfUS_lLHR7ECNjNK6FmvJrw38gjpBDx1oQK5j-JjA_iMcoaq8uwr1RiC3TQ5wWfAq1XVeGeC_aIgPs3eeNr_ysTD6jxv19jUQZFjApKuoqobUF9jgvQ2V9fmv6IJCikkkCoutiMMeM-oEAu7r5gJlcY6G8v4.js:47
