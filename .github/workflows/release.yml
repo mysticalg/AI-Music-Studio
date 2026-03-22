@@ -50,6 +50,32 @@ jobs:
           Set-Content -Path $checksumPath -Value "$($hash.Hash.ToLower())  $(Split-Path $env:ARCHIVE_PATH -Leaf)" -Encoding ASCII
           "CHECKSUM_PATH=$checksumPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          winget install --id JRSoftware.InnoSetup -e --accept-package-agreements --accept-source-agreements
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          $installerOutput = ./scripts/build_windows_installer.ps1 -RepoRoot $PWD -ReleaseVersion "${{ github.ref_name }}"
+          $installerPath = ($installerOutput | Select-Object -Last 1).ToString().Trim()
+          if (-not $installerPath) {
+            throw "Installer step did not return a path."
+          }
+          if (-not (Test-Path $installerPath)) {
+            throw "Installer path not found: $installerPath"
+          }
+          "INSTALLER_PATH=$installerPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Create installer SHA256 checksum
+        shell: pwsh
+        run: |
+          $hash = Get-FileHash -Path $env:INSTALLER_PATH -Algorithm SHA256
+          $checksumPath = "$env:INSTALLER_PATH.sha256"
+          Set-Content -Path $checksumPath -Value "$($hash.Hash.ToLower())  $(Split-Path $env:INSTALLER_PATH -Leaf)" -Encoding ASCII
+          "INSTALLER_CHECKSUM_PATH=$checksumPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -57,6 +83,8 @@ jobs:
           path: |
             ${{ env.ARCHIVE_PATH }}
             ${{ env.CHECKSUM_PATH }}
+            ${{ env.INSTALLER_PATH }}
+            ${{ env.INSTALLER_CHECKSUM_PATH }}
           if-no-files-found: error
 
       - name: Publish GitHub release
@@ -67,7 +95,7 @@ jobs:
           $tag = "${{ github.ref_name }}"
           gh release view $tag --json tagName *> $null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $env:ARCHIVE_PATH $env:CHECKSUM_PATH --clobber
+            gh release upload $tag $env:ARCHIVE_PATH $env:CHECKSUM_PATH $env:INSTALLER_PATH $env:INSTALLER_CHECKSUM_PATH --clobber
           } else {
-            gh release create $tag $env:ARCHIVE_PATH $env:CHECKSUM_PATH --title "AI Music Studio $tag" --generate-notes
+            gh release create $tag $env:ARCHIVE_PATH $env:CHECKSUM_PATH $env:INSTALLER_PATH $env:INSTALLER_CHECKSUM_PATH --title "AI Music Studio $tag" --generate-notes
           }
