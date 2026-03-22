@@ -24,6 +24,12 @@ private:
         juce::Colour panelEdge;
         juce::Colour text;
         juce::Colour hint;
+        juce::Colour faceplate = juce::Colours::transparentBlack;
+        juce::Colour trim = juce::Colours::transparentBlack;
+        juce::Colour legend = juce::Colours::transparentBlack;
+        juce::Colour knobBody = juce::Colours::transparentBlack;
+        juce::Colour knobCap = juce::Colours::transparentBlack;
+        bool tribute303 = false;
     };
 
     class AccentLookAndFeel final : public juce::LookAndFeel_V4
@@ -93,6 +99,7 @@ private:
     [[nodiscard]] Theme buildTheme() const;
     [[nodiscard]] std::vector<ChoiceSpec> buildChoiceSpecs() const;
     [[nodiscard]] std::vector<KnobSpec> buildKnobSpecs() const;
+    [[nodiscard]] bool isTribute303() const noexcept;
     void buildEditor();
 
     AdvancedVSTiAudioProcessor& audioProcessor;

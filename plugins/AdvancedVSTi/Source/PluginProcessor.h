@@ -14,6 +14,7 @@ public:
 
     void prepareToPlay (double sampleRate, int samplesPerBlock) override;
     void releaseResources() override;
+    void reset() override;
     void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
 
     [[nodiscard]] juce::AudioProcessorEditor* createEditor() override;
@@ -159,7 +160,55 @@ private:
         return buildFlavor() == InstrumentFlavor::drumMachine || buildFlavor() == InstrumentFlavor::drum808;
     }
 
-    void handleMidi (const juce::MidiBuffer& midiMessages, int numSamples);
+    [[nodiscard]] static constexpr bool isMonophonicFlavor() noexcept
+    {
+        return buildFlavor() == InstrumentFlavor::bassSynth;
+    }
+
+    [[nodiscard]] static constexpr int voiceLimitForFlavor() noexcept
+    {
+        if constexpr (buildFlavor() == InstrumentFlavor::bassSynth)
+            return 1;
+        if constexpr (buildFlavor() == InstrumentFlavor::drumMachine || buildFlavor() == InstrumentFlavor::drum808)
+            return 8;
+        if constexpr (buildFlavor() == InstrumentFlavor::stringSynth)
+            return 16;
+        if constexpr (buildFlavor() == InstrumentFlavor::leadSynth)
+            return 8;
+        if constexpr (buildFlavor() == InstrumentFlavor::padSynth)
+            return 8;
+        if constexpr (buildFlavor() == InstrumentFlavor::pluckSynth)
+            return 6;
+        if constexpr (buildFlavor() == InstrumentFlavor::sampler)
+            return 6;
+        if constexpr (buildFlavor() == InstrumentFlavor::acid303)
+            return 1;
+        if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+            return 8;
+        return maxVoices;
+    }
+
+    [[nodiscard]] static constexpr int maxUnisonForFlavor() noexcept
+    {
+        if constexpr (buildFlavor() == InstrumentFlavor::bassSynth
+                      || buildFlavor() == InstrumentFlavor::drumMachine
+                      || buildFlavor() == InstrumentFlavor::drum808
+                      || buildFlavor() == InstrumentFlavor::sampler
+                      || buildFlavor() == InstrumentFlavor::pluckSynth
+                      || buildFlavor() == InstrumentFlavor::acid303)
+            return 1;
+        if constexpr (buildFlavor() == InstrumentFlavor::stringSynth)
+            return 2;
+        if constexpr (buildFlavor() == InstrumentFlavor::padSynth)
+            return 2;
+        if constexpr (buildFlavor() == InstrumentFlavor::leadSynth)
+            return 1;
+        if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+            return 2;
+        return 2;
+    }
+
+    void handleMidiMessage (const juce::MidiMessage& message);
     float renderVoiceSample (VoiceState& voice);
     float renderDrumVoiceSample (VoiceState& voice);
     float oscSample (VoiceState& voice, float baseFreq, OscType type, float syncAmount);

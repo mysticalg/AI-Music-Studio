@@ -30,6 +30,48 @@ void AdvancedVSTiAudioProcessorEditor::AccentLookAndFeel::drawRotarySlider (
     float rotaryEndAngle,
     juce::Slider&)
 {
+    if (theme.tribute303)
+    {
+        const auto bounds = juce::Rectangle<float> (static_cast<float> (x), static_cast<float> (y), static_cast<float> (width), static_cast<float> (height)).reduced (10.0f);
+        const auto centre = bounds.getCentre();
+        const auto radius = juce::jmin (bounds.getWidth(), bounds.getHeight()) * 0.5f;
+        const auto angle = rotaryStartAngle + (sliderPosProportional * (rotaryEndAngle - rotaryStartAngle));
+
+        g.setColour (juce::Colours::black.withAlpha (0.16f));
+        g.fillEllipse (bounds.translated (0.0f, 2.0f));
+
+        g.setColour (theme.knobBody.isTransparent() ? juce::Colour::fromRGB (233, 232, 225) : theme.knobBody);
+        g.fillEllipse (bounds);
+        g.setColour (juce::Colours::white.withAlpha (0.84f));
+        g.drawEllipse (bounds.reduced (1.0f), 1.0f);
+        g.setColour (juce::Colour::fromRGB (108, 108, 104));
+        g.drawEllipse (bounds, 1.6f);
+
+        for (int index = 0; index < 22; ++index)
+        {
+            const auto proportion = static_cast<float> (index) / 21.0f;
+            const auto tickAngle = rotaryStartAngle + (proportion * (rotaryEndAngle - rotaryStartAngle));
+            const auto innerRadius = radius * 0.76f;
+            const auto outerRadius = radius * 0.92f;
+            const auto innerPoint = centre.getPointOnCircumference (innerRadius, tickAngle);
+            const auto outerPoint = centre.getPointOnCircumference (outerRadius, tickAngle);
+            g.setColour (theme.trim.isTransparent() ? juce::Colour::fromRGB (126, 72, 46) : theme.trim.withAlpha (0.7f));
+            g.drawLine ({ innerPoint, outerPoint }, 1.2f);
+        }
+
+        const auto capRadius = radius * 0.28f;
+        g.setColour (theme.knobCap.isTransparent() ? juce::Colour::fromRGB (64, 64, 66) : theme.knobCap);
+        g.fillEllipse (juce::Rectangle<float> (capRadius * 2.0f, capRadius * 2.0f).withCentre (centre));
+        g.setColour (juce::Colours::black.withAlpha (0.25f));
+        g.drawEllipse (juce::Rectangle<float> (capRadius * 2.0f, capRadius * 2.0f).withCentre (centre), 1.0f);
+
+        juce::Path indicator;
+        indicator.addRoundedRectangle (-2.0f, -radius * 0.72f, 4.0f, radius * 0.36f, 2.0f);
+        g.setColour (theme.accent);
+        g.fillPath (indicator, juce::AffineTransform::rotation (angle).translated (centre.x, centre.y));
+        return;
+    }
+
     const auto bounds = juce::Rectangle<float> (static_cast<float> (x), static_cast<float> (y), static_cast<float> (width), static_cast<float> (height)).reduced (8.0f);
     const auto radius = juce::jmin (bounds.getWidth(), bounds.getHeight()) * 0.5f;
     const auto lineW = juce::jmin (7.0f, radius * 0.14f);
@@ -75,22 +117,22 @@ AdvancedVSTiAudioProcessorEditor::KnobCard::KnobCard (
 {
     titleLabel.setText (titleText, juce::dontSendNotification);
     titleLabel.setJustificationType (juce::Justification::centred);
-    titleLabel.setFont (juce::Font (14.0f, juce::Font::bold));
-    titleLabel.setColour (juce::Label::textColourId, lf.theme.text);
+    titleLabel.setFont (juce::Font (lf.theme.tribute303 ? 12.0f : 14.0f, juce::Font::bold));
+    titleLabel.setColour (juce::Label::textColourId, lf.theme.tribute303 ? lf.theme.legend : lf.theme.text);
     addAndMakeVisible (titleLabel);
 
     hintLabel.setText (hintText, juce::dontSendNotification);
     hintLabel.setJustificationType (juce::Justification::centred);
-    hintLabel.setFont (juce::Font (11.0f, juce::Font::plain));
+    hintLabel.setFont (juce::Font (lf.theme.tribute303 ? 9.5f : 11.0f, juce::Font::plain));
     hintLabel.setColour (juce::Label::textColourId, lf.theme.hint);
     addAndMakeVisible (hintLabel);
 
     slider.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
-    slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 72, 22);
+    slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, lf.theme.tribute303 ? 56 : 72, lf.theme.tribute303 ? 18 : 22);
     slider.setLookAndFeel (&lookAndFeel);
     slider.setColour (juce::Slider::textBoxTextColourId, lf.theme.text);
-    slider.setColour (juce::Slider::textBoxBackgroundColourId, lf.theme.panel.darker (0.2f));
-    slider.setColour (juce::Slider::textBoxOutlineColourId, lf.theme.panelEdge);
+    slider.setColour (juce::Slider::textBoxBackgroundColourId, lf.theme.tribute303 ? lf.theme.faceplate.brighter (0.05f) : lf.theme.panel.darker (0.2f));
+    slider.setColour (juce::Slider::textBoxOutlineColourId, lf.theme.tribute303 ? lf.theme.trim : lf.theme.panelEdge);
     slider.setColour (juce::Slider::textBoxHighlightColourId, lf.theme.accent.withAlpha (0.18f));
     addAndMakeVisible (slider);
 }
@@ -98,6 +140,17 @@ AdvancedVSTiAudioProcessorEditor::KnobCard::KnobCard (
 void AdvancedVSTiAudioProcessorEditor::KnobCard::paint (juce::Graphics& g)
 {
     auto area = getLocalBounds().toFloat().reduced (1.0f);
+    if (lookAndFeel.theme.tribute303)
+    {
+        g.setColour (lookAndFeel.theme.faceplate.withAlpha (0.92f));
+        g.fillRoundedRectangle (area, 12.0f);
+        g.setColour (lookAndFeel.theme.trim.withAlpha (0.85f));
+        g.drawRoundedRectangle (area, 12.0f, 1.1f);
+        g.setColour (lookAndFeel.theme.accent.withAlpha (0.18f));
+        g.fillRoundedRectangle (area.removeFromBottom (3.0f), 1.5f);
+        return;
+    }
+
     g.setColour (lookAndFeel.theme.panel.withAlpha (0.92f));
     g.fillRoundedRectangle (area, 18.0f);
     g.setColour (lookAndFeel.theme.panelEdge);
@@ -106,10 +159,10 @@ void AdvancedVSTiAudioProcessorEditor::KnobCard::paint (juce::Graphics& g)
 
 void AdvancedVSTiAudioProcessorEditor::KnobCard::resized()
 {
-    auto area = getLocalBounds().reduced (12);
-    titleLabel.setBounds (area.removeFromTop (22));
-    hintLabel.setBounds (area.removeFromBottom (20));
-    slider.setBounds (area.reduced (0, 2));
+    auto area = getLocalBounds().reduced (lookAndFeel.theme.tribute303 ? 8 : 12);
+    titleLabel.setBounds (area.removeFromTop (lookAndFeel.theme.tribute303 ? 18 : 22));
+    hintLabel.setBounds (area.removeFromBottom (lookAndFeel.theme.tribute303 ? 16 : 20));
+    slider.setBounds (area.reduced (0, lookAndFeel.theme.tribute303 ? 0 : 2));
 }
 
 AdvancedVSTiAudioProcessorEditor::ChoiceCard::ChoiceCard (
@@ -120,18 +173,18 @@ AdvancedVSTiAudioProcessorEditor::ChoiceCard::ChoiceCard (
 {
     titleLabel.setText (titleText, juce::dontSendNotification);
     titleLabel.setJustificationType (juce::Justification::centredLeft);
-    titleLabel.setFont (juce::Font (13.0f, juce::Font::bold));
-    titleLabel.setColour (juce::Label::textColourId, theme.text);
+    titleLabel.setFont (juce::Font (theme.tribute303 ? 12.0f : 13.0f, juce::Font::bold));
+    titleLabel.setColour (juce::Label::textColourId, theme.tribute303 ? theme.legend : theme.text);
     addAndMakeVisible (titleLabel);
 
     hintLabel.setText (hintText, juce::dontSendNotification);
     hintLabel.setJustificationType (juce::Justification::centredLeft);
-    hintLabel.setFont (juce::Font (11.0f, juce::Font::plain));
+    hintLabel.setFont (juce::Font (theme.tribute303 ? 9.5f : 11.0f, juce::Font::plain));
     hintLabel.setColour (juce::Label::textColourId, theme.hint);
     addAndMakeVisible (hintLabel);
 
-    combo.setColour (juce::ComboBox::backgroundColourId, theme.panel.brighter (0.08f));
-    combo.setColour (juce::ComboBox::outlineColourId, theme.panelEdge);
+    combo.setColour (juce::ComboBox::backgroundColourId, theme.tribute303 ? theme.faceplate.brighter (0.06f) : theme.panel.brighter (0.08f));
+    combo.setColour (juce::ComboBox::outlineColourId, theme.tribute303 ? theme.trim : theme.panelEdge);
     combo.setColour (juce::ComboBox::textColourId, theme.text);
     combo.setColour (juce::ComboBox::arrowColourId, theme.accent);
     addAndMakeVisible (combo);
@@ -140,6 +193,17 @@ AdvancedVSTiAudioProcessorEditor::ChoiceCard::ChoiceCard (
 void AdvancedVSTiAudioProcessorEditor::ChoiceCard::paint (juce::Graphics& g)
 {
     auto area = getLocalBounds().toFloat().reduced (1.0f);
+    if (theme.tribute303)
+    {
+        g.setColour (theme.faceplate.withAlpha (0.96f));
+        g.fillRoundedRectangle (area, 10.0f);
+        g.setColour (theme.trim);
+        g.drawRoundedRectangle (area, 10.0f, 1.0f);
+        g.setColour (theme.accent.withAlpha (0.88f));
+        g.fillRoundedRectangle (area.removeFromLeft (6.0f), 6.0f);
+        return;
+    }
+
     g.setColour (theme.panel.withAlpha (0.92f));
     g.fillRoundedRectangle (area, 16.0f);
     g.setColour (theme.panelEdge);
@@ -161,27 +225,27 @@ AdvancedVSTiAudioProcessorEditor::AdvancedVSTiAudioProcessorEditor (AdvancedVSTi
       lookAndFeel (theme)
 {
     buildEditor();
-    setSize (1040, 640);
+    setSize (isTribute303() ? 1020 : 1040, isTribute303() ? 430 : 640);
 }
 
 void AdvancedVSTiAudioProcessorEditor::buildEditor()
 {
-    badgeLabel.setText (audioProcessor.getName(), juce::dontSendNotification);
+    badgeLabel.setText (isTribute303() ? "ACID BASS LINE EMULATOR TRIBUTE" : audioProcessor.getName(), juce::dontSendNotification);
     badgeLabel.setJustificationType (juce::Justification::centredLeft);
-    badgeLabel.setFont (juce::Font (12.0f, juce::Font::bold));
-    badgeLabel.setColour (juce::Label::textColourId, theme.accent);
+    badgeLabel.setFont (juce::Font (isTribute303() ? 11.0f : 12.0f, juce::Font::bold));
+    badgeLabel.setColour (juce::Label::textColourId, isTribute303() ? theme.legend : theme.accent);
     addAndMakeVisible (badgeLabel);
 
     titleLabel.setText (theme.title, juce::dontSendNotification);
     titleLabel.setJustificationType (juce::Justification::centredLeft);
-    titleLabel.setFont (juce::Font (28.0f, juce::Font::bold));
-    titleLabel.setColour (juce::Label::textColourId, theme.text);
+    titleLabel.setFont (juce::Font (isTribute303() ? 30.0f : 28.0f, juce::Font::bold));
+    titleLabel.setColour (juce::Label::textColourId, isTribute303() ? theme.trim : theme.text);
     addAndMakeVisible (titleLabel);
 
     subtitleLabel.setText (theme.subtitle, juce::dontSendNotification);
     subtitleLabel.setJustificationType (juce::Justification::centredLeft);
     subtitleLabel.setFont (juce::Font (13.0f, juce::Font::plain));
-    subtitleLabel.setColour (juce::Label::textColourId, theme.hint);
+    subtitleLabel.setColour (juce::Label::textColourId, isTribute303() ? theme.trim.darker (0.2f) : theme.hint);
     addAndMakeVisible (subtitleLabel);
 
     for (const auto& spec : buildChoiceSpecs())
@@ -201,6 +265,11 @@ void AdvancedVSTiAudioProcessorEditor::buildEditor()
     }
 }
 
+bool AdvancedVSTiAudioProcessorEditor::isTribute303() const noexcept
+{
+    return theme.tribute303;
+}
+
 AdvancedVSTiAudioProcessorEditor::Theme AdvancedVSTiAudioProcessorEditor::buildTheme() const
 {
     const auto name = normalizedPluginName (audioProcessor);
@@ -212,10 +281,22 @@ AdvancedVSTiAudioProcessorEditor::Theme AdvancedVSTiAudioProcessorEditor::buildT
                  juce::Colours::white, juce::Colour::fromRGB (205, 184, 160) };
 
     if (name.contains ("303"))
-        return { "AI TB303", "Resonant acid lines with sharper bite, tighter decay, and a more polished monosynth front panel.",
-                 juce::Colour::fromRGB (121, 255, 154), juce::Colour::fromRGB (33, 179, 116),
-                 juce::Colour::fromRGB (13, 18, 16), juce::Colour::fromRGB (20, 30, 26), juce::Colour::fromRGB (36, 92, 64),
-                 juce::Colours::white, juce::Colour::fromRGB (176, 211, 192) };
+    {
+        Theme tribute {
+            "AI TB303 Tribute",
+            "A respectful nod to the silver box: squelchy cutoff, snappy decay, and that unmistakable acid front panel.",
+            juce::Colour::fromRGB (255, 116, 38), juce::Colour::fromRGB (255, 190, 86),
+            juce::Colour::fromRGB (44, 46, 48), juce::Colour::fromRGB (221, 217, 204), juce::Colour::fromRGB (145, 87, 58),
+            juce::Colour::fromRGB (36, 34, 32), juce::Colour::fromRGB (119, 94, 73)
+        };
+        tribute.faceplate = juce::Colour::fromRGB (220, 216, 202);
+        tribute.trim = juce::Colour::fromRGB (133, 82, 56);
+        tribute.legend = juce::Colour::fromRGB (195, 83, 37);
+        tribute.knobBody = juce::Colour::fromRGB (235, 232, 224);
+        tribute.knobCap = juce::Colour::fromRGB (56, 56, 58);
+        tribute.tribute303 = true;
+        return tribute;
+    }
 
     if (name.contains ("drum"))
         return { "AI Drum Machine", "909-inspired punch, clap and hats with faster transient control and a sturdier drum front end.",
@@ -271,8 +352,8 @@ std::vector<AdvancedVSTiAudioProcessorEditor::ChoiceSpec> AdvancedVSTiAudioProce
 
     if (name.contains ("303"))
         return {
-            { "OSCTYPE", "Wave", "Saw or square foundation", { "Sine", "Saw", "Square", "Noise", "Sample" } },
-            { "FILTERTYPE", "Filter", "Acid filter response", { "LP", "BP", "HP", "Notch" } },
+            { "OSCTYPE", "Waveform", "Switch the acid core source", { "Sine", "Saw", "Square", "Noise", "Sample" } },
+            { "FILTERTYPE", "Filter Mode", "Tribute panel with modern filter options", { "LP", "BP", "HP", "Notch" } },
         };
 
     if (name.contains ("sampler"))
@@ -299,34 +380,28 @@ std::vector<AdvancedVSTiAudioProcessorEditor::KnobSpec> AdvancedVSTiAudioProcess
     if (name.contains ("808"))
         return {
             { "FMAMOUNT", "Punch", "Kick weight and beater intensity" },
-            { "SYNC", "Snap", "Transient snap into the body" },
             { "OSCGATE", "Decay", "Overall drum tail length" },
             { "CUTOFF", "Tone", "Brightness across hats and snare" },
-            { "RESONANCE", "Ring", "Tone ring and body resonance" },
-            { "FILTERENVAMOUNT", "Dust", "Noise and grit balance" },
-            { "RHYTHMGATE_DEPTH", "Accent", "Extra pulse on repeated hits" },
+            { "FILTERENVAMOUNT", "Noise", "Noise and grit balance" },
         };
 
     if (name.contains ("303"))
         return {
+            { "DETUNE", "Tune", "Fine tuning around the sweet spot" },
             { "CUTOFF", "Cutoff", "Main acid filter sweep" },
             { "RESONANCE", "Resonance", "Squelch and focus" },
             { "FILTERENVAMOUNT", "Env Mod", "Envelope push into the filter" },
-            { "FMAMOUNT", "Drive", "Bite and harmonic pressure" },
-            { "AMPDECAY", "Decay", "Short acid note length" },
-            { "OSCGATE", "Gate", "Held note length before release" },
-            { "LFO1RATE", "Motion", "Slow pitch motion for movement" },
+            { "AMPDECAY", "Decay", "Short acidic note length" },
+            { "FMAMOUNT", "Accent", "Extra bite and hit emphasis" },
+            { "OSCGATE", "Slide", "Held length and glide-style overlap" },
         };
 
     if (name.contains ("drum"))
         return {
             { "FMAMOUNT", "Punch", "Kick hit and transient weight" },
-            { "SYNC", "Attack", "Snap and click intensity" },
             { "OSCGATE", "Decay", "Short or longer drum bodies" },
             { "CUTOFF", "Tone", "Brightness and hat sheen" },
-            { "RESONANCE", "Ring", "Snare/tom resonance" },
             { "FILTERENVAMOUNT", "Noise", "Air and grit content" },
-            { "RHYTHMGATE_DEPTH", "Accent", "Movement in fast patterns" },
         };
 
     if (name.contains ("bass"))
@@ -335,20 +410,16 @@ std::vector<AdvancedVSTiAudioProcessorEditor::KnobSpec> AdvancedVSTiAudioProcess
             { "RESONANCE", "Resonance", "Focused filter edge" },
             { "FILTERENVAMOUNT", "Env Mod", "Envelope filter push" },
             { "FMAMOUNT", "Growl", "Extra harmonic bite" },
-            { "DETUNE", "Width", "Subtle width and weight" },
             { "AMPRELEASE", "Release", "Tail and sustain feel" },
-            { "LFO2FILTER", "Motion", "Slow filter movement" },
         };
 
     if (name.contains ("string") || name.contains ("pad"))
         return {
-            { "DETUNE", "Detune", "Ensemble spread" },
             { "CUTOFF", "Cutoff", "Brightness and air" },
-            { "FILTERENVAMOUNT", "Bloom", "Envelope swell depth" },
             { "AMPATTACK", "Attack", "Slow onset" },
             { "AMPRELEASE", "Release", "Tail length" },
-            { "LFO1RATE", "Drift", "Pitch drift speed" },
-            { "LFO2FILTER", "Motion", "Filter movement" },
+            { "DETUNE", "Detune", "Ensemble spread" },
+            { "FILTERENVAMOUNT", "Bloom", "Envelope swell depth" },
         };
 
     if (name.contains ("lead") || name.contains ("pluck"))
@@ -356,10 +427,8 @@ std::vector<AdvancedVSTiAudioProcessorEditor::KnobSpec> AdvancedVSTiAudioProcess
             { "CUTOFF", "Cutoff", "Top-end bite" },
             { "RESONANCE", "Resonance", "Focused edge" },
             { "FMAMOUNT", "Bite", "Extra harmonic attack" },
-            { "SYNC", "Sync", "Sharper harmonic shape" },
             { "AMPDECAY", "Decay", "Hook length" },
             { "FILTERENVAMOUNT", "Env Mod", "Filter snap" },
-            { "LFO1PITCH", "Vibrato", "Pitch motion amount" },
         };
 
     if (name.contains ("sampler"))
@@ -367,10 +436,7 @@ std::vector<AdvancedVSTiAudioProcessorEditor::KnobSpec> AdvancedVSTiAudioProcess
             { "SAMPLESTART", "Start", "Playback start point" },
             { "SAMPLEEND", "End", "Playback end point" },
             { "CUTOFF", "Cutoff", "Tone shaping" },
-            { "RESONANCE", "Resonance", "Focused colour" },
-            { "FILTERENVAMOUNT", "Env Mod", "Envelope filter push" },
             { "AMPRELEASE", "Release", "Tail length" },
-            { "LFO2FILTER", "Motion", "Slow colour movement" },
         };
 
     return {
@@ -387,6 +453,49 @@ std::vector<AdvancedVSTiAudioProcessorEditor::KnobSpec> AdvancedVSTiAudioProcess
 
 void AdvancedVSTiAudioProcessorEditor::paint (juce::Graphics& g)
 {
+    if (isTribute303())
+    {
+        auto bounds = getLocalBounds().toFloat();
+        g.fillAll (theme.background);
+
+        auto unit = bounds.reduced (14.0f);
+        g.setColour (juce::Colours::black.withAlpha (0.28f));
+        g.fillRoundedRectangle (unit.translated (0.0f, 5.0f), 22.0f);
+
+        g.setColour (theme.faceplate);
+        g.fillRoundedRectangle (unit, 22.0f);
+        g.setColour (juce::Colours::white.withAlpha (0.65f));
+        g.drawRoundedRectangle (unit.reduced (1.0f), 22.0f, 1.0f);
+        g.setColour (theme.trim);
+        g.drawRoundedRectangle (unit, 22.0f, 1.4f);
+
+        auto topStrip = unit.removeFromTop (52.0f);
+        g.setColour (theme.accent);
+        g.fillRoundedRectangle (topStrip.reduced (12.0f, 10.0f), 10.0f);
+        g.setColour (juce::Colours::black.withAlpha (0.22f));
+        g.drawRoundedRectangle (topStrip.reduced (12.0f, 10.0f), 10.0f, 1.0f);
+
+        g.setColour (theme.legend);
+        g.setFont (juce::Font (11.5f, juce::Font::bold));
+        g.drawFittedText ("COMPUTER CONTROLLED • ACID BASS LINE SYNTHESIZER", getLocalBounds().reduced (32, 20).removeFromTop (22), juce::Justification::centredRight, 1);
+
+        auto buttonRow = getLocalBounds().reduced (32, 26).removeFromBottom (30).toFloat();
+        const float buttonWidth = 28.0f;
+        const float gap = 7.0f;
+        const float totalWidth = (buttonWidth * 16.0f) + (gap * 15.0f);
+        float x = buttonRow.getCentreX() - (totalWidth * 0.5f);
+        for (int index = 0; index < 16; ++index)
+        {
+            juce::Rectangle<float> step (x, buttonRow.getY(), buttonWidth, 18.0f);
+            g.setColour ((index % 4 == 0) ? theme.accent.withAlpha (0.88f) : theme.trim.withAlpha (0.65f));
+            g.fillRoundedRectangle (step, 5.0f);
+            g.setColour (juce::Colours::black.withAlpha (0.25f));
+            g.drawRoundedRectangle (step, 5.0f, 1.0f);
+            x += buttonWidth + gap;
+        }
+        return;
+    }
+
     auto bounds = getLocalBounds().toFloat();
     juce::ColourGradient background (theme.background.brighter (0.06f), bounds.getTopLeft(),
                                      theme.background.darker (0.24f), bounds.getBottomRight(), false);
@@ -408,6 +517,43 @@ void AdvancedVSTiAudioProcessorEditor::paint (juce::Graphics& g)
 
 void AdvancedVSTiAudioProcessorEditor::resized()
 {
+    if (isTribute303())
+    {
+        auto area = getLocalBounds().reduced (28);
+        auto hero = area.removeFromTop (84);
+
+        auto titleArea = hero.removeFromLeft (juce::jmin (460, hero.getWidth() - 220));
+        badgeLabel.setBounds (titleArea.removeFromTop (18));
+        titleLabel.setBounds (titleArea.removeFromTop (38));
+        subtitleLabel.setBounds (titleArea.removeFromTop (28));
+
+        if (! choiceCards.isEmpty())
+        {
+            auto choiceArea = hero.reduced (0, 6);
+            const int spacing = 10;
+            const int cardWidth = (choiceArea.getWidth() - spacing) / 2;
+            for (int index = 0; index < choiceCards.size(); ++index)
+            {
+                choiceCards[index]->setBounds (choiceArea.removeFromLeft (cardWidth));
+                if (index + 1 < choiceCards.size())
+                    choiceArea.removeFromLeft (spacing);
+            }
+        }
+
+        area.removeFromTop (8);
+        const int spacing = 10;
+        const int knobCount = knobCards.size();
+        const int cardWidth = knobCount > 0 ? (area.getWidth() - ((knobCount - 1) * spacing)) / knobCount : area.getWidth();
+        const int cardHeight = 188;
+        int x = area.getX();
+        for (auto* card : knobCards)
+        {
+            card->setBounds (x, area.getY(), cardWidth, cardHeight);
+            x += cardWidth + spacing;
+        }
+        return;
+    }
+
     auto area = getLocalBounds().reduced (22);
     auto hero = area.removeFromTop (96);
     badgeLabel.setBounds (hero.removeFromTop (18));

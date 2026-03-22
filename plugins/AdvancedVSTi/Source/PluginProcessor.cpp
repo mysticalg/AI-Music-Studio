@@ -23,10 +23,18 @@ enum class DrumVoiceKind
 {
     kick,
     snare,
+    rim,
+    clap,
     closedHat,
     openHat,
-    clap,
-    tom,
+    lowTom,
+    midTom,
+    highTom,
+    crash,
+    ride,
+    cowbell,
+    clave,
+    maraca,
     perc
 };
 
@@ -56,26 +64,55 @@ float smoothTowards (float target, float coeff, float& state)
 
 DrumVoiceKind drumKindForMidi (int midiNote)
 {
+    // Bundled drum machines use a keyboard-friendly layout starting at C:
+    // C kick, C# rim, D snare, D# clap, E closed hat, F open hat,
+    // F# low tom, G mid tom, G# high tom, A crash, A# ride, B cowbell,
+    // next C clave, C# maraca, D perc.
+    if (midiNote >= 36)
+    {
+        switch (midiNote - 36)
+        {
+            case 0:  return DrumVoiceKind::kick;
+            case 1:  return DrumVoiceKind::rim;
+            case 2:  return DrumVoiceKind::snare;
+            case 3:  return DrumVoiceKind::clap;
+            case 4:  return DrumVoiceKind::closedHat;
+            case 5:  return DrumVoiceKind::openHat;
+            case 6:  return DrumVoiceKind::lowTom;
+            case 7:  return DrumVoiceKind::midTom;
+            case 8:  return DrumVoiceKind::highTom;
+            case 9:  return DrumVoiceKind::crash;
+            case 10: return DrumVoiceKind::ride;
+            case 11: return DrumVoiceKind::cowbell;
+            case 12: return DrumVoiceKind::clave;
+            case 13: return DrumVoiceKind::maraca;
+            case 14: return DrumVoiceKind::perc;
+            default: break;
+        }
+    }
+
     switch (midiNote)
     {
-        case 36:
         case 35: return DrumVoiceKind::kick;
-        case 38:
-        case 40: return DrumVoiceKind::snare;
-        case 42:
-        case 44: return DrumVoiceKind::closedHat;
-        case 46:
-        case 26: return DrumVoiceKind::openHat;
-        case 39:
-        case 54: return DrumVoiceKind::clap;
-        case 41:
-        case 43:
-        case 45:
-        case 47:
-        case 48:
-        case 50: return DrumVoiceKind::tom;
+        case 51:
+        case 53:
+        case 59: return DrumVoiceKind::ride;
+        case 52:
+        case 55:
+        case 57: return DrumVoiceKind::crash;
+        case 56: return DrumVoiceKind::cowbell;
+        case 69:
+        case 70:
+        case 82: return DrumVoiceKind::maraca;
+        case 75:
+        case 76: return DrumVoiceKind::clave;
         default: return DrumVoiceKind::perc;
     }
+}
+
+bool isHatKind (DrumVoiceKind kind) noexcept
+{
+    return kind == DrumVoiceKind::closedHat || kind == DrumVoiceKind::openHat;
 }
 } // namespace
 
@@ -109,9 +146,38 @@ void AdvancedVSTiAudioProcessor::prepareToPlay (double sampleRate, int samplesPe
     updateRenderParameters();
     refreshSampleBank();
     applyEnvelopeSettings();
+    reset();
 }
 
 void AdvancedVSTiAudioProcessor::releaseResources() {}
+
+void AdvancedVSTiAudioProcessor::reset()
+{
+    heldNotes.clear();
+    arpStep = 0;
+    lfo1Phase = 0.0f;
+    lfo2Phase = 0.0f;
+
+    leftFilter.reset();
+    rightFilter.reset();
+
+    for (auto& voice : voices)
+    {
+        voice.active = false;
+        voice.midiNote = -1;
+        voice.velocity = 0.0f;
+        voice.phase = 0.0f;
+        voice.fmPhase = 0.0f;
+        voice.syncPhase = 0.0f;
+        voice.samplePos = 0.0f;
+        voice.noteAge = 0.0f;
+        voice.auxPhase = 0.0f;
+        voice.toneState = 0.0f;
+        voice.colourState = 0.0f;
+        voice.ampEnv.reset();
+        voice.filterEnv.reset();
+    }
+}
 
 juce::StringArray AdvancedVSTiAudioProcessor::sampleBankChoices()
 {
@@ -261,55 +327,103 @@ void AdvancedVSTiAudioProcessor::buildGeneratedSampleBank (int bankIndex)
         juce::FloatVectorOperations::multiply (dst, 0.92f / peak, numSamples);
 }
 
-void AdvancedVSTiAudioProcessor::handleMidi (const juce::MidiBuffer& midiMessages, int)
+void AdvancedVSTiAudioProcessor::handleMidiMessage (const juce::MidiMessage& msg)
 {
-    for (const auto metadata : midiMessages)
+    if (msg.isNoteOn())
     {
-        const auto msg = metadata.getMessage();
-
-        if (msg.isNoteOn())
+        constexpr int polyphonyLimit = voiceLimitForFlavor();
+        if constexpr (isDrumFlavor())
         {
-            int voiceIndex = 0;
-            for (int i = 0; i < maxVoices; ++i)
+            const auto triggeredKind = drumKindForMidi (msg.getNoteNumber());
+            if (isHatKind (triggeredKind))
             {
-                if (! voices[static_cast<size_t> (i)].active)
+                for (auto& activeVoice : voices)
                 {
-                    voiceIndex = i;
-                    break;
+                    if (! activeVoice.active)
+                        continue;
+
+                    if (isHatKind (drumKindForMidi (activeVoice.midiNote)))
+                    {
+                        activeVoice.active = false;
+                        activeVoice.ampEnv.reset();
+                        activeVoice.filterEnv.reset();
+                    }
                 }
             }
-
-            auto& voice = voices[static_cast<size_t> (voiceIndex)];
-            voice.active = true;
-            voice.midiNote = msg.getNoteNumber();
-            voice.velocity = msg.getFloatVelocity();
-            voice.phase = 0.0f;
-            voice.fmPhase = 0.0f;
-            voice.syncPhase = 0.0f;
-            voice.samplePos = 0.0f;
-            voice.noteAge = 0.0f;
-            voice.auxPhase = 0.0f;
-            voice.toneState = 0.0f;
-            voice.colourState = 0.0f;
-            voice.ampEnv.noteOn();
-            voice.filterEnv.noteOn();
-
-            heldNotes.addIfNotAlreadyThere (voice.midiNote);
         }
-        else if (msg.isNoteOff())
-        {
-            if constexpr (isDrumFlavor())
-                continue;
 
-            const auto note = msg.getNoteNumber();
-            heldNotes.removeAllInstancesOf (note);
-            for (auto& voice : voices)
+        int voiceIndex = 0;
+        bool foundVoice = false;
+        float oldestVoiceAge = -1.0f;
+
+        if constexpr (isMonophonicFlavor())
+        {
+            heldNotes.clear();
+            for (auto& activeVoice : voices)
             {
-                if (voice.active && voice.midiNote == note)
-                {
-                    voice.ampEnv.noteOff();
-                    voice.filterEnv.noteOff();
-                }
+                if (! activeVoice.active)
+                    continue;
+
+                activeVoice.active = false;
+                activeVoice.ampEnv.reset();
+                activeVoice.filterEnv.reset();
+            }
+        }
+
+        for (int i = 0; i < polyphonyLimit; ++i)
+        {
+            auto& candidate = voices[static_cast<size_t> (i)];
+            if (! candidate.active)
+            {
+                voiceIndex = i;
+                foundVoice = true;
+                break;
+            }
+
+            if (candidate.noteAge > oldestVoiceAge)
+            {
+                oldestVoiceAge = candidate.noteAge;
+                voiceIndex = i;
+            }
+        }
+
+        auto& voice = voices[static_cast<size_t> (voiceIndex)];
+        if (! foundVoice && voice.active)
+        {
+            voice.ampEnv.reset();
+            voice.filterEnv.reset();
+        }
+        voice.active = true;
+        voice.midiNote = msg.getNoteNumber();
+        voice.velocity = msg.getFloatVelocity();
+        voice.phase = 0.0f;
+        voice.fmPhase = 0.0f;
+        voice.syncPhase = 0.0f;
+        voice.samplePos = 0.0f;
+        voice.noteAge = 0.0f;
+        voice.auxPhase = 0.0f;
+        voice.toneState = 0.0f;
+        voice.colourState = 0.0f;
+        voice.ampEnv.noteOn();
+        voice.filterEnv.noteOn();
+
+        heldNotes.addIfNotAlreadyThere (voice.midiNote);
+        return;
+    }
+
+    if (msg.isNoteOff())
+    {
+        if constexpr (isDrumFlavor())
+            return;
+
+        const auto note = msg.getNoteNumber();
+        heldNotes.removeAllInstancesOf (note);
+        for (auto& voice : voices)
+        {
+            if (voice.active && voice.midiNote == note)
+            {
+                voice.ampEnv.noteOff();
+                voice.filterEnv.noteOff();
             }
         }
     }
@@ -387,6 +501,16 @@ float AdvancedVSTiAudioProcessor::renderDrumVoiceSample (VoiceState& voice)
 
     float output = 0.0f;
     float duration = 0.4f;
+    auto advanceSine = [dt] (float& phase, float hz) -> float
+    {
+        phase = std::fmod (phase + hz * dt, 1.0f);
+        return std::sin (twoPi * phase);
+    };
+    auto advanceSquare = [dt] (float& phase, float hz) -> float
+    {
+        phase = std::fmod (phase + hz * dt, 1.0f);
+        return phase < 0.5f ? 1.0f : -1.0f;
+    };
 
     if constexpr (buildFlavor() == InstrumentFlavor::drum808)
     {
@@ -406,25 +530,17 @@ float AdvancedVSTiAudioProcessor::renderDrumVoiceSample (VoiceState& voice)
             case DrumVoiceKind::snare:
             {
                 duration = 0.62f;
-                voice.phase = std::fmod (voice.phase + 182.0f * dt, 1.0f);
-                voice.fmPhase = std::fmod (voice.fmPhase + 331.0f * dt, 1.0f);
-                const auto body = ((std::sin (twoPi * voice.phase) * 0.6f) + (std::sin (twoPi * voice.fmPhase) * 0.38f)) * std::exp (-age * 8.0f);
+                const auto body = ((advanceSine (voice.phase, 182.0f) * 0.6f) + (advanceSine (voice.fmPhase, 331.0f) * 0.38f)) * std::exp (-age * 8.0f);
                 const auto rattle = noise * std::exp (-age * (13.0f - brightness * 2.0f));
                 output = (body * 0.58f) + (rattle * 0.82f);
                 break;
             }
-            case DrumVoiceKind::closedHat:
-            case DrumVoiceKind::openHat:
+            case DrumVoiceKind::rim:
             {
-                duration = kind == DrumVoiceKind::closedHat ? 0.16f : 0.72f;
-                voice.phase = std::fmod (voice.phase + 412.0f * dt, 1.0f);
-                const auto metallic =
-                    std::sin (twoPi * voice.phase * 2.0f)
-                    + std::sin (twoPi * voice.phase * 3.97f)
-                    + std::sin (twoPi * voice.phase * 5.11f);
-                const auto env = std::exp (-age * (kind == DrumVoiceKind::closedHat ? 34.0f : 10.5f));
-                const auto airy = noise * std::exp (-age * (kind == DrumVoiceKind::closedHat ? 42.0f : 12.5f));
-                output = (metallic * 0.16f + airy * 0.78f) * env;
+                duration = 0.12f;
+                const auto wood = (advanceSine (voice.phase, 1710.0f) * 0.54f) + (advanceSine (voice.fmPhase, 2440.0f) * 0.24f);
+                const auto click = noise * std::exp (-age * 78.0f);
+                output = (wood * std::exp (-age * 26.0f)) + (click * 0.12f);
                 break;
             }
             case DrumVoiceKind::clap:
@@ -437,24 +553,92 @@ float AdvancedVSTiAudioProcessor::renderDrumVoiceSample (VoiceState& voice)
                 output = noise * ((0.82f * pulseA) + (0.78f * pulseB) + (0.66f * pulseC) + (0.4f * tail));
                 break;
             }
-            case DrumVoiceKind::tom:
+            case DrumVoiceKind::closedHat:
+            case DrumVoiceKind::openHat:
             {
-                duration = 0.95f;
-                const auto pitch = juce::jlimit (72.0f, 215.0f, midiToHz (voice.midiNote) * 0.9f);
+                duration = kind == DrumVoiceKind::closedHat ? 0.16f : 0.72f;
+                const auto metallic =
+                    advanceSine (voice.phase, 4180.0f)
+                    + advanceSine (voice.fmPhase, 6450.0f)
+                    + advanceSine (voice.auxPhase, 8630.0f)
+                    + advanceSine (voice.syncPhase, 10940.0f);
+                const auto env = std::exp (-age * (kind == DrumVoiceKind::closedHat ? 34.0f : 10.5f));
+                const auto airy = noise * std::exp (-age * (kind == DrumVoiceKind::closedHat ? 42.0f : 12.5f));
+                output = (metallic * 0.13f + airy * 0.78f) * env;
+                break;
+            }
+            case DrumVoiceKind::lowTom:
+            case DrumVoiceKind::midTom:
+            case DrumVoiceKind::highTom:
+            {
+                const auto basePitch = kind == DrumVoiceKind::lowTom ? 98.0f
+                                       : kind == DrumVoiceKind::midTom ? 146.0f
+                                                                       : 198.0f;
+                duration = kind == DrumVoiceKind::lowTom ? 1.0f
+                           : kind == DrumVoiceKind::midTom ? 0.86f
+                                                           : 0.7f;
+                const auto pitch = juce::jlimit (72.0f, 250.0f, basePitch + (voice.midiNote - 45) * 1.6f);
                 const auto sweep = 1.0f + 0.42f * std::exp (-age * 5.4f);
-                voice.auxPhase = std::fmod (voice.auxPhase + (pitch * sweep) * dt, 1.0f);
-                output = std::sin (twoPi * voice.auxPhase) * std::exp (-age * 3.6f);
-                output += std::sin (twoPi * std::fmod (voice.auxPhase * 0.5f, 1.0f)) * 0.22f * std::exp (-age * 2.7f);
+                const auto fundamental = advanceSine (voice.auxPhase, pitch * sweep);
+                const auto overtone = advanceSine (voice.syncPhase, (pitch * 1.49f) * (0.95f + std::exp (-age * 4.6f) * 0.1f));
+                output = (fundamental * 0.94f * std::exp (-age * 3.4f)) + (overtone * 0.18f * std::exp (-age * 4.1f));
+                break;
+            }
+            case DrumVoiceKind::crash:
+            {
+                duration = 1.28f;
+                const auto cluster =
+                    advanceSine (voice.phase, 2890.0f)
+                    + advanceSine (voice.fmPhase, 4310.0f)
+                    + advanceSine (voice.auxPhase, 6120.0f)
+                    + advanceSine (voice.syncPhase, 9150.0f);
+                const auto wash = noise * (0.86f + brightness * 0.08f);
+                output = (cluster * 0.11f + wash * 0.82f) * std::exp (-age * 2.9f);
+                output += noise * 0.08f * std::exp (-age * 10.0f);
+                break;
+            }
+            case DrumVoiceKind::ride:
+            {
+                duration = 1.85f;
+                const auto bell = advanceSine (voice.phase, 612.0f);
+                const auto metallic =
+                    advanceSine (voice.fmPhase, 3020.0f)
+                    + advanceSine (voice.auxPhase, 4680.0f)
+                    + advanceSine (voice.syncPhase, 7010.0f);
+                output = (bell * 0.34f * std::exp (-age * 2.1f)) + ((metallic * 0.16f) + (noise * 0.22f)) * std::exp (-age * 2.7f);
+                break;
+            }
+            case DrumVoiceKind::cowbell:
+            {
+                duration = 0.42f;
+                const auto bellA = advanceSquare (voice.phase, 541.0f);
+                const auto bellB = advanceSquare (voice.fmPhase, 811.0f);
+                const auto env = std::exp (-age * 8.8f);
+                output = ((bellA * 0.46f) + (bellB * 0.34f)) * env;
+                break;
+            }
+            case DrumVoiceKind::clave:
+            {
+                duration = 0.14f;
+                const auto body = advanceSine (voice.phase, 2470.0f) * std::exp (-age * 28.0f);
+                const auto click = noise * std::exp (-age * 96.0f);
+                output = body + (click * 0.05f);
+                break;
+            }
+            case DrumVoiceKind::maraca:
+            {
+                duration = 0.18f;
+                const auto shaker = noise * std::exp (-age * 20.0f);
+                const auto grain = advanceSine (voice.phase, 5200.0f) * 0.08f * std::exp (-age * 26.0f);
+                output = shaker * 0.82f + grain;
                 break;
             }
             case DrumVoiceKind::perc:
             default:
             {
                 duration = 0.38f;
-                voice.phase = std::fmod (voice.phase + 540.0f * dt, 1.0f);
-                voice.fmPhase = std::fmod (voice.fmPhase + 846.0f * dt, 1.0f);
-                const auto squareA = voice.phase < 0.5f ? 1.0f : -1.0f;
-                const auto squareB = voice.fmPhase < 0.5f ? 1.0f : -1.0f;
+                const auto squareA = advanceSquare (voice.phase, 540.0f);
+                const auto squareB = advanceSquare (voice.fmPhase, 846.0f);
                 output = (squareA * 0.42f + squareB * 0.34f) * std::exp (-age * 9.4f);
                 output += noise * 0.08f * std::exp (-age * 20.0f);
                 break;
@@ -480,27 +664,17 @@ float AdvancedVSTiAudioProcessor::renderDrumVoiceSample (VoiceState& voice)
             case DrumVoiceKind::snare:
             {
                 duration = 0.48f;
-                voice.phase = std::fmod (voice.phase + 186.0f * dt, 1.0f);
-                voice.fmPhase = std::fmod (voice.fmPhase + 329.0f * dt, 1.0f);
-                const auto body = ((std::sin (twoPi * voice.phase) * 0.56f) + (std::sin (twoPi * voice.fmPhase) * 0.31f)) * std::exp (-age * 10.6f);
+                const auto body = ((advanceSine (voice.phase, 186.0f) * 0.56f) + (advanceSine (voice.fmPhase, 329.0f) * 0.31f)) * std::exp (-age * 10.6f);
                 const auto sizzle = noise * std::exp (-age * (17.0f - brightness * 4.0f));
                 output = (body * 0.58f) + (sizzle * 0.88f);
                 break;
             }
-            case DrumVoiceKind::closedHat:
-            case DrumVoiceKind::openHat:
+            case DrumVoiceKind::rim:
             {
-                duration = kind == DrumVoiceKind::closedHat ? 0.13f : 0.56f;
-                voice.phase = std::fmod (voice.phase + 442.0f * dt, 1.0f);
-                const auto metallic =
-                    std::sin (twoPi * voice.phase * 2.0f)
-                    + std::sin (twoPi * voice.phase * 3.18f)
-                    + std::sin (twoPi * voice.phase * 4.27f)
-                    + std::sin (twoPi * voice.phase * 5.12f);
-                const auto body = metallic * 0.11f;
-                const auto air = noise * (0.74f + brightness * 0.14f);
-                const auto env = std::exp (-age * (kind == DrumVoiceKind::closedHat ? 44.0f : 12.8f));
-                output = (body + air) * env;
+                duration = 0.11f;
+                const auto crack = (advanceSine (voice.phase, 1825.0f) * 0.46f) + (advanceSine (voice.fmPhase, 2510.0f) * 0.26f);
+                const auto click = noise * std::exp (-age * 92.0f);
+                output = (crack * std::exp (-age * 30.0f)) + (click * 0.08f);
                 break;
             }
             case DrumVoiceKind::clap:
@@ -513,24 +687,92 @@ float AdvancedVSTiAudioProcessor::renderDrumVoiceSample (VoiceState& voice)
                 output = noise * ((0.86f * pulseA) + (0.74f * pulseB) + (0.58f * pulseC) + (0.32f * tail));
                 break;
             }
-            case DrumVoiceKind::tom:
+            case DrumVoiceKind::closedHat:
+            case DrumVoiceKind::openHat:
             {
-                duration = 0.76f;
-                const auto pitch = juce::jlimit (90.0f, 245.0f, midiToHz (voice.midiNote));
+                duration = kind == DrumVoiceKind::closedHat ? 0.13f : 0.56f;
+                const auto metallic =
+                    advanceSine (voice.phase, 4620.0f)
+                    + advanceSine (voice.fmPhase, 6840.0f)
+                    + advanceSine (voice.auxPhase, 9470.0f)
+                    + advanceSine (voice.syncPhase, 12030.0f);
+                const auto body = metallic * 0.1f;
+                const auto air = noise * (0.74f + brightness * 0.14f);
+                const auto env = std::exp (-age * (kind == DrumVoiceKind::closedHat ? 44.0f : 12.8f));
+                output = (body + air) * env;
+                break;
+            }
+            case DrumVoiceKind::lowTom:
+            case DrumVoiceKind::midTom:
+            case DrumVoiceKind::highTom:
+            {
+                const auto basePitch = kind == DrumVoiceKind::lowTom ? 112.0f
+                                       : kind == DrumVoiceKind::midTom ? 162.0f
+                                                                       : 222.0f;
+                duration = kind == DrumVoiceKind::lowTom ? 0.82f
+                           : kind == DrumVoiceKind::midTom ? 0.66f
+                                                           : 0.5f;
+                const auto pitch = juce::jlimit (90.0f, 280.0f, basePitch + (voice.midiNote - 45) * 1.8f);
                 const auto sweep = 0.84f + 0.31f * std::exp (-age * 6.2f);
-                voice.auxPhase = std::fmod (voice.auxPhase + (pitch * sweep) * dt, 1.0f);
-                const auto ringTone = std::sin (twoPi * voice.auxPhase) * std::exp (-age * 5.1f);
-                output = ringTone + noise * 0.06f * std::exp (-age * 24.0f);
+                const auto ringTone = advanceSine (voice.auxPhase, pitch * sweep) * std::exp (-age * 5.1f);
+                const auto overtone = advanceSine (voice.syncPhase, pitch * 1.52f) * 0.18f * std::exp (-age * 7.2f);
+                output = ringTone + overtone + noise * 0.05f * std::exp (-age * 24.0f);
+                break;
+            }
+            case DrumVoiceKind::crash:
+            {
+                duration = 1.14f;
+                const auto metallic =
+                    advanceSine (voice.phase, 3420.0f)
+                    + advanceSine (voice.fmPhase, 5180.0f)
+                    + advanceSine (voice.auxPhase, 7760.0f)
+                    + advanceSine (voice.syncPhase, 10520.0f);
+                const auto air = noise * (0.82f + brightness * 0.12f);
+                output = (metallic * 0.12f + air * 0.78f) * std::exp (-age * 3.8f);
+                break;
+            }
+            case DrumVoiceKind::ride:
+            {
+                duration = 1.72f;
+                const auto bell = advanceSine (voice.phase, 680.0f);
+                const auto metallic =
+                    advanceSine (voice.fmPhase, 3510.0f)
+                    + advanceSine (voice.auxPhase, 5630.0f)
+                    + advanceSine (voice.syncPhase, 8240.0f);
+                output = (bell * 0.32f * std::exp (-age * 2.4f)) + ((metallic * 0.14f) + (noise * 0.18f)) * std::exp (-age * 3.0f);
+                break;
+            }
+            case DrumVoiceKind::cowbell:
+            {
+                duration = 0.34f;
+                const auto bellA = advanceSquare (voice.phase, 587.0f);
+                const auto bellB = advanceSquare (voice.fmPhase, 845.0f);
+                const auto env = std::exp (-age * 10.5f);
+                output = ((bellA * 0.4f) + (bellB * 0.28f)) * env;
+                break;
+            }
+            case DrumVoiceKind::clave:
+            {
+                duration = 0.12f;
+                const auto body = advanceSine (voice.phase, 2860.0f) * std::exp (-age * 36.0f);
+                const auto click = noise * std::exp (-age * 120.0f);
+                output = body + (click * 0.04f);
+                break;
+            }
+            case DrumVoiceKind::maraca:
+            {
+                duration = 0.16f;
+                const auto shaker = noise * std::exp (-age * 24.0f);
+                const auto grit = advanceSine (voice.phase, 6100.0f) * 0.05f * std::exp (-age * 28.0f);
+                output = shaker * 0.88f + grit;
                 break;
             }
             case DrumVoiceKind::perc:
             default:
             {
                 duration = 0.28f;
-                voice.phase = std::fmod (voice.phase + 460.0f * dt, 1.0f);
-                voice.fmPhase = std::fmod (voice.fmPhase + 744.0f * dt, 1.0f);
-                const auto metallic = (std::sin (twoPi * voice.phase) * 0.52f) + (std::sin (twoPi * voice.fmPhase) * 0.31f);
-                const auto chop = voice.phase < 0.5f ? 1.0f : -1.0f;
+                const auto metallic = (advanceSine (voice.phase, 460.0f) * 0.52f) + (advanceSine (voice.fmPhase, 744.0f) * 0.31f);
+                const auto chop = advanceSquare (voice.syncPhase, 1220.0f);
                 output = (metallic + chop * 0.16f) * std::exp (-age * 13.0f);
                 output += noise * 0.11f * std::exp (-age * 26.0f);
                 break;
@@ -705,7 +947,7 @@ int AdvancedVSTiAudioProcessor::getArpNote() const
 void AdvancedVSTiAudioProcessor::updateRenderParameters()
 {
     renderParams.oscType = static_cast<OscType> (paramIndex (apvts, "OSCTYPE"));
-    renderParams.unisonVoices = juce::jmax (1, paramIndex (apvts, "UNISON"));
+    renderParams.unisonVoices = juce::jlimit (1, maxUnisonForFlavor(), paramIndex (apvts, "UNISON"));
     renderParams.lfo1Shape = paramIndex (apvts, "LFO1SHAPE");
     renderParams.lfo2Shape = paramIndex (apvts, "LFO2SHAPE");
     renderParams.arpMode = paramIndex (apvts, "ARPMODE");
@@ -752,7 +994,6 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
     updateRenderParameters();
     applyEnvelopeSettings();
-    handleMidi (midiMessages, buffer.getNumSamples());
 
     leftFilter.setResonance (renderParams.resonance);
     rightFilter.setResonance (renderParams.resonance);
@@ -762,9 +1003,19 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
     int arpCounter = 0;
     const auto arpIntervalSamples = juce::jmax (1, static_cast<int> (currentSampleRate / juce::jmax (0.25f, renderParams.arpRate)));
+    juce::MidiBuffer::Iterator midiIterator (midiMessages);
+    juce::MidiMessage nextMidiMessage;
+    int nextMidiSample = 0;
+    auto hasMidi = midiIterator.getNextEvent (nextMidiMessage, nextMidiSample);
 
     for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
     {
+        while (hasMidi && nextMidiSample <= sample)
+        {
+            handleMidiMessage (nextMidiMessage);
+            hasMidi = midiIterator.getNextEvent (nextMidiMessage, nextMidiSample);
+        }
+
         if (++arpCounter >= arpIntervalSamples)
         {
             arpCounter = 0;
@@ -795,6 +1046,12 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
         lfo1Phase = std::fmod (lfo1Phase + renderParams.lfo1Rate / static_cast<float> (currentSampleRate), 1.0f);
         lfo2Phase = std::fmod (lfo2Phase + renderParams.lfo2Rate / static_cast<float> (currentSampleRate), 1.0f);
+    }
+
+    while (hasMidi)
+    {
+        handleMidiMessage (nextMidiMessage);
+        hasMidi = midiIterator.getNextEvent (nextMidiMessage, nextMidiSample);
     }
 }
 
@@ -881,13 +1138,13 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
         filtDecayDefault = 0.09f;
         filtSustainDefault = 0.0f;
         filtReleaseDefault = 0.08f;
-        fmDefault = 180.0f;
-        syncDefault = 0.38f;
+        fmDefault = 150.0f;
+        syncDefault = 0.28f;
         cutoffDefault = 14000.0f;
-        resonanceDefault = 0.34f;
-        filterEnvAmountDefault = 0.18f;
+        resonanceDefault = 0.24f;
+        filterEnvAmountDefault = 0.12f;
         rhythmRateDefault = 16.0f;
-        rhythmDepthDefault = 0.08f;
+        rhythmDepthDefault = 0.0f;
     }
     else if constexpr (buildFlavor() == InstrumentFlavor::drum808)
     {
@@ -901,114 +1158,115 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
         filtDecayDefault = 0.16f;
         filtSustainDefault = 0.0f;
         filtReleaseDefault = 0.1f;
-        fmDefault = 120.0f;
-        syncDefault = 0.12f;
+        fmDefault = 90.0f;
+        syncDefault = 0.08f;
         cutoffDefault = 9200.0f;
-        resonanceDefault = 0.22f;
-        filterEnvAmountDefault = 0.08f;
+        resonanceDefault = 0.16f;
+        filterEnvAmountDefault = 0.05f;
         rhythmRateDefault = 16.0f;
+        rhythmDepthDefault = 0.0f;
     }
     else if constexpr (buildFlavor() == InstrumentFlavor::bassSynth)
     {
         oscDefault = 1;
-        unisonDefault = 2;
-        detuneDefault = 0.05f;
-        fmDefault = 8.0f;
+        unisonDefault = 1;
+        detuneDefault = 0.02f;
+        fmDefault = 2.0f;
         ampAttackDefault = 0.005f;
-        ampDecayDefault = 0.24f;
+        ampDecayDefault = 0.2f;
         ampSustainDefault = 0.78f;
-        ampReleaseDefault = 0.28f;
+        ampReleaseDefault = 0.18f;
         filtAttackDefault = 0.001f;
-        filtDecayDefault = 0.28f;
-        filtSustainDefault = 0.24f;
-        filtReleaseDefault = 0.22f;
-        envCurveDefault = 0.2f;
+        filtDecayDefault = 0.22f;
+        filtSustainDefault = 0.16f;
+        filtReleaseDefault = 0.14f;
+        envCurveDefault = 0.12f;
         cutoffDefault = 280.0f;
-        resonanceDefault = 0.38f;
-        filterEnvAmountDefault = 0.82f;
-        lfo1RateDefault = 0.18f;
-        lfo2RateDefault = 0.42f;
-        lfo2FilterDefault = 0.12f;
+        resonanceDefault = 0.28f;
+        filterEnvAmountDefault = 0.52f;
+        lfo1RateDefault = 0.1f;
+        lfo2RateDefault = 0.2f;
+        lfo2FilterDefault = 0.0f;
     }
     else if constexpr (buildFlavor() == InstrumentFlavor::stringSynth)
     {
         oscDefault = 1;
-        unisonDefault = 5;
-        detuneDefault = 0.22f;
+        unisonDefault = 2;
+        detuneDefault = 0.12f;
         gateDefault = 8.0f;
         ampAttackDefault = 0.42f;
-        ampDecayDefault = 1.1f;
+        ampDecayDefault = 0.9f;
         ampSustainDefault = 0.86f;
-        ampReleaseDefault = 2.2f;
+        ampReleaseDefault = 1.6f;
         filtAttackDefault = 0.18f;
-        filtDecayDefault = 0.95f;
-        filtSustainDefault = 0.72f;
-        filtReleaseDefault = 1.8f;
+        filtDecayDefault = 0.72f;
+        filtSustainDefault = 0.64f;
+        filtReleaseDefault = 1.2f;
         envCurveDefault = -0.15f;
-        cutoffDefault = 4600.0f;
-        resonanceDefault = 0.18f;
-        filterEnvAmountDefault = 0.22f;
-        lfo1RateDefault = 0.16f;
-        lfo1PitchDefault = 0.12f;
-        lfo2RateDefault = 0.14f;
-        lfo2FilterDefault = 0.18f;
-        rhythmDepthDefault = 0.05f;
+        cutoffDefault = 4000.0f;
+        resonanceDefault = 0.14f;
+        filterEnvAmountDefault = 0.14f;
+        lfo1RateDefault = 0.1f;
+        lfo1PitchDefault = 0.0f;
+        lfo2RateDefault = 0.1f;
+        lfo2FilterDefault = 0.0f;
+        rhythmDepthDefault = 0.0f;
     }
     else if constexpr (buildFlavor() == InstrumentFlavor::leadSynth)
     {
         oscDefault = 1;
-        unisonDefault = 3;
-        detuneDefault = 0.08f;
-        fmDefault = 24.0f;
-        syncDefault = 0.55f;
+        unisonDefault = 1;
+        detuneDefault = 0.04f;
+        fmDefault = 4.0f;
+        syncDefault = 0.1f;
         ampAttackDefault = 0.002f;
-        ampDecayDefault = 0.16f;
+        ampDecayDefault = 0.14f;
         ampSustainDefault = 0.68f;
-        ampReleaseDefault = 0.22f;
+        ampReleaseDefault = 0.16f;
         filtAttackDefault = 0.001f;
-        filtDecayDefault = 0.18f;
+        filtDecayDefault = 0.14f;
         filtSustainDefault = 0.22f;
-        filtReleaseDefault = 0.16f;
-        envCurveDefault = 0.28f;
-        cutoffDefault = 3200.0f;
-        resonanceDefault = 0.48f;
-        filterEnvAmountDefault = 0.54f;
-        lfo1RateDefault = 5.8f;
-        lfo1PitchDefault = 0.25f;
-        lfo2RateDefault = 0.9f;
-        lfo2FilterDefault = 0.14f;
+        filtReleaseDefault = 0.12f;
+        envCurveDefault = 0.2f;
+        cutoffDefault = 2800.0f;
+        resonanceDefault = 0.34f;
+        filterEnvAmountDefault = 0.42f;
+        lfo1RateDefault = 4.0f;
+        lfo1PitchDefault = 0.0f;
+        lfo2RateDefault = 0.5f;
+        lfo2FilterDefault = 0.0f;
     }
     else if constexpr (buildFlavor() == InstrumentFlavor::padSynth)
     {
         oscDefault = 1;
-        unisonDefault = 6;
-        detuneDefault = 0.3f;
+        unisonDefault = 2;
+        detuneDefault = 0.1f;
         gateDefault = 8.0f;
         ampAttackDefault = 0.65f;
-        ampDecayDefault = 1.5f;
+        ampDecayDefault = 1.15f;
         ampSustainDefault = 0.9f;
-        ampReleaseDefault = 2.9f;
+        ampReleaseDefault = 2.1f;
         filtAttackDefault = 0.28f;
-        filtDecayDefault = 1.2f;
-        filtSustainDefault = 0.84f;
-        filtReleaseDefault = 2.1f;
+        filtDecayDefault = 0.92f;
+        filtSustainDefault = 0.76f;
+        filtReleaseDefault = 1.4f;
         envCurveDefault = -0.28f;
-        cutoffDefault = 6200.0f;
-        resonanceDefault = 0.16f;
-        filterEnvAmountDefault = 0.18f;
-        lfo1RateDefault = 0.11f;
-        lfo1PitchDefault = 0.08f;
-        lfo2RateDefault = 0.19f;
-        lfo2FilterDefault = 0.2f;
-        rhythmDepthDefault = 0.03f;
+        cutoffDefault = 5400.0f;
+        resonanceDefault = 0.12f;
+        filterEnvAmountDefault = 0.12f;
+        lfo1RateDefault = 0.09f;
+        lfo1PitchDefault = 0.0f;
+        lfo2RateDefault = 0.12f;
+        lfo2FilterDefault = 0.0f;
+        rhythmDepthDefault = 0.0f;
     }
     else if constexpr (buildFlavor() == InstrumentFlavor::pluckSynth)
     {
         oscDefault = 2;
-        unisonDefault = 2;
-        detuneDefault = 0.03f;
-        fmDefault = 10.0f;
-        syncDefault = 0.18f;
+        unisonDefault = 1;
+        detuneDefault = 0.015f;
+        fmDefault = 2.0f;
+        syncDefault = 0.03f;
         gateDefault = 0.75f;
         ampAttackDefault = 0.001f;
         ampDecayDefault = 0.19f;
@@ -1018,13 +1276,13 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
         filtDecayDefault = 0.16f;
         filtSustainDefault = 0.08f;
         filtReleaseDefault = 0.14f;
-        envCurveDefault = 0.38f;
-        cutoffDefault = 2600.0f;
-        resonanceDefault = 0.34f;
-        filterEnvAmountDefault = 0.9f;
-        lfo1RateDefault = 0.2f;
-        lfo2RateDefault = 0.35f;
-        lfo2FilterDefault = 0.08f;
+        envCurveDefault = 0.3f;
+        cutoffDefault = 2400.0f;
+        resonanceDefault = 0.26f;
+        filterEnvAmountDefault = 0.62f;
+        lfo1RateDefault = 0.14f;
+        lfo2RateDefault = 0.24f;
+        lfo2FilterDefault = 0.0f;
     }
     else if constexpr (buildFlavor() == InstrumentFlavor::sampler)
     {
@@ -1043,15 +1301,15 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
         filtSustainDefault = 0.76f;
         filtReleaseDefault = 0.32f;
         envCurveDefault = 0.04f;
-        cutoffDefault = 6800.0f;
-        resonanceDefault = 0.22f;
-        filterEnvAmountDefault = 0.16f;
+        cutoffDefault = 6200.0f;
+        resonanceDefault = 0.18f;
+        filterEnvAmountDefault = 0.1f;
         sampleBankDefault = 0;
         sampleStartDefault = 0.0f;
         sampleEndDefault = 0.92f;
-        lfo1RateDefault = 0.18f;
-        lfo2RateDefault = 0.12f;
-        lfo2FilterDefault = 0.06f;
+        lfo1RateDefault = 0.12f;
+        lfo2RateDefault = 0.1f;
+        lfo2FilterDefault = 0.0f;
     }
     else if constexpr (buildFlavor() == InstrumentFlavor::acid303)
     {
@@ -1082,7 +1340,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
     params.push_back (std::make_unique<juce::AudioParameterChoice> ("SAMPLEBANK", "Sample Bank", sampleBankChoices(), sampleBankDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("SAMPLESTART", "Sample Start", 0.0f, 0.95f, sampleStartDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("SAMPLEEND", "Sample End", 0.05f, 1.0f, sampleEndDefault));
-    params.push_back (std::make_unique<juce::AudioParameterInt> ("UNISON", "Unison", 1, 8, unisonDefault));
+    params.push_back (std::make_unique<juce::AudioParameterInt> ("UNISON", "Unison", 1, maxUnisonForFlavor(), unisonDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("DETUNE", "Detune", 0.0f, 1.0f, detuneDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("FMAMOUNT", "FM Amount", 0.0f, 1000.0f, fmDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("SYNC", "Sync", 0.0f, 4.0f, syncDefault));
