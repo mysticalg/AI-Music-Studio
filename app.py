@@ -4723,7 +4723,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._playback_committed_total_bytes = 0
         self._playback_pending_bytes = bytearray()
         self._playback_logical_origin_frame = 0
-        self._playback_chunk_frames = 256
+        self._playback_chunk_frames = 512
         self._live_midi_chunk_frames = 128
         self._playback_sample_rate = int(getattr(self, '_playback_sample_rate', 44100))
         self._playback_channel_count = int(getattr(self, '_playback_channel_count', 2))
@@ -6081,15 +6081,20 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _recommended_audio_pump_interval_ms(self, frame_count: int) -> int:
         latency_ms = self._buffer_frames_latency_ms(frame_count)
-        # Wake often enough to keep genuinely low-latency buffers fed.
-        return int(clamp(int(math.floor((latency_ms * 0.5) + 0.5)), 1, 5))
+        # Wake often enough to keep the buffer fed but not so often that the
+        # pump competes with UI events for the main thread.  For larger
+        # buffers (>=512 frames / ~11ms at 44.1kHz) a 5ms interval is fine;
+        # for tiny buffers we still pump aggressively.
+        return int(clamp(int(math.floor((latency_ms * 0.4) + 0.5)), 1, 8))
 
     def _preferred_playback_chunk_frames(self) -> int:
-        desired = int(clamp(int(getattr(self, 'audio_buffer_frames', 256)), 64, 4096))
-        # Keep multiple chunks queued, but let larger output buffers scale the
-        # realtime render quantum so increasing the playback buffer also reduces
-        # synth starvation pressure.
-        return max(128, min(1024, desired // 2))
+        desired = int(clamp(int(getattr(self, 'audio_buffer_frames', 512)), 64, 4096))
+        # Scale chunk size with the output buffer so that each pump call
+        # generates a meaningful amount of audio rather than many tiny slices
+        # that each carry rendering overhead.  For typical buffers (512-1024)
+        # this yields 256-512 frame chunks which significantly reduces
+        # starvation pressure while still allowing 2-4 chunks to be queued.
+        return max(256, min(2048, desired))
 
     def _available_audio_sample_rates(self, device: QtMultimedia.QAudioDevice | None = None) -> list[int]:
         target = device or self._selected_audio_device()
@@ -6158,7 +6163,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return preferred
 
     def _desired_audio_buffer_frames(self) -> int:
-        return int(clamp(int(self.audio_buffer_frames), 64, 4096))
+        return int(clamp(int(getattr(self, 'audio_buffer_frames', 512)), 64, 4096))
 
     def _playback_audio_format(self) -> QtMultimedia.QAudioFormat:
         fmt = QtMultimedia.QAudioFormat()
@@ -7216,7 +7221,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 buffer_frames = int(max(self._live_midi_chunk_frames, self._live_midi_sink.bufferFrameCount()))
             except Exception:
                 buffer_frames = self._live_midi_chunk_frames * 4
-            max_writes = max(4, int(math.ceil(buffer_frames / max(1, self._live_midi_chunk_frames))) + 1)
+            max_writes = max(8, int(math.ceil(buffer_frames / max(1, self._live_midi_chunk_frames))) * 2 + 2)
             writes = 0
             while writes < max_writes:
                 bytes_free = int(max(0, self._live_midi_sink.bytesFree()))
@@ -7934,9 +7939,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._realtime_reset_pending = True
         self._reset_realtime_track_states()
         self._seek_media_to_project_tick(int(start_tick))
-        self._pump_realtime_audio(self._realtime_pump_generation)
+        # Pre-fill: pump repeatedly until the output buffer is substantially
+        # filled *before* the timer starts.  This eliminates the initial
+        # stutter that occurred when playback began with an almost-empty
+        # buffer and the first timer tick couldn't generate audio fast enough.
+        generation = self._realtime_pump_generation
+        for _prefill_pass in range(8):
+            self._pump_realtime_audio(generation)
         self._audio_pump_timer.start()
-        QtCore.QTimer.singleShot(0, lambda generation=self._realtime_pump_generation: self._pump_realtime_audio(generation))
+        QtCore.QTimer.singleShot(0, lambda g=generation: self._pump_realtime_audio(g))
         return True
 
     def _sample_audio_cache_key(self, path: str) -> str:
@@ -8644,9 +8655,27 @@ class MainWindow(QtWidgets.QMainWindow):
             buffer_frames = int(max(self._playback_chunk_frames, self._playback_sink.bufferFrameCount()))
         except Exception:
             buffer_frames = self._playback_chunk_frames * 4
-        max_writes = max(8, int(math.ceil(buffer_frames / max(1, self._playback_chunk_frames))) + 2)
+        # Allow enough writes to fully refill the buffer from empty — this is
+        # critical for catching up after UI-induced stalls that starve the
+        # audio sink.  The previous cap was too conservative and left the
+        # buffer partially empty after a hiccup, causing repeated underruns.
+        max_writes = max(16, int(math.ceil(buffer_frames / max(1, self._playback_chunk_frames))) * 2 + 4)
         writes = 0
         try:
+            # Detect underrun: if the sink has gone idle/stopped unexpectedly,
+            # the buffer ran dry.  Restart the device to recover.
+            try:
+                sink_state = self._playback_sink.state()
+                if sink_state == QtMultimedia.QtAudio.State.IdleState:
+                    _APP_LOGGER.warning("Audio sink idle (underrun detected) — recovering")
+                    self._playback_sink_device = self._playback_sink.start()
+                    if self._playback_sink_device is None:
+                        raise RuntimeError("Failed to restart audio sink after underrun")
+            except RuntimeError:
+                raise
+            except Exception:
+                pass
+
             while writes < max_writes:
                 bytes_free = int(max(0, self._playback_sink.bytesFree()))
                 if self._playback_pending_bytes:
@@ -8961,6 +8990,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._save_preferences()
         self._release_live_midi_host()
         self._refresh_live_midi_host()
+        # Restart active playback so the new buffer size actually takes
+        # effect.  Simply calling setBufferFrameCount on a running sink
+        # is ignored on most platforms, which made the buffer setting
+        # appear ineffective at stabilising playback.
+        self._restart_playback_preserving_tick()
         self.refresh_audio_output_menu()
         latency_ms = self._buffer_frames_latency_ms(self.audio_buffer_frames)
         self.statusBar().showMessage(
