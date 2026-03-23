@@ -124,31 +124,25 @@ public:
 
     void forceTopmostFront()
     {
-        setAlwaysOnTop(true);
+        setAlwaysOnTop(false);
         setMinimised(false);
         setVisible(true);
         toFront(true);
         grabKeyboardFocus();
+    }
 
-       #if JUCE_WINDOWS
-        if (auto* peer = getPeer())
-        {
-            if (auto hwnd = static_cast<HWND>(peer->getNativeHandle()))
-            {
-                ShowWindow(hwnd, IsIconic(hwnd) ? SW_RESTORE : SW_SHOWNORMAL);
-                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                             SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-                BringWindowToTop(hwnd);
-                SetForegroundWindow(hwnd);
-            }
-        }
-       #endif
+    void showBridgeEditorWindow()
+    {
+        setAlwaysOnTop(false);
+        setMinimised(false);
+        setVisible(true);
+        toFront(true);
+        grabKeyboardFocus();
     }
 
     void beginTopmostWarmup()
     {
-        topmostWarmupPassesRemaining = 12;
-        startTimer(150);
+        stopTimer();
     }
 
 private:
@@ -179,23 +173,11 @@ private:
     void activeWindowStatusChanged() override
     {
         juce::DocumentWindow::activeWindowStatusChanged();
-        if (isVisible())
-            forceTopmostFront();
     }
 
     void timerCallback() override
     {
-        if (!isVisible())
-        {
-            stopTimer();
-            return;
-        }
-
-        forceTopmostFront();
-
-        --topmostWarmupPassesRemaining;
-        if (topmostWarmupPassesRemaining <= 0)
-            stopTimer();
+        stopTimer();
     }
 
     void restoreBounds()
@@ -236,6 +218,7 @@ class HostComponent final : public juce::Component,
 public:
     HostComponent(juce::PropertiesFile& settings,
                   const juce::String& startupPluginPath,
+                  const juce::String& startupStatePath,
                   bool shouldOpenEditorOnStartup,
                   int requestedCommandPort,
                   bool bridgeModeEnabled,
@@ -243,6 +226,7 @@ public:
                   int startupBufferSize)
         : appSettings(settings),
           bridgeMode(bridgeModeEnabled),
+          managedStateFile(startupStatePath.isNotEmpty() ? juce::File(startupStatePath) : juce::File()),
           keyboardComponent(keyboardState, juce::MidiKeyboardComponent::horizontalKeyboard)
     {
         formatManager.addFormat(std::make_unique<juce::VST3PluginFormat>());
@@ -294,6 +278,8 @@ public:
         if (startupPath.isNotEmpty())
         {
             loadPlugin(startupPath);
+            if (pluginInstance != nullptr && managedStateFile.existsAsFile())
+                loadPluginStateFromFile(managedStateFile);
             if (shouldOpenEditorOnStartup && pluginInstance != nullptr)
                 openEditorWindow();
         }
@@ -311,6 +297,7 @@ public:
 
     ~HostComponent() override
     {
+        persistManagedState();
         commandServer.reset();
         deviceManager.removeAudioCallback(this);
         deviceManager.closeAudioDevice();
@@ -481,7 +468,11 @@ private:
             if (pluginInstance == nullptr)
                 return makeResponse(false, "No plugin loaded");
 
-            openEditorWindow();
+            juce::MessageManager::callAsync([this]
+            {
+                if (pluginInstance != nullptr)
+                    openEditorWindow();
+            });
             auto response = makeResponse(true, "Editor opened");
             appendStatusFields(response);
             return response;
@@ -547,12 +538,8 @@ private:
         if (command == "panic")
         {
             clearScheduledMidiEvents();
+            keyboardState.reset();
             enqueuePanicMessages(0);
-            {
-                juce::ScopedLock lock(pluginLock);
-                if (pluginInstance != nullptr)
-                    pluginInstance->reset();
-            }
             auto response = makeResponse(true, "Panic sent");
             appendStatusFields(response);
             return response;
@@ -964,8 +951,6 @@ private:
             enqueueMidiMessage(juce::MidiMessage::controllerEvent(midiChannel, 67, 0));
             enqueueMidiMessage(juce::MidiMessage::controllerEvent(midiChannel, 120, 0));
             enqueueMidiMessage(juce::MidiMessage::controllerEvent(midiChannel, 123, 0));
-            for (int note = 0; note < 128; ++note)
-                enqueueMidiMessage(juce::MidiMessage::noteOff(midiChannel, note, 0.0f));
         };
 
         if (channel <= 0)
@@ -1142,7 +1127,6 @@ private:
         if (pluginInstance == nullptr)
             return false;
         pluginInstance->setStateInformation(rawState.getData(), static_cast<int>(rawState.getSize()));
-        pluginInstance->reset();
         return true;
     }
 
@@ -1161,6 +1145,13 @@ private:
         if (!parentDir.exists() && !parentDir.createDirectory())
             return false;
         return stateFile.replaceWithData(rawState.getData(), rawState.getSize());
+    }
+
+    void persistManagedState()
+    {
+        if (managedStateFile == juce::File())
+            return;
+        savePluginStateToFile(managedStateFile);
     }
 
     juce::var renderOfflineAudioBlock(int numSamples)
@@ -1222,16 +1213,23 @@ private:
             editorWindow.reset();
             updateButtons();
         };
-        editorWindow->forceTopmostFront();
-        editorWindow->beginTopmostWarmup();
-        juce::MessageManager::callAsync([this]
+        if (bridgeMode)
         {
-            if (editorWindow != nullptr)
+            editorWindow->showBridgeEditorWindow();
+        }
+        else
+        {
+            editorWindow->forceTopmostFront();
+            editorWindow->beginTopmostWarmup();
+            juce::MessageManager::callAsync([this]
             {
-                editorWindow->forceTopmostFront();
-                editorWindow->beginTopmostWarmup();
-            }
-        });
+                if (editorWindow != nullptr)
+                {
+                    editorWindow->forceTopmostFront();
+                    editorWindow->beginTopmostWarmup();
+                }
+            });
+        }
     }
 
     void closeEditorWindow()
@@ -1284,6 +1282,7 @@ private:
     std::unique_ptr<juce::FileChooser> fileChooser;
     std::unique_ptr<HostCommandServer> commandServer;
     bool bridgeMode = false;
+    juce::File managedStateFile;
 
     double currentSampleRate = 44100.0;
     int currentBlockSize = 512;
@@ -1387,6 +1386,7 @@ class HostWindow final : public juce::DocumentWindow
 public:
     HostWindow(juce::PropertiesFile& settings,
                const juce::String& startupPluginPath,
+               const juce::String& startupStatePath,
                bool shouldOpenEditorOnStartup,
                int requestedCommandPort,
                bool bridgeModeEnabled,
@@ -1405,6 +1405,7 @@ public:
         setResizeLimits(760, 520, 1800, 1200);
         setContentOwned(new HostComponent(settings,
                                           startupPluginPath,
+                                          startupStatePath,
                                           shouldOpenEditorOnStartup,
                                           requestedCommandPort,
                                           bridgeMode,
@@ -1512,6 +1513,7 @@ namespace
             appProperties->setStorageParameters(hostSettingsOptions());
             component = std::make_unique<HostComponent>(*appProperties->getUserSettings(),
                                                         pluginPath,
+                                                        juce::String(),
                                                         shouldOpenEditorOnStartup,
                                                         0,
                                                         true,
@@ -1614,6 +1616,7 @@ public:
         appProperties->setStorageParameters(options);
         mainWindow = std::make_unique<HostWindow>(*appProperties->getUserSettings(),
                                                   parseStartupPluginPath(),
+                                                  parseStartupStatePath(),
                                                   shouldOpenEditorOnStartup(),
                                                   parseCommandPort(),
                                                   isBridgeModeEnabled(),
@@ -1649,6 +1652,17 @@ private:
     {
         const auto args = getCommandLineParameterArray();
         return args.contains("--open-editor");
+    }
+
+    juce::String parseStartupStatePath() const
+    {
+        const auto args = getCommandLineParameterArray();
+        for (int i = 0; i < args.size(); ++i)
+        {
+            if (args[i] == "--state-file" && i + 1 < args.size())
+                return args[i + 1].unquoted();
+        }
+        return {};
     }
 
     int parseCommandPort() const

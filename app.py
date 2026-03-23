@@ -1677,6 +1677,7 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         self._playhead_item: QtWidgets.QGraphicsLineItem | None = None
         self._note_items: dict[int, QtWidgets.QGraphicsRectItem] = {}
         self._hover_pitch: int | None = None
+        self._note_clipboard: list[tuple[int, int, int, int]] = []
         self.refresh()
 
     def current_track(self) -> TrackState:
@@ -2633,6 +2634,50 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         self.sync_selection()
         return [note for note in self.current_track().notes if note.selected]
 
+    def copy_selected(self) -> bool:
+        selected = sorted(self._selected_notes(), key=lambda note: (int(note.start_tick), int(note.pitch), int(note.duration_tick)))
+        if not selected:
+            self._note_clipboard = []
+            return False
+        anchor_tick = min(int(note.start_tick) for note in selected)
+        self._note_clipboard = [
+            (
+                int(note.start_tick) - anchor_tick,
+                int(note.duration_tick),
+                int(note.pitch),
+                int(note.velocity),
+            )
+            for note in selected
+        ]
+        return True
+
+    def paste_copied(self) -> bool:
+        if not self._note_clipboard:
+            return False
+        track = self.current_track()
+        paste_tick = max(0, int(getattr(self.project, 'playhead_tick', 0)))
+        for note in track.notes:
+            note.selected = False
+            self._update_note_item(note)
+
+        pasted_notes: list[MidiNote] = []
+        for offset_tick, duration_tick, pitch, velocity in self._note_clipboard:
+            duplicated = MidiNote(
+                start_tick=max(0, paste_tick + int(offset_tick)),
+                duration_tick=max(1, int(duration_tick)),
+                pitch=max(PITCH_MIN, min(PITCH_MAX, int(pitch))),
+                velocity=max(1, min(127, int(velocity))),
+                selected=True,
+            )
+            track.notes.append(duplicated)
+            pasted_notes.append(duplicated)
+            self._draw_note(duplicated)
+        for note in pasted_notes:
+            self._update_note_item(note)
+        self.selectionChanged.emit()
+        self.noteChanged.emit()
+        return True
+
     def _nudge_selected(self, *, delta_tick: int = 0, delta_pitch: int = 0) -> bool:
         selected = self._selected_notes()
         if not selected:
@@ -2704,6 +2749,14 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         self.noteChanged.emit()
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        if event.matches(QtGui.QKeySequence.StandardKey.Copy):
+            if self.copy_selected():
+                event.accept()
+                return
+        if event.matches(QtGui.QKeySequence.StandardKey.Paste):
+            if self.paste_copied():
+                event.accept()
+                return
         step_tick = self._grid_tick()
         handled = False
         if event.key() == QtCore.Qt.Key.Key_Left:
@@ -4328,12 +4381,14 @@ class AudioSettingsDialog(QtWidgets.QDialog):
         self._set_combo_items(self.native_host_rate_combo, native_rate_items, int(main_window.native_vst_host_sample_rate))
 
         native_buffer_values = {
-            16, 24, 32, 48, 64, 96, 128, 192, 240, 256, 384, 480, 512, 768, 960, 1024,
+            64, 96, 128, 192, 240, 256, 384, 480, 512, 768, 960, 1024,
             1536, 1920, 2048, 3072, 4096, int(main_window._native_vst_host_target_buffer_size()),
         }
         if int(main_window.native_vst_host_buffer_size) > 0:
             native_buffer_values.add(int(main_window.native_vst_host_buffer_size))
-        native_buffer_items: list[tuple[str, object]] = [(f'Auto ({main_window._native_vst_host_target_buffer_size()} samples)', 0)]
+        native_buffer_items: list[tuple[str, object]] = [
+            (f'0 samples (Auto -> {main_window._native_vst_host_target_buffer_size()} effective)', 0)
+        ]
         native_buffer_items.extend(
             (f'{size} samples', int(size)) for size in sorted(v for v in native_buffer_values if int(v) > 0)
         )
@@ -4599,6 +4654,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         configure_app_logging()
+        self._windows_timer_resolution_active = False
         self.project = ProjectState()
         self.ai_client = OpenAIClient()
         self.composer = OpenAIComposer(self.ai_client)
@@ -4647,6 +4703,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._layout_save_timer.timeout.connect(self._save_preferences)
         self._load_preferences()
         self._sync_bundled_vsti_directory()
+        self._request_high_resolution_timers()
         self._apply_selected_audio_output()
         self.playback_mix_path = RENDER_DIR / "_playback_mix.wav"
         self.note_preview_path = RENDER_DIR / "_preview" / "note_preview.wav"
@@ -4691,7 +4748,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._track_vsti_windows: dict[int, QtWidgets.QDialog] = {}
         self._track_native_vsti_close_events: dict[int, threading.Event] = {}
         self._track_native_vsti_hwnds: dict[int, int] = {}
+        self._track_native_vsti_processes: dict[int, QtCore.QProcess] = {}
         self._track_native_vst_host_bridges: dict[int, object] = {}
+        self._native_vst_host_retry_after: dict[int, float] = {}
         self._track_meter_levels: dict[int, float] = {}
         self._sample_audio_cache: dict[str, tuple[object, int, int]] = {}
         self._realtime_reset_pending = False
@@ -6005,21 +6064,27 @@ class MainWindow(QtWidgets.QMainWindow):
     def _native_vst_host_target_buffer_size(self) -> int:
         selected = int(getattr(self, 'native_vst_host_buffer_size', 0) or 0)
         if selected > 0:
-            return int(clamp(selected, 16, 4096))
-        return int(clamp(self._desired_audio_buffer_frames(), 16, 4096))
+            return int(clamp(selected, 64, 4096))
+        # Keep the native host on a stable, sane block size by default instead of
+        # following the main playback buffer. The main output buffer should affect
+        # sink latency, not the VST host's audio callback cadence.
+        return 512
 
     def _buffer_frames_latency_ms(self, frame_count: int) -> float:
         return (max(1, int(frame_count)) / float(max(1, self._playback_sample_rate))) * 1000.0
 
+    def _recommended_audio_pump_interval_ms(self, frame_count: int) -> int:
+        latency_ms = self._buffer_frames_latency_ms(frame_count)
+        # Wake often enough to keep genuinely low-latency buffers fed.
+        return int(clamp(int(math.floor((latency_ms * 0.5) + 0.5)), 1, 5))
+
     def _preferred_playback_chunk_frames(self) -> int:
-        desired = max(64, int(self._desired_audio_buffer_frames()))
-        if desired <= 64:
-            return 64
-        if desired <= 128:
-            return 128
-        if desired <= 256:
-            return 256
-        return 512
+        desired = int(clamp(int(getattr(self, 'audio_buffer_frames', 256)), 64, 4096))
+        # Use a smaller scheduling quantum than the hardware/output buffer so the
+        # sink can keep multiple chunks queued. This avoids buffer-dependent
+        # "slow" playback caused by starvation gaps when the pump wakes a little
+        # late on the UI thread.
+        return max(64, min(256, desired // 2))
 
     def _available_audio_sample_rates(self, device: QtMultimedia.QAudioDevice | None = None) -> list[int]:
         target = device or self._selected_audio_device()
@@ -6088,7 +6153,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return preferred
 
     def _desired_audio_buffer_frames(self) -> int:
-        return max(self._playback_chunk_frames, int(clamp(int(self.audio_buffer_frames), 64, 4096)))
+        return int(clamp(int(self.audio_buffer_frames), 64, 4096))
 
     def _playback_audio_format(self) -> QtMultimedia.QAudioFormat:
         fmt = QtMultimedia.QAudioFormat()
@@ -6374,7 +6439,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._can_use_native_vst_host(entry):
             self._release_live_midi_host(idx)
             return None
-        return entry if self._open_native_vst_host_for_track(idx, entry, open_editor=False) else None
+        return entry if self._open_native_vst_host_for_track(idx, entry, open_editor=False, show_error=False) else None
 
     def _send_native_vst_host_message(self, row: int, msg: object) -> bool:
         info = self._live_midi_track_info(row)
@@ -6383,7 +6448,7 @@ class MainWindow(QtWidgets.QMainWindow):
         idx, _track, entry = info
         if not self._can_use_native_vst_host(entry):
             return False
-        if not self._open_native_vst_host_for_track(idx, entry, open_editor=False):
+        if not self._open_native_vst_host_for_track(idx, entry, open_editor=False, show_error=False):
             return False
         bridge = self._track_native_vst_host_bridges.get(int(idx))
         if bridge is None:
@@ -6543,16 +6608,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _native_vst_host_scheduling_lead_frames(self) -> int:
         host_buffer = max(1, int(self._native_vst_host_target_buffer_size()))
-        output_buffer = max(1, int(self._desired_audio_buffer_frames()))
-        sink = getattr(self, '_playback_sink', None)
-        if sink is not None:
-            try:
-                output_buffer = max(output_buffer, int(max(0, sink.bufferFrameCount())))
-            except Exception:
-                pass
-        # Keep native-host playback aligned with the same configured output latency
-        # used by the Qt sink for the metronome and General MIDI path.
-        return max(host_buffer, output_buffer)
+        queued_output = max(
+            int(self._estimated_queued_output_frames()),
+            int(self._desired_audio_buffer_frames()),
+        )
+        # Align native-host playback to the same audible queue the Qt sink is
+        # currently carrying, while keeping the host's own callback block as the
+        # minimum scheduling floor.
+        return max(host_buffer, queued_output)
 
     def _schedule_native_vst_track_chunk(
         self,
@@ -6567,7 +6630,7 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> bool:
         if not self._can_use_native_vst_host(entry):
             return False
-        if not self._open_native_vst_host_for_track(idx, entry, open_editor=False):
+        if not self._open_native_vst_host_for_track(idx, entry, open_editor=False, show_error=False):
             return False
         bridge = self._track_native_vst_host_bridges.get(int(idx))
         if bridge is None:
@@ -6583,8 +6646,14 @@ class MainWindow(QtWidgets.QMainWindow):
             bootstrap_active=bool(state.instrument_reset_pending),
         )
         queued_output_frames = self._native_vst_host_scheduling_lead_frames() + max(0, int(output_offset_frames))
-        reset_channels = [int(clamp(track.midi_channel, 0, 15)) + 1] if state.instrument_reset_pending else None
-        clear_channels = [int(clamp(track.midi_channel, 0, 15)) + 1] if state.native_host_epoch_flush_pending and not state.instrument_reset_pending else None
+        target_channel = int(clamp(track.midi_channel, 0, 15)) + 1
+        reset_channels = [target_channel] if state.instrument_reset_pending else None
+        clear_channels = None
+        if state.native_host_epoch_flush_pending:
+            # Force all-notes-off at loop/edit epoch boundaries so stale voices
+            # cannot survive into the next scheduling pass.
+            if reset_channels is None:
+                reset_channels = [target_channel]
         if not self._schedule_native_vst_host_messages(
             idx,
             bridge,
@@ -6720,7 +6789,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._live_midi_pump_in_progress = True
         bytes_per_frame = self._playback_bytes_per_frame()
-        minimum_bytes = max(bytes_per_frame, self._live_midi_chunk_frames * bytes_per_frame)
         try:
             try:
                 buffer_frames = int(max(self._live_midi_chunk_frames, self._live_midi_sink.bufferFrameCount()))
@@ -6739,9 +6807,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     del self._live_midi_pending_bytes[:written]
                     writes += 1
                     continue
-                if bytes_free < minimum_bytes:
+                free_frames = max(1, int(bytes_free // bytes_per_frame))
+                if bytes_free <= 0:
                     break
-                chunk = self._render_live_midi_chunk_bytes(self._live_midi_chunk_frames)
+                chunk_frames = max(1, min(self._live_midi_chunk_frames, free_frames))
+                chunk = self._render_live_midi_chunk_bytes(chunk_frames)
                 if not chunk:
                     break
                 self._live_midi_pending_bytes.extend(chunk)
@@ -6951,6 +7021,33 @@ class MainWindow(QtWidgets.QMainWindow):
             state.native_host_epoch_flush_pending = True
             state.native_host_scheduled_until_frame = -1
             state.native_host_loop_epoch += 1
+        self._clear_realtime_mix_cache()
+
+    def _prioritize_note_offs_for_edit(self) -> None:
+        if not bool(hasattr(self, 'playback_timer') and self.playback_timer.isActive()):
+            return
+        current_generation = int(self._realtime_pump_generation)
+        for row in list(getattr(self, '_track_native_vst_host_bridges', {}).keys()):
+            track = self.project.tracks[int(row)] if 0 <= int(row) < len(self.project.tracks) else None
+            self._panic_native_vst_host_track(int(row), track, exhaustive=True, generation=current_generation)
+        self._mark_realtime_track_states_for_reset()
+
+    def _force_note_off_for_track(self, row: int) -> None:
+        row = int(row)
+        if row < 0 or row >= len(self.project.tracks):
+            return
+        track = self.project.tracks[row]
+        if bool(hasattr(self, 'playback_timer') and self.playback_timer.isActive()):
+            current_generation = int(self._realtime_pump_generation)
+            self._panic_native_vst_host_track(row, track, exhaustive=True, generation=current_generation)
+            state = self._realtime_track_states.get(row)
+            if state is not None:
+                state.instrument_reset_pending = True
+                state.loop_bootstrap_pending = False
+                state.native_host_epoch_flush_pending = False
+                state.fx_reset_pending = True
+                state.native_host_scheduled_until_frame = -1
+                state.native_host_loop_epoch = 0
         self._clear_realtime_mix_cache()
 
     def _discard_realtime_track_state(self, idx: int) -> None:
@@ -7304,6 +7401,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._reload_playback_mix_if_running()
 
     def on_piano_roll_notes_committed(self) -> None:
+        self._prioritize_note_offs_for_edit()
+        self._invalidate_playback_caches()
         self._schedule_deferred_note_refresh(
             refresh_velocity=True,
             refresh_timeline=True,
@@ -8042,7 +8141,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._audio_pump_in_progress = True
         bytes_per_frame = self._playback_bytes_per_frame()
-        minimum_bytes = max(bytes_per_frame, self._playback_chunk_frames * bytes_per_frame)
         try:
             buffer_frames = int(max(self._playback_chunk_frames, self._playback_sink.bufferFrameCount()))
         except Exception:
@@ -8064,10 +8162,12 @@ class MainWindow(QtWidgets.QMainWindow):
                     writes += 1
                     continue
 
-                if bytes_free < minimum_bytes:
+                free_frames = max(1, int(bytes_free // bytes_per_frame))
+                if bytes_free <= 0:
                     break
 
-                chunk = self._generate_realtime_chunk_bytes(self._playback_chunk_frames)
+                chunk_frames = max(1, min(self._playback_chunk_frames, free_frames))
+                chunk = self._generate_realtime_chunk_bytes(chunk_frames)
                 if not chunk:
                     break
                 self._playback_pending_bytes.extend(chunk)
@@ -8275,7 +8375,7 @@ class MainWindow(QtWidgets.QMainWindow):
         native_buffer_group = QtGui.QActionGroup(native_buffer_menu)
         native_buffer_group.setExclusive(True)
         follow_output_buffer = native_buffer_menu.addAction(
-            f'Auto ({self._native_vst_host_target_buffer_size()} samples)'
+            f'0 samples (Auto -> {self._native_vst_host_target_buffer_size()} effective)'
         )
         follow_output_buffer.setCheckable(True)
         follow_output_buffer.setChecked(int(self.native_vst_host_buffer_size) <= 0)
@@ -8400,7 +8500,11 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def set_native_vst_host_buffer_size(self, value: int) -> None:
-        self.native_vst_host_buffer_size = int(clamp(int(value), 0, 4096))
+        target = int(value)
+        if target <= 0:
+            self.native_vst_host_buffer_size = 0
+        else:
+            self.native_vst_host_buffer_size = int(clamp(target, 64, 4096))
         self._save_preferences()
         self.refresh_audio_output_menu()
         self.statusBar().showMessage(
@@ -8439,7 +8543,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _apply_audio_buffer_preference(self) -> None:
         self._playback_chunk_frames = self._preferred_playback_chunk_frames()
-        self._live_midi_chunk_frames = max(64, min(256, self._playback_chunk_frames))
+        self._live_midi_chunk_frames = max(64, min(128, self._playback_chunk_frames))
+        playback_interval_ms = self._recommended_audio_pump_interval_ms(self._playback_chunk_frames)
+        live_interval_ms = self._recommended_audio_pump_interval_ms(self._live_midi_chunk_frames)
+        if hasattr(self, '_audio_pump_timer'):
+            self._audio_pump_timer.setInterval(playback_interval_ms)
+        if hasattr(self, '_live_midi_pump_timer'):
+            self._live_midi_pump_timer.setInterval(live_interval_ms)
         if getattr(self, '_playback_sink', None) is not None:
             try:
                 self._playback_sink.setBufferFrameCount(self._desired_audio_buffer_frames())
@@ -8464,6 +8574,51 @@ class MainWindow(QtWidgets.QMainWindow):
     def available_instrument_plugin_names(self) -> list[str]:
         return [entry.name for entry in self.project.vsti_rack if entry.host_supported and entry.is_instrument]
 
+    def _existing_vsti_entry_for_path(self, plugin_path: str) -> VSTInstrument | None:
+        normalized_path = self._normalized_vsti_path(plugin_path)
+        for entry in self.project.vsti_rack:
+            try:
+                if self._normalized_vsti_path(entry.path) == normalized_path:
+                    return entry
+            except Exception:
+                continue
+        return None
+
+    def _should_avoid_inprocess_vst_probe(self, plugin_path: str) -> bool:
+        normalized_path = self._normalized_vsti_path(plugin_path)
+        suffix = Path(normalized_path).suffix.lower()
+        if suffix != '.vst3':
+            return False
+        if self._canonical_bundled_vsti_path(normalized_path) is not None:
+            return False
+        return bool(self._can_use_native_vst_host(self._existing_vsti_entry_for_path(normalized_path)))
+
+    def _probe_native_vst_host_plugin(self, plugin_path: str) -> tuple[str, bool, str]:
+        normalized_path = self._normalized_vsti_path(plugin_path)
+        if not NATIVE_VST_HOST_AVAILABLE or NativeVstHostBridge is None:
+            return Path(normalized_path).stem, False, "Native VST host is unavailable."
+        bridge = NativeVstHostBridge(
+            plugin_path=normalized_path,
+            open_editor=False,
+            sample_rate=self._native_vst_host_target_sample_rate(),
+            buffer_size=max(64, int(self._native_vst_host_target_buffer_size())),
+        )
+        try:
+            bridge.start(startup_timeout=8.0)
+            status = bridge.command('status')
+            plugin_name = str(status.get('plugin_name') or Path(normalized_path).stem)
+            loaded = bool(status.get('plugin_loaded', False))
+            message = 'Plugin loaded in native host' if loaded else 'Plugin failed to load in native host'
+            return plugin_name, loaded, message
+        except Exception as exc:
+            _APP_LOGGER.exception("Native VST probe failed path=%s", normalized_path)
+            return Path(normalized_path).stem, False, str(exc)
+        finally:
+            try:
+                bridge.stop()
+            except Exception:
+                pass
+
     def _describe_plugin_path(self, plugin_path: str) -> tuple[str, bool, bool, str, bool, str]:
         normalized_path = self._normalized_vsti_path(plugin_path)
         cached = self.vsti_description_cache.get(normalized_path)
@@ -8485,6 +8640,29 @@ class MainWindow(QtWidgets.QMainWindow):
             return result
         if not PEDALBOARD_AVAILABLE:
             result = (default_name, True, False, '', True, '')
+            self.vsti_description_cache[normalized_path] = result
+            return result
+        existing_entry = self._existing_vsti_entry_for_path(normalized_path)
+        if self._should_avoid_inprocess_vst_probe(normalized_path):
+            plugin_name, host_supported, host_detail = self._probe_native_vst_host_plugin(normalized_path)
+            if existing_entry is not None:
+                result = (
+                    str(existing_entry.name or plugin_name or default_name),
+                    bool(existing_entry.is_instrument),
+                    bool(existing_entry.is_effect),
+                    str(existing_entry.category or ''),
+                    bool(host_supported),
+                    '' if host_supported else host_detail,
+                )
+            else:
+                result = (
+                    plugin_name or default_name,
+                    False,
+                    False,
+                    '',
+                    bool(host_supported),
+                    '' if host_supported else host_detail,
+                )
             self.vsti_description_cache[normalized_path] = result
             return result
         try:
@@ -8667,6 +8845,15 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         try:
             plugin = plugin_instance
+            if plugin is None:
+                plugin = self.vsti_binary_loader.handle(normalized_path)
+            if plugin is None and self._should_avoid_inprocess_vst_probe(normalized_path):
+                _APP_LOGGER.info(
+                    "Skipping in-process VST metadata probe path=%s to avoid external plugin crash risk",
+                    normalized_path,
+                )
+                self.vsti_plugin_metadata[normalized_path] = []
+                return
             if plugin is None:
                 plugin, _resolved_path = load_vst_plugin_with_fallback(normalized_path)
             names = [str(name) for name in plugin.parameters.keys()]
@@ -8987,6 +9174,17 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
         return x, y, width, height
 
+    def _native_vsti_window_bounds_for_track(self, row: int) -> tuple[int, int, int, int] | None:
+        if row < 0 or row >= len(self.project.tracks):
+            return None
+        track = self.project.tracks[int(row)]
+        if not track.rack_vsti:
+            return None
+        entry = self._rack_vsti_entry(track.rack_vsti)
+        if entry is None:
+            return None
+        return self._preferred_native_vsti_bounds(entry.path)
+
     def _remember_native_vsti_window_bounds(self, row: int, path: str | None = None) -> None:
         hwnd = int(self._track_native_vsti_hwnds.get(int(row), 0) or 0)
         if not hwnd or os.name != 'nt':
@@ -9039,6 +9237,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _center_foreground_native_window_async(
         self,
         *,
+        target_pid: int | None = None,
         known_hwnds: set[int] | None = None,
         delay_sec: float = 0.12,
         retries: int = 16,
@@ -9066,7 +9265,7 @@ class MainWindow(QtWidgets.QMainWindow):
             class MONITORINFO(ctypes.Structure):
                 _fields_ = [('cbSize', ctypes.c_ulong), ('rcMonitor', RECT), ('rcWork', RECT), ('dwFlags', ctypes.c_ulong)]
 
-            pid = int(kernel32.GetCurrentProcessId())
+            pid = int(target_pid or int(kernel32.GetCurrentProcessId()))
             existing_hwnds = set(known_hwnds or set())
             try:
                 main_hwnd = int(self.winId()) if self.winId() else 0
@@ -10009,10 +10208,24 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             _APP_LOGGER.exception("Failed stopping native VST host bridge for row=%s", row)
 
-    def _open_native_vst_host_for_track(self, row: int, entry: VSTInstrument, *, open_editor: bool = True) -> bool:
+    def _defer_native_vst_host_retry(self, row: int, delay_sec: float = 2.0) -> None:
+        self._native_vst_host_retry_after[int(row)] = time.monotonic() + max(0.1, float(delay_sec))
+
+    def _open_native_vst_host_for_track(
+        self,
+        row: int,
+        entry: VSTInstrument,
+        *,
+        open_editor: bool = True,
+        show_error: bool = True,
+    ) -> bool:
         if not self._can_use_native_vst_host(entry):
             return False
         row = int(row)
+        if not open_editor:
+            retry_after = float(self._native_vst_host_retry_after.get(row, 0.0) or 0.0)
+            if retry_after > 0.0 and time.monotonic() < retry_after:
+                return False
         track = self.project.tracks[row] if 0 <= row < len(self.project.tracks) else None
         desired_sample_rate = self._native_vst_host_target_sample_rate()
         desired_buffer_size = self._native_vst_host_target_buffer_size()
@@ -10026,6 +10239,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if existing is not None and self._native_vst_host_bridge_alive(row):
             try:
                 if self._normalized_vsti_path(existing_path) != self._normalized_vsti_path(entry.path):
+                    self._stop_native_vst_host_bridge(row)
+                    existing = None
+                elif existing_sample_rate != desired_sample_rate or existing_buffer_size != desired_buffer_size:
                     self._stop_native_vst_host_bridge(row)
                     existing = None
                 elif existing_state_path != desired_state_path or existing_state_mtime_ns != desired_state_mtime_ns:
@@ -10042,6 +10258,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     "Native VST host bridge command failed row=%s rack_name=%s", row, entry.name
                 )
                 self._stop_native_vst_host_bridge(row)
+                self._defer_native_vst_host_retry(row)
                 existing = None
         if existing is None:
             try:
@@ -10054,6 +10271,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 bridge.start()
                 self._prime_native_vst_host_bridge_state(bridge, track, entry)
                 self._track_native_vst_host_bridges[row] = bridge
+                self._native_vst_host_retry_after.pop(row, None)
                 self.statusBar().showMessage(f'Opened native VST host: {entry.name}')
                 return True
             except Exception as exc:
@@ -10063,12 +10281,14 @@ class MainWindow(QtWidgets.QMainWindow):
                     entry.name,
                     entry.path,
                 )
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    'Native VST host unavailable',
-                    f'Could not open the native VST host for {entry.name}.\n\n{exc}',
-                )
+                if show_error:
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        'Native VST host unavailable',
+                        f'Could not open the native VST host for {entry.name}.\n\n{exc}',
+                    )
                 self._track_native_vst_host_bridges.pop(row, None)
+                self._defer_native_vst_host_retry(row)
                 return False
         return True
 
@@ -10165,6 +10385,20 @@ class MainWindow(QtWidgets.QMainWindow):
                 dialog.close()
             except Exception:
                 pass
+        process = self._track_native_vsti_processes.pop(row, None)
+        if process is not None:
+            try:
+                if process.state() != QtCore.QProcess.ProcessState.NotRunning:
+                    process.terminate()
+                    if not process.waitForFinished(1500):
+                        process.kill()
+                        process.waitForFinished(1500)
+            except Exception:
+                _APP_LOGGER.exception("Failed stopping standalone VST editor process for row=%s", row)
+            try:
+                process.deleteLater()
+            except Exception:
+                pass
         if bridge is not None:
             if teardown_host:
                 self._stop_native_vst_host_bridge(row)
@@ -10195,6 +10429,16 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 _APP_LOGGER.exception("Failed focusing native VST host bridge for row=%s", row)
                 self._stop_native_vst_host_bridge(int(row))
+        process = self._track_native_vsti_processes.get(int(row))
+        if process is not None and process.state() != QtCore.QProcess.ProcessState.NotRunning:
+            hwnd = int(self._track_native_vsti_hwnds.get(int(row), 0) or 0)
+            if not hwnd and os.name == 'nt':
+                self._center_foreground_native_window_async(
+                    target_pid=int(process.processId()),
+                    track_row=int(row),
+                    preferred_bounds=self._native_vsti_window_bounds_for_track(int(row)),
+                )
+                return True
         hwnd = int(self._track_native_vsti_hwnds.get(int(row), 0) or 0)
         if not hwnd or os.name != 'nt':
             return False
@@ -10218,6 +10462,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _native_vst_host_editor_visible(self, row: int) -> bool:
         row = int(row)
+        process = self._track_native_vsti_processes.get(row)
+        if process is not None and process.state() != QtCore.QProcess.ProcessState.NotRunning:
+            return True
         bridge = self._track_native_vst_host_bridges.get(row)
         if bridge is None or not self._native_vst_host_bridge_alive(row):
             return False
@@ -10248,6 +10495,128 @@ class MainWindow(QtWidgets.QMainWindow):
         if entry is None:
             return
         self.vsti_binary_loader.release(entry.path)
+
+    def _open_standalone_native_vst_editor(self, row: int, entry: VSTInstrument, track: TrackState) -> bool:
+        if not NATIVE_VST_HOST_AVAILABLE or NATIVE_VST_HOST_EXE is None or not Path(NATIVE_VST_HOST_EXE).exists():
+            QtWidgets.QMessageBox.warning(
+                self,
+                'Native VST host unavailable',
+                f'Could not find the standalone VST host executable for {entry.name}.',
+            )
+            return False
+        row = int(row)
+        existing = self._track_native_vsti_processes.get(row)
+        if existing is not None and existing.state() != QtCore.QProcess.ProcessState.NotRunning:
+            return self._focus_track_native_vsti_window(row)
+
+        state_path = self._effective_vsti_state_path(track, entry)
+        if state_path is None:
+            state_path = self._default_vsti_state_cache_path(track, entry)
+        try:
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        track.vsti_state_path = str(state_path)
+
+        bridge = self._track_native_vst_host_bridges.get(row)
+        if bridge is not None and self._native_vst_host_bridge_alive(row):
+            self._stop_native_vst_host_bridge(row)
+
+        process = QtCore.QProcess(self)
+        process.setProgram(str(NATIVE_VST_HOST_EXE))
+        process.setArguments(
+            [
+                '--plugin',
+                str(entry.path),
+                '--state-file',
+                str(state_path),
+                '--open-editor',
+                '--sample-rate',
+                str(int(self._native_vst_host_target_sample_rate())),
+                '--buffer-size',
+                str(int(max(64, self._native_vst_host_target_buffer_size()))),
+            ]
+        )
+        process.finished.connect(
+            lambda exit_code, exit_status, row=row, path=str(state_path), proc=process:
+            self._on_standalone_native_vst_editor_finished(row, path, proc, exit_code, exit_status)
+        )
+        process.errorOccurred.connect(
+            lambda error, row=row, name=entry.name: _APP_LOGGER.warning(
+                "Standalone VST editor process error row=%s rack_name=%s error=%s",
+                row,
+                name,
+                self._qt_enum_debug_value(error),
+            )
+        )
+        process.start()
+
+        self._track_native_vsti_processes[row] = process
+        self._track_native_vsti_close_events[row] = threading.Event()
+        QtCore.QTimer.singleShot(
+            250,
+            lambda row=row, proc=process: self._center_foreground_native_window_async(
+                target_pid=int(proc.processId()) if proc.state() != QtCore.QProcess.ProcessState.NotRunning else 0,
+                track_row=row,
+                preferred_bounds=self._native_vsti_window_bounds_for_track(row),
+            ),
+        )
+        self.statusBar().showMessage(f'Opened standalone VST editor: {entry.name}')
+        return True
+
+    def _on_standalone_native_vst_editor_finished(
+        self,
+        row: int,
+        state_path: str,
+        process: QtCore.QProcess,
+        exit_code: int,
+        exit_status: QtCore.QProcess.ExitStatus,
+    ) -> None:
+        row = int(row)
+        tracked = self._track_native_vsti_processes.get(row)
+        if tracked is process:
+            self._track_native_vsti_processes.pop(row, None)
+        close_event = self._track_native_vsti_close_events.pop(row, None)
+        if close_event is not None:
+            try:
+                close_event.set()
+            except Exception:
+                pass
+        self._track_native_vsti_hwnds.pop(row, None)
+        try:
+            process.deleteLater()
+        except Exception:
+            pass
+        if 0 <= row < len(self.project.tracks):
+            track = self.project.tracks[row]
+            if state_path:
+                track.vsti_state_path = str(state_path)
+        self._stop_native_vst_host_bridge(row)
+        self._discard_realtime_track_state(row)
+        self._invalidate_playback_caches()
+        self._reload_playback_mix_if_running()
+        self._update_track_list_item(row)
+        if row == self.current_track_index():
+            self.instruments.load_track()
+            self.mixer.load_track()
+        if exit_status != QtCore.QProcess.ExitStatus.NormalExit:
+            _APP_LOGGER.warning(
+                "Standalone VST editor exited abnormally row=%s exit_code=%s exit_status=%s",
+                row,
+                exit_code,
+                self._qt_enum_debug_value(exit_status),
+            )
+
+    @staticmethod
+    def _qt_enum_debug_value(value: object) -> object:
+        try:
+            return value.value  # PySide enum objects
+        except Exception:
+            pass
+        try:
+            return int(value)
+        except Exception:
+            return repr(value)
 
     def _get_track_playback_audio(self, idx: int, track: TrackState) -> tuple[object, int]:
         cache_key = self._track_audio_cache_key(track, idx)
@@ -10521,7 +10890,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 converted_frames = int(round((44100.0 * float(legacy_buffer_value)) / 1000.0))
                 self.audio_buffer_frames = int(clamp(converted_frames, 64, 4096))
         self.native_vst_host_sample_rate = self._coerce_int(payload.get('native_vst_host_sample_rate', 0), 0, 0, 384000)
-        self.native_vst_host_buffer_size = self._coerce_int(payload.get('native_vst_host_buffer_size', 0), 0, 0, 4096)
+        loaded_native_host_buffer = self._coerce_int(payload.get('native_vst_host_buffer_size', 0), 0, 0, 4096)
+        if loaded_native_host_buffer <= 0:
+            self.native_vst_host_buffer_size = 0
+        else:
+            self.native_vst_host_buffer_size = int(clamp(loaded_native_host_buffer, 64, 4096))
         self.note_length_offset_ticks = self._coerce_int(payload.get('note_length_offset_ticks', 0), 0, -480, 480)
         refresh_pref = payload.get('playback_ui_refresh_ms', 16)
         try:
@@ -11053,13 +11426,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.information(self, 'Unsupported VSTI', f'{vst.name} does not have a usable native editor here.\n\n{detail}')
                 return
             if self._can_use_native_vst_host(vst):
-                if self._open_native_vst_host_for_track(track_index, vst, open_editor=True):
+                if self._open_standalone_native_vst_editor(track_index, vst, track):
                     self._update_track_list_item(track_index)
                 else:
                     QtWidgets.QMessageBox.warning(
                         self,
                         'Internal VST host unavailable',
-                        f'Could not open {vst.name} in the internal VST host.',
+                        f'Could not open {vst.name} in the standalone VST editor host.',
                     )
                 return
             QtWidgets.QMessageBox.warning(
@@ -11751,6 +12124,8 @@ class MainWindow(QtWidgets.QMainWindow):
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+R"), self, self.render_all_tracks)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Q"), self, self.piano_roll.quantize_selected)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+D"), self, self.piano_roll.duplicate_selected_by_grid)
+        QtGui.QShortcut(QtGui.QKeySequence.StandardKey.Copy, self, self.piano_roll.copy_selected)
+        QtGui.QShortcut(QtGui.QKeySequence.StandardKey.Paste, self, self.piano_roll.paste_copied)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+G"), self, self.compose_with_ai)
         QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Delete), self, self.piano_roll.delete_selected)
         QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Space), self, lambda: self.stop_playback() if self.playback_timer.isActive() else self.start_playback())
@@ -11867,6 +12242,30 @@ class MainWindow(QtWidgets.QMainWindow):
         self._register_virtual_piano_shortcuts()
         self._apply_virtual_piano_window_preferences()
 
+    def _request_high_resolution_timers(self) -> None:
+        if self._windows_timer_resolution_active or sys.platform != 'win32':
+            return
+        try:
+            result = ctypes.windll.winmm.timeBeginPeriod(1)
+        except Exception:
+            _APP_LOGGER.exception("Failed to request 1 ms Windows timer resolution")
+            return
+        if int(result) == 0:
+            self._windows_timer_resolution_active = True
+        else:
+            _APP_LOGGER.warning("Windows timeBeginPeriod(1) failed with code=%s", result)
+
+    def _release_high_resolution_timers(self) -> None:
+        if not self._windows_timer_resolution_active or sys.platform != 'win32':
+            return
+        self._windows_timer_resolution_active = False
+        try:
+            result = ctypes.windll.winmm.timeEndPeriod(1)
+            if int(result) != 0:
+                _APP_LOGGER.warning("Windows timeEndPeriod(1) failed with code=%s", result)
+        except Exception:
+            _APP_LOGGER.exception("Failed to release 1 ms Windows timer resolution")
+
     def _shutdown_runtime_resources(self) -> None:
         if self._shutdown_complete:
             return
@@ -11919,6 +12318,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._stop_native_vst_host_bridge(int(row))
             except Exception:
                 _APP_LOGGER.exception("Failed to stop native VST host bridge during shutdown for row=%s", row)
+        for row, process in list(getattr(self, '_track_native_vsti_processes', {}).items()):
+            try:
+                if process is not None and process.state() != QtCore.QProcess.ProcessState.NotRunning:
+                    process.terminate()
+                    if not process.waitForFinished(1500):
+                        process.kill()
+                        process.waitForFinished(1500)
+            except Exception:
+                _APP_LOGGER.exception("Failed to stop standalone VST editor process during shutdown for row=%s", row)
+            finally:
+                self._track_native_vsti_processes.pop(int(row), None)
         for sink, buffer in list(getattr(self, '_preview_resources', [])):
             try:
                 sink.stop()
@@ -11954,6 +12364,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.vsti_binary_loader.clear()
             except Exception:
                 _APP_LOGGER.exception("Failed to clear VST loader handles during shutdown")
+        self._release_high_resolution_timers()
         mark_clean_shutdown("shutdown")
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
@@ -12452,6 +12863,10 @@ class MainWindow(QtWidgets.QMainWindow):
             edit_action = menu.addAction(f'Edit "{track.rack_vsti}" Parameters...')
             edit_action.triggered.connect(lambda _checked=False, idx=row, name=track.rack_vsti: self.open_vsti_gui_by_name(name, idx))
 
+        menu.addSeparator()
+        duplicate_action = menu.addAction('Duplicate Track')
+        duplicate_action.triggered.connect(lambda _checked=False, idx=row: self.duplicate_track(idx))
+
         menu.exec(global_pos)
 
     def _track_has_toggleable_vsti(self, track: TrackState) -> bool:
@@ -12489,7 +12904,7 @@ class MainWindow(QtWidgets.QMainWindow):
         entry = self._rack_vsti_entry(track.rack_vsti) if track.rack_vsti else None
         if track.live_armed:
             if entry is not None and self._can_use_native_vst_host(entry):
-                self._open_native_vst_host_for_track(row, entry, open_editor=False)
+                self._open_native_vst_host_for_track(row, entry, open_editor=False, show_error=False)
         else:
             self._release_live_midi_host(row)
         self._update_track_list_item(row)
@@ -12633,6 +13048,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._track_list_rebuilding or row < 0 or row >= len(self.project.tracks):
             return
         self.project.tracks[row].mute = bool(checked)
+        if checked:
+            self._force_note_off_for_track(row)
         if row == self.current_track_index():
             self.mixer.load_track()
         self._invalidate_playback_caches(clear_track_audio=False)
@@ -12713,6 +13130,61 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sample_timeline.refresh()
         self.rebuild_midi_sections()
         self.arrangement_overview.refresh()
+
+    @staticmethod
+    def _duplicate_track_state(source: TrackState, duplicate_number: int) -> TrackState:
+        clone = TrackState(
+            name=f"{source.name} Copy" if duplicate_number <= 1 else f"{source.name} Copy {duplicate_number}",
+            track_type=str(source.track_type),
+            notes=[
+                MidiNote(
+                    start_tick=int(note.start_tick),
+                    duration_tick=int(note.duration_tick),
+                    pitch=int(note.pitch),
+                    velocity=int(note.velocity),
+                    selected=bool(note.selected),
+                )
+                for note in source.notes
+            ],
+            volume=float(source.volume),
+            pan=float(source.pan),
+            instrument=str(source.instrument),
+            instrument_mode=str(source.instrument_mode),
+            rack_vsti=str(source.rack_vsti),
+            plugins=list(source.plugins),
+            vsti_parameters={str(key): float(value) for key, value in source.vsti_parameters.items()},
+            vsti_state_path=str(source.vsti_state_path),
+            vsti_output_gain_db=float(source.vsti_output_gain_db),
+            vsti_wet_mix=float(source.vsti_wet_mix),
+            vst_fx_chain=list(source.vst_fx_chain),
+            midi_program=int(source.midi_program),
+            midi_channel=int(source.midi_channel),
+            synth_profile=str(source.synth_profile),
+            rendered_audio_path=str(source.rendered_audio_path),
+            mute=bool(source.mute),
+            solo=bool(source.solo),
+            live_armed=False,
+            color_hex=str(source.color_hex),
+        )
+        return clone
+
+    def duplicate_track(self, row: int) -> None:
+        row = int(row)
+        if row < 0 or row >= len(self.project.tracks):
+            return
+        source = self.project.tracks[row]
+        duplicate_count = sum(1 for track in self.project.tracks if str(track.name).startswith(f"{source.name} Copy"))
+        clone = self._duplicate_track_state(source, duplicate_count + 1)
+        insert_at = row + 1
+        self.project.tracks.insert(insert_at, clone)
+        self._invalidate_playback_caches()
+        self._populate_track_list()
+        self.track_list.setCurrentRow(insert_at)
+        self.timeline.refresh()
+        self.sample_timeline.refresh()
+        self.rebuild_midi_sections()
+        self.arrangement_overview.refresh()
+        self.statusBar().showMessage(f'Duplicated track "{source.name}"')
 
     def new_project(self) -> None:
         self._reset_project_runtime_state()

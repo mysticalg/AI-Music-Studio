@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import os
 import socket
 import subprocess
 import time
@@ -204,7 +205,8 @@ class _SubprocessHostBackend:
         request = {"command": command, **payload}
         encoded = (json.dumps(request) + "\n").encode("utf-8")
 
-        with socket.create_connection(("127.0.0.1", self.port), timeout=5.0) as sock:
+        with socket.create_connection(("127.0.0.1", self.port), timeout=0.35) as sock:
+            sock.settimeout(0.35)
             sock.sendall(encoded)
             sock.shutdown(socket.SHUT_WR)
 
@@ -267,7 +269,8 @@ class NativeVstHostBridge:
         self.in_process = False
 
     def start(self, startup_timeout: float = 10.0) -> None:
-        if _InProcessHostBackend.available():
+        prefer_in_process = str(os.getenv("AIMS_NATIVE_VST_IN_PROCESS", "")).strip().lower() in {"1", "true", "yes", "on"}
+        if prefer_in_process and _InProcessHostBackend.available():
             backend: _InProcessHostBackend | _SubprocessHostBackend = _InProcessHostBackend(
                 self.plugin_path,
                 open_editor=self.open_editor,
