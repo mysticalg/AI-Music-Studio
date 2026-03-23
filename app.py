@@ -6864,7 +6864,7 @@ class MainWindow(QtWidgets.QMainWindow):
             encoded['sample_offset'] = max(0, int(offset))
             encoded['priority'] = int(order)
             payload_events.append(encoded)
-        if not payload_events:
+        if not payload_events and not reset_channels and not clear_channels:
             return True
         try:
             payload: dict[str, object] = {
@@ -6884,6 +6884,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _native_vst_host_scheduling_lead_frames(self) -> int:
         return 0
+
+    def _flush_native_vst_host_pending_messages(self, bridge: object, *, frames: int | None = None) -> None:
+        flush_frames = int(
+            max(
+                1,
+                min(
+                    4096,
+                    int(frames or getattr(bridge, 'buffer_size', 0) or self._native_vst_host_target_buffer_size() or 512),
+                ),
+            )
+        )
+        bridge.command('render_audio', frames=flush_frames)
 
     def _finish_warm_native_vst_host_for_track(self, row: int) -> None:
         row = int(row)
@@ -6992,6 +7004,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         try:
             bridge.command('panic')
+            self._flush_native_vst_host_pending_messages(bridge, frames=buffer_size)
         except Exception:
             _APP_LOGGER.exception("Failed resetting native VST host before note preview row=%s", row)
 
@@ -7000,7 +7013,7 @@ class MainWindow(QtWidgets.QMainWindow):
             bridge,
             events,
             0,
-            reset_channels=[midi_channel + 1],
+            clear_channels=[midi_channel + 1],
             loop_epoch=0,
         ):
             return False
@@ -7063,19 +7076,12 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         queued_output_frames = self._native_vst_host_scheduling_lead_frames() + max(0, int(output_offset_frames))
         target_channel = int(clamp(track.midi_channel, 0, 15)) + 1
-        reset_channels = [target_channel] if state.instrument_reset_pending else None
-        clear_channels = None
-        if state.native_host_epoch_flush_pending:
-            # Force all-notes-off at loop/edit epoch boundaries so stale voices
-            # cannot survive into the next scheduling pass.
-            if reset_channels is None:
-                reset_channels = [target_channel]
+        clear_channels = [target_channel] if (state.instrument_reset_pending or state.native_host_epoch_flush_pending) else None
         if not self._schedule_native_vst_host_messages(
             idx,
             bridge,
             events,
             queued_output_frames,
-            reset_channels=reset_channels,
             clear_channels=clear_channels,
             loop_epoch=state.native_host_loop_epoch,
         ):
@@ -11033,6 +11039,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         try:
             bridge.command('panic')
+            self._flush_native_vst_host_pending_messages(bridge, frames=buffer_size)
         except Exception:
             _APP_LOGGER.exception("Failed resetting native VST host before offline render track=%s", track.name)
 
@@ -11061,7 +11068,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 base_offset_frames=0,
                 events=payload_events,
                 loop_epoch=0,
-                reset_channels=[channel + 1],
+                clear_channels=[channel + 1],
             )
 
         max_tick = max((note.start_tick + note.duration_tick for note in track.notes), default=0)
