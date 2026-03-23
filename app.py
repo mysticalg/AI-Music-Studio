@@ -8511,14 +8511,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self._reset_realtime_track_states()
         self._seek_media_to_project_tick(int(start_tick))
         self._use_prerendered_transport_mix = False
-        if bool(getattr(self, 'prefer_prerendered_vst_playback', False)):
-            try:
-                self._use_prerendered_transport_mix = self._build_playback_mix()
-            except Exception:
-                self._use_prerendered_transport_mix = False
-                _APP_LOGGER.exception("Failed building prerendered transport mix")
+        # --- TEMPORARILY DISABLED: prerendered playback mix ---
+        # The full-project prerender causes significant performance degradation
+        # because _build_playback_mix() allocates and fills arrays for the
+        # entire project duration upfront.  Bypass to use realtime rendering.
+        # if bool(getattr(self, 'prefer_prerendered_vst_playback', False)):
+        #     try:
+        #         self._use_prerendered_transport_mix = self._build_playback_mix()
+        #     except Exception:
+        #         self._use_prerendered_transport_mix = False
+        #         _APP_LOGGER.exception("Failed building prerendered transport mix")
         native_output_attempted = False
-        direct_native_plugin = None if bool(getattr(self, 'prefer_prerendered_vst_playback', False)) else self._direct_native_transport_candidate()
+        # With prerender disabled, always allow direct native transport candidate
+        direct_native_plugin = self._direct_native_transport_candidate()
         if self._native_output_bridge_supported():
             native_output_attempted = True
             try:
