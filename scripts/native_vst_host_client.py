@@ -13,17 +13,24 @@ def build_parser() -> argparse.ArgumentParser:
                             "status",
                             "load",
                             "unload",
+                            "load_state",
+                            "save_state",
                             "open_editor",
                             "close_editor",
                             "note_on",
                             "note_off",
                             "all_notes_off",
+                            "panic",
+                            "schedule_midi",
+                            "render_audio",
+                            "configure_buses",
                             "quit",
                         ])
     parser.add_argument("--path", help="plugin path for the load command")
     parser.add_argument("--note", type=int, help="MIDI note number")
     parser.add_argument("--velocity", type=float, help="MIDI velocity 0..1")
     parser.add_argument("--channel", type=int, help="MIDI channel 1..16")
+    parser.add_argument("--json", help="additional JSON object payload merged into the command")
     return parser
 
 
@@ -39,6 +46,11 @@ def main() -> int:
         payload["velocity"] = args.velocity
     if args.channel is not None:
         payload["channel"] = args.channel
+    if args.json:
+        extra = json.loads(args.json)
+        if not isinstance(extra, dict):
+            raise SystemExit("--json must decode to an object")
+        payload.update(extra)
 
     request = (json.dumps(payload) + "\n").encode("utf-8")
 

@@ -267,8 +267,22 @@ public:
 
         setOpaque(true);
 
-        initialiseAudio();
-        restoreAudioPreferences(startupSampleRate, startupBufferSize);
+        if (!bridgeMode)
+        {
+            initialiseAudio();
+            restoreAudioPreferences(startupSampleRate, startupBufferSize);
+        }
+        else
+        {
+            currentSampleRate = startupSampleRate > 0.0
+                ? startupSampleRate
+                : appSettings.getDoubleValue("audio_sample_rate", currentSampleRate);
+            currentBlockSize = startupBufferSize > 0
+                ? startupBufferSize
+                : appSettings.getIntValue("audio_buffer_size", currentBlockSize);
+            currentSampleRate = currentSampleRate > 0.0 ? currentSampleRate : 44100.0;
+            currentBlockSize = juce::jmax(64, currentBlockSize);
+        }
         updateDeviceBoxes();
         updateDeviceLabel();
         updateButtons();
@@ -299,8 +313,11 @@ public:
     {
         persistManagedState();
         commandServer.reset();
-        deviceManager.removeAudioCallback(this);
-        deviceManager.closeAudioDevice();
+        if (audioInitialised)
+        {
+            deviceManager.removeAudioCallback(this);
+            deviceManager.closeAudioDevice();
+        }
         closeEditorWindow();
         unloadPlugin();
     }
@@ -396,6 +413,20 @@ private:
         if (command == "status")
         {
             auto response = makeResponse(true, "status");
+            appendStatusFields(response);
+            return response;
+        }
+
+        if (command == "configure_buses")
+        {
+            if (pluginInstance == nullptr)
+                return makeResponse(false, "No plugin loaded");
+
+            juce::String error;
+            if (!configureBuses(request, error))
+                return makeResponse(false, error.isNotEmpty() ? error : "Could not configure plugin buses");
+
+            auto response = makeResponse(true, "Plugin buses configured");
             appendStatusFields(response);
             return response;
         }
@@ -676,8 +707,17 @@ private:
                 ? object->getProperty("frames")
                 : juce::var(currentBlockSize));
             const auto frames = juce::jlimit(1, 4096, requestedFrames);
-            auto response = renderOfflineAudioBlock(frames);
-            appendStatusFields(response);
+            auto response = renderOfflineAudioBlock(frames, object->getProperty("input_buses"));
+            setResponseField(response, "plugin_loaded", pluginInstance != nullptr);
+            setResponseField(response, "plugin_name", pluginDescription.name);
+            setResponseField(response, "plugin_path",
+                             normaliseVst3PathForSettings(pathEditor.getText().trim()));
+            setResponseField(response, "editor_open", editorWindow != nullptr);
+            setResponseField(response, "sample_rate", currentSampleRate);
+            setResponseField(response, "buffer_size", currentBlockSize);
+            setResponseField(response, "command_port", getActiveCommandPort());
+            setResponseField(response, "bridge_mode", bridgeMode);
+            setResponseField(response, "input_buses", describeBuses(true));
             setResponseField(response, "frames", frames);
             return response;
         }
@@ -701,6 +741,9 @@ private:
         setResponseField(response, "sample_rate", currentSampleRate);
         setResponseField(response, "buffer_size", currentBlockSize);
         setResponseField(response, "command_port", getActiveCommandPort());
+        setResponseField(response, "bridge_mode", bridgeMode);
+        setResponseField(response, "input_buses", describeBuses(true));
+        setResponseField(response, "output_buses", describeBuses(false));
     }
 
     void configureButton(juce::TextButton& button, const juce::String& text)
@@ -714,10 +757,14 @@ private:
     {
         deviceManager.initialise(0, 2, nullptr, true, {}, nullptr);
         deviceManager.addAudioCallback(this);
+        audioInitialised = true;
     }
 
     void restoreAudioPreferences(double startupSampleRate, int startupBufferSize)
     {
+        if (!audioInitialised)
+            return;
+
         const auto wantedRate = startupSampleRate > 0.0
             ? startupSampleRate
             : appSettings.getDoubleValue("audio_sample_rate", 0.0);
@@ -770,6 +817,17 @@ private:
         sampleRateBox.clear(juce::dontSendNotification);
         bufferSizeBox.clear(juce::dontSendNotification);
 
+        if (bridgeMode)
+        {
+            const auto rateValue = juce::jmax(1, static_cast<int>(std::round(currentSampleRate)));
+            const auto bufferValue = juce::jmax(64, currentBlockSize);
+            sampleRateBox.addItem(juce::String(rateValue) + " Hz", rateValue);
+            sampleRateBox.setSelectedId(rateValue, juce::dontSendNotification);
+            bufferSizeBox.addItem(juce::String(bufferValue) + " samples", bufferValue);
+            bufferSizeBox.setSelectedId(bufferValue, juce::dontSendNotification);
+            return;
+        }
+
         if (auto* device = deviceManager.getCurrentAudioDevice())
         {
             int selectedRate = 0;
@@ -796,6 +854,17 @@ private:
 
     void updateDeviceLabel()
     {
+        if (bridgeMode)
+        {
+            deviceLabel.setText(
+                "Bridge render mode  "
+                    + juce::String(static_cast<int>(std::round(currentSampleRate))) + " Hz"
+                    + "  " + juce::String(currentBlockSize) + " samples",
+                juce::dontSendNotification
+            );
+            return;
+        }
+
         if (auto* device = deviceManager.getCurrentAudioDevice())
         {
             deviceLabel.setText(
@@ -1034,6 +1103,162 @@ private:
         scheduledMidiEvents.swapWith(keep);
     }
 
+    juce::var describeBuses(bool isInput) const
+    {
+        juce::Array<juce::var> buses;
+        auto* plugin = pluginInstance.get();
+        if (plugin == nullptr)
+            return juce::var(buses);
+
+        for (int busIndex = 0; busIndex < plugin->getBusCount(isInput); ++busIndex)
+        {
+            const auto* bus = plugin->getBus(isInput, busIndex);
+            if (bus == nullptr)
+                continue;
+
+            auto* object = new juce::DynamicObject();
+            object->setProperty("bus_index", busIndex);
+            object->setProperty("name", bus->getName());
+            object->setProperty("direction", isInput ? "input" : "output");
+            object->setProperty("is_main", bus->isMain());
+            object->setProperty("enabled", bus->isEnabled());
+            object->setProperty("enabled_by_default", bus->isEnabledByDefault());
+            object->setProperty("channel_count", bus->getNumberOfChannels());
+            object->setProperty("default_channel_count", bus->getDefaultLayout().size());
+            object->setProperty("last_enabled_channel_count", bus->getLastEnabledLayout().size());
+            object->setProperty("max_supported_channels", bus->getMaxSupportedChannels(16));
+            object->setProperty("layout", bus->getCurrentLayout().getDescription());
+            buses.add(juce::var(object));
+        }
+
+        return juce::var(buses);
+    }
+
+    bool applyRequestedBusLayouts(const juce::var& busesVar,
+                                  bool isInput,
+                                  juce::AudioProcessor::BusesLayout& layout,
+                                  juce::String& error) const
+    {
+        if (!busesVar.isArray())
+            return true;
+
+        auto* plugin = pluginInstance.get();
+        if (plugin == nullptr)
+        {
+            error = "No plugin loaded";
+            return false;
+        }
+
+        auto* busesArray = busesVar.getArray();
+        auto& targets = isInput ? layout.inputBuses : layout.outputBuses;
+
+        for (const auto& busVar : *busesArray)
+        {
+            auto* busObject = busVar.getDynamicObject();
+            if (busObject == nullptr)
+                continue;
+
+            const auto busIndex = static_cast<int>(busObject->getProperty("bus_index"));
+            if (busIndex < 0 || busIndex >= targets.size())
+            {
+                error = "Invalid bus index";
+                return false;
+            }
+
+            auto* bus = plugin->getBus(isInput, busIndex);
+            if (bus == nullptr)
+            {
+                error = "Bus not found";
+                return false;
+            }
+
+            auto shouldEnable = !busObject->hasProperty("enabled")
+                || static_cast<bool>(busObject->getProperty("enabled"));
+            if (bus->isMain())
+                shouldEnable = true;
+
+            if (!shouldEnable)
+            {
+                targets.getReference(busIndex) = juce::AudioChannelSet::disabled();
+                continue;
+            }
+
+            int channels = busObject->hasProperty("channels")
+                ? static_cast<int>(busObject->getProperty("channels"))
+                : 0;
+            if (channels <= 0)
+                channels = bus->getLastEnabledLayout().size();
+            if (channels <= 0)
+                channels = bus->getDefaultLayout().size();
+            if (channels <= 0)
+                channels = juce::jmax(1, bus->getNumberOfChannels());
+
+            auto desiredLayout = bus->supportedLayoutWithChannels(channels);
+            if (desiredLayout.isDisabled())
+                desiredLayout = bus->getLastEnabledLayout();
+            if (desiredLayout.isDisabled())
+                desiredLayout = bus->getDefaultLayout();
+            if (desiredLayout.isDisabled() && bus->isMain())
+                desiredLayout = juce::AudioChannelSet::canonicalChannelSet(juce::jmax(1, channels));
+            if (desiredLayout.isDisabled())
+            {
+                error = "Unsupported bus channel layout";
+                return false;
+            }
+
+            targets.getReference(busIndex) = desiredLayout;
+        }
+
+        return true;
+    }
+
+    bool configureBuses(const juce::var& request, juce::String& error)
+    {
+        auto* requestObject = request.getDynamicObject();
+        if (requestObject == nullptr)
+        {
+            error = "configure_buses requires an object payload";
+            return false;
+        }
+
+        juce::AudioProcessor::BusesLayout layout;
+        {
+            juce::ScopedLock lock(pluginLock);
+            if (pluginInstance == nullptr)
+            {
+                error = "No plugin loaded";
+                return false;
+            }
+
+            layout = pluginInstance->getBusesLayout();
+            if (requestObject->hasProperty("input_buses"))
+            {
+                for (int busIndex = 1; busIndex < layout.inputBuses.size(); ++busIndex)
+                    layout.inputBuses.getReference(busIndex) = juce::AudioChannelSet::disabled();
+            }
+            if (requestObject->hasProperty("output_buses"))
+            {
+                for (int busIndex = 1; busIndex < layout.outputBuses.size(); ++busIndex)
+                    layout.outputBuses.getReference(busIndex) = juce::AudioChannelSet::disabled();
+            }
+
+            if (!applyRequestedBusLayouts(requestObject->getProperty("input_buses"), true, layout, error))
+                return false;
+            if (!applyRequestedBusLayouts(requestObject->getProperty("output_buses"), false, layout, error))
+                return false;
+
+            pluginInstance->releaseResources();
+            if (!pluginInstance->setBusesLayout(layout))
+            {
+                error = "Plugin rejected the requested bus layout";
+                return false;
+            }
+        }
+
+        preparePluginForPlayback();
+        return true;
+    }
+
     void loadPlugin(const juce::String& pluginPath)
     {
         const auto preferredPath = normaliseVst3PathForSettings(pluginPath);
@@ -1074,6 +1299,7 @@ private:
             juce::ScopedLock lock(pluginLock);
             pluginDescription = description;
             pluginInstance = std::move(instance);
+            pluginInstance->disableNonMainBuses();
         }
 
         pathEditor.setText(pluginFile.getFullPathName(), juce::dontSendNotification);
@@ -1104,9 +1330,6 @@ private:
         if (pluginInstance == nullptr)
             return;
         pluginInstance->setRateAndBufferSizeDetails(currentSampleRate, currentBlockSize);
-        // Keep the host on the plugin's main I/O only. Enabling aux buses can
-        // produce channel layouts that don't match this simple stereo host.
-        pluginInstance->disableNonMainBuses();
         pluginInstance->prepareToPlay(currentSampleRate, currentBlockSize);
     }
 
@@ -1156,17 +1379,131 @@ private:
         savePluginStateToFile(managedStateFile);
     }
 
-    juce::var renderOfflineAudioBlock(int numSamples)
+    static juce::String encodeInterleavedBusAudio(const juce::AudioBuffer<float>& buffer)
+    {
+        juce::MemoryOutputStream stream;
+        const auto channelCount = buffer.getNumChannels();
+        const auto sampleCount = buffer.getNumSamples();
+        for (int sample = 0; sample < sampleCount; ++sample)
+        {
+            for (int channel = 0; channel < channelCount; ++channel)
+            {
+                const auto value = buffer.getSample(channel, sample);
+                stream.write(&value, sizeof(value));
+            }
+        }
+        return juce::Base64::toBase64(stream.getData(), stream.getDataSize());
+    }
+
+    void populateInputBuses(juce::AudioBuffer<float>& processBuffer, int numSamples, const juce::var& inputBusesVar)
+    {
+        auto* plugin = pluginInstance.get();
+        if (plugin == nullptr || !inputBusesVar.isArray())
+            return;
+
+        if (auto* busesArray = inputBusesVar.getArray())
+        {
+            for (const auto& busVar : *busesArray)
+            {
+                auto* busObject = busVar.getDynamicObject();
+                if (busObject == nullptr)
+                    continue;
+
+                const auto busIndex = static_cast<int>(busObject->getProperty("bus_index"));
+                if (busIndex < 0 || busIndex >= plugin->getBusCount(true))
+                    continue;
+
+                auto busBuffer = plugin->getBusBuffer(processBuffer, true, busIndex);
+                busBuffer.clear();
+                if (busBuffer.getNumChannels() <= 0)
+                    continue;
+
+                const auto base64Audio = busObject->getProperty("audio_b64").toString();
+                if (base64Audio.isEmpty())
+                    continue;
+
+                const auto providedChannels = juce::jmax(
+                    1,
+                    static_cast<int>(busObject->hasProperty("channels")
+                        ? busObject->getProperty("channels")
+                        : juce::var(busBuffer.getNumChannels())))
+                ;
+
+                juce::MemoryOutputStream decoded;
+                if (!juce::Base64::convertFromBase64(decoded, base64Audio))
+                    continue;
+
+                const auto totalFloats = static_cast<int>(decoded.getDataSize() / sizeof(float));
+                const auto availableFrames = providedChannels > 0 ? totalFloats / providedChannels : 0;
+                auto* samples = static_cast<const float*>(decoded.getData());
+
+                for (int channel = 0; channel < busBuffer.getNumChannels(); ++channel)
+                {
+                    const auto sourceChannel = channel < providedChannels ? channel : 0;
+                    auto* destination = busBuffer.getWritePointer(channel);
+                    for (int sample = 0; sample < numSamples; ++sample)
+                    {
+                        if (sample < availableFrames)
+                            destination[sample] = samples[(sample * providedChannels) + sourceChannel];
+                        else
+                            destination[sample] = 0.0f;
+                    }
+                }
+            }
+        }
+    }
+
+    juce::var describeRenderedOutputBuses(juce::AudioBuffer<float>& processBuffer) const
+    {
+        juce::Array<juce::var> outputs;
+        auto* plugin = pluginInstance.get();
+        if (plugin == nullptr)
+            return juce::var(outputs);
+
+        for (int busIndex = 0; busIndex < plugin->getBusCount(false); ++busIndex)
+        {
+            const auto* bus = plugin->getBus(false, busIndex);
+            if (bus == nullptr)
+                continue;
+
+            auto* object = new juce::DynamicObject();
+            object->setProperty("bus_index", busIndex);
+            object->setProperty("name", bus->getName());
+            object->setProperty("is_main", bus->isMain());
+            object->setProperty("enabled", bus->isEnabled());
+            object->setProperty("channel_count", bus->getNumberOfChannels());
+
+            auto busBuffer = plugin->getBusBuffer(processBuffer, false, busIndex);
+            if (bus->isEnabled() && busBuffer.getNumChannels() > 0)
+            {
+                object->setProperty("audio_b64", encodeInterleavedBusAudio(busBuffer));
+                object->setProperty("channels", busBuffer.getNumChannels());
+                object->setProperty("frames", busBuffer.getNumSamples());
+                object->setProperty("format", "f32le-interleaved");
+            }
+
+            outputs.add(juce::var(object));
+        }
+
+        return juce::var(outputs);
+    }
+
+    juce::var renderOfflineAudioBlock(int numSamples, const juce::var& inputBusesVar)
     {
         auto response = makeResponse(true, "Rendered audio");
-        juce::AudioBuffer<float> buffer(juce::jmax(2, pluginInstance != nullptr ? pluginInstance->getTotalNumOutputChannels() : 2),
-                                        juce::jmax(1, numSamples));
+        const auto channelCount = juce::jmax(
+            pluginInstance != nullptr ? pluginInstance->getTotalNumInputChannels() : 0,
+            pluginInstance != nullptr ? pluginInstance->getTotalNumOutputChannels() : 2
+        );
+        juce::AudioBuffer<float> buffer(juce::jmax(2, channelCount), juce::jmax(1, numSamples));
         buffer.clear();
 
         {
             juce::ScopedLock lock(pluginLock);
             if (pluginInstance == nullptr)
                 return makeResponse(false, "No plugin loaded");
+
+            populateInputBuses(buffer, numSamples, inputBusesVar);
 
             juce::MidiBuffer midi;
             keyboardState.processNextMidiBuffer(midi, 0, numSamples, true);
@@ -1176,19 +1513,27 @@ private:
             renderedSampleFrames.fetch_add(numSamples);
         }
 
-        juce::MemoryOutputStream stream;
-        const auto channelCount = buffer.getNumChannels();
-        for (int sample = 0; sample < numSamples; ++sample)
+        juce::AudioBuffer<float> mainBusBuffer(2, numSamples);
+        mainBusBuffer.clear();
+        if (pluginInstance != nullptr && pluginInstance->getBusCount(false) > 0)
         {
-            const auto left = buffer.getSample(0, sample);
-            const auto right = channelCount > 1 ? buffer.getSample(1, sample) : left;
-            stream.write(&left, sizeof(left));
-            stream.write(&right, sizeof(right));
+            auto renderedMainBus = pluginInstance->getBusBuffer(buffer, false, 0);
+            if (renderedMainBus.getNumChannels() > 0)
+            {
+                const auto leftChannel = 0;
+                const auto rightChannel = renderedMainBus.getNumChannels() > 1 ? 1 : 0;
+                for (int sample = 0; sample < numSamples; ++sample)
+                {
+                    mainBusBuffer.setSample(0, sample, renderedMainBus.getSample(leftChannel, sample));
+                    mainBusBuffer.setSample(1, sample, renderedMainBus.getSample(rightChannel, sample));
+                }
+            }
         }
 
-        setResponseField(response, "audio_b64", juce::Base64::toBase64(stream.getData(), stream.getDataSize()));
+        setResponseField(response, "audio_b64", encodeInterleavedBusAudio(mainBusBuffer));
         setResponseField(response, "channels", 2);
         setResponseField(response, "format", "f32le-interleaved");
+        setResponseField(response, "output_buses", describeRenderedOutputBuses(buffer));
         return response;
     }
 
@@ -1284,6 +1629,7 @@ private:
     std::unique_ptr<juce::FileChooser> fileChooser;
     std::unique_ptr<HostCommandServer> commandServer;
     bool bridgeMode = false;
+    bool audioInitialised = false;
     juce::File managedStateFile;
 
     double currentSampleRate = 44100.0;

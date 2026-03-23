@@ -953,6 +953,8 @@ class TrackState:
     vsti_state_path: str = ""
     vsti_output_gain_db: float = 0.0
     vsti_wet_mix: float = 100.0
+    vsti_output_bus_routes: list[dict[str, object]] = dataclasses.field(default_factory=list)
+    vsti_input_bus_routes: list[dict[str, object]] = dataclasses.field(default_factory=list)
     vst_fx_chain: list[str] = dataclasses.field(default_factory=list)
     midi_program: int = 0
     midi_channel: int = 0
@@ -4663,6 +4665,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.vsti_binary_loader = VSTBinaryLoader()
         self.vsti_plugin_metadata: dict[str, list[str]] = {}
         self.vsti_description_cache: dict[str, tuple[str, bool, bool, str, bool, str]] = {}
+        self.vsti_bus_metadata: dict[str, dict[str, list[dict[str, object]]]] = {}
         self._vsti_worker_pool = QtCore.QThreadPool(self)
         self._vsti_worker_pool.setMaxThreadCount(2)
         self._vsti_background_loads_inflight: set[str] = set()
@@ -5598,6 +5601,8 @@ class MainWindow(QtWidgets.QMainWindow):
             track.vsti_state_path = str(raw_track.get('vsti_state_path') or '')
             track.vsti_output_gain_db = self._coerce_float(raw_track.get('vsti_output_gain_db'), 0.0, -48.0, 24.0)
             track.vsti_wet_mix = self._coerce_float(raw_track.get('vsti_wet_mix'), 100.0, 0.0, 100.0)
+            track.vsti_output_bus_routes = self._sanitize_vsti_output_bus_routes(raw_track.get('vsti_output_bus_routes'))
+            track.vsti_input_bus_routes = self._sanitize_vsti_input_bus_routes(raw_track.get('vsti_input_bus_routes'))
             track.vst_fx_chain = [str(item) for item in raw_track.get('vst_fx_chain', []) if isinstance(item, str)]
             track.midi_program = self._coerce_int(raw_track.get('midi_program'), 0, 0, 127)
             track.midi_channel = self._coerce_int(raw_track.get('midi_channel'), index % 16, 0, 15)
@@ -6254,6 +6259,24 @@ class MainWindow(QtWidgets.QMainWindow):
             int(track.midi_channel),
             str(effective_state_path) if effective_state_path else '',
             self._path_mtime_ns(effective_state_path) if effective_state_path else 0,
+            tuple(
+                (
+                    int(route.get('bus_index', 0)),
+                    bool(route.get('enabled', False)),
+                    round(float(route.get('gain_db', 0.0)), 6),
+                    round(float(route.get('pan', 0.0)), 6),
+                )
+                for route in self._sanitize_vsti_output_bus_routes(track.vsti_output_bus_routes)
+            ),
+            tuple(
+                (
+                    int(route.get('bus_index', 0)),
+                    bool(route.get('enabled', False)),
+                    int(route.get('source_track_index', -1)),
+                    round(float(route.get('gain_db', 0.0)), 6),
+                )
+                for route in self._sanitize_vsti_input_bus_routes(track.vsti_input_bus_routes)
+            ),
             tuple(str(name) for name in track.vst_fx_chain),
             tuple(self._rack_vsti_path(name) for name in track.vst_fx_chain),
         )
@@ -6328,6 +6351,259 @@ class MainWindow(QtWidgets.QMainWindow):
                 return False
             _APP_LOGGER.exception("Failed loading native VST host state path=%s", state_path)
             return False
+
+    def _native_vst_host_bus_payload(self, track: TrackState | None, entry: VSTInstrument | None) -> dict[str, object]:
+        if track is None or entry is None:
+            return {'input_buses': [], 'output_buses': []}
+
+        output_buses = [
+            {
+                'bus_index': int(route.get('bus_index', 0)),
+                'enabled': bool(route.get('enabled', False)),
+                'channels': max(1, int(route.get('channels', 2) or 2)),
+            }
+            for route in self._effective_vsti_output_bus_routes(track, entry)
+        ]
+        input_buses = [
+            {
+                'bus_index': int(route.get('bus_index', 0)),
+                'enabled': bool(route.get('enabled', False)) and int(route.get('source_track_index', -1)) >= 0,
+                'channels': max(1, int(route.get('channels', 2) or 2)),
+            }
+            for route in self._effective_vsti_input_bus_routes(track, entry)
+        ]
+        return {'input_buses': input_buses, 'output_buses': output_buses}
+
+    @staticmethod
+    def _native_vst_host_bus_payload_signature(payload: dict[str, object]) -> tuple[object, ...]:
+        def _shape(direction: str) -> tuple[tuple[int, bool, int], ...]:
+            buses = payload.get(direction, [])
+            if not isinstance(buses, list):
+                return ()
+            shaped: list[tuple[int, bool, int]] = []
+            for bus in buses:
+                if not isinstance(bus, dict):
+                    continue
+                shaped.append(
+                    (
+                        int(bus.get('bus_index', 0)),
+                        bool(bus.get('enabled', False)),
+                        int(bus.get('channels', 0) or 0),
+                    )
+                )
+            return tuple(sorted(shaped))
+
+        return (_shape('input_buses'), _shape('output_buses'))
+
+    def _configure_native_vst_host_bridge_buses(
+        self,
+        bridge: object,
+        track: TrackState | None,
+        entry: VSTInstrument | None,
+    ) -> tuple[bool, dict[str, object]]:
+        if bridge is None or track is None or entry is None:
+            return False, {}
+
+        payload = self._native_vst_host_bus_payload(track, entry)
+        signature = self._native_vst_host_bus_payload_signature(payload)
+        existing_signature = getattr(bridge, '_aims_bus_routing_signature', None)
+        status: dict[str, object] = {}
+        try:
+            if existing_signature != signature:
+                bridge.command('configure_buses', **payload)
+            status = bridge.command('status')
+            if isinstance(status, dict):
+                self._store_native_vst_bus_metadata(entry.path, status)
+            setattr(bridge, '_aims_bus_routing_signature', signature)
+            return True, status if isinstance(status, dict) else {}
+        except Exception:
+            _APP_LOGGER.exception("Failed configuring native VST host buses path=%s", entry.path)
+            return False, {}
+
+    def _encode_native_vst_bus_audio(self, data: object, frame_count: int, channels: int) -> str:
+        frames = max(1, int(frame_count))
+        channel_count = max(1, int(channels))
+        if np is not None:
+            if channel_count <= 1:
+                shaped = np.asarray(self._ensure_mono_sample_count(data, frames), dtype=np.float32).reshape(1, frames)
+            elif channel_count == 2:
+                shaped = np.asarray(self._ensure_stereo_sample_count(data, frames), dtype=np.float32).reshape(2, frames)
+            else:
+                mono = np.asarray(self._ensure_mono_sample_count(data, frames), dtype=np.float32).reshape(1, frames)
+                shaped = np.repeat(mono, channel_count, axis=0)
+            interleaved = np.asarray(shaped.T.reshape(-1), dtype=np.float32)
+            return base64.b64encode(interleaved.tobytes()).decode('ascii')
+
+        if channel_count <= 1:
+            mono = list(self._ensure_mono_sample_count(data, frames))
+            values = mono
+        else:
+            stereo = self._ensure_stereo_sample_count(data, frames)
+            values = []
+            for frame in range(frames):
+                left = float(stereo[0][frame])
+                right = float(stereo[1][frame])
+                for channel in range(channel_count):
+                    values.append(left if channel == 0 else right if channel == 1 else left)
+        raw = bytearray()
+        for value in values:
+            raw.extend(struct.pack('<f', float(value)))
+        return base64.b64encode(bytes(raw)).decode('ascii')
+
+    def _decode_native_vst_bus_audio(self, raw_bus: dict[str, object], frame_count: int) -> object:
+        channels = max(1, int(raw_bus.get('channels', 0) or 1))
+        audio_b64 = str(raw_bus.get('audio_b64') or '')
+        if not audio_b64:
+            return np.zeros((channels, max(1, int(frame_count))), dtype=np.float32) if np is not None else [[0.0] * max(1, int(frame_count)) for _ in range(channels)]
+
+        raw = base64.b64decode(audio_b64.encode('ascii'))
+        expected_frames = max(1, int(frame_count))
+        if np is not None:
+            audio = np.frombuffer(raw, dtype=np.float32)
+            if channels <= 0:
+                channels = 1
+            if audio.size == 0:
+                return np.zeros((channels, expected_frames), dtype=np.float32)
+            actual_frames = max(0, int(audio.size // channels))
+            audio = audio[:actual_frames * channels]
+            if actual_frames <= 0:
+                return np.zeros((channels, expected_frames), dtype=np.float32)
+            shaped = audio.reshape(actual_frames, channels).T.astype(np.float32, copy=False)
+            if shaped.shape[1] == expected_frames:
+                return shaped
+            if shaped.shape[1] > expected_frames:
+                return shaped[:, :expected_frames].astype(np.float32, copy=False)
+            padded = np.zeros((channels, expected_frames), dtype=np.float32)
+            padded[:, :shaped.shape[1]] = shaped
+            return padded
+
+        floats = [item[0] for item in struct.iter_unpack('<f', raw)]
+        frames: list[list[float]] = [[0.0] * expected_frames for _ in range(channels)]
+        actual_frames = min(expected_frames, len(floats) // channels)
+        for frame in range(actual_frames):
+            for channel in range(channels):
+                frames[channel][frame] = float(floats[(frame * channels) + channel])
+        return frames
+
+    def _native_vst_source_track_audio_slice(
+        self,
+        source_track_index: int,
+        start_frame: int,
+        frame_count: int,
+        sample_rate: int,
+        *,
+        realtime: bool,
+    ) -> object:
+        if source_track_index < 0 or source_track_index >= len(self.project.tracks):
+            if np is not None:
+                return np.zeros((2, max(1, int(frame_count))), dtype=np.float32)
+            return [[0.0] * max(1, int(frame_count)), [0.0] * max(1, int(frame_count))]
+        source_track = self.project.tracks[int(source_track_index)]
+        if realtime:
+            source_audio = self._get_realtime_cached_track_audio(int(source_track_index), source_track, sample_rate)
+        else:
+            source_audio, source_sample_rate = self._get_track_playback_audio(int(source_track_index), source_track)
+            if int(source_sample_rate) != int(sample_rate):
+                source_audio = resample_samples(source_audio, source_sample_rate, sample_rate)
+        return self._slice_stereo_audio(source_audio, start_frame, frame_count)
+
+    def _native_vst_input_bus_payload(
+        self,
+        track: TrackState,
+        entry: VSTInstrument,
+        start_frame: int,
+        frame_count: int,
+        sample_rate: int,
+        *,
+        realtime: bool,
+    ) -> list[dict[str, object]]:
+        payload: list[dict[str, object]] = []
+        track_index = self._track_index_for_object(track)
+        for route in self._effective_vsti_input_bus_routes(track, entry):
+            source_track_index = int(route.get('source_track_index', -1))
+            if not bool(route.get('enabled', False)) or source_track_index < 0 or source_track_index == track_index:
+                continue
+            source_audio = self._native_vst_source_track_audio_slice(
+                source_track_index,
+                start_frame,
+                frame_count,
+                sample_rate,
+                realtime=realtime,
+            )
+            gain_linear = 10.0 ** (float(route.get('gain_db', 0.0)) / 20.0)
+            if np is not None:
+                source_audio = np.asarray(source_audio, dtype=np.float32) * gain_linear
+            else:
+                source_audio = [float(value) * gain_linear for value in source_audio]
+            payload.append(
+                {
+                    'bus_index': int(route.get('bus_index', 0)),
+                    'channels': max(1, int(route.get('channels', 2) or 2)),
+                    'audio_b64': self._encode_native_vst_bus_audio(
+                        source_audio,
+                        frame_count,
+                        max(1, int(route.get('channels', 2) or 2)),
+                    ),
+                }
+            )
+        return payload
+
+    def _mix_native_vst_render_response(
+        self,
+        track: TrackState,
+        entry: VSTInstrument,
+        response: dict[str, object],
+        frame_count: int,
+        *,
+        return_mono: bool,
+    ) -> object:
+        route_by_bus = {
+            int(route.get('bus_index', 0)): route
+            for route in self._effective_vsti_output_bus_routes(track, entry)
+        }
+        raw_buses = response.get('output_buses')
+        if not isinstance(raw_buses, list) or not raw_buses:
+            raw_buses = [
+                {
+                    'bus_index': 0,
+                    'channels': int(response.get('channels', 2) or 2),
+                    'audio_b64': response.get('audio_b64', ''),
+                }
+            ]
+
+        if np is not None:
+            stereo_mix: object = np.zeros((2, max(1, int(frame_count))), dtype=np.float32)
+        else:
+            stereo_mix = [[0.0] * max(1, int(frame_count)), [0.0] * max(1, int(frame_count))]
+
+        for raw_bus in raw_buses:
+            if not isinstance(raw_bus, dict):
+                continue
+            route = route_by_bus.get(int(raw_bus.get('bus_index', 0)))
+            if route is None or not bool(route.get('enabled', False)):
+                continue
+            decoded = self._decode_native_vst_bus_audio(raw_bus, frame_count)
+            stereo = self._ensure_stereo_sample_count(decoded, frame_count)
+            gain_linear = 10.0 ** (float(route.get('gain_db', 0.0)) / 20.0)
+            left_gain, right_gain = self._pan_gains(float(route.get('pan', 0.0)))
+            if np is not None and isinstance(stereo, np.ndarray):
+                bus_audio = np.asarray(stereo, dtype=np.float32).copy()
+                bus_audio[0] *= gain_linear * left_gain
+                bus_audio[1] *= gain_linear * right_gain
+                stereo_mix += bus_audio
+            else:
+                for pos in range(max(1, int(frame_count))):
+                    stereo_mix[0][pos] += float(stereo[0][pos]) * gain_linear * left_gain
+                    stereo_mix[1][pos] += float(stereo[1][pos]) * gain_linear * right_gain
+
+        overall_gain = max(0.0, float(track.volume)) * (10.0 ** (float(track.vsti_output_gain_db) / 20.0))
+        if np is not None and isinstance(stereo_mix, np.ndarray):
+            stereo_mix = np.asarray(stereo_mix, dtype=np.float32) * overall_gain
+            return self._as_mono_audio(stereo_mix) if return_mono else stereo_mix
+        stereo_mix = [[float(value) * overall_gain for value in channel] for channel in stereo_mix]
+        if return_mono:
+            return self._as_mono_audio(stereo_mix)
+        return stereo_mix
 
     def _live_midi_track_info(self, row: int | None = None) -> tuple[int, TrackState, VSTInstrument] | None:
         idx = self.current_track_index() if row is None else int(row)
@@ -6607,15 +6883,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
 
     def _native_vst_host_scheduling_lead_frames(self) -> int:
-        host_buffer = max(1, int(self._native_vst_host_target_buffer_size()))
-        queued_output = max(
-            int(self._estimated_queued_output_frames()),
-            int(self._desired_audio_buffer_frames()),
-        )
-        # Align native-host playback to the same audible queue the Qt sink is
-        # currently carrying, while keeping the host's own callback block as the
-        # minimum scheduling floor.
-        return max(host_buffer, queued_output)
+        return 0
 
     def _schedule_native_vst_track_chunk(
         self,
@@ -7753,14 +8021,25 @@ class MainWindow(QtWidgets.QMainWindow):
         if rendered_sample_rate != sample_rate:
             data = resample_samples(data, rendered_sample_rate, sample_rate)
             rendered_sample_rate = sample_rate
-        if np is not None:
-            cached_audio: object = np.asarray(self._as_mono_audio(data), dtype=np.float32).copy()
+        if np is not None and isinstance(data, np.ndarray):
+            sample_count = int(data.shape[-1]) if data.ndim >= 2 else int(data.shape[0])
+            cached_audio = np.asarray(
+                self._ensure_stereo_sample_count(data, max(1, sample_count)),
+                dtype=np.float32,
+            ).copy()
         else:
             try:
-                mono_source = self._as_mono_audio(data)
-                cached_audio = [float(value) for value in mono_source]
+                if isinstance(data, (list, tuple)) and data and isinstance(data[0], (list, tuple)):
+                    sample_count = max((len(channel) for channel in data if isinstance(channel, (list, tuple))), default=1)
+                else:
+                    sample_count = len(data)
+                stereo_source = self._ensure_stereo_sample_count(data, max(1, int(sample_count)))
+                cached_audio = [
+                    [float(value) for value in stereo_source[0]],
+                    [float(value) for value in stereo_source[1]],
+                ]
             except Exception:
-                cached_audio = [0.0]
+                cached_audio = [[0.0], [0.0]]
         state.cached_audio = cached_audio
         state.cached_audio_sample_rate = int(rendered_sample_rate)
         state.cached_audio_key = state.key
@@ -7813,7 +8092,7 @@ class MainWindow(QtWidgets.QMainWindow):
             audio = np.asarray(plugin(audio, sample_rate, buffer_size=max(64, audio.shape[-1]), reset=reset_flag), dtype=np.float32)
             if audio.ndim == 1:
                 audio = audio[None, :]
-        return self._as_mono_audio(audio)
+        return np.asarray(audio, dtype=np.float32)
 
     def _render_sample_track_chunk(self, idx: int, track: TrackState, start_frame: int, frame_count: int) -> tuple[object, int]:
         total_samples = max(1, int(frame_count))
@@ -7864,9 +8143,54 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if track.instrument_mode == 'VSTI Rack' and entry is not None and entry.is_instrument and entry.host_supported:
             if self._can_use_native_vst_host(entry):
-                if np is not None:
-                    return np.zeros(max(1, int(frame_count)), dtype=np.float32), sample_rate
-                return [0.0] * max(1, int(frame_count)), sample_rate
+                if not self._open_native_vst_host_for_track(idx, entry, open_editor=False, show_error=False):
+                    if np is not None:
+                        return np.zeros(max(1, int(frame_count)), dtype=np.float32), sample_rate
+                    return [0.0] * max(1, int(frame_count)), sample_rate
+                bridge = self._track_native_vst_host_bridges.get(int(idx))
+                if bridge is None:
+                    if np is not None:
+                        return np.zeros(max(1, int(frame_count)), dtype=np.float32), sample_rate
+                    return [0.0] * max(1, int(frame_count)), sample_rate
+                try:
+                    if not self._schedule_native_vst_track_chunk(
+                        idx,
+                        track,
+                        entry,
+                        start_frame,
+                        frame_count,
+                        state,
+                        output_offset_frames=0,
+                    ):
+                        raise RuntimeError('Could not schedule native VST MIDI block')
+                    input_buses = self._native_vst_input_bus_payload(
+                        track,
+                        entry,
+                        start_frame,
+                        frame_count,
+                        sample_rate,
+                        realtime=True,
+                    )
+                    response = bridge.command('render_audio', frames=max(1, int(frame_count)), input_buses=input_buses)
+                    rendered = self._mix_native_vst_render_response(
+                        track,
+                        entry,
+                        response,
+                        max(1, int(frame_count)),
+                        return_mono=False,
+                    )
+                    rendered = self._apply_realtime_vst_fx_chain(idx, track, rendered, sample_rate, state)
+                    state.last_error = ""
+                    state.instrument_reset_pending = False
+                    state.fx_reset_pending = False
+                    return rendered, sample_rate
+                except Exception as exc:
+                    state.last_error = str(exc)
+                    _APP_LOGGER.exception("Realtime native VST render failed track_index=%s rack=%s", idx, track.rack_vsti)
+                    self._stop_native_vst_host_bridge(idx)
+                    if np is not None:
+                        return np.zeros(max(1, int(frame_count)), dtype=np.float32), sample_rate
+                    return [0.0] * max(1, int(frame_count)), sample_rate
 
         data, sample_rate = self.renderer.render_track_chunk(track, self.project.bpm, start_sec, duration_sec)
         data = self._apply_realtime_vst_fx_chain(idx, track, data, sample_rate, state)
@@ -7881,6 +8205,12 @@ class MainWindow(QtWidgets.QMainWindow):
             data, _sample_rate = self._render_sample_track_chunk(idx, track, start_frame, expected_samples)
         else:
             data, _sample_rate = self._render_instrument_track_chunk(idx, track, start_frame, expected_samples)
+        if np is not None and isinstance(data, np.ndarray) and data.ndim == 2:
+            stereo = self._ensure_stereo_sample_count(data, expected_samples)
+            return self._apply_track_pan_stereo(stereo, track.pan)
+        if isinstance(data, (list, tuple)) and data and isinstance(data[0], (list, tuple)):
+            stereo = self._ensure_stereo_sample_count(data, expected_samples)
+            return self._apply_track_pan_stereo(stereo, track.pan)
         mono = self._ensure_mono_sample_count(data, expected_samples)
         stereo = self._apply_track_pan(mono, track.pan)
         return self._ensure_stereo_sample_count(stereo, expected_samples)
@@ -8063,7 +8393,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._loop_declick_pending_frames = 0
             if self._realtime_reset_pending:
                 self._reset_realtime_track_states()
-            self._schedule_realtime_native_vst_segment(self._playback_frame_position, frame_count, output_offset_frames=0)
             segment = self._render_realtime_segment_cached(self._playback_frame_position, frame_count)
             if np is not None and isinstance(mix, np.ndarray) and isinstance(segment, np.ndarray):
                 mix[:, :frame_count] = segment
@@ -8090,11 +8419,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 segment_frames = min(remaining, max(1, loop_end_frame - self._playback_frame_position))
                 if self._realtime_reset_pending:
                     self._reset_realtime_track_states()
-                self._schedule_realtime_native_vst_segment(
-                    self._playback_frame_position,
-                    segment_frames,
-                    output_offset_frames=offset,
-                )
                 segment = self._render_realtime_segment_cached(
                     self._playback_frame_position,
                     segment_frames,
@@ -8597,15 +8921,8 @@ class MainWindow(QtWidgets.QMainWindow):
         normalized_path = self._normalized_vsti_path(plugin_path)
         if not NATIVE_VST_HOST_AVAILABLE or NativeVstHostBridge is None:
             return Path(normalized_path).stem, False, "Native VST host is unavailable."
-        bridge = NativeVstHostBridge(
-            plugin_path=normalized_path,
-            open_editor=False,
-            sample_rate=self._native_vst_host_target_sample_rate(),
-            buffer_size=max(64, int(self._native_vst_host_target_buffer_size())),
-        )
         try:
-            bridge.start(startup_timeout=8.0)
-            status = bridge.command('status')
+            status = self._probe_native_vst_host_status(normalized_path) or {}
             plugin_name = str(status.get('plugin_name') or Path(normalized_path).stem)
             loaded = bool(status.get('plugin_loaded', False))
             message = 'Plugin loaded in native host' if loaded else 'Plugin failed to load in native host'
@@ -8613,11 +8930,6 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as exc:
             _APP_LOGGER.exception("Native VST probe failed path=%s", normalized_path)
             return Path(normalized_path).stem, False, str(exc)
-        finally:
-            try:
-                bridge.stop()
-            except Exception:
-                pass
 
     def _describe_plugin_path(self, plugin_path: str) -> tuple[str, bool, bool, str, bool, str]:
         normalized_path = self._normalized_vsti_path(plugin_path)
@@ -8860,6 +9172,190 @@ class MainWindow(QtWidgets.QMainWindow):
             self.vsti_plugin_metadata[normalized_path] = names
         except Exception:
             self.vsti_plugin_metadata[normalized_path] = []
+
+    @staticmethod
+    def _coerce_native_vst_bus_list(raw_buses: object) -> list[dict[str, object]]:
+        buses: list[dict[str, object]] = []
+        if not isinstance(raw_buses, list):
+            return buses
+        for raw_bus in raw_buses:
+            if not isinstance(raw_bus, dict):
+                continue
+            try:
+                bus_index = max(0, int(raw_bus.get('bus_index', 0)))
+            except Exception:
+                continue
+            buses.append(
+                {
+                    'bus_index': bus_index,
+                    'name': str(raw_bus.get('name') or f'Bus {bus_index + 1}'),
+                    'direction': str(raw_bus.get('direction') or ''),
+                    'is_main': bool(raw_bus.get('is_main', False)),
+                    'enabled': bool(raw_bus.get('enabled', False)),
+                    'enabled_by_default': bool(raw_bus.get('enabled_by_default', False)),
+                    'channel_count': max(0, int(raw_bus.get('channel_count', 0) or 0)),
+                    'default_channel_count': max(0, int(raw_bus.get('default_channel_count', 0) or 0)),
+                    'last_enabled_channel_count': max(0, int(raw_bus.get('last_enabled_channel_count', 0) or 0)),
+                    'max_supported_channels': int(raw_bus.get('max_supported_channels', 0) or 0),
+                    'layout': str(raw_bus.get('layout') or ''),
+                }
+            )
+        buses.sort(key=lambda item: int(item.get('bus_index', 0)))
+        return buses
+
+    def _store_native_vst_bus_metadata(self, plugin_path: str, status: dict[str, object] | None) -> None:
+        if not status:
+            return
+        normalized = self._normalized_vsti_path(plugin_path)
+        self.vsti_bus_metadata[normalized] = {
+            'input_buses': self._coerce_native_vst_bus_list(status.get('input_buses')),
+            'output_buses': self._coerce_native_vst_bus_list(status.get('output_buses')),
+        }
+
+    def _probe_native_vst_host_status(self, plugin_path: str) -> dict[str, object] | None:
+        normalized_path = self._normalized_vsti_path(plugin_path)
+        if not NATIVE_VST_HOST_AVAILABLE or NativeVstHostBridge is None:
+            return None
+        bridge = NativeVstHostBridge(
+            plugin_path=normalized_path,
+            open_editor=False,
+            sample_rate=self._native_vst_host_target_sample_rate(),
+            buffer_size=max(64, int(self._native_vst_host_target_buffer_size())),
+        )
+        try:
+            bridge.start(startup_timeout=8.0)
+            status = bridge.command('status')
+            if isinstance(status, dict):
+                self._store_native_vst_bus_metadata(normalized_path, status)
+                return status
+        except Exception:
+            _APP_LOGGER.exception("Native VST status probe failed path=%s", normalized_path)
+        finally:
+            try:
+                bridge.stop()
+            except Exception:
+                pass
+        return None
+
+    def _native_vst_bus_metadata_for_path(self, plugin_path: str, *, refresh: bool = False) -> dict[str, list[dict[str, object]]]:
+        normalized = self._normalized_vsti_path(plugin_path)
+        cached = self.vsti_bus_metadata.get(normalized)
+        if cached is not None and not refresh:
+            return cached
+        status = self._probe_native_vst_host_status(normalized)
+        if isinstance(status, dict):
+            return self.vsti_bus_metadata.get(normalized, {'input_buses': [], 'output_buses': []})
+        return cached or {'input_buses': [], 'output_buses': []}
+
+    def _sanitize_vsti_output_bus_routes(self, routes: object) -> list[dict[str, object]]:
+        deduped: dict[int, dict[str, object]] = {}
+        if isinstance(routes, list):
+            for raw_route in routes:
+                if not isinstance(raw_route, dict):
+                    continue
+                bus_index = self._coerce_int(raw_route.get('bus_index'), -1, -1)
+                if bus_index < 0:
+                    continue
+                deduped[bus_index] = {
+                    'bus_index': int(bus_index),
+                    'enabled': bool(raw_route.get('enabled', True)),
+                    'gain_db': self._coerce_float(raw_route.get('gain_db'), 0.0, -48.0, 24.0),
+                    'pan': self._coerce_float(raw_route.get('pan'), 0.0, -1.0, 1.0),
+                }
+        return [deduped[index] for index in sorted(deduped)]
+
+    def _sanitize_vsti_input_bus_routes(self, routes: object) -> list[dict[str, object]]:
+        deduped: dict[int, dict[str, object]] = {}
+        if isinstance(routes, list):
+            for raw_route in routes:
+                if not isinstance(raw_route, dict):
+                    continue
+                bus_index = self._coerce_int(raw_route.get('bus_index'), -1, -1)
+                if bus_index < 0:
+                    continue
+                source_track_index = self._coerce_int(raw_route.get('source_track_index'), -1, -1)
+                deduped[bus_index] = {
+                    'bus_index': int(bus_index),
+                    'enabled': bool(raw_route.get('enabled', source_track_index >= 0)),
+                    'source_track_index': int(source_track_index),
+                    'gain_db': self._coerce_float(raw_route.get('gain_db'), 0.0, -48.0, 24.0),
+                }
+        return [deduped[index] for index in sorted(deduped)]
+
+    def _effective_vsti_output_bus_routes(self, track: TrackState, entry: VSTInstrument | None) -> list[dict[str, object]]:
+        metadata = self._native_vst_bus_metadata_for_path(entry.path) if entry is not None else {'output_buses': []}
+        saved_routes = {int(route['bus_index']): dict(route) for route in self._sanitize_vsti_output_bus_routes(track.vsti_output_bus_routes)}
+        effective: list[dict[str, object]] = []
+        for bus in metadata.get('output_buses', []):
+            bus_index = int(bus.get('bus_index', 0))
+            route = dict(saved_routes.pop(bus_index, {}))
+            route['bus_index'] = bus_index
+            route['name'] = str(bus.get('name') or f'Output {bus_index + 1}')
+            route['is_main'] = bool(bus.get('is_main', False))
+            route['channels'] = max(
+                1,
+                int(bus.get('channel_count', 0) or 0)
+                or int(bus.get('default_channel_count', 0) or 0)
+                or 2,
+            )
+            route['enabled'] = bool(route.get('enabled', route['is_main']))
+            route['gain_db'] = self._coerce_float(route.get('gain_db'), 0.0, -48.0, 24.0)
+            route['pan'] = self._coerce_float(route.get('pan'), 0.0, -1.0, 1.0)
+            effective.append(route)
+        for route in saved_routes.values():
+            effective.append(
+                {
+                    'bus_index': int(route.get('bus_index', 0)),
+                    'name': f"Output {int(route.get('bus_index', 0)) + 1}",
+                    'is_main': bool(int(route.get('bus_index', 0)) == 0),
+                    'channels': 2,
+                    'enabled': bool(route.get('enabled', int(route.get('bus_index', 0)) == 0)),
+                    'gain_db': self._coerce_float(route.get('gain_db'), 0.0, -48.0, 24.0),
+                    'pan': self._coerce_float(route.get('pan'), 0.0, -1.0, 1.0),
+                }
+            )
+        effective.sort(key=lambda item: int(item.get('bus_index', 0)))
+        return effective
+
+    def _effective_vsti_input_bus_routes(self, track: TrackState, entry: VSTInstrument | None) -> list[dict[str, object]]:
+        metadata = self._native_vst_bus_metadata_for_path(entry.path) if entry is not None else {'input_buses': []}
+        saved_routes = {int(route['bus_index']): dict(route) for route in self._sanitize_vsti_input_bus_routes(track.vsti_input_bus_routes)}
+        effective: list[dict[str, object]] = []
+        for bus in metadata.get('input_buses', []):
+            bus_index = int(bus.get('bus_index', 0))
+            route = dict(saved_routes.pop(bus_index, {}))
+            source_track_index = self._coerce_int(route.get('source_track_index'), -1, -1)
+            enabled = bool(route.get('enabled', source_track_index >= 0 and not bool(bus.get('is_main', False))))
+            effective.append(
+                {
+                    'bus_index': bus_index,
+                    'name': str(bus.get('name') or f'Input {bus_index + 1}'),
+                    'is_main': bool(bus.get('is_main', False)),
+                    'channels': max(
+                        1,
+                        int(bus.get('channel_count', 0) or 0)
+                        or int(bus.get('default_channel_count', 0) or 0)
+                        or 2,
+                    ),
+                    'enabled': enabled,
+                    'source_track_index': source_track_index,
+                    'gain_db': self._coerce_float(route.get('gain_db'), 0.0, -48.0, 24.0),
+                }
+            )
+        for route in saved_routes.values():
+            effective.append(
+                {
+                    'bus_index': int(route.get('bus_index', 0)),
+                    'name': f"Input {int(route.get('bus_index', 0)) + 1}",
+                    'is_main': bool(int(route.get('bus_index', 0)) == 0),
+                    'channels': 2,
+                    'enabled': bool(route.get('enabled', False)),
+                    'source_track_index': self._coerce_int(route.get('source_track_index'), -1, -1),
+                    'gain_db': self._coerce_float(route.get('gain_db'), 0.0, -48.0, 24.0),
+                }
+            )
+        effective.sort(key=lambda item: int(item.get('bus_index', 0)))
+        return effective
 
     def _load_rack_plugin(self, rack_name: str):
         if not PEDALBOARD_AVAILABLE or not load_plugin:
@@ -10131,6 +10627,24 @@ class MainWindow(QtWidgets.QMainWindow):
             'native_vst_host_buffer_size': self._native_vst_host_target_buffer_size() if instrument_entry is not None and self._can_use_native_vst_host(instrument_entry) else 0,
             'vsti_output_gain_db': round(float(track.vsti_output_gain_db), 6),
             'vsti_wet_mix': round(float(track.vsti_wet_mix), 6),
+            'vsti_output_bus_routes': [
+                (
+                    int(route.get('bus_index', 0)),
+                    bool(route.get('enabled', False)),
+                    round(float(route.get('gain_db', 0.0)), 6),
+                    round(float(route.get('pan', 0.0)), 6),
+                )
+                for route in self._sanitize_vsti_output_bus_routes(track.vsti_output_bus_routes)
+            ],
+            'vsti_input_bus_routes': [
+                (
+                    int(route.get('bus_index', 0)),
+                    bool(route.get('enabled', False)),
+                    int(route.get('source_track_index', -1)),
+                    round(float(route.get('gain_db', 0.0)), 6),
+                )
+                for route in self._sanitize_vsti_input_bus_routes(track.vsti_input_bus_routes)
+            ],
             'vst_fx_chain': list(track.vst_fx_chain),
             'vst_fx_paths': [self._rack_vsti_path(name) for name in track.vst_fx_chain],
             'notes': [(note.start_tick, note.duration_tick, note.pitch, note.velocity) for note in track.notes],
@@ -10161,6 +10675,24 @@ class MainWindow(QtWidgets.QMainWindow):
             self._path_mtime_ns(effective_state_path) if effective_state_path else 0,
             round(float(track.vsti_output_gain_db), 6),
             round(float(track.vsti_wet_mix), 6),
+            tuple(
+                (
+                    int(route.get('bus_index', 0)),
+                    bool(route.get('enabled', False)),
+                    round(float(route.get('gain_db', 0.0)), 6),
+                    round(float(route.get('pan', 0.0)), 6),
+                )
+                for route in self._sanitize_vsti_output_bus_routes(track.vsti_output_bus_routes)
+            ),
+            tuple(
+                (
+                    int(route.get('bus_index', 0)),
+                    bool(route.get('enabled', False)),
+                    int(route.get('source_track_index', -1)),
+                    round(float(route.get('gain_db', 0.0)), 6),
+                )
+                for route in self._sanitize_vsti_input_bus_routes(track.vsti_input_bus_routes)
+            ),
             tuple(str(name) for name in track.vst_fx_chain),
             tuple(self._rack_vsti_path(name) for name in track.vst_fx_chain),
         )
@@ -10230,12 +10762,14 @@ class MainWindow(QtWidgets.QMainWindow):
         desired_sample_rate = self._native_vst_host_target_sample_rate()
         desired_buffer_size = self._native_vst_host_target_buffer_size()
         desired_state_path, desired_state_mtime_ns = self._native_vst_host_state_signature(track, entry)
+        desired_bus_signature = self._native_vst_host_bus_payload_signature(self._native_vst_host_bus_payload(track, entry))
         existing = self._track_native_vst_host_bridges.get(row)
         existing_path = str(getattr(existing, 'plugin_path', '') or '')
         existing_sample_rate = int(getattr(existing, 'sample_rate', 0) or 0)
         existing_buffer_size = int(getattr(existing, 'buffer_size', 0) or 0)
         existing_state_path = str(getattr(existing, '_aims_loaded_state_path', '') or '')
         existing_state_mtime_ns = int(getattr(existing, '_aims_loaded_state_mtime_ns', 0) or 0)
+        existing_bus_signature = getattr(existing, '_aims_bus_routing_signature', None)
         if existing is not None and self._native_vst_host_bridge_alive(row):
             try:
                 if self._normalized_vsti_path(existing_path) != self._normalized_vsti_path(entry.path):
@@ -10247,11 +10781,25 @@ class MainWindow(QtWidgets.QMainWindow):
                 elif existing_state_path != desired_state_path or existing_state_mtime_ns != desired_state_mtime_ns:
                     self._stop_native_vst_host_bridge(row)
                     existing = None
+                elif existing_bus_signature != desired_bus_signature:
+                    ok, _status = self._configure_native_vst_host_bridge_buses(existing, track, entry)
+                    if not ok:
+                        self._stop_native_vst_host_bridge(row)
+                        existing = None
+                    elif open_editor:
+                        existing.command('open_editor')
+                        return True
+                    else:
+                        return True
                 elif open_editor:
-                    existing.command('open_editor')
+                    status = existing.command('open_editor')
+                    if isinstance(status, dict):
+                        self._store_native_vst_bus_metadata(entry.path, status)
                     return True
                 else:
-                    existing.command('status')
+                    status = existing.command('status')
+                    if isinstance(status, dict):
+                        self._store_native_vst_bus_metadata(entry.path, status)
                     return True
             except Exception:
                 _APP_LOGGER.exception(
@@ -10270,9 +10818,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
                 bridge.start()
                 self._prime_native_vst_host_bridge_state(bridge, track, entry)
+                ok, status = self._configure_native_vst_host_bridge_buses(bridge, track, entry)
+                if not ok:
+                    raise RuntimeError('Could not configure plugin bus layout')
                 self._track_native_vst_host_bridges[row] = bridge
                 self._native_vst_host_retry_after.pop(row, None)
+                if isinstance(status, dict):
+                    self._store_native_vst_bus_metadata(entry.path, status)
                 self.statusBar().showMessage(f'Opened native VST host: {entry.name}')
+                if open_editor:
+                    bridge.command('open_editor')
                 return True
             except Exception as exc:
                 _APP_LOGGER.exception(
@@ -10346,29 +10901,28 @@ class MainWindow(QtWidgets.QMainWindow):
         chunk_frames = int(clamp(max(256, min(buffer_size, 2048)), 256, 2048))
         rendered_chunks: list[object] = []
         remaining = total_frames
+        render_cursor = 0
         while remaining > 0:
             current_frames = min(chunk_frames, remaining)
-            response = bridge.command('render_audio', frames=current_frames)
-            raw = base64.b64decode(str(response.get('audio_b64') or '').encode('ascii'))
-            chunk = np.frombuffer(raw, dtype=np.float32)
-            expected = current_frames * 2
-            if chunk.size < expected:
-                padded = np.zeros(expected, dtype=np.float32)
-                padded[:chunk.size] = chunk
-                chunk = padded
-            elif chunk.size > expected:
-                chunk = chunk[:expected]
-            mono = chunk.reshape(current_frames, 2).mean(axis=1).astype(np.float32, copy=False)
-            rendered_chunks.append(mono.copy())
+            input_buses = self._native_vst_input_bus_payload(
+                track,
+                entry,
+                render_cursor,
+                current_frames,
+                sample_rate,
+                realtime=False,
+            )
+            response = bridge.command('render_audio', frames=current_frames, input_buses=input_buses)
+            mono = self._mix_native_vst_render_response(track, entry, response, current_frames, return_mono=True)
+            rendered_chunks.append(np.asarray(mono, dtype=np.float32).copy())
             remaining -= current_frames
+            render_cursor += current_frames
         setattr(bridge, '_aims_skip_stop', True)
 
         if rendered_chunks:
             data = np.concatenate(rendered_chunks).astype(np.float32, copy=False)
         else:
             data = np.zeros(1, dtype=np.float32)
-        gain_linear = max(0.0, float(track.volume)) * (10.0 ** (float(track.vsti_output_gain_db) / 20.0))
-        data = np.clip(np.asarray(data, dtype=np.float32) * gain_linear, -1.0, 1.0)
         data = self._apply_vst_fx_chain(track, data, sample_rate)
         return data, sample_rate
 
@@ -11160,6 +11714,7 @@ class MainWindow(QtWidgets.QMainWindow):
             for plugin_path in removable:
                 self.vsti_description_cache.pop(plugin_path, None)
                 self.vsti_plugin_metadata.pop(plugin_path, None)
+                self.vsti_bus_metadata.pop(plugin_path, None)
         self._dedupe_and_filter_vsti_state()
         if save:
             self._save_preferences()
@@ -12686,11 +13241,6 @@ class MainWindow(QtWidgets.QMainWindow):
         track = self.current_track()
         if track.track_type != 'instrument':
             return
-        if track.instrument_mode == 'VSTI Rack' and track.rack_vsti:
-            entry = self._rack_vsti_entry(track.rack_vsti)
-            if entry is not None and entry.is_instrument and entry.host_supported:
-                if self._trigger_live_track_note_preview(pitch, velocity, duration_tick):
-                    return
         try:
             preview_note = MidiNote(start_tick=0, duration_tick=max(1, int(duration_tick)), pitch=int(pitch), velocity=int(clamp(velocity, 1, 127)))
             preview_track = dataclasses.replace(
@@ -12862,12 +13412,172 @@ class MainWindow(QtWidgets.QMainWindow):
         if track.track_type == 'instrument' and track.instrument_mode == 'VSTI Rack' and track.rack_vsti:
             edit_action = menu.addAction(f'Edit "{track.rack_vsti}" Parameters...')
             edit_action.triggered.connect(lambda _checked=False, idx=row, name=track.rack_vsti: self.open_vsti_gui_by_name(name, idx))
+            entry = self._rack_vsti_entry(track.rack_vsti)
+            if entry is not None and entry.is_instrument and entry.host_supported and self._can_use_native_vst_host(entry):
+                routing_action = menu.addAction('Configure VST Routing...')
+                routing_action.triggered.connect(lambda _checked=False, idx=row: self._open_track_vst_routing_dialog(idx))
 
         menu.addSeparator()
         duplicate_action = menu.addAction('Duplicate Track')
         duplicate_action.triggered.connect(lambda _checked=False, idx=row: self.duplicate_track(idx))
 
         menu.exec(global_pos)
+
+    def _open_track_vst_routing_dialog(self, row: int) -> None:
+        if row < 0 or row >= len(self.project.tracks):
+            return
+        track = self.project.tracks[row]
+        if track.instrument_mode != 'VSTI Rack' or not track.rack_vsti:
+            return
+        entry = self._rack_vsti_entry(track.rack_vsti)
+        if entry is None or not entry.is_instrument or not entry.host_supported:
+            return
+
+        metadata = self._native_vst_bus_metadata_for_path(entry.path, refresh=True)
+        output_routes = self._effective_vsti_output_bus_routes(track, entry)
+        input_routes = self._effective_vsti_input_bus_routes(track, entry)
+
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(f'VST Routing - {track.name}')
+        dialog.resize(760, 520)
+        layout = QtWidgets.QVBoxLayout(dialog)
+
+        info = QtWidgets.QLabel(
+            'Configure which plugin output buses are mixed into this track and which track signals feed plugin input buses.'
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        output_group = QtWidgets.QGroupBox('Output Buses')
+        output_form = QtWidgets.QFormLayout(output_group)
+        output_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        output_widgets: list[dict[str, object]] = []
+        if output_routes:
+            for route in output_routes:
+                row_widget = QtWidgets.QWidget()
+                row_layout = QtWidgets.QHBoxLayout(row_widget)
+                row_layout.setContentsMargins(0, 0, 0, 0)
+                row_layout.setSpacing(8)
+                enabled_box = QtWidgets.QCheckBox('Enabled')
+                enabled_box.setChecked(bool(route.get('enabled', False)))
+                gain_spin = QtWidgets.QDoubleSpinBox()
+                gain_spin.setDecimals(1)
+                gain_spin.setRange(-48.0, 24.0)
+                gain_spin.setSuffix(' dB')
+                gain_spin.setValue(float(route.get('gain_db', 0.0)))
+                pan_spin = QtWidgets.QDoubleSpinBox()
+                pan_spin.setDecimals(2)
+                pan_spin.setRange(-1.0, 1.0)
+                pan_spin.setSingleStep(0.05)
+                pan_spin.setValue(float(route.get('pan', 0.0)))
+                pan_spin.setToolTip('Pan this output bus before it reaches the track mix.')
+                row_layout.addWidget(enabled_box)
+                row_layout.addWidget(QtWidgets.QLabel('Gain'))
+                row_layout.addWidget(gain_spin)
+                row_layout.addWidget(QtWidgets.QLabel('Pan'))
+                row_layout.addWidget(pan_spin)
+                row_layout.addStretch(1)
+                label = f"{route.get('name', f'Output {int(route.get('bus_index', 0)) + 1}')} ({int(route.get('channels', 2) or 2)} ch)"
+                if bool(route.get('is_main', False)):
+                    label += ' [Main]'
+                output_form.addRow(label, row_widget)
+                output_widgets.append(
+                    {
+                        'bus_index': int(route.get('bus_index', 0)),
+                        'enabled': enabled_box,
+                        'gain': gain_spin,
+                        'pan': pan_spin,
+                    }
+                )
+        else:
+            output_form.addRow(QtWidgets.QLabel('No plugin output buses were reported by the host.'))
+        layout.addWidget(output_group)
+
+        input_group = QtWidgets.QGroupBox('Input / Sidechain Buses')
+        input_form = QtWidgets.QFormLayout(input_group)
+        input_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        input_widgets: list[dict[str, object]] = []
+        source_items = [('None', -1)]
+        for idx, source_track in enumerate(self.project.tracks):
+            if idx == row:
+                continue
+            source_items.append((f'{idx + 1}. {source_track.name}', idx))
+        if input_routes:
+            for route in input_routes:
+                row_widget = QtWidgets.QWidget()
+                row_layout = QtWidgets.QHBoxLayout(row_widget)
+                row_layout.setContentsMargins(0, 0, 0, 0)
+                row_layout.setSpacing(8)
+                source_combo = QtWidgets.QComboBox()
+                for label, value in source_items:
+                    source_combo.addItem(label, value)
+                selected_index = source_combo.findData(int(route.get('source_track_index', -1)))
+                if selected_index >= 0:
+                    source_combo.setCurrentIndex(selected_index)
+                gain_spin = QtWidgets.QDoubleSpinBox()
+                gain_spin.setDecimals(1)
+                gain_spin.setRange(-48.0, 24.0)
+                gain_spin.setSuffix(' dB')
+                gain_spin.setValue(float(route.get('gain_db', 0.0)))
+                row_layout.addWidget(QtWidgets.QLabel('Source'))
+                row_layout.addWidget(source_combo, 1)
+                row_layout.addWidget(QtWidgets.QLabel('Gain'))
+                row_layout.addWidget(gain_spin)
+                label = f"{route.get('name', f'Input {int(route.get('bus_index', 0)) + 1}')} ({int(route.get('channels', 2) or 2)} ch)"
+                if bool(route.get('is_main', False)):
+                    label += ' [Main]'
+                input_form.addRow(label, row_widget)
+                input_widgets.append(
+                    {
+                        'bus_index': int(route.get('bus_index', 0)),
+                        'source': source_combo,
+                        'gain': gain_spin,
+                    }
+                )
+        else:
+            input_form.addRow(QtWidgets.QLabel('No plugin input buses were reported by the host.'))
+        layout.addWidget(input_group)
+
+        summary = QtWidgets.QLabel(
+            f"Detected {len(metadata.get('output_buses', []))} output bus(es) and {len(metadata.get('input_buses', []))} input bus(es)."
+        )
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        self._center_dialog(dialog)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+
+        track.vsti_output_bus_routes = self._sanitize_vsti_output_bus_routes(
+            [
+                {
+                    'bus_index': int(widget['bus_index']),
+                    'enabled': bool(widget['enabled'].isChecked()),
+                    'gain_db': float(widget['gain'].value()),
+                    'pan': float(widget['pan'].value()),
+                }
+                for widget in output_widgets
+            ]
+        )
+        track.vsti_input_bus_routes = self._sanitize_vsti_input_bus_routes(
+            [
+                {
+                    'bus_index': int(widget['bus_index']),
+                    'enabled': int(widget['source'].currentData() or -1) >= 0,
+                    'source_track_index': int(widget['source'].currentData() or -1),
+                    'gain_db': float(widget['gain'].value()),
+                }
+                for widget in input_widgets
+            ]
+        )
+        self._stop_native_vst_host_bridge(int(row))
+        self._reload_playback_mix_if_running()
+        self._clear_realtime_mix_cache()
+        self.statusBar().showMessage(f'Updated VST routing for {track.name}')
 
     def _track_has_toggleable_vsti(self, track: TrackState) -> bool:
         return (
@@ -12878,10 +13588,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def _track_is_live_armable(self, track: TrackState) -> bool:
-        if not self._track_has_toggleable_vsti(track):
-            return False
-        entry = self._rack_vsti_entry(track.rack_vsti)
-        return bool(entry is not None and self._can_use_native_vst_host(entry))
+        return False
 
     def _track_uses_native_vsti_editor(self, track: TrackState) -> bool:
         if not self._track_has_toggleable_vsti(track):
@@ -13156,6 +13863,8 @@ class MainWindow(QtWidgets.QMainWindow):
             vsti_state_path=str(source.vsti_state_path),
             vsti_output_gain_db=float(source.vsti_output_gain_db),
             vsti_wet_mix=float(source.vsti_wet_mix),
+            vsti_output_bus_routes=[dict(route) for route in source.vsti_output_bus_routes],
+            vsti_input_bus_routes=[dict(route) for route in source.vsti_input_bus_routes],
             vst_fx_chain=list(source.vst_fx_chain),
             midi_program=int(source.midi_program),
             midi_channel=int(source.midi_channel),
