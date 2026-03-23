@@ -8414,16 +8414,21 @@ class MainWindow(QtWidgets.QMainWindow):
         return count
 
     def _realtime_render_ahead_frames(self) -> int:
-        native_buffer = max(256, int(self._native_vst_host_target_buffer_size()))
         output_buffer = max(128, int(self._desired_audio_buffer_frames()))
+        # Render just enough ahead to keep the buffer fed across a few pump
+        # cycles without blocking the main thread for so long that the
+        # output buffer drains.  With a 2048-frame buffer at 48 kHz the old
+        # formula produced 16 384+ frame renders (~341 ms) — far longer than
+        # the buffer duration (42 ms), guaranteeing underruns on every cache
+        # miss.  Keep the render batch close to the buffer size so each
+        # cache-miss render finishes well within the time the buffered audio
+        # takes to play out.
         base = max(
-            self._playback_chunk_frames * 8,
-            output_buffer * 4,
-            native_buffer * 8,
-            4096,
+            self._playback_chunk_frames * 2,
+            output_buffer * 2,
+            2048,
         )
-        extra = max(0, self._active_realtime_vsti_track_count() - 1) * max(2048, native_buffer * 2)
-        return min(32768, base + extra)
+        return min(8192, base)
 
     def _estimated_queued_output_frames(self) -> int:
         sink = getattr(self, '_playback_sink', None)
