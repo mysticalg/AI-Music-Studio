@@ -4723,7 +4723,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._playback_committed_total_bytes = 0
         self._playback_pending_bytes = bytearray()
         self._playback_logical_origin_frame = 0
-        self._playback_chunk_frames = 512
+        self._playback_chunk_frames = 256
         self._live_midi_chunk_frames = 128
         self._playback_sample_rate = int(getattr(self, '_playback_sample_rate', 44100))
         self._playback_channel_count = int(getattr(self, '_playback_channel_count', 2))
@@ -6082,19 +6082,19 @@ class MainWindow(QtWidgets.QMainWindow):
     def _recommended_audio_pump_interval_ms(self, frame_count: int) -> int:
         latency_ms = self._buffer_frames_latency_ms(frame_count)
         # Wake often enough to keep the buffer fed but not so often that the
-        # pump competes with UI events for the main thread.  For larger
-        # buffers (>=512 frames / ~11ms at 44.1kHz) a 5ms interval is fine;
-        # for tiny buffers we still pump aggressively.
-        return int(clamp(int(math.floor((latency_ms * 0.4) + 0.5)), 1, 8))
+        # pump competes with UI events for the main thread.  Cap at 5ms so
+        # even larger buffers stay responsive to underrun recovery.
+        return int(clamp(int(math.floor((latency_ms * 0.4) + 0.5)), 1, 5))
 
     def _preferred_playback_chunk_frames(self) -> int:
         desired = int(clamp(int(getattr(self, 'audio_buffer_frames', 512)), 64, 4096))
-        # Scale chunk size with the output buffer so that each pump call
-        # generates a meaningful amount of audio rather than many tiny slices
-        # that each carry rendering overhead.  For typical buffers (512-1024)
-        # this yields 256-512 frame chunks which significantly reduces
-        # starvation pressure while still allowing 2-4 chunks to be queued.
-        return max(256, min(2048, desired))
+        # Keep chunks at half the buffer size so that at least two chunks
+        # fit in the output buffer.  This gives the pump enough headroom to
+        # recover from momentary UI-thread stalls without underrunning.
+        # For typical buffers (512-1024) this yields 256-512 frame chunks.
+        chunk = max(256, min(1024, desired // 2))
+        # Never exceed the buffer itself (matters for tiny buffers <256).
+        return min(chunk, desired)
 
     def _available_audio_sample_rates(self, device: QtMultimedia.QAudioDevice | None = None) -> list[int]:
         target = device or self._selected_audio_device()
@@ -7946,6 +7946,12 @@ class MainWindow(QtWidgets.QMainWindow):
         generation = self._realtime_pump_generation
         for _prefill_pass in range(8):
             self._pump_realtime_audio(generation)
+            # If the pump encountered a fatal error it calls stop_playback()
+            # which clears _playback_active.  Detect that and bail out so
+            # start_playback() reports the failure instead of silently
+            # proceeding with a dead audio sink.
+            if not self._playback_active:
+                return False
         self._audio_pump_timer.start()
         QtCore.QTimer.singleShot(0, lambda g=generation: self._pump_realtime_audio(g))
         return True
