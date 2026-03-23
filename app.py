@@ -4882,7 +4882,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._realtime_gc_timer.timeout.connect(self._run_deferred_realtime_gc)
         self._audio_pump_timer = QtCore.QTimer(self)
         self._audio_pump_timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
-        self._audio_pump_timer.setInterval(5)
+        self._audio_pump_timer.setInterval(10)
         self._audio_pump_timer.timeout.connect(self._pump_realtime_audio)
         self._native_output_warm_timer = QtCore.QTimer(self)
         self._native_output_warm_timer.setSingleShot(True)
@@ -6281,9 +6281,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _recommended_audio_pump_interval_ms(self, frame_count: int) -> int:
         latency_ms = self._buffer_frames_latency_ms(frame_count)
         # Wake often enough to keep the buffer fed but not so often that the
-        # pump competes with UI events for the main thread.  Cap at 5ms so
-        # even larger buffers stay responsive to underrun recovery.
-        return int(clamp(int(math.floor((latency_ms * 0.4) + 0.5)), 1, 5))
+        # pump competes with UI events for the main thread.  Cap at 10ms to
+        # give the UI event loop breathing room between pump cycles.
+        return int(clamp(int(math.floor((latency_ms * 0.4) + 0.5)), 2, 10))
 
     def _preferred_playback_chunk_frames(self) -> int:
         desired = int(self._desired_audio_buffer_frames())
@@ -8683,7 +8683,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._playback_sink_device = sink_device
         self._playback_active = True
         generation = self._realtime_pump_generation
-        for _prefill_pass in range(4):
+        for _prefill_pass in range(2):
             self._pump_realtime_audio(generation)
             # If the pump encountered a fatal error it calls stop_playback()
             # which clears _playback_active.  Detect that and bail out so
@@ -9155,20 +9155,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _realtime_render_ahead_frames(self) -> int:
         output_buffer = max(128, int(self._desired_audio_buffer_frames()))
-        # Render just enough ahead to keep the buffer fed across a few pump
-        # cycles without blocking the main thread for so long that the
-        # output buffer drains.  With a 2048-frame buffer at 48 kHz the old
-        # formula produced 16 384+ frame renders (~341 ms) — far longer than
-        # the buffer duration (42 ms), guaranteeing underruns on every cache
-        # miss.  Keep the render batch close to the buffer size so each
-        # cache-miss render finishes well within the time the buffered audio
-        # takes to play out.
+        # Keep render batches small to avoid blocking the main thread.
+        # Large render-ahead values cause cache-miss stalls that starve
+        # both the audio output and the UI event loop.  Render just one
+        # buffer's worth so each cache miss completes quickly.
         base = max(
-            self._playback_chunk_frames * 2,
-            output_buffer * 2,
-            2048,
+            self._playback_chunk_frames,
+            output_buffer,
         )
-        return min(8192, base)
+        return min(2048, base)
 
     def _estimated_queued_output_frames(self) -> int:
         if self._native_output_bridge_alive():
@@ -9532,11 +9527,10 @@ class MainWindow(QtWidgets.QMainWindow):
             buffer_frames = int(max(self._playback_chunk_frames, self._playback_sink.bufferFrameCount()))
         except Exception:
             buffer_frames = self._playback_chunk_frames * 4
-        # Allow enough writes to fully refill the buffer from empty — this is
-        # critical for catching up after UI-induced stalls that starve the
-        # audio sink.  The previous cap was too conservative and left the
-        # buffer partially empty after a hiccup, causing repeated underruns.
-        max_writes = max(16, int(math.ceil(buffer_frames / max(1, self._playback_chunk_frames))) * 2 + 4)
+        # Allow a few writes per pump cycle to keep the buffer fed without
+        # monopolising the main thread.  Excessive writes cause UI stalls
+        # that are worse than the occasional audio glitch they prevent.
+        max_writes = max(4, int(math.ceil(buffer_frames / max(1, self._playback_chunk_frames))) + 2)
         writes = 0
         try:
             # IdleState means the output buffer has drained completely but
