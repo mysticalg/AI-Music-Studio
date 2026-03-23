@@ -6071,10 +6071,10 @@ class MainWindow(QtWidgets.QMainWindow):
         selected = int(getattr(self, 'native_vst_host_buffer_size', 0) or 0)
         if selected > 0:
             return int(clamp(selected, 64, 4096))
-        # Keep the native host on a stable, sane block size by default instead of
-        # following the main playback buffer. The main output buffer should affect
-        # sink latency, not the VST host's audio callback cadence.
-        return 512
+        # In auto mode, follow the main output buffer upward so heavier synths
+        # gain stability when the user raises the playback buffer, while still
+        # keeping a sensible floor for low-latency sessions.
+        return int(clamp(max(512, self._desired_audio_buffer_frames()), 512, 2048))
 
     def _buffer_frames_latency_ms(self, frame_count: int) -> float:
         return (max(1, int(frame_count)) / float(max(1, self._playback_sample_rate))) * 1000.0
@@ -6086,11 +6086,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _preferred_playback_chunk_frames(self) -> int:
         desired = int(clamp(int(getattr(self, 'audio_buffer_frames', 256)), 64, 4096))
-        # Use a smaller scheduling quantum than the hardware/output buffer so the
-        # sink can keep multiple chunks queued. This avoids buffer-dependent
-        # "slow" playback caused by starvation gaps when the pump wakes a little
-        # late on the UI thread.
-        return max(64, min(256, desired // 2))
+        # Keep multiple chunks queued, but let larger output buffers scale the
+        # realtime render quantum so increasing the playback buffer also reduces
+        # synth starvation pressure.
+        return max(128, min(1024, desired // 2))
 
     def _available_audio_sample_rates(self, device: QtMultimedia.QAudioDevice | None = None) -> list[int]:
         target = device or self._selected_audio_device()
@@ -7929,6 +7928,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._realtime_reset_pending = True
         self._reset_realtime_track_states()
         self._seek_media_to_project_tick(int(start_tick))
+        self._pump_realtime_audio(self._realtime_pump_generation)
         self._audio_pump_timer.start()
         QtCore.QTimer.singleShot(0, lambda generation=self._realtime_pump_generation: self._pump_realtime_audio(generation))
         return True
@@ -8391,9 +8391,16 @@ class MainWindow(QtWidgets.QMainWindow):
         return count
 
     def _realtime_render_ahead_frames(self) -> int:
-        base = max(self._playback_chunk_frames * 4, 4096)
-        extra = max(0, self._active_realtime_vsti_track_count() - 1) * 1024
-        return min(16384, base + extra)
+        native_buffer = max(256, int(self._native_vst_host_target_buffer_size()))
+        output_buffer = max(128, int(self._desired_audio_buffer_frames()))
+        base = max(
+            self._playback_chunk_frames * 8,
+            output_buffer * 4,
+            native_buffer * 8,
+            4096,
+        )
+        extra = max(0, self._active_realtime_vsti_track_count() - 1) * max(2048, native_buffer * 2)
+        return min(32768, base + extra)
 
     def _estimated_queued_output_frames(self) -> int:
         sink = getattr(self, '_playback_sink', None)
