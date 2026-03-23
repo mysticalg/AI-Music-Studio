@@ -650,6 +650,30 @@ private:
             return response;
         }
 
+        if (command == "set_parameters")
+        {
+            if (pluginInstance == nullptr)
+                return makeResponse(false, "No plugin loaded");
+
+            juce::String error;
+            int appliedCount = 0;
+            juce::StringArray unmatchedParameters;
+            if (!applyRequestedParameterValues(object->getProperty("parameters"), error, appliedCount, unmatchedParameters))
+                return makeResponse(false, error.isNotEmpty() ? error : "Could not update plugin parameters");
+
+            auto response = makeResponse(true, "Plugin parameters updated");
+            appendStatusFields(response);
+            setResponseField(response, "applied_parameter_count", appliedCount);
+            if (!unmatchedParameters.isEmpty())
+            {
+                juce::Array<juce::var> unmatched;
+                for (const auto& name : unmatchedParameters)
+                    unmatched.add(name);
+                setResponseField(response, "unmatched_parameters", juce::var(unmatched));
+            }
+            return response;
+        }
+
         if (command == "queue_audio")
         {
             const auto audioBase64 = object->getProperty("audio_b64").toString();
@@ -1737,6 +1761,93 @@ private:
         if (!parentDir.exists() && !parentDir.createDirectory())
             return false;
         return stateFile.replaceWithData(rawState.getData(), rawState.getSize());
+    }
+
+    bool applyRequestedParameterValues(const juce::var& parametersVar,
+                                       juce::String& error,
+                                       int& appliedCount,
+                                       juce::StringArray& unmatchedParameters)
+    {
+        auto* parameterObject = parametersVar.getDynamicObject();
+        if (parameterObject == nullptr)
+        {
+            error = "set_parameters requires an object payload";
+            return false;
+        }
+
+        juce::ScopedLock lock(pluginLock);
+        if (pluginInstance == nullptr)
+        {
+            error = "No plugin loaded";
+            return false;
+        }
+
+        auto parameters = pluginInstance->getParameters();
+        auto resolveParameterIndex = [&parameters](const juce::String& rawName) -> int
+        {
+            const auto requestedName = rawName.trim();
+            if (requestedName.isEmpty())
+                return -1;
+
+            if (requestedName.startsWithIgnoreCase("Param "))
+            {
+                const auto legacyNumber = requestedName.fromFirstOccurrenceOf(" ", false, false).trim().getIntValue();
+                const auto legacyIndex = legacyNumber - 1;
+                if (juce::isPositiveAndBelow(legacyIndex, parameters.size()))
+                    return legacyIndex;
+            }
+
+            for (int index = 0; index < parameters.size(); ++index)
+            {
+                auto* parameter = parameters[index];
+                if (parameter == nullptr)
+                    continue;
+
+                auto parameterName = parameter->getName(256).trim();
+                if (parameterName.isEmpty())
+                    parameterName = "Param " + juce::String(index + 1);
+
+                if (parameterName.equalsIgnoreCase(requestedName)
+                    || ("Param " + juce::String(index + 1)).equalsIgnoreCase(requestedName))
+                {
+                    return index;
+                }
+            }
+
+            return -1;
+        };
+
+        for (const auto& property : parameterObject->getProperties())
+        {
+            const auto parameterName = property.name.toString();
+            const auto parameterIndex = resolveParameterIndex(parameterName);
+            if (!juce::isPositiveAndBelow(parameterIndex, parameters.size()))
+            {
+                unmatchedParameters.addIfNotAlreadyThere(parameterName);
+                continue;
+            }
+
+            auto* parameter = parameters[parameterIndex];
+            if (parameter == nullptr)
+            {
+                unmatchedParameters.addIfNotAlreadyThere(parameterName);
+                continue;
+            }
+
+            const auto normalizedValue = juce::jlimit(
+                0.0f,
+                1.0f,
+                static_cast<float>(static_cast<double>(property.value)) / 100.0f
+            );
+            parameter->beginChangeGesture();
+            parameter->setValueNotifyingHost(normalizedValue);
+            parameter->endChangeGesture();
+            ++appliedCount;
+        }
+
+        if (appliedCount > 0)
+            pluginInstance->updateHostDisplay();
+        return true;
     }
 
     void persistManagedState()
