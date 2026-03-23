@@ -4754,6 +4754,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._track_native_vsti_processes: dict[int, QtCore.QProcess] = {}
         self._track_native_vst_host_bridges: dict[int, object] = {}
         self._native_vst_host_retry_after: dict[int, float] = {}
+        self._native_vst_host_warm_timers: dict[int, QtCore.QTimer] = {}
         self._track_meter_levels: dict[int, float] = {}
         self._sample_audio_cache: dict[str, tuple[object, int, int]] = {}
         self._realtime_reset_pending = False
@@ -6885,6 +6886,154 @@ class MainWindow(QtWidgets.QMainWindow):
     def _native_vst_host_scheduling_lead_frames(self) -> int:
         return 0
 
+    def _finish_warm_native_vst_host_for_track(self, row: int) -> None:
+        row = int(row)
+        if row < 0 or row >= len(self.project.tracks):
+            return
+        current_track = self.project.tracks[row]
+        current_entry = self._rack_vsti_entry(current_track.rack_vsti) if current_track.rack_vsti else None
+        if (
+            current_track.track_type != 'instrument'
+            or current_track.instrument_mode != 'VSTI Rack'
+            or current_entry is None
+            or not current_entry.is_instrument
+            or not current_entry.host_supported
+            or not self._can_use_native_vst_host(current_entry)
+            or self._native_vst_host_bridge_alive(row)
+        ):
+            return
+        self._open_native_vst_host_for_track(row, current_entry, open_editor=False, show_error=False)
+
+    def _warm_native_vst_host_for_track(self, row: int, *, delay_ms: int = 220) -> None:
+        row = int(row)
+        if row < 0 or row >= len(self.project.tracks):
+            return
+        if self._native_vst_host_bridge_alive(row):
+            return
+
+        track = self.project.tracks[row]
+        entry = self._rack_vsti_entry(track.rack_vsti) if track.rack_vsti else None
+        if (
+            track.track_type != 'instrument'
+            or track.instrument_mode != 'VSTI Rack'
+            or entry is None
+            or not entry.is_instrument
+            or not entry.host_supported
+            or not self._can_use_native_vst_host(entry)
+        ):
+            return
+
+        timer = self._native_vst_host_warm_timers.get(row)
+        if timer is None:
+            timer = QtCore.QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda target_row=row: self._finish_warm_native_vst_host_for_track(target_row))
+            self._native_vst_host_warm_timers[row] = timer
+        timer.start(max(0, int(delay_ms)))
+
+    def _preview_note_with_native_vst_host(
+        self,
+        row: int,
+        track: TrackState,
+        entry: VSTInstrument,
+        pitch: int,
+        velocity: int,
+        duration_tick: int,
+    ) -> bool:
+        if np is None or not self._can_use_native_vst_host(entry):
+            return False
+        if hasattr(self, 'playback_timer') and self.playback_timer.isActive():
+            return False
+        if row < 0 or row >= len(self.project.tracks):
+            return False
+        if not self._native_vst_host_bridge_alive(row):
+            self._warm_native_vst_host_for_track(row)
+            return False
+
+        bridge = self._track_native_vst_host_bridges.get(int(row))
+        if bridge is None:
+            self._warm_native_vst_host_for_track(row)
+            return False
+
+        sample_rate = max(
+            1,
+            int(getattr(bridge, 'sample_rate', 0) or self._native_vst_host_target_sample_rate() or self._playback_sample_rate or 44100),
+        )
+        buffer_size = max(1, int(getattr(bridge, 'buffer_size', 0) or self._native_vst_host_target_buffer_size() or 512))
+        preview_seconds = max(
+            0.3,
+            min(1.5, (max(1, int(duration_tick)) / TICKS_PER_BEAT) * (60.0 / max(1, self.project.bpm)) + 0.35),
+        )
+        total_frames = max(1, int(math.ceil(preview_seconds * sample_rate)))
+        note_duration_frames = max(1, tick_to_sample_frame(max(1, int(duration_tick)), sample_rate, self.project.bpm))
+        note_off_frame = min(max(1, note_duration_frames), max(1, total_frames - 1))
+        midi_channel = int(clamp(track.midi_channel, 0, 15))
+        events = [
+            (
+                0,
+                2,
+                mido.Message(
+                    'note_on',
+                    channel=midi_channel,
+                    note=int(clamp(pitch, 0, 127)),
+                    velocity=int(clamp(velocity, 1, 127)),
+                ),
+            ),
+            (
+                note_off_frame,
+                1,
+                mido.Message(
+                    'note_off',
+                    channel=midi_channel,
+                    note=int(clamp(pitch, 0, 127)),
+                    velocity=0,
+                ),
+            ),
+        ]
+
+        try:
+            bridge.command('panic')
+        except Exception:
+            _APP_LOGGER.exception("Failed resetting native VST host before note preview row=%s", row)
+
+        if not self._schedule_native_vst_host_messages(
+            row,
+            bridge,
+            events,
+            0,
+            reset_channels=[midi_channel + 1],
+            loop_epoch=0,
+        ):
+            return False
+
+        try:
+            chunk_frames = int(clamp(max(buffer_size, 512), 512, 4096))
+            rendered_chunks: list[np.ndarray] = []
+            remaining = total_frames
+            while remaining > 0:
+                current_frames = min(chunk_frames, remaining)
+                response = bridge.command('render_audio', frames=current_frames)
+                rendered = self._mix_native_vst_render_response(
+                    track,
+                    entry,
+                    response,
+                    current_frames,
+                    return_mono=False,
+                )
+                rendered_chunks.append(np.asarray(rendered, dtype=np.float32).copy())
+                remaining -= current_frames
+
+            if rendered_chunks:
+                preview_audio = np.concatenate(rendered_chunks, axis=1).astype(np.float32, copy=False)
+            else:
+                preview_audio = np.zeros((2, 1), dtype=np.float32)
+
+            self._play_pcm_preview(preview_audio, sample_rate)
+            return True
+        except Exception:
+            _APP_LOGGER.exception("Native VST note preview failed row=%s rack=%s", row, entry.name)
+            return False
+
     def _schedule_native_vst_track_chunk(
         self,
         idx: int,
@@ -7671,6 +7820,19 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_piano_roll_notes_committed(self) -> None:
         self._prioritize_note_offs_for_edit()
         self._invalidate_playback_caches()
+        current_row = self.current_track_index()
+        if 0 <= current_row < len(self.project.tracks):
+            track = self.project.tracks[current_row]
+            entry = self._rack_vsti_entry(track.rack_vsti) if track.rack_vsti else None
+            if (
+                track.track_type == 'instrument'
+                and track.instrument_mode == 'VSTI Rack'
+                and entry is not None
+                and entry.is_instrument
+                and entry.host_supported
+                and self._can_use_native_vst_host(entry)
+            ):
+                self._warm_native_vst_host_for_track(current_row)
         self._schedule_deferred_note_refresh(
             refresh_velocity=True,
             refresh_timeline=True,
@@ -13238,8 +13400,26 @@ class MainWindow(QtWidgets.QMainWindow):
     def preview_current_track_note(self, pitch: int, velocity: int = 100, duration_tick: int = TICKS_PER_BEAT // 2) -> None:
         if not self.project.tracks:
             return
+        track_index = self.current_track_index()
         track = self.current_track()
         if track.track_type != 'instrument':
+            return
+        entry = self._rack_vsti_entry(track.rack_vsti) if track.rack_vsti else None
+        if (
+            track.instrument_mode == 'VSTI Rack'
+            and entry is not None
+            and entry.is_instrument
+            and entry.host_supported
+            and self._can_use_native_vst_host(entry)
+        ):
+            self._preview_note_with_native_vst_host(
+                track_index,
+                track,
+                entry,
+                int(pitch),
+                int(velocity),
+                int(duration_tick),
+            )
             return
         try:
             preview_note = MidiNote(start_tick=0, duration_tick=max(1, int(duration_tick)), pitch=int(pitch), velocity=int(clamp(velocity, 1, 127)))
