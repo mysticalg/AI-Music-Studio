@@ -8673,22 +8673,24 @@ class MainWindow(QtWidgets.QMainWindow):
         max_writes = max(16, int(math.ceil(buffer_frames / max(1, self._playback_chunk_frames))) * 2 + 4)
         writes = 0
         try:
-            # Detect underrun: if the sink has gone idle/stopped unexpectedly,
-            # the buffer ran dry.  Restart the device to recover.
-            # Skip this check when no data has been committed yet — a freshly
-            # started sink is legitimately idle (empty buffer), not underrunning.
-            if self._playback_committed_total_bytes > 0:
-                try:
-                    sink_state = self._playback_sink.state()
-                    if sink_state == QtMultimedia.QtAudio.State.IdleState:
-                        _APP_LOGGER.warning("Audio sink idle (underrun detected) — recovering")
-                        self._playback_sink_device = self._playback_sink.start()
-                        if self._playback_sink_device is None:
-                            raise RuntimeError("Failed to restart audio sink after underrun")
-                except RuntimeError:
-                    raise
-                except Exception:
-                    pass
+            # IdleState means the output buffer has drained completely but
+            # the sink is still running.  There is no need to call start()
+            # again — doing so triggers "QAudioSink::start() called while
+            # already started" and returns None, crashing playback.  Just
+            # log the underrun and continue writing data to the existing
+            # device; the sink will resume playing automatically once the
+            # buffer is refilled.
+            try:
+                sink_state = self._playback_sink.state()
+                if sink_state == QtMultimedia.QtAudio.State.IdleState and self._playback_committed_total_bytes > 0:
+                    _APP_LOGGER.debug("Audio sink idle (buffer drained) — refilling")
+                elif sink_state == QtMultimedia.QtAudio.State.StoppedState:
+                    error = self._playback_sink.error()
+                    raise RuntimeError(f"Audio sink stopped unexpectedly: {error}")
+            except RuntimeError:
+                raise
+            except Exception:
+                pass
 
             while writes < max_writes:
                 bytes_free = int(max(0, self._playback_sink.bytesFree()))
