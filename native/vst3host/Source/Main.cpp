@@ -1104,7 +1104,9 @@ private:
         if (pluginInstance == nullptr)
             return;
         pluginInstance->setRateAndBufferSizeDetails(currentSampleRate, currentBlockSize);
-        pluginInstance->enableAllBuses();
+        // Keep the host on the plugin's main I/O only. Enabling aux buses can
+        // produce channel layouts that don't match this simple stereo host.
+        pluginInstance->disableNonMainBuses();
         pluginInstance->prepareToPlay(currentSampleRate, currentBlockSize);
     }
 
