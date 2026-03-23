@@ -8670,17 +8670,20 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             # Detect underrun: if the sink has gone idle/stopped unexpectedly,
             # the buffer ran dry.  Restart the device to recover.
-            try:
-                sink_state = self._playback_sink.state()
-                if sink_state == QtMultimedia.QtAudio.State.IdleState:
-                    _APP_LOGGER.warning("Audio sink idle (underrun detected) — recovering")
-                    self._playback_sink_device = self._playback_sink.start()
-                    if self._playback_sink_device is None:
-                        raise RuntimeError("Failed to restart audio sink after underrun")
-            except RuntimeError:
-                raise
-            except Exception:
-                pass
+            # Skip this check when no data has been committed yet — a freshly
+            # started sink is legitimately idle (empty buffer), not underrunning.
+            if self._playback_committed_total_bytes > 0:
+                try:
+                    sink_state = self._playback_sink.state()
+                    if sink_state == QtMultimedia.QtAudio.State.IdleState:
+                        _APP_LOGGER.warning("Audio sink idle (underrun detected) — recovering")
+                        self._playback_sink_device = self._playback_sink.start()
+                        if self._playback_sink_device is None:
+                            raise RuntimeError("Failed to restart audio sink after underrun")
+                except RuntimeError:
+                    raise
+                except Exception:
+                    pass
 
             while writes < max_writes:
                 bytes_free = int(max(0, self._playback_sink.bytesFree()))
