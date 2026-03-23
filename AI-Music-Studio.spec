@@ -11,11 +11,6 @@ binaries = []
 datas = []
 hiddenimports = []
 
-for package_name in ("pedalboard",):
-    binaries += collect_dynamic_libs(package_name)
-    datas += collect_data_files(package_name)
-    hiddenimports += collect_submodules(package_name)
-
 datas.append((str(project_root / "README.md"), "."))
 
 a = Analysis(

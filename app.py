@@ -40,16 +40,6 @@ except Exception:
     np = None
 
 try:
-    from pedalboard import Pedalboard, load_plugin
-    PEDALBOARD_AVAILABLE = True
-    PEDALBOARD_IMPORT_ERROR = ""
-except Exception:
-    Pedalboard = None
-    load_plugin = None
-    PEDALBOARD_AVAILABLE = False
-    PEDALBOARD_IMPORT_ERROR = str(sys.exc_info()[1])
-
-try:
     from scripts.native_vst_host_bridge import HOST_DLL as NATIVE_VST_HOST_DLL, HOST_EXE as NATIVE_VST_HOST_EXE, NativeVstHostBridge
     NATIVE_VST_HOST_AVAILABLE = bool(NATIVE_VST_HOST_DLL.exists() or NATIVE_VST_HOST_EXE.exists())
     NATIVE_VST_HOST_IMPORT_ERROR = ""
@@ -557,67 +547,6 @@ def configure_app_logging() -> logging.Logger:
     return _APP_LOGGER
 
 
-def vst_host_candidate_paths(path: str | Path) -> list[str]:
-    resolved = Path(path).expanduser().resolve()
-    candidates: list[Path] = [resolved]
-
-    # VST3 bundles are platform-specific directories. Add the likely loadable
-    # module paths for each desktop OS before falling back to a recursive scan.
-    if resolved.suffix.lower() == ".vst3" and resolved.is_dir():
-        if os.name == "nt":
-            windows_bundle_dir = resolved / "Contents" / "x86_64-win"
-            expected_binary = windows_bundle_dir / f"{resolved.stem}.vst3"
-            if expected_binary.exists():
-                candidates.append(expected_binary)
-            if windows_bundle_dir.exists():
-                candidates.extend(sorted(windows_bundle_dir.glob("*.vst3")))
-        elif sys.platform == "darwin":
-            macos_bundle_dir = resolved / "Contents" / "MacOS"
-            expected_binary = macos_bundle_dir / resolved.stem
-            if expected_binary.exists():
-                candidates.append(expected_binary)
-            if macos_bundle_dir.exists():
-                candidates.extend(sorted(child for child in macos_bundle_dir.iterdir() if child.is_file()))
-        else:
-            linux_bundle_dir = resolved / "Contents" / "x86_64-linux"
-            expected_binary = linux_bundle_dir / f"{resolved.stem}.so"
-            if expected_binary.exists():
-                candidates.append(expected_binary)
-            if linux_bundle_dir.exists():
-                candidates.extend(sorted(child for child in linux_bundle_dir.iterdir() if child.is_file()))
-
-        candidates.extend(sorted(child for child in resolved.rglob("*.vst3") if child != resolved))
-
-    unique: list[str] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        try:
-            key = str(candidate.resolve())
-        except Exception:
-            key = str(candidate)
-        if key in seen or not candidate.exists():
-            continue
-        seen.add(key)
-        unique.append(key)
-    return unique
-
-
-def load_vst_plugin_with_fallback(path: str):
-    if not PEDALBOARD_AVAILABLE or not load_plugin:
-        raise RuntimeError(pedalboard_runtime_hint() or "Pedalboard is not available.")
-
-    errors: list[str] = []
-    for candidate in vst_host_candidate_paths(path):
-        try:
-            return load_plugin(candidate), candidate
-        except Exception as exc:
-            errors.append(f"{candidate}: {exc}")
-
-    if errors:
-        raise RuntimeError("\n".join(errors))
-    raise RuntimeError(f"Plugin path does not exist: {path}")
-
-
 def load_startup_preferences() -> dict:
     if not APP_PREFS_PATH.exists():
         return {}
@@ -628,11 +557,11 @@ def load_startup_preferences() -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
-def pedalboard_runtime_hint() -> str:
-    if PEDALBOARD_AVAILABLE:
+def native_vst_host_runtime_hint() -> str:
+    if NATIVE_VST_HOST_AVAILABLE:
         return ""
-    detail = PEDALBOARD_IMPORT_ERROR or "missing pedalboard dependency"
-    return f"VST3 hosting is unavailable in {sys.executable}: {detail}"
+    detail = NATIVE_VST_HOST_IMPORT_ERROR or "native JUCE host unavailable"
+    return f"Native JUCE VST hosting is unavailable in {sys.executable}: {detail}"
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -1027,113 +956,6 @@ def track_text_color(color: QtGui.QColor) -> QtGui.QColor:
 
 def qcolor_to_hex(color: QtGui.QColor) -> str:
     return color.name(QtGui.QColor.NameFormat.HexRgb) if color.isValid() else ""
-
-
-class VSTBinaryLoader:
-    def __init__(self) -> None:
-        self._handles: dict[str, object] = {}
-        self._errors: dict[str, str] = {}
-        self._resolved_paths: dict[str, str] = {}
-        self._lock = threading.Lock()
-
-    @staticmethod
-    def _normalize_key(path: str) -> str:
-        try:
-            return str(Path(path).expanduser().resolve())
-        except Exception:
-            return str(Path(path))
-
-    def is_loaded(self, path: str) -> bool:
-        normalized = self._normalize_key(path)
-        with self._lock:
-            return normalized in self._handles
-
-    def load(self, path: str) -> tuple[bool, str]:
-        normalized = self._normalize_key(path)
-        with self._lock:
-            if normalized in self._handles:
-                return True, 'Already loaded'
-        suffix = Path(normalized).suffix.lower()
-        if suffix != '.vst3':
-            detail = 'Unsupported plugin format for this host. Use a VST3 plugin to get real VST playback.'
-            with self._lock:
-                self._errors[normalized] = detail
-            return False, detail
-        if not PEDALBOARD_AVAILABLE or not load_plugin:
-            detail = pedalboard_runtime_hint() or 'Pedalboard is not available. Install pedalboard and restart the app to host VST3 plugins.'
-            with self._lock:
-                self._errors[normalized] = detail
-            return False, detail
-        app_instance = QtCore.QCoreApplication.instance()
-        if app_instance is not None and QtCore.QThread.currentThread() != app_instance.thread():
-            detail = 'Pedalboard VST3 plugins must be loaded on the main thread for reliable playback and editor support.'
-            with self._lock:
-                self._errors[normalized] = detail
-            return False, detail
-        try:
-            handle, resolved_path = load_vst_plugin_with_fallback(normalized)
-            with self._lock:
-                self._handles[normalized] = handle
-                self._resolved_paths[normalized] = resolved_path
-                self._errors.pop(normalized, None)
-            return True, 'Loaded via pedalboard'
-        except Exception as exc:
-            with self._lock:
-                self._errors[normalized] = str(exc)
-            return False, str(exc)
-
-    def last_error(self, path: str) -> str:
-        normalized = self._normalize_key(path)
-        with self._lock:
-            return self._errors.get(normalized, '')
-
-    def handle(self, path: str):
-        normalized = self._normalize_key(path)
-        with self._lock:
-            return self._handles.get(normalized)
-
-    def resolved_path(self, path: str) -> str:
-        normalized = self._normalize_key(path)
-        with self._lock:
-            return self._resolved_paths.get(normalized, '')
-
-    def clear(self) -> None:
-        with self._lock:
-            self._handles.clear()
-            self._errors.clear()
-            self._resolved_paths.clear()
-
-    def release(self, path: str) -> None:
-        normalized = self._normalize_key(path)
-        with self._lock:
-            self._handles.pop(normalized, None)
-            self._errors.pop(normalized, None)
-            self._resolved_paths.pop(normalized, None)
-
-
-class VSTLoadWorkerSignals(QtCore.QObject):
-    finished = QtCore.Signal(str, bool, str, list)
-
-
-class VSTLoadWorker(QtCore.QRunnable):
-    def __init__(self, loader: VSTBinaryLoader, plugin_path: str) -> None:
-        super().__init__()
-        self.loader = loader
-        self.plugin_path = plugin_path
-        self.signals = VSTLoadWorkerSignals()
-
-    @QtCore.Slot()
-    def run(self) -> None:
-        ok, detail = self.loader.load(self.plugin_path)
-        param_names: list[str] = []
-        if ok:
-            plugin = self.loader.handle(self.plugin_path)
-            if plugin is not None:
-                try:
-                    param_names = [str(name) for name in plugin.parameters.keys()]
-                except Exception:
-                    param_names = []
-        self.signals.finished.emit(self.plugin_path, ok, detail, param_names)
 
 
 @dataclasses.dataclass
@@ -3857,7 +3679,7 @@ class InstrumentFxWidget(QtWidgets.QWidget):
 
         btn_row = QtWidgets.QHBoxLayout()
         self.assign_rack_btn = QtWidgets.QPushButton('Use Selected Rack VSTI')
-        self.load_vsti_btn = QtWidgets.QPushButton('Load Selected VSTI Binary')
+        self.load_vsti_btn = QtWidgets.QPushButton('Refresh VSTI Info')
         self.open_vsti_gui_btn = QtWidgets.QPushButton('Open VSTI GUI')
         self.edit_vsti_params_btn = QtWidgets.QPushButton('Edit VSTI Parameters')
         btn_row.addWidget(self.assign_rack_btn)
@@ -3898,8 +3720,8 @@ class InstrumentFxWidget(QtWidgets.QWidget):
         self.edit_vsti_params_btn.setEnabled(use_vsti and bool(active_track.rack_vsti) and (active_entry is None or active_entry.host_supported))
         if not self._instrument_entries():
             self.vsti_selector.setToolTip('Add at least one supported VST3 instrument plugin to the rack.')
-        elif not PEDALBOARD_AVAILABLE:
-            self.vsti_selector.setToolTip(pedalboard_runtime_hint())
+        elif not NATIVE_VST_HOST_AVAILABLE:
+            self.vsti_selector.setToolTip(native_vst_host_runtime_hint())
         elif active_entry is not None and not active_entry.host_supported:
             self.vsti_selector.setToolTip(active_entry.host_error or 'This rack plugin is not supported by the current VST backend.')
         else:
@@ -4744,14 +4566,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.composer = OpenAIComposer(self.ai_client)
         self.instrument_ai = InstrumentIntelligence(self.ai_client)
         self.renderer = AISynthRenderer()
-        self.vsti_binary_loader = VSTBinaryLoader()
         self.vsti_plugin_metadata: dict[str, list[str]] = {}
         self.vsti_description_cache: dict[str, tuple[str, bool, bool, str, bool, str]] = {}
         self.vsti_bus_metadata: dict[str, dict[str, list[dict[str, object]]]] = {}
-        self._vsti_worker_pool = QtCore.QThreadPool(self)
-        self._vsti_worker_pool.setMaxThreadCount(2)
-        self._vsti_background_loads_inflight: set[str] = set()
-        self._active_vsti_workers: dict[str, VSTLoadWorker] = {}
         self.vsti_directory = BUNDLED_VSTI_DIR
         self.user_vsti_directory = USER_VSTI_DIR
         self.user_vsti_directory.mkdir(parents=True, exist_ok=True)
@@ -4810,10 +4627,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._preview_sink: QtMultimedia.QAudioSink | None = None
         self._preview_buffer_device: QtCore.QBuffer | None = None
         self._preview_resources: list[tuple[QtMultimedia.QAudioSink, QtCore.QBuffer]] = []
+        self._last_track_preview_notes: dict[int, tuple[int, int, int]] = {}
+        self._pending_parameter_audition_row: int | None = None
         self._playback_mix_wav_bytes = b''
         self._playback_mix_samples: object | None = None
         self._playback_mix_sample_rate = 0
+        self._playback_mix_start_frame = 0
+        self._playback_mix_frame_count = 0
         self._use_prerendered_transport_mix = False
+        self._pending_prerender_mix_refresh = False
+        self._pending_prerender_mix_clear_track_audio = False
+        self._pending_prerender_mix_reason = ''
         self._playback_frame_position = 0
         self._playback_generated_total_frames = 0
         self._playback_committed_total_bytes = 0
@@ -4868,6 +4692,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._deferred_rebuild_sections = False
         self._deferred_refresh_arrangement = False
         self._deferred_reload_mix = False
+        self._parameter_audition_timer = QtCore.QTimer(self)
+        self._parameter_audition_timer.setSingleShot(True)
+        self._parameter_audition_timer.setInterval(120)
+        self._parameter_audition_timer.timeout.connect(self._play_pending_parameter_audition)
+        self._prerender_mix_refresh_timer = QtCore.QTimer(self)
+        self._prerender_mix_refresh_timer.setSingleShot(True)
+        self._prerender_mix_refresh_timer.setInterval(90)
+        self._prerender_mix_refresh_timer.timeout.connect(self._flush_prerendered_playback_mix_refresh)
         self._tempo_ui_refresh_timer = QtCore.QTimer(self)
         self._tempo_ui_refresh_timer.setSingleShot(True)
         self._tempo_ui_refresh_timer.timeout.connect(self._flush_tempo_ui_refresh)
@@ -5174,7 +5006,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.refresh_vsti_rack_ui()
         self.refresh_openai_status()
-        QtCore.QTimer.singleShot(350, self._start_vsti_background_warmup)
 
     def _setup_floating_transport(self) -> None:
         self.playback_timer = QtCore.QTimer(self)
@@ -5841,6 +5672,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._playback_mix_wav_bytes = b''
         self._playback_mix_samples = None
         self._playback_mix_sample_rate = 0
+        self._playback_mix_start_frame = 0
+        self._playback_mix_frame_count = 0
         self._use_prerendered_transport_mix = False
         self._playback_mix_cache_key = ''
         self._playback_mix_duration_sec = 0.0
@@ -6110,6 +5943,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._playback_mix_wav_bytes = b''
         self._playback_mix_samples = None
         self._playback_mix_sample_rate = 0
+        self._playback_mix_start_frame = 0
+        self._playback_mix_frame_count = 0
         if clear_track_audio:
             self._track_playback_audio_cache.clear()
         if reset_realtime:
@@ -7188,17 +7023,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._live_midi_poll_timer.stop()
 
     def _ensure_live_midi_fx_plugins(self, track: TrackState, state: LiveMidiHostState) -> None:
-        if state.fx_plugins:
-            return
-        plugins: list[object] = []
-        for entry in self._effect_chain_entries(track):
-            try:
-                plugin = self._load_rack_plugin(entry.name)
-            except Exception:
-                plugin = None
-            if plugin is not None and bool(getattr(plugin, 'is_effect', False)):
-                plugins.append(plugin)
-        state.fx_plugins = plugins
+        _ = track
+        state.fx_plugins = []
 
     @staticmethod
     def _pan_gains(pan: float) -> tuple[float, float]:
@@ -7277,21 +7103,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
                 if np is not None:
                     audio = np.asarray(self._apply_track_pan_stereo(audio, track.pan), dtype=np.float32)
-                    self._ensure_live_midi_fx_plugins(track, state)
-                    if state.fx_plugins:
-                        reset_flag = bool(state.fx_reset_pending)
-                        for plugin in state.fx_plugins:
-                            audio = np.asarray(
-                                plugin(
-                                    audio,
-                                    self._playback_sample_rate,
-                                    buffer_size=max(64, int(audio.shape[-1])),
-                                    reset=reset_flag,
-                                ),
-                                dtype=np.float32,
-                            )
-                            if audio.ndim == 1:
-                                audio = audio[None, :]
                     mix += np.asarray(audio, dtype=np.float32)
                 else:
                     stereo = self._apply_track_pan_stereo(audio, track.pan)
@@ -7859,12 +7670,6 @@ class MainWindow(QtWidgets.QMainWindow):
             if entry is None:
                 stale_rows.append(row)
                 continue
-            if state.plugin is not None:
-                snapshot = self._plugin_parameter_snapshot(state.plugin)
-                if snapshot and snapshot != track.vsti_parameters:
-                    self._apply_track_vsti_parameters_live(track, snapshot, editor_plugin=state.plugin)
-                    self._save_vsti_plugin_state(state.plugin, track, entry)
-                    self._reload_playback_mix_if_running()
         for row in stale_rows:
             self._release_live_midi_host(row)
 
@@ -8334,14 +8139,80 @@ class MainWindow(QtWidgets.QMainWindow):
     def _reload_playback_mix_if_running(self) -> None:
         if not hasattr(self, 'playback_timer') or not self.playback_timer.isActive():
             return
-        self._invalidate_playback_caches(clear_track_audio=False, reset_realtime=True)
         if bool(getattr(self, '_use_prerendered_transport_mix', False)):
-            try:
-                if not self._build_playback_mix():
-                    self._use_prerendered_transport_mix = False
-            except Exception:
-                _APP_LOGGER.exception("Failed rebuilding prerendered playback mix while transport was active")
-                self._use_prerendered_transport_mix = False
+            self._schedule_prerendered_playback_mix_refresh(reason='playback update')
+            return
+        self._invalidate_playback_caches(clear_track_audio=False, reset_realtime=True)
+
+    def _schedule_prerendered_playback_mix_refresh(
+        self,
+        *,
+        clear_track_audio: bool = False,
+        reason: str = '',
+    ) -> None:
+        self._pending_prerender_mix_refresh = True
+        self._pending_prerender_mix_clear_track_audio = (
+            self._pending_prerender_mix_clear_track_audio or bool(clear_track_audio)
+        )
+        if reason:
+            self._pending_prerender_mix_reason = str(reason)
+        if hasattr(self, '_prerender_mix_refresh_timer'):
+            self._prerender_mix_refresh_timer.start()
+
+    def _flush_prerendered_playback_mix_refresh(self) -> None:
+        if not bool(getattr(self, '_pending_prerender_mix_refresh', False)):
+            return
+        if not bool(getattr(self, '_playback_active', False)) or not bool(getattr(self, '_use_prerendered_transport_mix', False)):
+            self._pending_prerender_mix_refresh = False
+            self._pending_prerender_mix_clear_track_audio = False
+            self._pending_prerender_mix_reason = ''
+            return
+
+        queued_frames = max(0, int(self._estimated_queued_output_frames()))
+        target_frames = max(1, int(self._desired_audio_buffer_frames()))
+        minimum_headroom = max(self._playback_chunk_frames, target_frames // 2)
+        if queued_frames < minimum_headroom and self._playback_active:
+            self._prerender_mix_refresh_timer.start(30)
+            return
+
+        clear_track_audio = bool(self._pending_prerender_mix_clear_track_audio)
+        reason = str(getattr(self, '_pending_prerender_mix_reason', '') or '')
+        self._pending_prerender_mix_refresh = False
+        self._pending_prerender_mix_clear_track_audio = False
+        self._pending_prerender_mix_reason = ''
+
+        previous_mix_key = str(self._playback_mix_cache_key or '')
+        previous_mix_duration = float(self._playback_mix_duration_sec or 0.0)
+        previous_mix_wav = self._playback_mix_wav_bytes
+        previous_mix_samples = self._playback_mix_samples
+        previous_mix_sample_rate = int(self._playback_mix_sample_rate or 0)
+        previous_mix_start_frame = int(getattr(self, '_playback_mix_start_frame', 0) or 0)
+        previous_mix_frame_count = int(getattr(self, '_playback_mix_frame_count', 0) or 0)
+
+        if clear_track_audio:
+            self._track_playback_audio_cache.clear()
+
+        try:
+            rebuilt = self._build_playback_mix(
+                start_frame=int(getattr(self, '_playback_frame_position', 0) or 0),
+                frame_count=self._prerender_playback_window_frames(),
+            )
+        except Exception:
+            rebuilt = False
+            _APP_LOGGER.exception("Failed refreshing prerendered playback mix during active playback")
+
+        if rebuilt:
+            if reason:
+                self.statusBar().showMessage(f'Updated prerendered playback from the next buffered section ({reason}).')
+            return
+
+        self._playback_mix_cache_key = previous_mix_key
+        self._playback_mix_duration_sec = previous_mix_duration
+        self._playback_mix_wav_bytes = previous_mix_wav
+        self._playback_mix_samples = previous_mix_samples
+        self._playback_mix_sample_rate = previous_mix_sample_rate
+        self._playback_mix_start_frame = previous_mix_start_frame
+        self._playback_mix_frame_count = previous_mix_frame_count
 
     def _schedule_deferred_note_refresh(
         self,
@@ -8984,34 +8855,10 @@ class MainWindow(QtWidgets.QMainWindow):
         sample_rate: int,
         state: RealtimeTrackPlaybackState,
     ) -> object:
-        if not PEDALBOARD_AVAILABLE or np is None or Pedalboard is None:
-            return data
-        effect_entries = self._effect_chain_entries(track)
-        if not effect_entries:
-            return data
-
-        if not state.fx_plugins:
-            plugins: list[object] = []
-            for entry in effect_entries:
-                try:
-                    plugin = self._load_rack_plugin(entry.name)
-                except Exception:
-                    plugin = None
-                if plugin is not None and bool(getattr(plugin, 'is_effect', False)):
-                    plugins.append(plugin)
-            state.fx_plugins = plugins
-        if not state.fx_plugins:
-            return data
-
-        audio = np.asarray(data, dtype=np.float32)
-        if audio.ndim == 1:
-            audio = audio[None, :]
-        reset_flag = state.fx_reset_pending
-        for plugin in state.fx_plugins:
-            audio = np.asarray(plugin(audio, sample_rate, buffer_size=max(64, audio.shape[-1]), reset=reset_flag), dtype=np.float32)
-            if audio.ndim == 1:
-                audio = audio[None, :]
-        return np.asarray(audio, dtype=np.float32)
+        _ = idx, sample_rate, state
+        # Playback has moved to the native JUCE host path. Do not route
+        # realtime transport audio back through a separate Python plugin path.
+        return data
 
     def _render_sample_track_chunk(self, idx: int, track: TrackState, start_frame: int, frame_count: int) -> tuple[object, int]:
         total_samples = max(1, int(frame_count))
@@ -9224,6 +9071,58 @@ class MainWindow(QtWidgets.QMainWindow):
         logical_frame = loop_start_frame + ((origin_offset + audible_generated) % loop_length)
         return sample_frame_to_tick(logical_frame, self._playback_sample_rate, self.project.bpm)
 
+    def _prerender_playback_window_frames(self) -> int:
+        target_frames = max(1, int(self._desired_audio_buffer_frames()))
+        return max(target_frames, self._playback_chunk_frames * 2)
+
+    def _empty_stereo_playback_samples(self, frame_count: int) -> object:
+        count = max(0, int(frame_count))
+        if np is not None:
+            return np.zeros((2, count), dtype=np.float32)
+        return [[0.0] * count, [0.0] * count]
+
+    def _ensure_prerendered_playback_mix_window(self, start_frame: int, frame_count: int) -> bool:
+        requested_start = max(0, int(start_frame))
+        requested_count = max(1, int(frame_count))
+        cache = self._playback_mix_samples
+        cache_start = int(getattr(self, '_playback_mix_start_frame', 0) or 0)
+        cache_end = cache_start + int(getattr(self, '_playback_mix_frame_count', 0) or 0)
+        if (
+            cache is not None
+            and int(self._playback_mix_sample_rate) == int(self._playback_sample_rate)
+            and requested_start >= cache_start
+            and (requested_start + requested_count) <= cache_end
+        ):
+            return True
+        try:
+            return self._build_playback_mix(
+                start_frame=requested_start,
+                frame_count=max(requested_count, self._prerender_playback_window_frames()),
+            )
+        except Exception:
+            _APP_LOGGER.exception(
+                "Failed building prerender playback window start_frame=%s frame_count=%s",
+                requested_start,
+                requested_count,
+            )
+            self._playback_mix_samples = None
+            self._playback_mix_sample_rate = 0
+            self._playback_mix_start_frame = 0
+            self._playback_mix_frame_count = 0
+            return False
+
+    def _slice_prerendered_playback_window(self, start_frame: int, frame_count: int) -> object:
+        requested_start = max(0, int(start_frame))
+        requested_count = max(1, int(frame_count))
+        if not self._ensure_prerendered_playback_mix_window(requested_start, requested_count):
+            return self._empty_stereo_playback_samples(requested_count)
+        source = self._playback_mix_samples
+        if source is None:
+            return self._empty_stereo_playback_samples(requested_count)
+        offset = max(0, requested_start - int(getattr(self, '_playback_mix_start_frame', 0) or 0))
+        segment = self._slice_stereo_audio(source, offset, requested_count)
+        return self._ensure_stereo_sample_count(segment, requested_count)
+
     def _slice_stereo_audio(self, data: object, start_frame: int, frame_count: int) -> object:
         start = max(0, int(start_frame))
         count = max(1, int(frame_count))
@@ -9336,10 +9235,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _generate_realtime_chunk_samples(self, frame_count: int) -> object:
         if frame_count <= 0:
-            if np is not None:
-                return np.zeros((2, 0), dtype=np.float32)
-            return [[], []]
-        if bool(getattr(self, '_use_prerendered_transport_mix', False)) and self._playback_mix_samples is not None:
+            return self._empty_stereo_playback_samples(0)
+        if bool(getattr(self, '_use_prerendered_transport_mix', False)):
             return self._generate_prerendered_playback_chunk_samples(frame_count)
         if np is not None:
             mix = np.zeros((2, frame_count), dtype=np.float32)
@@ -9419,13 +9316,9 @@ class MainWindow(QtWidgets.QMainWindow):
         ]
 
     def _generate_prerendered_playback_chunk_samples(self, frame_count: int) -> object:
-        source = self._playback_mix_samples
-        if source is None:
-            if np is not None:
-                return np.zeros((2, max(0, int(frame_count))), dtype=np.float32)
-            return [[0.0] * max(0, int(frame_count)), [0.0] * max(0, int(frame_count))]
-
-        requested = max(1, int(frame_count))
+        requested = max(0, int(frame_count))
+        if requested <= 0:
+            return self._empty_stereo_playback_samples(0)
         if np is not None:
             mix: object = np.zeros((2, requested), dtype=np.float32)
         else:
@@ -9433,8 +9326,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if not self.project.loop_enabled:
             self._loop_declick_pending_frames = 0
-            segment = self._slice_stereo_audio(source, self._playback_frame_position, requested)
-            segment = self._ensure_stereo_sample_count(segment, requested)
+            segment = self._slice_prerendered_playback_window(self._playback_frame_position, requested)
             if np is not None and isinstance(mix, np.ndarray) and isinstance(segment, np.ndarray):
                 mix[:, :requested] = segment
             else:
@@ -9455,8 +9347,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if self._playback_frame_position < loop_start_frame or self._playback_frame_position >= loop_end_frame:
                     self._playback_frame_position = loop_start_frame
                 segment_frames = min(remaining, max(1, loop_end_frame - self._playback_frame_position))
-                segment = self._slice_stereo_audio(source, self._playback_frame_position, segment_frames)
-                segment = self._ensure_stereo_sample_count(segment, segment_frames)
+                segment = self._slice_prerendered_playback_window(self._playback_frame_position, segment_frames)
                 if np is not None and isinstance(mix, np.ndarray) and isinstance(segment, np.ndarray):
                     mix[:, offset:offset + segment_frames] = segment
                 else:
@@ -10213,19 +10104,55 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         return bool(self._can_use_native_vst_host(self._existing_vsti_entry_for_path(normalized_path)))
 
-    def _probe_native_vst_host_plugin(self, plugin_path: str) -> tuple[str, bool, str]:
+    @staticmethod
+    def _parameter_names_from_native_status(status: dict[str, object] | None) -> list[str]:
+        if not isinstance(status, dict):
+            return []
+        names: list[str] = []
+        raw_names = status.get('parameter_names')
+        if isinstance(raw_names, list):
+            for raw_name in raw_names:
+                name = str(raw_name or '').strip()
+                if name and name not in {'-', '--', '---'} and name not in names:
+                    names.append(name)
+        if names:
+            return names
+        raw_parameters = status.get('plugin_parameters')
+        if isinstance(raw_parameters, list):
+            for raw_parameter in raw_parameters:
+                if not isinstance(raw_parameter, dict):
+                    continue
+                name = str(raw_parameter.get('name') or '').strip()
+                if name and name not in {'-', '--', '---'} and name not in names:
+                    names.append(name)
+        return names
+
+    def _store_native_vst_probe_metadata(self, plugin_path: str, status: dict[str, object] | None) -> None:
+        if not isinstance(status, dict):
+            return
+        normalized = self._normalized_vsti_path(plugin_path)
+        self._store_native_vst_bus_metadata(normalized, status)
+        self.vsti_plugin_metadata[normalized] = self._parameter_names_from_native_status(status)
+
+    def _probe_native_vst_host_plugin(
+        self,
+        plugin_path: str,
+    ) -> tuple[str, bool, bool, str, bool, str]:
         normalized_path = self._normalized_vsti_path(plugin_path)
         if not NATIVE_VST_HOST_AVAILABLE or NativeVstHostBridge is None:
-            return Path(normalized_path).stem, False, "Native VST host is unavailable."
+            return Path(normalized_path).stem, False, False, "", False, native_vst_host_runtime_hint() or "Native VST host is unavailable."
         try:
             status = self._probe_native_vst_host_status(normalized_path) or {}
             plugin_name = str(status.get('plugin_name') or Path(normalized_path).stem)
+            is_instrument = bool(status.get('plugin_is_instrument', False))
+            is_effect = bool(status.get('plugin_is_effect', False))
+            category = str(status.get('plugin_category') or '')
             loaded = bool(status.get('plugin_loaded', False))
             message = 'Plugin loaded in native host' if loaded else 'Plugin failed to load in native host'
-            return plugin_name, loaded, message
+            return plugin_name, is_instrument, is_effect, category, loaded, message
         except Exception as exc:
             _APP_LOGGER.exception("Native VST probe failed path=%s", normalized_path)
-            return Path(normalized_path).stem, False, str(exc)
+            return Path(normalized_path).stem, False, False, "", False, str(exc)
 
     def _describe_plugin_path(self, plugin_path: str) -> tuple[str, bool, bool, str, bool, str]:
         normalized_path = self._normalized_vsti_path(plugin_path)
@@ -10246,44 +10173,23 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             self.vsti_description_cache[normalized_path] = result
             return result
-        if not PEDALBOARD_AVAILABLE:
-            result = (default_name, True, False, '', True, '')
-            self.vsti_description_cache[normalized_path] = result
-            return result
         existing_entry = self._existing_vsti_entry_for_path(normalized_path)
-        if self._should_avoid_inprocess_vst_probe(normalized_path):
-            plugin_name, host_supported, host_detail = self._probe_native_vst_host_plugin(normalized_path)
-            if existing_entry is not None:
-                result = (
-                    str(existing_entry.name or plugin_name or default_name),
-                    bool(existing_entry.is_instrument),
-                    bool(existing_entry.is_effect),
-                    str(existing_entry.category or ''),
-                    bool(host_supported),
-                    '' if host_supported else host_detail,
-                )
-            else:
-                result = (
-                    plugin_name or default_name,
-                    False,
-                    False,
-                    '',
-                    bool(host_supported),
-                    '' if host_supported else host_detail,
-                )
-            self.vsti_description_cache[normalized_path] = result
-            return result
-        try:
-            plugin = self.vsti_binary_loader.handle(normalized_path)
-            if plugin is None:
-                plugin, _resolved_path = load_vst_plugin_with_fallback(normalized_path)
-            name = str(getattr(plugin, 'name', '') or default_name)
-            is_instrument = bool(getattr(plugin, 'is_instrument', False))
-            is_effect = bool(getattr(plugin, 'is_effect', False))
-            category = str(getattr(plugin, 'category', '') or '')
-            result = (name, is_instrument, is_effect, category, True, '')
-        except Exception as exc:
-            result = (default_name, False, False, '', False, str(exc))
+        plugin_name, is_instrument, is_effect, category, host_supported, host_detail = self._probe_native_vst_host_plugin(normalized_path)
+        if existing_entry is not None:
+            if not is_instrument and bool(existing_entry.is_instrument):
+                is_instrument = True
+            if not is_effect and bool(existing_entry.is_effect):
+                is_effect = True
+            if not category:
+                category = str(existing_entry.category or '')
+        result = (
+            str((existing_entry.name if existing_entry is not None else '') or plugin_name or default_name),
+            bool(is_instrument),
+            bool(is_effect),
+            str(category or ''),
+            bool(host_supported),
+            '' if host_supported else host_detail,
+        )
         self.vsti_description_cache[normalized_path] = result
         return result
 
@@ -10448,28 +10354,20 @@ class MainWindow(QtWidgets.QMainWindow):
         plugin_path = self._rack_vsti_path(rack_name)
         if not plugin_path:
             return []
+        normalized_path = self._normalized_vsti_path(plugin_path)
+        if normalized_path not in self.vsti_plugin_metadata:
+            self._capture_vsti_metadata(normalized_path)
         return list(self.vsti_plugin_metadata.get(self._normalized_vsti_path(plugin_path), []))
 
     def _capture_vsti_metadata(self, plugin_path: str, plugin_instance=None) -> None:
+        del plugin_instance
         normalized_path = self._normalized_vsti_path(plugin_path)
-        if not PEDALBOARD_AVAILABLE or normalized_path in self.vsti_plugin_metadata:
+        if normalized_path in self.vsti_plugin_metadata:
             return
-        try:
-            plugin = plugin_instance
-            if plugin is None:
-                plugin = self.vsti_binary_loader.handle(normalized_path)
-            if plugin is None and self._should_avoid_inprocess_vst_probe(normalized_path):
-                _APP_LOGGER.info(
-                    "Skipping in-process VST metadata probe path=%s to avoid external plugin crash risk",
-                    normalized_path,
-                )
-                self.vsti_plugin_metadata[normalized_path] = []
-                return
-            if plugin is None:
-                plugin, _resolved_path = load_vst_plugin_with_fallback(normalized_path)
-            names = [str(name) for name in plugin.parameters.keys()]
-            self.vsti_plugin_metadata[normalized_path] = names
-        except Exception:
+        status = self._probe_native_vst_host_status(normalized_path)
+        if isinstance(status, dict):
+            self._store_native_vst_probe_metadata(normalized_path, status)
+        else:
             self.vsti_plugin_metadata[normalized_path] = []
 
     @staticmethod
@@ -10525,7 +10423,7 @@ class MainWindow(QtWidgets.QMainWindow):
             bridge.start(startup_timeout=8.0)
             status = bridge.command('status')
             if isinstance(status, dict):
-                self._store_native_vst_bus_metadata(normalized_path, status)
+                self._store_native_vst_probe_metadata(normalized_path, status)
                 return status
         except Exception:
             _APP_LOGGER.exception("Native VST status probe failed path=%s", normalized_path)
@@ -10657,15 +10555,8 @@ class MainWindow(QtWidgets.QMainWindow):
         return effective
 
     def _load_rack_plugin(self, rack_name: str):
-        if not PEDALBOARD_AVAILABLE or not load_plugin:
-            return None
-        entry = self._rack_vsti_entry(rack_name)
-        if entry is None or not Path(entry.path).exists():
-            return None
-        _APP_LOGGER.debug("Creating rack plugin instance rack_name=%s path=%s", rack_name, entry.path)
-        plugin, _resolved_path = load_vst_plugin_with_fallback(entry.path)
-        self._capture_vsti_metadata(entry.path, plugin)
-        return plugin
+        _ = rack_name
+        return None
 
     @staticmethod
     def _plugin_parameter_snapshot(plugin) -> dict[str, float]:
@@ -10828,26 +10719,8 @@ class MainWindow(QtWidgets.QMainWindow):
         return [left, right]
 
     def _apply_saved_plugin_parameters(self, plugin, values: dict[str, float]) -> None:
-        if not PEDALBOARD_AVAILABLE or not values:
-            return
-        try:
-            param_names = [str(name) for name in plugin.parameters.keys()]
-            for idx, param in enumerate(plugin.parameters.values()):
-                key = param_names[idx] if idx < len(param_names) else f'Param {idx + 1}'
-                legacy_key = f'Param {idx + 1}'
-                if key in values:
-                    param_value = values[key]
-                elif legacy_key in values:
-                    param_value = values[legacy_key]
-                else:
-                    continue
-                try:
-                    normalized = safe_finite_float(param_value, 0.0) / 100.0
-                    param.raw_value = max(0.0, min(1.0, normalized))
-                except Exception:
-                    continue
-        except Exception:
-            return
+        _ = plugin, values
+        return
 
     def _track_index_for_object(self, track: TrackState) -> int:
         for idx, candidate in enumerate(self.project.tracks):
@@ -10904,7 +10777,13 @@ class MainWindow(QtWidgets.QMainWindow):
             _APP_LOGGER.exception("Failed applying live native VST parameters")
             return False
 
-    def _sync_native_vst_host_parameters(self, track: TrackState, values: dict[str, float]) -> None:
+    def _sync_native_vst_host_parameters(
+        self,
+        track: TrackState,
+        values: dict[str, float],
+        *,
+        include_output_bridge: bool = True,
+    ) -> None:
         if track.instrument_mode != 'VSTI Rack' or not track.rack_vsti:
             return
         entry = self._rack_vsti_entry(track.rack_vsti)
@@ -10919,17 +10798,18 @@ class MainWindow(QtWidgets.QMainWindow):
         if bridge is not None and self._native_vst_host_bridge_alive(track_index):
             self._apply_native_vst_bridge_parameter_values(bridge, values)
 
-        direct_candidate = self._direct_native_transport_candidate()
-        direct_candidate_row = int(direct_candidate[0]) if direct_candidate is not None else -1
-        direct_row = int(getattr(self, '_direct_native_transport_row', -1) or -1)
-        direct_bridge = getattr(self, '_native_output_bridge', None)
-        if (
-            direct_bridge is not None
-            and self._native_output_bridge_alive()
-            and (direct_row == track_index or direct_candidate_row == track_index)
-            and self._normalized_vsti_path(str(getattr(direct_bridge, 'plugin_path', '') or '')) == self._normalized_vsti_path(entry.path)
-        ):
-            self._apply_native_vst_bridge_parameter_values(direct_bridge, values)
+        if include_output_bridge:
+            direct_candidate = self._direct_native_transport_candidate()
+            direct_candidate_row = int(direct_candidate[0]) if direct_candidate is not None else -1
+            direct_row = int(getattr(self, '_direct_native_transport_row', -1) or -1)
+            direct_bridge = getattr(self, '_native_output_bridge', None)
+            if (
+                direct_bridge is not None
+                and self._native_output_bridge_alive()
+                and (direct_row == track_index or direct_candidate_row == track_index)
+                and self._normalized_vsti_path(str(getattr(direct_bridge, 'plugin_path', '') or '')) == self._normalized_vsti_path(entry.path)
+            ):
+                self._apply_native_vst_bridge_parameter_values(direct_bridge, values)
 
     def _apply_track_vsti_parameters_live(
         self,
@@ -10942,8 +10822,15 @@ class MainWindow(QtWidgets.QMainWindow):
             str(key): max(0.0, min(100.0, safe_finite_float(value, 0.0)))
             for key, value in dict(values or {}).items()
         }
+        prerender_playback_active = bool(getattr(self, '_playback_active', False)) and bool(
+            getattr(self, '_use_prerendered_transport_mix', False)
+        )
         track.vsti_parameters = sanitized
-        self._sync_native_vst_host_parameters(track, sanitized)
+        self._sync_native_vst_host_parameters(
+            track,
+            sanitized,
+            include_output_bridge=not prerender_playback_active,
+        )
         if editor_plugin is not None:
             self._apply_saved_plugin_parameters(editor_plugin, sanitized)
         track_index = self._track_index_for_object(track)
@@ -10960,6 +10847,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._apply_saved_plugin_parameters(live_state.plugin, sanitized)
                 live_state.key = self._track_live_host_key(track, track_index)
                 live_state.last_error = ""
+            self._queue_parameter_change_audition(track_index)
+        if prerender_playback_active:
+            self._schedule_prerendered_playback_mix_refresh(reason='VST parameter change')
+            self.statusBar().showMessage('Saved VST parameter change. Updating the next prerendered buffer section.')
+            return
         self._invalidate_playback_caches(clear_track_audio=False, reset_realtime=True)
         self._reload_playback_mix_if_running()
 
@@ -11367,19 +11259,8 @@ class MainWindow(QtWidgets.QMainWindow):
         modeless: bool = False,
         track_row: int | None = None,
     ) -> QtWidgets.QDialog | None:
-        plugin = self._active_realtime_instrument_plugin_for_track(track, vst.name)
+        plugin = None
         parameter_items: list[tuple[str, object]] = []
-        if PEDALBOARD_AVAILABLE and vst.host_supported:
-            try:
-                if plugin is None:
-                    plugin = self._load_rack_plugin(vst.name)
-                if plugin is not None:
-                    if plugin is not self._active_realtime_instrument_plugin_for_track(track, vst.name):
-                        self._load_saved_vsti_plugin_state(plugin, track, vst)
-                    self._apply_saved_plugin_parameters(plugin, track.vsti_parameters)
-                    parameter_items = [(str(key), param) for key, param in plugin.parameters.items()]
-            except Exception:
-                plugin = None
 
         self._capture_vsti_metadata(vst.path)
         param_names = [key for key, _param in parameter_items] if parameter_items else self.vsti_parameter_names_for_rack(vst.name)
@@ -11871,28 +11752,10 @@ class MainWindow(QtWidgets.QMainWindow):
         return messages
 
     def _apply_vst_fx_chain(self, track: TrackState, data: object, sample_rate: int) -> object:
-        if not PEDALBOARD_AVAILABLE or np is None or Pedalboard is None or not track.vst_fx_chain:
-            return data
-
-        effects = []
-        for fx_name in track.vst_fx_chain:
-            entry = self._rack_vsti_entry(fx_name)
-            if entry is None or not entry.is_effect:
-                continue
-            try:
-                plugin = self._load_rack_plugin(entry.name)
-            except Exception:
-                plugin = None
-            if plugin is not None and bool(getattr(plugin, 'is_effect', False)):
-                effects.append(plugin)
-        if not effects:
-            return data
-
-        audio = np.asarray(data, dtype=np.float32)
-        if audio.ndim == 1:
-            audio = audio[None, :]
-        processed = Pedalboard(effects)(audio, sample_rate)
-        return self._as_mono_audio(processed)
+        _ = track, sample_rate
+        # Offline playback/prerender rendering should stay on the native JUCE
+        # side as well. Leave the input unchanged until native FX hosting lands.
+        return data
 
     def _render_track_audio(self, track: TrackState, target_sample_rate: int | None = None) -> tuple[object, int]:
         sample_rate = max(1, int(target_sample_rate or 44100))
@@ -11920,26 +11783,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.statusBar().showMessage(f'Internal VST render fallback to synth for {track.name}: {exc}')
 
         data, sr = self.renderer.render_track_audio(track, self.project.bpm)
-
-        if track.instrument_mode == 'VSTI Rack' and entry is not None and entry.is_effect:
-            try:
-                plugin = self._load_rack_plugin(entry.name)
-                if plugin is not None and bool(getattr(plugin, 'is_effect', False)) and np is not None:
-                    self._load_saved_vsti_plugin_state(plugin, track, entry)
-                    self._apply_saved_plugin_parameters(plugin, track.vsti_parameters)
-                    dry_audio = np.asarray(data, dtype=np.float32)
-                    if dry_audio.ndim == 1:
-                        dry_audio = dry_audio[None, :]
-                    wet_audio = plugin(dry_audio, sr)
-                    wet_audio = np.asarray(wet_audio, dtype=np.float32)
-                    if wet_audio.ndim == 1:
-                        wet_audio = wet_audio[None, :]
-                    wet_mix = max(0.0, min(1.0, float(track.vsti_wet_mix) / 100.0))
-                    blended = (wet_audio * wet_mix) + (dry_audio * (1.0 - wet_mix))
-                    gain_linear = 10.0 ** (float(track.vsti_output_gain_db) / 20.0)
-                    data = np.clip(self._as_mono_audio(blended) * gain_linear, -1.0, 1.0)
-            except Exception as exc:
-                self.statusBar().showMessage(f'VST effect fallback to synth for {track.name}: {exc}')
 
         data = self._apply_vst_fx_chain(track, data, sr)
         return data, sr
@@ -11975,7 +11818,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     and instrument_entry.is_instrument
                     and self._can_use_native_vst_host(instrument_entry)
                 )
-                else 'pedalboard' if PEDALBOARD_AVAILABLE else 'builtin'
+                else 'builtin'
             ),
             'track_type': track.track_type,
             'instrument': track.instrument,
@@ -12419,10 +12262,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._discard_realtime_track_state(row)
         if self._track_uses_rack_vsti(previous_rack_vsti, exclude_row=row):
             return
-        entry = self._rack_vsti_entry(previous_rack_vsti)
-        if entry is None:
-            return
-        self.vsti_binary_loader.release(entry.path)
 
     def _open_standalone_native_vst_editor(self, row: int, entry: VSTInstrument, track: TrackState) -> bool:
         if not NATIVE_VST_HOST_AVAILABLE or NATIVE_VST_HOST_EXE is None or not Path(NATIVE_VST_HOST_EXE).exists():
@@ -12637,44 +12476,65 @@ class MainWindow(QtWidgets.QMainWindow):
             }
         )
 
-    def _build_playback_mix(self) -> bool:
+    def _build_playback_mix(self, start_frame: int | None = None, frame_count: int | None = None) -> bool:
         left = self.project.left_locator_sec
         right = self.project.right_locator_sec
         if right <= left:
             return False
 
+        sample_rate = max(1, int(self._playback_sample_rate))
         mix_duration_sec = self._playback_mix_duration_seconds()
         cache_key = self._playback_mix_cache_signature(mix_duration_sec)
+        window_start = max(
+            0,
+            int(
+                self._playback_frame_position
+                if start_frame is None
+                else start_frame
+            ),
+        )
+        requested_frames = max(
+            1,
+            int(frame_count if frame_count is not None else self._prerender_playback_window_frames()),
+        )
+        if self.project.loop_enabled:
+            loop_start_frame, loop_end_frame = self._loop_frame_bounds()
+            if window_start < loop_start_frame or window_start >= loop_end_frame:
+                window_start = loop_start_frame
+            requested_frames = min(requested_frames, max(1, loop_end_frame - window_start))
+        else:
+            project_end_frame = max(1, int(math.ceil(max(0.0, mix_duration_sec) * sample_rate)))
+            if window_start >= project_end_frame:
+                requested_frames = 1
+            else:
+                requested_frames = min(requested_frames, max(1, project_end_frame - window_start))
         if (
             self._playback_mix_cache_key == cache_key
             and self._playback_mix_samples is not None
             and int(self._playback_mix_sample_rate) == int(self._playback_sample_rate)
+            and window_start >= int(getattr(self, '_playback_mix_start_frame', 0) or 0)
+            and (window_start + requested_frames)
+            <= (int(getattr(self, '_playback_mix_start_frame', 0) or 0) + int(getattr(self, '_playback_mix_frame_count', 0) or 0))
         ):
             self._playback_mix_duration_sec = mix_duration_sec
             return True
 
-        sample_rate = max(1, int(self._playback_sample_rate))
-        mix_length = max(1, int(mix_duration_sec * sample_rate))
         if np is not None:
-            mix: object = np.zeros((2, mix_length), dtype=np.float32)
+            mix: object = np.zeros((2, requested_frames), dtype=np.float32)
         else:
-            mix = [[0.0] * mix_length, [0.0] * mix_length]
-        has_audio = False
+            mix = [[0.0] * requested_frames, [0.0] * requested_frames]
+        has_sources = False
 
         if bool(getattr(self.project, 'metronome_enabled', False)):
-            cursor = 0
-            while cursor < mix_length:
-                current_frames = min(8192, mix_length - cursor)
-                click = self._render_metronome_segment(cursor, current_frames)
-                click = self._ensure_stereo_sample_count(click, current_frames)
-                if np is not None and isinstance(mix, np.ndarray) and isinstance(click, np.ndarray):
-                    mix[:, cursor:cursor + current_frames] += click
-                else:
-                    for channel in range(2):
-                        for i in range(current_frames):
-                            mix[channel][cursor + i] += click[channel][i]
-                cursor += current_frames
-            has_audio = True
+            click = self._render_metronome_segment(window_start, requested_frames)
+            click = self._ensure_stereo_sample_count(click, requested_frames)
+            if np is not None and isinstance(mix, np.ndarray) and isinstance(click, np.ndarray):
+                mix[:, :requested_frames] += click
+            else:
+                for channel in range(2):
+                    for i in range(requested_frames):
+                        mix[channel][i] += click[channel][i]
+            has_sources = True
 
         solo_tracks = {idx for idx, t in enumerate(self.project.tracks) if t.solo}
         for idx, track in enumerate(self.project.tracks):
@@ -12685,33 +12545,30 @@ class MainWindow(QtWidgets.QMainWindow):
             if track.mute:
                 continue
 
+            has_sources = True
             data, sr = self._get_track_playback_audio(idx, track, sample_rate)
             if sr != sample_rate:
                 data = resample_samples(data, sr, sample_rate)
 
             if np is not None and isinstance(data, np.ndarray) and data.ndim == 2:
-                track_audio = self._apply_track_pan_stereo(data, track.pan)
+                track_audio = self._slice_stereo_audio(data, window_start, requested_frames)
+                track_audio = self._apply_track_pan_stereo(track_audio, track.pan)
             elif isinstance(data, (list, tuple)) and data and isinstance(data[0], (list, tuple)):
-                track_audio = self._apply_track_pan_stereo(data, track.pan)
+                track_audio = self._slice_stereo_audio(data, window_start, requested_frames)
+                track_audio = self._apply_track_pan_stereo(track_audio, track.pan)
             else:
-                track_audio = self._apply_track_pan(data, track.pan)
+                track_audio = self._slice_mono_audio(data, window_start, requested_frames)
+                track_audio = self._apply_track_pan(track_audio, track.pan)
             track_audio = self._ensure_stereo_sample_count(
                 track_audio,
-                track_audio.shape[-1] if np is not None and isinstance(track_audio, np.ndarray) else len(track_audio[0]) if isinstance(track_audio, (list, tuple)) and track_audio else 0,
+                requested_frames,
             )
             if np is not None and isinstance(mix, np.ndarray) and isinstance(track_audio, np.ndarray):
-                count = min(mix.shape[1], track_audio.shape[1])
-                if count <= 0:
-                    continue
-                mix[:, :count] += track_audio[:, :count]
+                mix[:, :requested_frames] += track_audio[:, :requested_frames]
             else:
-                count = min(len(mix[0]), len(track_audio[0]) if track_audio else 0)
-                if count <= 0:
-                    continue
                 for channel in range(2):
-                    for i in range(count):
+                    for i in range(requested_frames):
                         mix[channel][i] += track_audio[channel][i]
-            has_audio = True
 
         for clip in self.project.sample_clips:
             if clip.track_index < 0 or clip.track_index >= len(self.project.tracks):
@@ -12721,49 +12578,66 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             if clip_track.mute:
                 continue
-            wav_path = Path(clip.path)
-            if wav_path.suffix.lower() == '.mp3':
-                converted = RENDER_DIR / f'{wav_path.stem}_play.wav'
-                convert_audio(wav_path, converted)
-                wav_path = converted
-            data, sr = load_wav_samples(wav_path)
+            has_sources = True
+            data, sr = self._sample_audio_data(clip.path)
             if sr != sample_rate:
                 data = resample_samples(data, sr, sample_rate)
                 sr = sample_rate
 
             data = self._apply_vst_fx_chain(clip_track, data, sr)
 
-            clip_start = clip.start_sec
-            clip_length = data.shape[0] if np is not None and isinstance(data, np.ndarray) else len(data)
-            clip_end = clip.start_sec + (clip_length / sample_rate)
-            if clip_end <= 0.0 or clip_start >= mix_duration_sec:
-                continue
-            src_start = 0
-            dst_start = max(0, int(clip_start * sample_rate))
-            if np is not None and isinstance(mix, np.ndarray) and isinstance(data, np.ndarray):
-                stereo_data = self._apply_track_pan(data, clip_track.pan)
-                stereo_data = self._ensure_stereo_sample_count(stereo_data, data.shape[0])
-                count = min(stereo_data.shape[1] - src_start, mix.shape[1] - dst_start)
-                if count <= 0:
-                    continue
-                mix[:, dst_start : dst_start + count] += stereo_data[:, src_start : src_start + count] * 0.7 * float(clip_track.volume)
+            clip_start_frame = max(0, int(float(clip.start_sec) * sample_rate))
+            if np is not None and isinstance(data, np.ndarray):
+                if data.ndim == 2 and data.shape[0] == 2:
+                    clip_frame_count = int(data.shape[1])
+                elif data.ndim == 2 and data.shape[1] == 2:
+                    clip_frame_count = int(data.shape[0])
+                else:
+                    clip_frame_count = int(data.shape[0])
+            elif isinstance(data, (list, tuple)) and data and isinstance(data[0], (list, tuple)):
+                clip_frame_count = max((len(channel) for channel in data[:2]), default=0)
             else:
-                stereo_data = self._apply_track_pan(data, clip_track.pan)
-                stereo_data = self._ensure_stereo_sample_count(stereo_data, len(data))
-                count = min(len(stereo_data[0]) - src_start, len(mix[0]) - dst_start)
-                if count <= 0:
-                    continue
+                clip_frame_count = len(data) if isinstance(data, (list, tuple)) else 0
+            if clip_frame_count <= 0:
+                continue
+            clip_end_frame = clip_start_frame + clip_frame_count
+            window_end = window_start + requested_frames
+            overlap_start = max(window_start, clip_start_frame)
+            overlap_end = min(window_end, clip_end_frame)
+            if overlap_end <= overlap_start:
+                continue
+            src_start = overlap_start - clip_start_frame
+            dst_start = overlap_start - window_start
+            overlap_frames = overlap_end - overlap_start
+            if np is not None and isinstance(mix, np.ndarray) and isinstance(data, np.ndarray):
+                if data.ndim == 2 and (data.shape[0] == 2 or data.shape[1] == 2):
+                    stereo_data = self._slice_stereo_audio(data, src_start, overlap_frames)
+                    stereo_data = self._apply_track_pan_stereo(stereo_data, clip_track.pan)
+                else:
+                    mono_data = self._slice_mono_audio(data, src_start, overlap_frames)
+                    stereo_data = self._apply_track_pan(mono_data, clip_track.pan)
+                stereo_data = self._ensure_stereo_sample_count(stereo_data, overlap_frames)
+                mix[:, dst_start : dst_start + overlap_frames] += stereo_data[:, :overlap_frames] * 0.7 * float(clip_track.volume)
+            else:
+                if isinstance(data, (list, tuple)) and data and isinstance(data[0], (list, tuple)):
+                    stereo_data = self._slice_stereo_audio(data, src_start, overlap_frames)
+                    stereo_data = self._apply_track_pan_stereo(stereo_data, clip_track.pan)
+                else:
+                    mono_data = self._slice_mono_audio(data, src_start, overlap_frames)
+                    stereo_data = self._apply_track_pan(mono_data, clip_track.pan)
+                stereo_data = self._ensure_stereo_sample_count(stereo_data, overlap_frames)
                 for channel in range(2):
-                    for i in range(count):
-                        mix[channel][dst_start + i] += stereo_data[channel][src_start + i] * 0.7 * float(clip_track.volume)
-            has_audio = True
+                    for i in range(overlap_frames):
+                        mix[channel][dst_start + i] += stereo_data[channel][i] * 0.7 * float(clip_track.volume)
 
-        if not has_audio:
+        if not has_sources:
             self._playback_mix_cache_key = ''
             self._playback_mix_duration_sec = 0.0
             self._playback_mix_wav_bytes = b''
             self._playback_mix_samples = None
             self._playback_mix_sample_rate = 0
+            self._playback_mix_start_frame = 0
+            self._playback_mix_frame_count = 0
             return False
 
         if np is not None and isinstance(mix, np.ndarray):
@@ -12775,9 +12649,11 @@ class MainWindow(QtWidgets.QMainWindow):
             ]
         self._playback_mix_samples = mix_for_output
         self._playback_mix_sample_rate = sample_rate
+        self._playback_mix_start_frame = window_start
+        self._playback_mix_frame_count = requested_frames
         self._playback_mix_wav_bytes = b''
         self._playback_mix_cache_key = cache_key
-        self._playback_mix_duration_sec = mix_length / sample_rate
+        self._playback_mix_duration_sec = mix_duration_sec
         return True
 
 
@@ -13304,9 +13180,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(f'Scanned sample folders. Added {added} sample(s).')
 
     def _queue_vsti_background_load(self, path: str, *, show_message: bool = False, reason: str = 'manual') -> bool:
-        normalized = self._normalized_vsti_path(path)
-        if show_message:
-            self.statusBar().showMessage(f'VST3 plugins now load on the main thread when first used: {Path(normalized).name}')
+        _ = path, show_message, reason
         return False
 
     def _on_vsti_background_load_finished(
@@ -13318,62 +13192,30 @@ class MainWindow(QtWidgets.QMainWindow):
         reason: str,
         show_message: bool,
     ) -> None:
-        normalized = self._normalized_vsti_path(path)
-        self._vsti_background_loads_inflight.discard(normalized)
-        self._active_vsti_workers.pop(normalized, None)
-        if ok:
-            self.vsti_plugin_metadata[normalized] = list(param_names)
-            if show_message:
-                self.statusBar().showMessage(f'Loaded VST3 plugin in background: {Path(normalized).name}')
-        elif show_message:
-            QtWidgets.QMessageBox.warning(self, 'VSTI load failed', f'Could not load {Path(normalized).name}\n\n{detail}')
-
-        self.refresh_vsti_rack_ui()
+        _ = path, ok, detail, param_names, reason, show_message
+        return
 
     def _start_vsti_background_warmup(self) -> None:
         return
 
-    def _temporarily_stop_playback_for_vsti_load(self) -> tuple[bool, int]:
-        was_playing = bool(hasattr(self, 'playback_timer') and self.playback_timer.isActive())
-        resume_tick = int(self.project.playhead_tick)
-        if not was_playing:
-            return False, resume_tick
-        self.stop_playback()
-        self._reset_realtime_track_states(clear_plugins=True)
-        self._realtime_reset_pending = True
-        return True, resume_tick
-
-    def _resume_playback_after_vsti_load(self, was_playing: bool, resume_tick: int) -> None:
-        if not was_playing:
-            return
-        self._set_playhead_tick_position(int(resume_tick))
-        QtCore.QTimer.singleShot(0, self.start_playback)
-
     def _load_vsti_binary_path(self, path: str, show_message: bool = True) -> bool:
         normalized = self._normalized_vsti_path(path)
-        _APP_LOGGER.info(
-            "Loading VST3 path=%s show_message=%s playing=%s",
-            normalized,
-            bool(show_message),
-            bool(hasattr(self, 'playback_timer') and self.playback_timer.isActive()),
-        )
-        paused_playback, resume_tick = self._temporarily_stop_playback_for_vsti_load()
-        try:
-            ok, detail = self.vsti_binary_loader.load(normalized)
-            if ok:
-                self._capture_vsti_metadata(normalized, self.vsti_binary_loader.handle(normalized))
-        finally:
-            self._resume_playback_after_vsti_load(paused_playback, resume_tick)
+        _APP_LOGGER.info("Refreshing native VST metadata path=%s show_message=%s", normalized, bool(show_message))
+        status = self._probe_native_vst_host_status(normalized)
+        ok = isinstance(status, dict) and bool(status.get('plugin_loaded', False))
+        detail = 'Plugin loaded in native host' if ok else (native_vst_host_runtime_hint() or 'Could not load plugin in native host')
         if ok:
-            _APP_LOGGER.info("Loaded VST3 path=%s detail=%s", normalized, detail)
+            self._capture_vsti_metadata(normalized)
+            _APP_LOGGER.info("Refreshed native VST metadata path=%s detail=%s", normalized, detail)
         else:
-            _APP_LOGGER.warning("Failed loading VST3 path=%s detail=%s", normalized, detail)
+            _APP_LOGGER.warning("Failed refreshing native VST metadata path=%s detail=%s", normalized, detail)
         if show_message:
             name = Path(normalized).name
             if ok:
-                self.statusBar().showMessage(f'Loaded VST3 plugin: {name}')
+                self.statusBar().showMessage(f'Refreshed VST3 metadata: {name}')
             else:
-                QtWidgets.QMessageBox.warning(self, 'VSTI load failed', f'Could not load {name}\n\n{detail}')
+                QtWidgets.QMessageBox.warning(self, 'VSTI probe failed', f'Could not probe {name}\n\n{detail}')
+        self.refresh_vsti_rack_ui()
         return ok
 
     def load_vsti_binary_by_name(self, vsti_name: str) -> None:
@@ -13384,15 +13226,7 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QMessageBox.information(self, 'VSTI not found', f'No rack VSTI named {vsti_name}.')
 
     def _load_vsti_editor_plugin(self, vst: VSTInstrument):
-        normalized = self._normalized_vsti_path(vst.path)
-        ok, detail = self.vsti_binary_loader.load(normalized)
-        if not ok:
-            raise RuntimeError(detail or f'Could not load {vst.name}')
-        plugin = self.vsti_binary_loader.handle(normalized)
-        if plugin is None:
-            raise RuntimeError(f'Loaded {vst.name} but no plugin handle was available for the editor.')
-        self._capture_vsti_metadata(normalized, plugin)
-        return plugin
+        raise RuntimeError(f'In-process VST wrapper loading has been removed for {vst.name}. Use the native JUCE editor instead.')
 
     def open_vsti_gui_by_name(self, vsti_name: str, row: int | None = None) -> None:
         for vst in self.project.vsti_rack:
@@ -13803,14 +13637,13 @@ class MainWindow(QtWidgets.QMainWindow):
             supported_rack = [vst for vst in self.project.vsti_rack if vst.host_supported]
             if supported_rack:
                 for vst in supported_rack:
-                    loaded_flag = 'OK' if self.vsti_binary_loader.is_loaded(vst.path) else '...'
                     roles = []
                     if vst.is_instrument:
                         roles.append('INST')
                     if vst.is_effect:
                         roles.append('FX')
                     role_text = '/'.join(roles) if roles else 'UNK'
-                    action = QtGui.QAction(f'Rack: {loaded_flag} [{role_text}] {vst.name}', self)
+                    action = QtGui.QAction(f'Rack: [{role_text}] {vst.name}', self)
                     action.setProperty('rack_item', True)
                     action.setEnabled(False)
                     self.vsti_menu.addAction(action)
@@ -14340,20 +14173,6 @@ class MainWindow(QtWidgets.QMainWindow):
             _APP_LOGGER.exception("Failed to reset realtime track states during shutdown")
         if hasattr(self, '_realtime_track_states'):
             self._realtime_track_states.clear()
-        if hasattr(self, '_active_vsti_workers'):
-            self._active_vsti_workers.clear()
-        if hasattr(self, '_vsti_background_loads_inflight'):
-            self._vsti_background_loads_inflight.clear()
-        if hasattr(self, '_vsti_worker_pool'):
-            try:
-                self._vsti_worker_pool.waitForDone(250)
-            except Exception:
-                pass
-        if hasattr(self, 'vsti_binary_loader'):
-            try:
-                self.vsti_binary_loader.clear()
-            except Exception:
-                _APP_LOGGER.exception("Failed to clear VST loader handles during shutdown")
         self._release_high_resolution_timers()
         mark_clean_shutdown("shutdown")
 
@@ -14673,10 +14492,29 @@ class MainWindow(QtWidgets.QMainWindow):
     def preview_current_track_note(self, pitch: int, velocity: int = 100, duration_tick: int = TICKS_PER_BEAT // 2) -> None:
         if not self.project.tracks:
             return
-        track_index = self.current_track_index()
-        track = self.current_track()
+        self._preview_track_note(
+            self.current_track_index(),
+            int(pitch),
+            int(velocity),
+            int(duration_tick),
+        )
+
+    def _preview_track_note(
+        self,
+        track_index: int,
+        pitch: int,
+        velocity: int = 100,
+        duration_tick: int = TICKS_PER_BEAT // 2,
+    ) -> bool:
+        if track_index < 0 or track_index >= len(self.project.tracks):
+            return False
+        track = self.project.tracks[int(track_index)]
         if track.track_type != 'instrument':
-            return
+            return False
+        pitch = int(clamp(pitch, 0, 127))
+        velocity = int(clamp(velocity, 1, 127))
+        duration_tick = max(1, int(duration_tick))
+        self._last_track_preview_notes[int(track_index)] = (pitch, velocity, duration_tick)
         entry = self._rack_vsti_entry(track.rack_vsti) if track.rack_vsti else None
         if (
             track.instrument_mode == 'VSTI Rack'
@@ -14685,17 +14523,16 @@ class MainWindow(QtWidgets.QMainWindow):
             and entry.host_supported
             and self._can_use_native_vst_host(entry)
         ):
-            self._preview_note_with_native_vst_host(
-                track_index,
+            return self._preview_note_with_native_vst_host(
+                int(track_index),
                 track,
                 entry,
-                int(pitch),
-                int(velocity),
-                int(duration_tick),
+                pitch,
+                velocity,
+                duration_tick,
             )
-            return
         try:
-            preview_note = MidiNote(start_tick=0, duration_tick=max(1, int(duration_tick)), pitch=int(pitch), velocity=int(clamp(velocity, 1, 127)))
+            preview_note = MidiNote(start_tick=0, duration_tick=duration_tick, pitch=pitch, velocity=velocity)
             preview_track = dataclasses.replace(
                 track,
                 notes=[preview_note],
@@ -14711,8 +14548,42 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 clip = list(data[:preview_samples])
             self._play_pcm_preview(clip, sr)
+            return True
         except Exception:
+            return False
+
+    def _queue_parameter_change_audition(self, row: int) -> None:
+        row = int(row)
+        if bool(getattr(self, '_playback_active', False)):
             return
+        if row < 0 or row >= len(self.project.tracks):
+            return
+        if self.project.tracks[row].track_type != 'instrument':
+            return
+        self._pending_parameter_audition_row = row
+        self._parameter_audition_timer.start()
+
+    def _play_pending_parameter_audition(self) -> None:
+        row = int(getattr(self, '_pending_parameter_audition_row', -1) or -1)
+        self._pending_parameter_audition_row = None
+        if bool(getattr(self, '_playback_active', False)):
+            return
+        if row < 0 or row >= len(self.project.tracks):
+            return
+        pitch, velocity, duration_tick = self._last_track_preview_notes.get(
+            row,
+            (60, 100, TICKS_PER_BEAT // 2),
+        )
+        if self._preview_track_note(row, pitch, velocity, duration_tick):
+            return
+        entry = self._rack_vsti_entry(self.project.tracks[row].rack_vsti) if self.project.tracks[row].rack_vsti else None
+        if (
+            entry is not None
+            and entry.is_instrument
+            and entry.host_supported
+            and self._can_use_native_vst_host(entry)
+        ):
+            QtCore.QTimer.singleShot(140, lambda target_row=row: self._queue_parameter_change_audition(target_row))
 
     def insert_live_note(self, pitch: int) -> None:
         track = self.current_track()
@@ -15292,6 +15163,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sample_timeline.refresh()
         self.rebuild_midi_sections()
         self.arrangement_overview.refresh()
+        self._reload_playback_mix_if_running()
 
     @staticmethod
     def _duplicate_track_state(source: TrackState, duplicate_number: int) -> TrackState:
@@ -15348,6 +15220,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sample_timeline.refresh()
         self.rebuild_midi_sections()
         self.arrangement_overview.refresh()
+        self._reload_playback_mix_if_running()
         self.statusBar().showMessage(f'Duplicated track "{source.name}"')
 
     def new_project(self) -> None:

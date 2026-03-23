@@ -43,11 +43,13 @@ class _InProcessHostBackend:
         open_editor: bool = False,
         sample_rate: int | None = None,
         buffer_size: int | None = None,
+        audio_device_type: str | None = None,
     ) -> None:
         self.plugin_path = plugin_path
         self.open_editor = bool(open_editor)
         self.sample_rate = int(sample_rate) if sample_rate else 0
         self.buffer_size = int(buffer_size) if buffer_size else 0
+        self.audio_device_type = str(audio_device_type or "").strip()
         self.handle: int | None = None
         self.process = self
 
@@ -155,6 +157,7 @@ class _SubprocessHostBackend:
         hidden: bool = True,
         sample_rate: int | None = None,
         buffer_size: int | None = None,
+        audio_device_type: str | None = None,
     ) -> None:
         self.plugin_path = plugin_path
         self.port = port or _find_free_port()
@@ -163,6 +166,7 @@ class _SubprocessHostBackend:
         self.hidden = bool(hidden)
         self.sample_rate = int(sample_rate) if sample_rate else 0
         self.buffer_size = int(buffer_size) if buffer_size else 0
+        self.audio_device_type = str(audio_device_type or "").strip()
         self.process: subprocess.Popen[str] | None = None
         self._socket: socket.socket | None = None
         self._recv_buffer = bytearray()
@@ -184,6 +188,8 @@ class _SubprocessHostBackend:
             args.extend(["--sample-rate", str(self.sample_rate)])
         if self.buffer_size > 0:
             args.extend(["--buffer-size", str(self.buffer_size)])
+        if self.audio_device_type:
+            args.extend(["--audio-device-type", self.audio_device_type])
         if self.open_editor:
             args.append("--open-editor")
 
@@ -304,6 +310,7 @@ class NativeVstHostBridge:
         hidden: bool = True,
         sample_rate: int | None = None,
         buffer_size: int | None = None,
+        audio_device_type: str | None = None,
     ) -> None:
         self.plugin_path = plugin_path
         self.port = port or _find_free_port()
@@ -312,6 +319,7 @@ class NativeVstHostBridge:
         self.hidden = bool(hidden)
         self.sample_rate = int(sample_rate) if sample_rate else 0
         self.buffer_size = int(buffer_size) if buffer_size else 0
+        self.audio_device_type = str(audio_device_type or "").strip()
         self._backend: _InProcessHostBackend | _SubprocessHostBackend | None = None
         self.process: Any = None
         self.in_process = False
@@ -328,6 +336,7 @@ class NativeVstHostBridge:
                 open_editor=self.open_editor,
                 sample_rate=self.sample_rate,
                 buffer_size=self.buffer_size,
+                audio_device_type=self.audio_device_type,
             )
         else:
             backend = _SubprocessHostBackend(
@@ -338,6 +347,7 @@ class NativeVstHostBridge:
                 hidden=self.hidden,
                 sample_rate=self.sample_rate,
                 buffer_size=self.buffer_size,
+                audio_device_type=self.audio_device_type,
             )
         backend.start(startup_timeout=startup_timeout)
         self._backend = backend

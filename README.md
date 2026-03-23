@@ -109,7 +109,7 @@ The project site is served from the `docs/` folder via `.github/workflows/deploy
 1. Build or download macOS-native `.vst3` bundles for the bundled instruments. Windows `.vst3` builds will not load on macOS.
 2. Copy those bundles into `vsti/` before packaging, or into `AI Music Studio.app/Contents/Resources/vsti` after packaging.
 3. Package the Python app as a macOS `.app` with Qt for Python deployment tooling such as `pyside6-deploy`.
-4. Install runtime dependencies in the packaging environment, including `PySide6`, `numpy`, `mido`, `python-rtmidi`, and `pedalboard`.
+4. Install runtime dependencies in the packaging environment, including `PySide6`, `numpy`, `mido`, and `python-rtmidi`.
 5. Test audio output enumeration, VST3 discovery, and plugin UI opening on both Apple Silicon and Intel macOS if you plan to distribute widely.
 
 ## Usage flow (samples)

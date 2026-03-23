@@ -1,6 +1,6 @@
 # AI Music Studio VST Host
 
-This is the first native-host step away from the current Python/Pedalboard editor path.
+This is the native JUCE host that powers AI Music Studio's VST playback and editor path.
 
 Current scope:
 
@@ -8,6 +8,7 @@ Current scope:
 - Loads one VST3 at a time
 - Opens the plugin's real native editor
 - Hosts audio directly through JUCE's audio device manager
+- Lets you choose the JUCE backend and output device in the host window
 - Provides a built-in MIDI keyboard for live testing
 - Remembers the last plugin path, host window bounds, and editor window bounds
 - Exposes an optional localhost JSON command bridge for load/editor/MIDI control
@@ -17,6 +18,14 @@ Build:
 ```powershell
 .\scripts\build_native_vst_host.ps1
 ```
+
+The Windows build now enables:
+
+- `Windows Audio`
+- `Windows Audio (Exclusive Mode)`
+- `Windows Audio (Low Latency Mode)`
+- `DirectSound`
+- `ASIO` when a usable ASIO driver is installed
 
 Run:
 
@@ -44,6 +53,12 @@ py .\scripts\native_vst_host_client.py --port 47653 --command status
 py .\scripts\native_vst_host_client.py --port 47653 --command open_editor
 py .\scripts\native_vst_host_client.py --port 47653 --command note_on --note 60 --velocity 0.8
 py .\scripts\native_vst_host_client.py --port 47653 --command note_off --note 60
+```
+
+You can also request a backend on startup:
+
+```powershell
+.\build\native-vst3host\AIMusicStudioVSTHost_artefacts\Release\AI Music Studio VST Host.exe --audio-device-type "Windows Audio (Exclusive Mode)"
 ```
 
 Or use the Python bridge helper directly:

@@ -245,7 +245,8 @@ public:
                   int requestedCommandPort,
                   bool bridgeModeEnabled,
                   double startupSampleRate,
-                  int startupBufferSize)
+                  int startupBufferSize,
+                  const juce::String& startupAudioDeviceType)
         : appSettings(settings),
           bridgeMode(bridgeModeEnabled),
           managedStateFile(startupStatePath.isNotEmpty() ? juce::File(startupStatePath) : juce::File()),
@@ -273,6 +274,15 @@ public:
         addAndMakeVisible(deviceLabel);
         deviceLabel.setColour(juce::Label::textColourId, juce::Colours::whitesmoke);
 
+        if (!bridgeMode)
+        {
+            addAndMakeVisible(deviceTypeBox);
+            deviceTypeBox.addListener(this);
+
+            addAndMakeVisible(outputDeviceBox);
+            outputDeviceBox.addListener(this);
+        }
+
         addAndMakeVisible(sampleRateBox);
         sampleRateBox.addListener(this);
 
@@ -292,7 +302,7 @@ public:
         if (!bridgeMode)
         {
             initialiseAudio();
-            restoreAudioPreferences(startupSampleRate, startupBufferSize);
+            restoreAudioPreferences(startupSampleRate, startupBufferSize, startupAudioDeviceType);
         }
         else
         {
@@ -364,15 +374,35 @@ public:
         area.removeFromTop(8);
 
         auto deviceRow = area.removeFromTop(34);
-        deviceLabel.setBounds(deviceRow.removeFromLeft(300));
-        deviceRow.removeFromLeft(8);
-        sampleRateBox.setBounds(deviceRow.removeFromLeft(140));
-        deviceRow.removeFromLeft(8);
-        bufferSizeBox.setBounds(deviceRow.removeFromLeft(140));
-        deviceRow.removeFromLeft(8);
-        editorButton.setBounds(deviceRow.removeFromLeft(120));
-        deviceRow.removeFromLeft(8);
-        unloadButton.setBounds(deviceRow.removeFromLeft(90));
+        if (!bridgeMode)
+        {
+            deviceTypeBox.setBounds(deviceRow.removeFromLeft(210));
+            deviceRow.removeFromLeft(8);
+            outputDeviceBox.setBounds(deviceRow.removeFromLeft(250));
+            deviceRow.removeFromLeft(8);
+            sampleRateBox.setBounds(deviceRow.removeFromLeft(140));
+            deviceRow.removeFromLeft(8);
+            bufferSizeBox.setBounds(deviceRow.removeFromLeft(140));
+            deviceRow.removeFromLeft(8);
+            editorButton.setBounds(deviceRow.removeFromLeft(120));
+            deviceRow.removeFromLeft(8);
+            unloadButton.setBounds(deviceRow.removeFromLeft(90));
+
+            area.removeFromTop(8);
+            deviceLabel.setBounds(area.removeFromTop(24));
+        }
+        else
+        {
+            deviceLabel.setBounds(deviceRow.removeFromLeft(300));
+            deviceRow.removeFromLeft(8);
+            sampleRateBox.setBounds(deviceRow.removeFromLeft(140));
+            deviceRow.removeFromLeft(8);
+            bufferSizeBox.setBounds(deviceRow.removeFromLeft(140));
+            deviceRow.removeFromLeft(8);
+            editorButton.setBounds(deviceRow.removeFromLeft(120));
+            deviceRow.removeFromLeft(8);
+            unloadButton.setBounds(deviceRow.removeFromLeft(90));
+        }
 
         area.removeFromTop(8);
         statusLabel.setBounds(area.removeFromTop(24));
@@ -899,10 +929,70 @@ private:
 
     void appendStatusFields(juce::var& response) const
     {
+        bool pluginIsInstrument = false;
+        bool pluginIsEffect = false;
+        juce::String pluginCategory = pluginDescription.category;
+        juce::StringArray parameterNames;
+        juce::Array<juce::var> parameters;
+        juce::String audioDeviceType;
+        juce::String audioDeviceName;
+        juce::StringArray availableAudioDeviceTypes;
+        juce::StringArray availableAudioOutputDevices;
+
+        {
+            juce::ScopedLock lock(pluginLock);
+            if (pluginInstance != nullptr)
+            {
+                pluginIsInstrument = pluginDescription.isInstrument
+                    || (pluginInstance->acceptsMidi() && pluginInstance->getTotalNumInputChannels() == 0);
+                pluginIsEffect = !pluginIsInstrument;
+
+                auto pluginParameters = pluginInstance->getParameters();
+                for (int index = 0; index < pluginParameters.size(); ++index)
+                {
+                    auto* parameter = pluginParameters[index];
+                    if (parameter == nullptr)
+                        continue;
+
+                    auto parameterName = parameter->getName(256).trim();
+                    if (parameterName.isEmpty())
+                        parameterName = "Param " + juce::String(index + 1);
+
+                    auto* parameterObject = new juce::DynamicObject();
+                    parameterObject->setProperty("index", index);
+                    parameterObject->setProperty("name", parameterName);
+                    parameterObject->setProperty("label", parameter->getLabel().trim());
+                    parameterObject->setProperty("normalized_value", parameter->getValue());
+                    parameters.add(juce::var(parameterObject));
+                    parameterNames.addIfNotAlreadyThere(parameterName);
+                }
+            }
+        }
+
+        if (audioInitialised)
+        {
+            audioDeviceType = deviceManager.getCurrentAudioDeviceType();
+            if (auto* device = deviceManager.getCurrentAudioDevice())
+                audioDeviceName = device->getName();
+            for (auto* type : const_cast<juce::AudioDeviceManager&>(deviceManager).getAvailableDeviceTypes())
+            {
+                if (type == nullptr || ! isUsableAudioDeviceType(*type))
+                    continue;
+                availableAudioDeviceTypes.addIfNotAlreadyThere(type->getTypeName());
+            }
+            if (auto* type = deviceManager.getCurrentDeviceTypeObject())
+                availableAudioOutputDevices = type->getDeviceNames(false);
+        }
+
         setResponseField(response, "plugin_loaded", pluginInstance != nullptr);
         setResponseField(response, "plugin_name", pluginDescription.name);
         setResponseField(response, "plugin_path",
                          normaliseVst3PathForSettings(pathEditor.getText().trim()));
+        setResponseField(response, "plugin_is_instrument", pluginIsInstrument);
+        setResponseField(response, "plugin_is_effect", pluginIsEffect);
+        setResponseField(response, "plugin_category", pluginCategory);
+        setResponseField(response, "parameter_names", juce::var(parameterNames));
+        setResponseField(response, "plugin_parameters", juce::var(parameters));
         setResponseField(response, "editor_open", editorWindow != nullptr);
         setResponseField(response, "sample_rate", currentSampleRate);
         setResponseField(response, "buffer_size", currentBlockSize);
@@ -913,6 +1003,10 @@ private:
         setResponseField(response, "plugin_output_pan", pluginOutputPan.load());
         setResponseField(response, "input_buses", describeBuses(true));
         setResponseField(response, "output_buses", describeBuses(false));
+        setResponseField(response, "audio_device_type", audioDeviceType);
+        setResponseField(response, "audio_device_name", audioDeviceName);
+        setResponseField(response, "available_audio_device_types", juce::var(availableAudioDeviceTypes));
+        setResponseField(response, "available_audio_output_devices", juce::var(availableAudioOutputDevices));
         setResponseField(response, "audio_stream_enabled", static_cast<bool>(audioStreamEnabled.load()));
         setResponseField(response, "queued_audio_frames", queuedStreamAudioFrames(kMainAudioStreamId));
         setResponseField(response, "queued_audio_channels", queuedStreamAudioChannels(kMainAudioStreamId));
@@ -927,6 +1021,66 @@ private:
         button.addListener(this);
     }
 
+    bool isUsableAudioDeviceType(const juce::AudioIODeviceType& type) const
+    {
+        return ! type.getDeviceNames(false).isEmpty()
+            || ! type.getDeviceNames(true).isEmpty();
+    }
+
+    juce::String canonicalAudioDeviceTypeName(const juce::String& requestedType)
+    {
+        const auto target = requestedType.trim();
+        if (target.isEmpty())
+            return {};
+
+        for (auto* type : deviceManager.getAvailableDeviceTypes())
+        {
+            if (type == nullptr)
+                continue;
+            const auto typeName = type->getTypeName();
+            if (typeName.equalsIgnoreCase(target))
+                return typeName;
+        }
+
+        return {};
+    }
+
+    juce::String canonicalAudioOutputDeviceName(const juce::String& requestedName) const
+    {
+        const auto target = requestedName.trim();
+        if (target.isEmpty())
+            return {};
+
+        if (auto* type = deviceManager.getCurrentDeviceTypeObject())
+        {
+            for (const auto& deviceName : type->getDeviceNames(false))
+            {
+                if (deviceName.equalsIgnoreCase(target))
+                    return deviceName;
+            }
+        }
+
+        return {};
+    }
+
+    bool applyAudioDeviceType(const juce::String& requestedType, bool treatAsChosenDevice)
+    {
+        if (!audioInitialised)
+            return false;
+
+        const auto typeName = canonicalAudioDeviceTypeName(requestedType);
+        if (typeName.isEmpty())
+            return false;
+
+        if (! deviceManager.getCurrentAudioDeviceType().equalsIgnoreCase(typeName))
+            deviceManager.setCurrentAudioDeviceType(typeName, treatAsChosenDevice);
+
+        const auto activeType = deviceManager.getCurrentAudioDeviceType();
+        if (treatAsChosenDevice && activeType.isNotEmpty())
+            appSettings.setValue("audio_device_type", activeType);
+        return activeType.equalsIgnoreCase(typeName);
+    }
+
     void initialiseAudio()
     {
         deviceManager.initialise(0, 2, nullptr, true, {}, nullptr);
@@ -934,10 +1088,18 @@ private:
         audioInitialised = true;
     }
 
-    void restoreAudioPreferences(double startupSampleRate, int startupBufferSize)
+    void restoreAudioPreferences(double startupSampleRate,
+                                 int startupBufferSize,
+                                 const juce::String& startupDeviceType = {})
     {
         if (!audioInitialised)
             return;
+
+        const auto preferredType = startupDeviceType.isNotEmpty()
+            ? startupDeviceType.trim()
+            : appSettings.getValue("audio_device_type").trim();
+        if (preferredType.isNotEmpty())
+            applyAudioDeviceType(preferredType, true);
 
         const auto wantedRate = startupSampleRate > 0.0
             ? startupSampleRate
@@ -945,10 +1107,21 @@ private:
         const auto wantedBuffer = startupBufferSize > 0
             ? startupBufferSize
             : appSettings.getIntValue("audio_buffer_size", 0);
+        const auto wantedOutputDevice = appSettings.getValue("audio_output_device_name").trim();
         if (auto* device = deviceManager.getCurrentAudioDevice())
         {
             auto setup = deviceManager.getAudioDeviceSetup();
             bool changed = false;
+
+            if (wantedOutputDevice.isNotEmpty())
+            {
+                const auto outputDeviceName = canonicalAudioOutputDeviceName(wantedOutputDevice);
+                if (outputDeviceName.isNotEmpty() && ! setup.outputDeviceName.equalsIgnoreCase(outputDeviceName))
+                {
+                    setup.outputDeviceName = outputDeviceName;
+                    changed = true;
+                }
+            }
 
             if (wantedRate > 0.0)
             {
@@ -980,14 +1153,104 @@ private:
                 deviceManager.setAudioDeviceSetup(setup, true);
         }
 
+        if (deviceManager.getCurrentAudioDevice() == nullptr)
+        {
+            const auto failedType = deviceManager.getCurrentAudioDeviceType();
+            for (auto* type : deviceManager.getAvailableDeviceTypes())
+            {
+                if (type == nullptr || ! isUsableAudioDeviceType(*type))
+                    continue;
+
+                const auto typeName = type->getTypeName();
+                if (typeName.equalsIgnoreCase(failedType))
+                    continue;
+
+                deviceManager.setCurrentAudioDeviceType(typeName, false);
+                if (deviceManager.getCurrentAudioDevice() != nullptr)
+                    break;
+            }
+        }
+
+        if (auto* device = deviceManager.getCurrentAudioDevice())
+        {
+            const auto activeType = deviceManager.getCurrentAudioDeviceType();
+            if (activeType.isNotEmpty())
+                appSettings.setValue("audio_device_type", activeType);
+            appSettings.setValue("audio_output_device_name", device->getName());
+        }
         if (startupSampleRate > 0.0)
             appSettings.setValue("audio_sample_rate", startupSampleRate);
         if (startupBufferSize > 0)
             appSettings.setValue("audio_buffer_size", startupBufferSize);
     }
 
+    void updateOutputDeviceBox()
+    {
+        if (bridgeMode)
+            return;
+
+        outputDeviceBox.clear(juce::dontSendNotification);
+
+        juce::String currentDeviceName;
+        if (auto* device = deviceManager.getCurrentAudioDevice())
+            currentDeviceName = device->getName();
+
+        int selectedId = 0;
+        int itemId = 1;
+        if (auto* type = deviceManager.getCurrentDeviceTypeObject())
+        {
+            for (const auto& deviceName : type->getDeviceNames(false))
+            {
+                outputDeviceBox.addItem(deviceName, itemId);
+                if (deviceName.equalsIgnoreCase(currentDeviceName))
+                    selectedId = itemId;
+                ++itemId;
+            }
+        }
+
+        if (selectedId != 0)
+            outputDeviceBox.setSelectedId(selectedId, juce::dontSendNotification);
+        else if (outputDeviceBox.getNumItems() > 0)
+            outputDeviceBox.setSelectedItemIndex(0, juce::dontSendNotification);
+
+        outputDeviceBox.setEnabled(outputDeviceBox.getNumItems() > 0);
+    }
+
+    void updateDeviceTypeBox()
+    {
+        if (bridgeMode)
+            return;
+
+        deviceTypeBox.clear(juce::dontSendNotification);
+
+        const auto currentType = deviceManager.getCurrentAudioDeviceType();
+        int selectedId = 0;
+        int itemId = 1;
+
+        for (auto* type : deviceManager.getAvailableDeviceTypes())
+        {
+            if (type == nullptr || ! isUsableAudioDeviceType(*type))
+                continue;
+
+            const auto typeName = type->getTypeName();
+            deviceTypeBox.addItem(typeName, itemId);
+            if (typeName.equalsIgnoreCase(currentType))
+                selectedId = itemId;
+            ++itemId;
+        }
+
+        if (selectedId != 0)
+            deviceTypeBox.setSelectedId(selectedId, juce::dontSendNotification);
+        else if (deviceTypeBox.getNumItems() > 0)
+            deviceTypeBox.setSelectedItemIndex(0, juce::dontSendNotification);
+
+        deviceTypeBox.setEnabled(deviceTypeBox.getNumItems() > 1);
+    }
+
     void updateDeviceBoxes()
     {
+        updateDeviceTypeBox();
+        updateOutputDeviceBox();
         sampleRateBox.clear(juce::dontSendNotification);
         bufferSizeBox.clear(juce::dontSendNotification);
 
@@ -1041,8 +1304,10 @@ private:
 
         if (auto* device = deviceManager.getCurrentAudioDevice())
         {
+            const auto currentType = deviceManager.getCurrentAudioDeviceType();
             deviceLabel.setText(
-                "Audio: " + device->getName()
+                "Audio: " + (currentType.isNotEmpty() ? currentType + "  |  " : juce::String())
+                + device->getName()
                 + "  " + juce::String(static_cast<int>(std::round(device->getCurrentSampleRate()))) + " Hz"
                 + "  " + juce::String(device->getCurrentBufferSizeSamples()) + " samples",
                 juce::dontSendNotification
@@ -1101,8 +1366,42 @@ private:
 
     void comboBoxChanged(juce::ComboBox* box) override
     {
+        if (box == &deviceTypeBox && ! bridgeMode)
+        {
+            const auto selectedType = deviceTypeBox.getText().trim();
+            if (selectedType.isNotEmpty())
+            {
+                const auto wantedRate = sampleRateBox.getSelectedId() > 0
+                    ? static_cast<double>(sampleRateBox.getSelectedId())
+                    : appSettings.getDoubleValue("audio_sample_rate", 0.0);
+                const auto wantedBuffer = bufferSizeBox.getSelectedId() > 0
+                    ? bufferSizeBox.getSelectedId()
+                    : appSettings.getIntValue("audio_buffer_size", 0);
+
+                if (applyAudioDeviceType(selectedType, true))
+                {
+                    restoreAudioPreferences(wantedRate, wantedBuffer, selectedType);
+                    updateDeviceBoxes();
+                    updateDeviceLabel();
+                    preparePluginForPlayback();
+                }
+            }
+            return;
+        }
+
         auto setup = deviceManager.getAudioDeviceSetup();
         bool changed = false;
+
+        if (box == &outputDeviceBox && ! bridgeMode)
+        {
+            const auto outputDeviceName = canonicalAudioOutputDeviceName(outputDeviceBox.getText());
+            if (outputDeviceName.isNotEmpty() && ! setup.outputDeviceName.equalsIgnoreCase(outputDeviceName))
+            {
+                setup.outputDeviceName = outputDeviceName;
+                appSettings.setValue("audio_output_device_name", outputDeviceName);
+                changed = true;
+            }
+        }
 
         if (box == &sampleRateBox && sampleRateBox.getSelectedId() > 0)
         {
@@ -1133,6 +1432,17 @@ private:
     {
         currentSampleRate = device != nullptr ? device->getCurrentSampleRate() : 44100.0;
         currentBlockSize = device != nullptr ? device->getCurrentBufferSizeSamples() : 512;
+        if (! bridgeMode)
+        {
+            const auto activeType = deviceManager.getCurrentAudioDeviceType();
+            if (activeType.isNotEmpty())
+                appSettings.setValue("audio_device_type", activeType);
+            if (device != nullptr)
+                appSettings.setValue("audio_output_device_name", device->getName());
+            updateDeviceTypeBox();
+            updateOutputDeviceBox();
+            updateDeviceLabel();
+        }
         keyboardState.reset();
         preparePluginForPlayback();
     }
@@ -2104,6 +2414,8 @@ private:
     juce::TextButton editorButton;
     juce::Label statusLabel;
     juce::Label deviceLabel;
+    juce::ComboBox deviceTypeBox;
+    juce::ComboBox outputDeviceBox;
     juce::ComboBox sampleRateBox;
     juce::ComboBox bufferSizeBox;
     juce::MidiKeyboardComponent keyboardComponent;
@@ -2274,7 +2586,8 @@ public:
                bool bridgeModeEnabled,
                bool startHidden,
                double startupSampleRate,
-               int startupBufferSize)
+               int startupBufferSize,
+               const juce::String& startupAudioDeviceType)
         : juce::DocumentWindow("AI Music Studio VST Host",
                                juce::Colour::fromRGB(20, 24, 31),
                                juce::DocumentWindow::allButtons),
@@ -2292,7 +2605,8 @@ public:
                                           requestedCommandPort,
                                           bridgeMode,
                                           startupSampleRate,
-                                          startupBufferSize),
+                                          startupBufferSize,
+                                          startupAudioDeviceType),
                         true);
         restoreBounds();
         if (!hiddenOnStartup)
@@ -2388,7 +2702,8 @@ namespace
         LibraryHostInstance(const juce::String& pluginPath,
                             bool shouldOpenEditorOnStartup,
                             double startupSampleRate,
-                            int startupBufferSize)
+                            int startupBufferSize,
+                            const juce::String& startupAudioDeviceType)
             : guiInitializer(std::make_unique<juce::ScopedJuceInitialiser_GUI>())
         {
             appProperties = std::make_unique<juce::ApplicationProperties>();
@@ -2400,7 +2715,8 @@ namespace
                                                         0,
                                                         true,
                                                         startupSampleRate,
-                                                        startupBufferSize);
+                                                        startupBufferSize,
+                                                        startupAudioDeviceType);
         }
 
         juce::String command(const juce::String& requestLine)
@@ -2428,7 +2744,8 @@ AIMS_VST_HOST_API void* aims_vst_host_create(const char* pluginPath,
         auto instance = std::make_unique<LibraryHostInstance>(juce::String::fromUTF8(pluginPath != nullptr ? pluginPath : ""),
                                                               openEditor != 0,
                                                               sampleRate,
-                                                              bufferSize);
+                                                              bufferSize,
+                                                              juce::String());
         copyUtf8ToBuffer("", errorBuffer, errorBufferBytes);
         return instance.release();
     }
@@ -2507,7 +2824,8 @@ public:
                                                   isBridgeModeEnabled(),
                                                   shouldStartHidden(),
                                                   parseStartupSampleRate(),
-                                                  parseStartupBufferSize());
+                                                  parseStartupBufferSize(),
+                                                  parseStartupAudioDeviceType());
     }
 
     void shutdown() override
@@ -2584,6 +2902,18 @@ private:
         }
 
         return 0;
+    }
+
+    juce::String parseStartupAudioDeviceType() const
+    {
+        const auto args = getCommandLineParameterArray();
+        for (int i = 0; i < args.size(); ++i)
+        {
+            if (args[i] == "--audio-device-type" && i + 1 < args.size())
+                return args[i + 1].unquoted();
+        }
+
+        return {};
     }
 
     bool isBridgeModeEnabled() const
