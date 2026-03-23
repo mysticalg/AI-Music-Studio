@@ -205,14 +205,14 @@ class _SubprocessHostBackend:
         request = {"command": command, **payload}
         encoded = (json.dumps(request) + "\n").encode("utf-8")
 
-        with socket.create_connection(("127.0.0.1", self.port), timeout=0.35) as sock:
-            sock.settimeout(0.35)
+        with socket.create_connection(("127.0.0.1", self.port), timeout=0.5) as sock:
+            sock.settimeout(0.5)
             sock.sendall(encoded)
             sock.shutdown(socket.SHUT_WR)
 
             chunks: list[bytes] = []
             while True:
-                chunk = sock.recv(4096)
+                chunk = sock.recv(65536)
                 if not chunk:
                     break
                 chunks.append(chunk)
@@ -269,8 +269,13 @@ class NativeVstHostBridge:
         self.in_process = False
 
     def start(self, startup_timeout: float = 10.0) -> None:
-        prefer_in_process = str(os.getenv("AIMS_NATIVE_VST_IN_PROCESS", "")).strip().lower() in {"1", "true", "yes", "on"}
-        if prefer_in_process and _InProcessHostBackend.available():
+        # In-process is the default when the DLL is available — it eliminates
+        # TCP connection overhead (~16 ms per command) that makes subprocess
+        # rendering too slow for realtime playback.  Set
+        # AIMS_NATIVE_VST_SUBPROCESS=1 to force the subprocess backend.
+        force_subprocess = str(os.getenv("AIMS_NATIVE_VST_SUBPROCESS", "")).strip().lower() in {"1", "true", "yes", "on"}
+        use_in_process = not force_subprocess and _InProcessHostBackend.available()
+        if use_in_process:
             backend: _InProcessHostBackend | _SubprocessHostBackend = _InProcessHostBackend(
                 self.plugin_path,
                 open_editor=self.open_editor,
