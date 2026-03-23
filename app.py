@@ -5178,7 +5178,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _setup_floating_transport(self) -> None:
         self.playback_timer = QtCore.QTimer(self)
-        self.playback_timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
+        self.playback_timer.setTimerType(QtCore.Qt.TimerType.CoarseTimer)
         self.playback_timer.setInterval(self.playback_ui_refresh_ms)
         self.playback_timer.timeout.connect(self._tick_playback)
         self._playback_started_at = 0.0
@@ -8289,10 +8289,6 @@ class MainWindow(QtWidgets.QMainWindow):
     def _set_playhead_tick_position(self, tick: int, playback_tick: bool = False) -> None:
         self.project.playhead_tick = max(0, int(tick))
         self.project.playhead_sec = self._transport_tick_to_seconds(self.project.playhead_tick)
-        if hasattr(self, 'playhead_spin'):
-            self.playhead_spin.blockSignals(True)
-            self.playhead_spin.setValue(self.project.playhead_sec)
-            self.playhead_spin.blockSignals(False)
 
         if not playback_tick and hasattr(self, 'playback_timer') and self.playback_timer.isActive():
             if self.project.loop_enabled:
@@ -8302,18 +8298,24 @@ class MainWindow(QtWidgets.QMainWindow):
                 ):
                     self.project.playhead_tick = loop_start_tick
                     self.project.playhead_sec = self._transport_tick_to_seconds(self.project.playhead_tick)
-                    if hasattr(self, 'playhead_spin'):
-                        self.playhead_spin.blockSignals(True)
-                        self.playhead_spin.setValue(self.project.playhead_sec)
-                        self.playhead_spin.blockSignals(False)
             self._seek_media_to_project_tick(self.project.playhead_tick)
-        self._refresh_transport_controls()
 
         if playback_tick:
             now = time.time()
             if now - self._last_playhead_ui_refresh < self._playhead_ui_refresh_interval:
                 return
             self._last_playhead_ui_refresh = now
+        else:
+            # Only refresh transport button states for non-playback ticks
+            # (start/stop/seek).  During playback the button state is static
+            # and the unpolish/polish cycle is expensive (up to ~19ms spikes).
+            self._refresh_transport_controls()
+
+        # Update playhead spin box only at the throttled rate
+        if hasattr(self, 'playhead_spin'):
+            self.playhead_spin.blockSignals(True)
+            self.playhead_spin.setValue(self.project.playhead_sec)
+            self.playhead_spin.blockSignals(False)
 
         self.sample_timeline.update_overlay_items()
         self.arrangement_overview.update_overlay_items()
@@ -9621,7 +9623,7 @@ class MainWindow(QtWidgets.QMainWindow):
             state = self._realtime_track_state(row, track)
             if self._realtime_reset_pending:
                 self._realtime_reset_pending = False
-            max_writes = max(16, int(math.ceil(target_ahead_frames / max(1, self._playback_chunk_frames))) * 2 + 4)
+            max_writes = max(4, int(math.ceil(target_ahead_frames / max(1, self._playback_chunk_frames))) + 2)
             writes = 0
 
             while writes < max_writes and self._direct_native_transport_output_cursor_frame < target_output_frame:
@@ -9689,7 +9691,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 int(status.get('buffer_size') or self._desired_audio_buffer_frames() or self._playback_chunk_frames),
             ))
             target_frames = int(max(self._desired_audio_buffer_frames(), buffer_frames))
-            max_writes = max(16, int(math.ceil(target_frames / max(1, self._playback_chunk_frames))) * 2 + 4)
+            max_writes = max(4, int(math.ceil(target_frames / max(1, self._playback_chunk_frames))) + 2)
             writes = 0
             queued_frames = int(status.get('queued_audio_frames') or 0)
             self._native_output_queued_frames = queued_frames
