@@ -4,8 +4,10 @@
 #include <juce_gui_extra/juce_gui_extra.h>
 #if JUCE_WINDOWS
 #include <windows.h>
+#include <crtdbg.h>
 #endif
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <mutex>
 #include <utility>
@@ -16,6 +18,9 @@ constexpr int kDefaultWindowWidth = 1040;
 constexpr int kDefaultWindowHeight = 720;
 constexpr int kDefaultMidiChannel = 1;
 constexpr int kDefaultCommandPort = 47653;
+const juce::String kMainAudioStreamId = "main";
+const juce::String kPreviewAudioStreamId = "preview";
+const juce::String kLiveMidiAudioStreamId = "live_midi";
 
 juce::String normaliseVst3PathForSettings(const juce::String& path)
 {
@@ -57,6 +62,23 @@ float clampMidiVelocity(float velocity)
 {
     return juce::jlimit(0.0f, 1.0f, velocity);
 }
+
+juce::String normaliseQueuedAudioStreamId(const juce::String& value)
+{
+    const auto streamId = value.trim().toLowerCase();
+    if (streamId == kPreviewAudioStreamId || streamId == kLiveMidiAudioStreamId)
+        return streamId;
+    return kMainAudioStreamId;
+}
+
+#if JUCE_WINDOWS
+void suppressWindowsCrashDialogs()
+{
+    const auto currentMode = ::SetErrorMode(0);
+    ::SetErrorMode(currentMode | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+}
+#endif
 }
 
 class HostComponent;
@@ -365,17 +387,44 @@ public:
     {
         const auto request = juce::JSON::parse(line);
         if (request.isVoid())
-            return juce::JSON::toString(makeResponse(false, "Invalid JSON command"));
+            return juce::JSON::toString(makeResponse(false, "Invalid JSON command"), true);
 
+        // Performance-critical commands (render_audio, schedule_midi, status,
+        // ping) are safe to run directly on the calling thread because they
+        // use their own locks (pluginLock, scheduledMidiLock).  Dispatching
+        // them through MessageManager::callSync adds ~15-18 ms of thread
+        // synchronisation overhead per call on Windows, which is far too
+        // slow for realtime audio rendering.
+        auto* requestObject = request.getDynamicObject();
+        if (requestObject != nullptr)
+        {
+            const auto command = requestObject->getProperty("command")
+                                     .toString().trim().toLowerCase();
+            if (command == "render_audio" || command == "schedule_midi"
+                || command == "status" || command == "ping"
+                || command == "note_on" || command == "note_off"
+                || command == "all_notes_off" || command == "panic"
+                || command == "queue_audio" || command == "clear_audio_queue"
+                || command == "start_audio_stream")
+            {
+                const auto result = handleRemoteCommand(request);
+                return juce::JSON::toString(result, true);
+            }
+        }
+
+        // All other commands (load_plugin, open_editor, etc.) touch GUI
+        // state and must run on the message thread.
         const auto result = juce::MessageManager::callSync([this, request]() mutable
         {
             return handleRemoteCommand(request);
         });
 
         if (!result.has_value())
-            return juce::JSON::toString(makeResponse(false, "Failed to dispatch command to message thread"));
+            return juce::JSON::toString(makeResponse(false, "Failed to dispatch command to message thread"), true);
 
-        return juce::JSON::toString(*result);
+        // Use compact (single-line) JSON so newlines can be used as message
+        // delimiters for the persistent TCP connection protocol.
+        return juce::JSON::toString(*result, true);
     }
 
     int getActiveCommandPort() const noexcept
@@ -391,6 +440,16 @@ private:
         int64_t sequence = 0;
         int64_t loopEpoch = 0;
         juce::MidiMessage message;
+    };
+
+    struct BufferedOutputStream
+    {
+        juce::MemoryBlock data;
+        size_t readOffset = 0;
+        int channelCount = 2;
+        int64_t inputFrames = 0;
+        int64_t outputFrames = 0;
+        int64_t underruns = 0;
     };
 
     juce::var handleRemoteCommand(const juce::var& request)
@@ -576,6 +635,89 @@ private:
             return response;
         }
 
+        if (command == "set_output_mix")
+        {
+            const auto gain = object->hasProperty("gain")
+                ? static_cast<float>(static_cast<double>(object->getProperty("gain")))
+                : 1.0f;
+            const auto pan = object->hasProperty("pan")
+                ? static_cast<float>(static_cast<double>(object->getProperty("pan")))
+                : 0.0f;
+            pluginOutputGain.store(juce::jmax(0.0f, gain));
+            pluginOutputPan.store(juce::jlimit(-1.0f, 1.0f, pan));
+            auto response = makeResponse(true, "Output mix updated");
+            appendStatusFields(response);
+            return response;
+        }
+
+        if (command == "queue_audio")
+        {
+            const auto audioBase64 = object->getProperty("audio_b64").toString();
+            if (audioBase64.isEmpty())
+                return makeResponse(false, "queue_audio requires audio_b64");
+            const auto streamId = normaliseQueuedAudioStreamId(
+                object->hasProperty("stream_id")
+                    ? object->getProperty("stream_id").toString()
+                    : kMainAudioStreamId
+            );
+
+            const auto format = object->hasProperty("format")
+                ? object->getProperty("format").toString().trim().toLowerCase()
+                : juce::String("f32le-interleaved");
+            if (format.isNotEmpty() && format != "f32le-interleaved")
+                return makeResponse(false, "queue_audio currently supports only f32le-interleaved audio");
+
+            const auto channels = juce::jmax(
+                1,
+                static_cast<int>(object->hasProperty("channels")
+                    ? object->getProperty("channels")
+                    : juce::var(2))
+            );
+
+            juce::String error;
+            int appendedFrames = 0;
+            if (!queueStreamedAudio(streamId, audioBase64, channels, error, appendedFrames))
+                return makeResponse(false, error.isNotEmpty() ? error : "Could not queue audio");
+
+            auto response = makeResponse(true, "Queued audio");
+            appendStatusFields(response);
+            setResponseField(response, "stream_id", streamId);
+            setResponseField(response, "appended_audio_frames", appendedFrames);
+            return response;
+        }
+
+        if (command == "clear_audio_queue")
+        {
+            const auto streamId = normaliseQueuedAudioStreamId(
+                object->hasProperty("stream_id")
+                    ? object->getProperty("stream_id").toString()
+                    : kMainAudioStreamId
+            );
+            const auto resetCounters = static_cast<bool>(object->hasProperty("reset_counters")
+                ? object->getProperty("reset_counters")
+                : juce::var(false));
+            clearStreamedAudioQueue(streamId, resetCounters);
+            auto response = makeResponse(true, "Cleared audio queue");
+            appendStatusFields(response);
+            setResponseField(response, "stream_id", streamId);
+            return response;
+        }
+
+        if (command == "start_audio_stream")
+        {
+            const auto streamId = normaliseQueuedAudioStreamId(
+                object->hasProperty("stream_id")
+                    ? object->getProperty("stream_id").toString()
+                    : kMainAudioStreamId
+            );
+            if (streamId == kMainAudioStreamId)
+                audioStreamEnabled.store(true);
+            auto response = makeResponse(true, "Audio stream started");
+            appendStatusFields(response);
+            setResponseField(response, "stream_id", streamId);
+            return response;
+        }
+
         if (command == "schedule_midi")
         {
             const auto baseOffsetFrames = juce::jmax<int64_t>(
@@ -740,10 +882,18 @@ private:
         setResponseField(response, "editor_open", editorWindow != nullptr);
         setResponseField(response, "sample_rate", currentSampleRate);
         setResponseField(response, "buffer_size", currentBlockSize);
+        setResponseField(response, "rendered_sample_frames", static_cast<double>(renderedSampleFrames.load()));
         setResponseField(response, "command_port", getActiveCommandPort());
         setResponseField(response, "bridge_mode", bridgeMode);
+        setResponseField(response, "plugin_output_gain", pluginOutputGain.load());
+        setResponseField(response, "plugin_output_pan", pluginOutputPan.load());
         setResponseField(response, "input_buses", describeBuses(true));
         setResponseField(response, "output_buses", describeBuses(false));
+        setResponseField(response, "audio_stream_enabled", static_cast<bool>(audioStreamEnabled.load()));
+        setResponseField(response, "queued_audio_frames", queuedStreamAudioFrames(kMainAudioStreamId));
+        setResponseField(response, "queued_audio_channels", queuedStreamAudioChannels(kMainAudioStreamId));
+        setResponseField(response, "audio_queue_underruns", static_cast<double>(queuedStreamAudioUnderruns(kMainAudioStreamId)));
+        setResponseField(response, "audio_streams", describeQueuedAudioStreams());
     }
 
     void configureButton(juce::TextButton& button, const juce::String& text)
@@ -978,17 +1128,39 @@ private:
         juce::AudioBuffer<float> buffer(outputChannelData, numOutputChannels, numSamples);
         buffer.clear();
 
-        auto* plugin = pluginInstance.get();
-        if (plugin == nullptr)
-            return;
+        {
+            juce::ScopedLock lock(pluginLock);
+            auto* plugin = pluginInstance.get();
+            if (plugin != nullptr)
+            {
+                juce::MidiBuffer midi;
+                keyboardState.processNextMidiBuffer(midi, 0, numSamples, true);
+                appendPendingMidiMessages(midi);
+                appendScheduledMidiMessages(midi, numSamples);
+                plugin->processBlock(buffer, midi);
+                applyPluginOutputMix(buffer);
+            }
+        }
 
-        juce::ScopedLock lock(pluginLock);
-        juce::MidiBuffer midi;
-        keyboardState.processNextMidiBuffer(midi, 0, numSamples, true);
-        appendPendingMidiMessages(midi);
-        appendScheduledMidiMessages(midi, numSamples);
-        plugin->processBlock(buffer, midi);
+        mixQueuedAudioStreamsIntoBuffer(buffer);
+
         renderedSampleFrames.fetch_add(numSamples);
+    }
+
+    void applyPluginOutputMix(juce::AudioBuffer<float>& buffer)
+    {
+        const auto gain = juce::jmax(0.0f, pluginOutputGain.load());
+        const auto pan = juce::jlimit(-1.0f, 1.0f, pluginOutputPan.load());
+        const auto angle = (pan + 1.0f) * juce::MathConstants<float>::pi * 0.25f;
+        const auto leftGain = std::cos(angle) * gain;
+        const auto rightGain = std::sin(angle) * gain;
+
+        if (buffer.getNumChannels() > 0)
+            buffer.applyGain(0, 0, buffer.getNumSamples(), leftGain);
+        if (buffer.getNumChannels() > 1)
+            buffer.applyGain(1, 0, buffer.getNumSamples(), rightGain);
+        for (int channel = 2; channel < buffer.getNumChannels(); ++channel)
+            buffer.applyGain(channel, 0, buffer.getNumSamples(), gain);
     }
 
     void enqueueMidiMessage(const juce::MidiMessage& message)
@@ -1313,6 +1485,11 @@ private:
     {
         closeEditorWindow();
         clearScheduledMidiEvents();
+        {
+            juce::ScopedLock lock(pluginLock);
+            if (pluginInstance != nullptr)
+                pluginInstance->suspendProcessing(true);
+        }
         releasePluginResources();
         {
             juce::ScopedLock lock(pluginLock);
@@ -1331,13 +1508,203 @@ private:
             return;
         pluginInstance->setRateAndBufferSizeDetails(currentSampleRate, currentBlockSize);
         pluginInstance->prepareToPlay(currentSampleRate, currentBlockSize);
+        pluginInstance->suspendProcessing(false);
     }
 
     void releasePluginResources()
     {
         juce::ScopedLock lock(pluginLock);
         if (pluginInstance != nullptr)
+        {
+            pluginInstance->suspendProcessing(true);
             pluginInstance->releaseResources();
+        }
+    }
+
+    BufferedOutputStream& queuedAudioStreamForId(const juce::String& streamId)
+    {
+        if (streamId == kPreviewAudioStreamId)
+            return previewOutputStream;
+        if (streamId == kLiveMidiAudioStreamId)
+            return liveMidiOutputStream;
+        return mainOutputStream;
+    }
+
+    const BufferedOutputStream& queuedAudioStreamForId(const juce::String& streamId) const
+    {
+        if (streamId == kPreviewAudioStreamId)
+            return previewOutputStream;
+        if (streamId == kLiveMidiAudioStreamId)
+            return liveMidiOutputStream;
+        return mainOutputStream;
+    }
+
+    void compactQueuedAudioIfNeeded(BufferedOutputStream& stream)
+    {
+        if (stream.readOffset == 0)
+            return;
+        if (stream.readOffset >= stream.data.getSize())
+        {
+            stream.data.setSize(0);
+            stream.readOffset = 0;
+            return;
+        }
+
+        juce::MemoryBlock compacted(
+            static_cast<const char*>(stream.data.getData()) + stream.readOffset,
+            stream.data.getSize() - stream.readOffset
+        );
+        stream.data.swapWith(compacted);
+        stream.readOffset = 0;
+    }
+
+    bool queueStreamedAudio(const juce::String& streamId,
+                            const juce::String& audioBase64,
+                            int channels,
+                            juce::String& error,
+                            int& appendedFrames)
+    {
+        appendedFrames = 0;
+        const auto channelCount = juce::jmax(1, channels);
+        juce::MemoryOutputStream decoded;
+        if (!juce::Base64::convertFromBase64(decoded, audioBase64))
+        {
+            error = "Could not decode queued audio";
+            return false;
+        }
+
+        const auto frameBytes = static_cast<size_t>(channelCount) * sizeof(float);
+        if (frameBytes == 0 || (decoded.getDataSize() % frameBytes) != 0)
+        {
+            error = "Queued audio payload size does not match channel count";
+            return false;
+        }
+
+        appendedFrames = static_cast<int>(decoded.getDataSize() / frameBytes);
+        if (appendedFrames <= 0)
+            return true;
+
+        juce::ScopedLock lock(streamAudioLock);
+        auto& stream = queuedAudioStreamForId(streamId);
+        compactQueuedAudioIfNeeded(stream);
+        stream.data.append(decoded.getData(), decoded.getDataSize());
+        stream.channelCount = channelCount;
+        stream.inputFrames += appendedFrames;
+        return true;
+    }
+
+    void clearStreamedAudioQueue(const juce::String& streamId, bool resetCounters)
+    {
+        {
+            juce::ScopedLock lock(streamAudioLock);
+            auto& stream = queuedAudioStreamForId(streamId);
+            stream.data.setSize(0);
+            stream.readOffset = 0;
+            stream.channelCount = 2;
+            if (resetCounters)
+            {
+                stream.inputFrames = 0;
+                stream.outputFrames = 0;
+                stream.underruns = 0;
+            }
+        }
+        if (streamId == kMainAudioStreamId)
+            audioStreamEnabled.store(false);
+    }
+
+    int queuedStreamAudioFrames(const juce::String& streamId) const
+    {
+        juce::ScopedLock lock(streamAudioLock);
+        const auto& stream = queuedAudioStreamForId(streamId);
+        if (stream.channelCount <= 0)
+            return 0;
+        const auto frameBytes = static_cast<size_t>(stream.channelCount) * sizeof(float);
+        if (frameBytes == 0 || stream.data.getSize() <= stream.readOffset)
+            return 0;
+        return static_cast<int>((stream.data.getSize() - stream.readOffset) / frameBytes);
+    }
+
+    int queuedStreamAudioChannels(const juce::String& streamId) const
+    {
+        juce::ScopedLock lock(streamAudioLock);
+        return juce::jmax(1, queuedAudioStreamForId(streamId).channelCount);
+    }
+
+    int64_t queuedStreamAudioUnderruns(const juce::String& streamId) const
+    {
+        juce::ScopedLock lock(streamAudioLock);
+        return queuedAudioStreamForId(streamId).underruns;
+    }
+
+    juce::var describeQueuedAudioStreams() const
+    {
+        juce::Array<juce::var> streams;
+        const auto addStream = [&](const juce::String& streamId, const BufferedOutputStream& stream)
+        {
+            auto* object = new juce::DynamicObject();
+            const auto frameBytes = static_cast<size_t>(juce::jmax(1, stream.channelCount)) * sizeof(float);
+            const auto queuedFrames = (frameBytes == 0 || stream.data.getSize() <= stream.readOffset)
+                ? 0
+                : static_cast<int>((stream.data.getSize() - stream.readOffset) / frameBytes);
+            object->setProperty("stream_id", streamId);
+            object->setProperty("queued_frames", queuedFrames);
+            object->setProperty("channels", juce::jmax(1, stream.channelCount));
+            object->setProperty("underruns", static_cast<double>(stream.underruns));
+            object->setProperty("active", streamId == kMainAudioStreamId ? static_cast<bool>(audioStreamEnabled.load()) : true);
+            streams.add(juce::var(object));
+        };
+
+        juce::ScopedLock lock(streamAudioLock);
+        addStream(kMainAudioStreamId, mainOutputStream);
+        addStream(kPreviewAudioStreamId, previewOutputStream);
+        addStream(kLiveMidiAudioStreamId, liveMidiOutputStream);
+        return juce::var(streams);
+    }
+
+    bool mixQueuedAudioStreamIntoBuffer(const juce::String& streamId, juce::AudioBuffer<float>& buffer)
+    {
+        const auto numSamples = buffer.getNumSamples();
+        const auto numChannels = buffer.getNumChannels();
+        auto& stream = queuedAudioStreamForId(streamId);
+        if (stream.channelCount <= 0)
+            return false;
+        const auto frameBytes = static_cast<size_t>(stream.channelCount) * sizeof(float);
+        if (frameBytes == 0 || stream.data.getSize() <= stream.readOffset)
+            return false;
+
+        const auto availableFrames = static_cast<int>((stream.data.getSize() - stream.readOffset) / frameBytes);
+        const auto copiedFrames = juce::jmin(numSamples, availableFrames);
+        auto* source = reinterpret_cast<const float*>(
+            static_cast<const char*>(stream.data.getData()) + stream.readOffset
+        );
+        for (int sample = 0; sample < copiedFrames; ++sample)
+        {
+            for (int channel = 0; channel < numChannels; ++channel)
+            {
+                const auto sourceChannel = stream.channelCount == 1 ? 0 : juce::jmin(channel, stream.channelCount - 1);
+                buffer.addSample(channel, sample, source[(sample * stream.channelCount) + sourceChannel]);
+            }
+        }
+
+        stream.readOffset += static_cast<size_t>(copiedFrames) * frameBytes;
+        stream.outputFrames += copiedFrames;
+        if (stream.readOffset >= stream.data.getSize())
+        {
+            stream.data.setSize(0);
+            stream.readOffset = 0;
+        }
+        if (copiedFrames < numSamples)
+            ++stream.underruns;
+        return true;
+    }
+
+    void mixQueuedAudioStreamsIntoBuffer(juce::AudioBuffer<float>& buffer)
+    {
+        juce::ScopedLock lock(streamAudioLock);
+        if (audioStreamEnabled.load())
+            mixQueuedAudioStreamIntoBuffer(kMainAudioStreamId, buffer);
+        mixQueuedAudioStreamIntoBuffer(kPreviewAudioStreamId, buffer);
+        mixQueuedAudioStreamIntoBuffer(kLiveMidiAudioStreamId, buffer);
     }
 
     bool loadPluginStateFromFile(const juce::File& stateFile)
@@ -1608,6 +1975,13 @@ private:
     juce::MidiBuffer pendingMidiMessages;
     juce::CriticalSection scheduledMidiLock;
     juce::Array<ScheduledMidiEvent> scheduledMidiEvents;
+    mutable juce::CriticalSection streamAudioLock;
+    BufferedOutputStream mainOutputStream;
+    BufferedOutputStream previewOutputStream;
+    BufferedOutputStream liveMidiOutputStream;
+    std::atomic<bool> audioStreamEnabled { false };
+    std::atomic<float> pluginOutputGain { 1.0f };
+    std::atomic<float> pluginOutputPan { 0.0f };
     std::atomic<int64_t> renderedSampleFrames { 0 };
     std::atomic<int64_t> scheduledMidiSequence { 0 };
 
@@ -1688,45 +2062,94 @@ void HostCommandServer::run()
         if (client == nullptr)
             continue;
 
+        // Disable Nagle's algorithm on the accepted socket so that small
+        // responses are sent immediately.  Without this, TCP batches small
+        // writes, adding ~15 ms of delayed-ACK latency per round-trip on
+        // Windows — far too slow for realtime audio IPC.
+        {
+            int flag = 1;
+            // IPPROTO_TCP = 6, TCP_NODELAY = 1
+            ::setsockopt(static_cast<int>(client->getRawSocketHandle()),
+                         6, 1,
+                         reinterpret_cast<const char*>(&flag), sizeof(flag));
+        }
+
         handleClient(*client);
     }
 }
 
 void HostCommandServer::handleClient(juce::StreamingSocket& client)
 {
+    // Persistent connection: keep reading newline-delimited commands until
+    // the client disconnects or an idle timeout (2 s) expires.  This avoids
+    // the ~10-16 ms TCP connection overhead per command on Windows that made
+    // realtime VST rendering choppy.
     juce::String incoming;
-    char buffer[2048]{};
+    char buffer[4096]{};
 
-    while (!threadShouldExit())
+    for (;;)
     {
-        const auto ready = client.waitUntilReady(true, 500);
+        // Try to extract a complete line from any data already buffered.
+        while (incoming.containsChar('\n'))
+        {
+            const auto line = incoming.upToFirstOccurrenceOf("\n", false, false).trim();
+            incoming = incoming.fromFirstOccurrenceOf("\n", false, false);
+
+            const auto response = owner.handleRemoteCommandLine(
+                line.isNotEmpty() ? line : "{\"command\":\"status\"}");
+            const auto responseLine = response + "\n";
+            if (client.write(responseLine.toRawUTF8(),
+                             static_cast<int>(responseLine.getNumBytesAsUTF8())) < 0)
+                return;
+        }
+
+        if (threadShouldExit())
+            return;
+
+        // Wait for more data.  Use a 2-second idle timeout so that legacy
+        // one-shot clients (which close their write-half after sending) are
+        // handled promptly, while persistent clients can keep the socket
+        // open across many commands.
+        const auto ready = client.waitUntilReady(true, 2000);
         if (ready < 0)
             return;
 
         if (ready == 0)
         {
+            // Idle timeout — if there is leftover data without a newline,
+            // treat it as a final command (legacy one-shot protocol).
             if (incoming.isNotEmpty())
-                break;
-            continue;
+            {
+                const auto line = incoming.trim();
+                incoming.clear();
+                const auto response = owner.handleRemoteCommandLine(
+                    line.isNotEmpty() ? line : "{\"command\":\"status\"}");
+                const auto responseLine = response + "\n";
+                client.write(responseLine.toRawUTF8(),
+                             static_cast<int>(responseLine.getNumBytesAsUTF8()));
+            }
+            return;
         }
 
         const auto bytesRead = client.read(buffer, static_cast<int>(std::size(buffer) - 1), false);
         if (bytesRead <= 0)
-            break;
+        {
+            // Client disconnected.  Process any remaining buffered data.
+            if (incoming.isNotEmpty())
+            {
+                const auto line = incoming.trim();
+                const auto response = owner.handleRemoteCommandLine(
+                    line.isNotEmpty() ? line : "{\"command\":\"status\"}");
+                const auto responseLine = response + "\n";
+                client.write(responseLine.toRawUTF8(),
+                             static_cast<int>(responseLine.getNumBytesAsUTF8()));
+            }
+            return;
+        }
 
         buffer[bytesRead] = '\0';
         incoming << juce::String::fromUTF8(buffer, bytesRead);
-
-        if (incoming.containsChar('\n'))
-            break;
     }
-
-    const auto line = incoming.upToFirstOccurrenceOf("\n", false, false).trim();
-    const auto response = owner.handleRemoteCommandLine(line.isNotEmpty() ? line
-                                                                          : "{\"command\":\"status\"}");
-    const auto responseLine = response + "\n";
-    client.write(responseLine.toRawUTF8(), static_cast<int>(responseLine.getNumBytesAsUTF8()));
-    client.close();
 }
 
 class HostWindow final : public juce::DocumentWindow
@@ -1872,7 +2295,7 @@ namespace
         juce::String command(const juce::String& requestLine)
         {
             return component != nullptr ? component->handleRemoteCommandLine(requestLine)
-                                        : juce::JSON::toString(makeResponse(false, "Host component unavailable"));
+                                        : juce::JSON::toString(makeResponse(false, "Host component unavailable"), true);
         }
 
     private:
@@ -1917,7 +2340,7 @@ AIMS_VST_HOST_API int aims_vst_host_command(void* handle,
     auto* instance = static_cast<LibraryHostInstance*>(handle);
     if (instance == nullptr)
     {
-        copyUtf8ToBuffer(juce::JSON::toString(makeResponse(false, "Invalid host handle")), responseBuffer, responseBufferBytes);
+        copyUtf8ToBuffer(juce::JSON::toString(makeResponse(false, "Invalid host handle"), true), responseBuffer, responseBufferBytes);
         return 0;
     }
     const auto response = instance->command(juce::String::fromUTF8(requestLine != nullptr ? requestLine : ""));
@@ -1955,6 +2378,9 @@ public:
 
     void initialise(const juce::String&) override
     {
+#if JUCE_WINDOWS
+        suppressWindowsCrashDialogs();
+#endif
         juce::PropertiesFile::Options options;
         options.applicationName = "AI Music Studio VST Host";
         options.filenameSuffix = "settings";

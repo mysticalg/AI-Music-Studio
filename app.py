@@ -4260,11 +4260,15 @@ class AudioSettingsDialog(QtWidgets.QDialog):
         self.output_sample_format_combo = QtWidgets.QComboBox()
         self.output_latency_label = QtWidgets.QLabel()
         self.output_buffer_frames_label = QtWidgets.QLabel()
+        self.output_driver_block_label = QtWidgets.QLabel()
+        self.output_queued_ahead_label = QtWidgets.QLabel()
         output_form.addRow('Device', device_widget)
         output_form.addRow('Sample rate', self.output_sample_rate_combo)
         output_form.addRow('Bit depth / format', self.output_sample_format_combo)
-        output_form.addRow('Estimated latency', self.output_latency_label)
-        output_form.addRow('Output buffer', self.output_buffer_frames_label)
+        output_form.addRow('Playback prebuffer target', self.output_latency_label)
+        output_form.addRow('Playback prebuffer', self.output_buffer_frames_label)
+        output_form.addRow('Driver block size', self.output_driver_block_label)
+        output_form.addRow('Playback queued ahead', self.output_queued_ahead_label)
         body_layout.addWidget(output_group)
 
         playback_group = QtWidgets.QGroupBox('Playback')
@@ -4276,7 +4280,7 @@ class AudioSettingsDialog(QtWidgets.QDialog):
         self.note_length_offset_spin.setRange(-480, 480)
         self.note_length_offset_spin.setSingleStep(1)
         self.note_length_offset_spin.setSuffix(' ticks')
-        playback_form.addRow('Audio buffer', self.audio_buffer_combo)
+        playback_form.addRow('Playback prebuffer', self.audio_buffer_combo)
         playback_form.addRow('Playhead refresh', self.playhead_refresh_combo)
         playback_form.addRow('Note length offset', self.note_length_offset_spin)
         body_layout.addWidget(playback_group)
@@ -4290,11 +4294,17 @@ class AudioSettingsDialog(QtWidgets.QDialog):
         self.native_host_buffer_combo = QtWidgets.QComboBox()
         native_form.addRow('Startup format', self.native_host_summary_label)
         native_form.addRow('Sample rate', self.native_host_rate_combo)
-        native_form.addRow('Buffer size', self.native_host_buffer_combo)
+        native_form.addRow('Prebuffer source', self.native_host_buffer_combo)
+        self.native_host_buffer_combo.setEnabled(False)
+        self.native_host_buffer_combo.setToolTip('Native VST playback now follows the main playback prebuffer target.')
         body_layout.addWidget(native_group)
         body_layout.addStretch(1)
 
         buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
+        self.reset_audio_btn = buttons.addButton('Reset Audio Engine', QtWidgets.QDialogButtonBox.ButtonRole.ActionRole)
+        self.reset_audio_btn.setToolTip(
+            'Flush active output, preview, and native host playback audio so the current device and buffer settings are reapplied.'
+        )
         buttons.rejected.connect(self.close)
         layout.addWidget(buttons)
 
@@ -4307,6 +4317,11 @@ class AudioSettingsDialog(QtWidgets.QDialog):
         self.note_length_offset_spin.valueChanged.connect(self._on_note_length_offset_changed)
         self.native_host_rate_combo.currentIndexChanged.connect(self._on_native_host_rate_changed)
         self.native_host_buffer_combo.currentIndexChanged.connect(self._on_native_host_buffer_changed)
+        self.reset_audio_btn.clicked.connect(self._on_reset_audio_clicked)
+
+        self._refresh_timer = QtCore.QTimer(self)
+        self._refresh_timer.setInterval(250)
+        self._refresh_timer.timeout.connect(self._refresh_status_from_mainwindow)
 
     def _main_window(self):
         return self.parent() if isinstance(self.parent(), MainWindow) else None
@@ -4323,19 +4338,35 @@ class AudioSettingsDialog(QtWidgets.QDialog):
         combo.setCurrentIndex(active_index)
         del blocker
 
-    def refresh_from_mainwindow(self) -> None:
+    def _refresh_status_from_mainwindow(self) -> None:
+        self.refresh_from_mainwindow(refresh_controls=False)
+
+    def refresh_from_mainwindow(self, *, refresh_controls: bool = True) -> None:
         main_window = self._main_window()
         if main_window is None:
             return
         current_device = main_window._selected_audio_device()
         preferred = current_device.preferredFormat()
-        latency_ms = (main_window._desired_audio_buffer_frames() / float(max(1, main_window._playback_sample_rate))) * 1000.0
+        output_status = main_window._native_output_status() if main_window._native_output_bridge_alive() else None
+        latency_ms = main_window._buffer_frames_latency_ms(main_window._desired_audio_buffer_frames())
         self.output_summary_label.setText(main_window._audio_output_summary())
         self.output_latency_label.setText(f'{latency_ms:.1f} ms')
-        self.output_buffer_frames_label.setText(f'{main_window._desired_audio_buffer_frames()} samples')
-        self.native_host_summary_label.setText(
-            f'{main_window._native_vst_host_target_sample_rate()} Hz, {main_window._native_vst_host_target_buffer_size()} samples'
+        self.output_buffer_frames_label.setText(
+            main_window._playback_prebuffer_target_summary()
         )
+        self.output_driver_block_label.setText(
+            main_window._driver_block_size_summary(output_status)
+        )
+        self.output_queued_ahead_label.setText(
+            main_window._queued_ahead_summary(output_status)
+        )
+        self.native_host_summary_label.setText(
+            f'{main_window._native_vst_host_target_sample_rate()} Hz, '
+            f'{main_window._native_vst_host_target_buffer_size()} samples '
+            f'({main_window._buffer_frames_duration_ms(main_window._native_vst_host_target_buffer_size(), main_window._native_vst_host_target_sample_rate()):.1f} ms, follows playback prebuffer)'
+        )
+        if not refresh_controls:
+            return
 
         device_items = [('System Default Soundcard', '')]
         for device in QtMultimedia.QMediaDevices.audioOutputs():
@@ -4357,7 +4388,12 @@ class AudioSettingsDialog(QtWidgets.QDialog):
             str(main_window.selected_audio_sample_format_name or 'Auto'),
         )
 
-        audio_buffer_values = {64, 128, 256, 512, 1024, 2048, 4096, int(main_window.audio_buffer_frames)}
+        audio_buffer_values = set(
+            main_window._buffer_choice_values_for_sample_rate(
+                main_window._playback_sample_rate,
+                include_value=int(main_window.audio_buffer_frames),
+            )
+        )
         audio_buffer_items = [
             (
                 f'{value} samples ({(int(value) / float(max(1, main_window._playback_sample_rate))) * 1000.0:.1f} ms)',
@@ -4383,19 +4419,24 @@ class AudioSettingsDialog(QtWidgets.QDialog):
         native_rate_items.extend((f'{rate} Hz', int(rate)) for rate in sorted(v for v in native_rate_values if int(v) > 0))
         self._set_combo_items(self.native_host_rate_combo, native_rate_items, int(main_window.native_vst_host_sample_rate))
 
-        native_buffer_values = {
-            64, 96, 128, 192, 240, 256, 384, 480, 512, 768, 960, 1024,
-            1536, 1920, 2048, 3072, 4096, int(main_window._native_vst_host_target_buffer_size()),
-        }
-        if int(main_window.native_vst_host_buffer_size) > 0:
-            native_buffer_values.add(int(main_window.native_vst_host_buffer_size))
-        native_buffer_items: list[tuple[str, object]] = [
-            (f'0 samples (Auto -> {main_window._native_vst_host_target_buffer_size()} effective)', 0)
-        ]
-        native_buffer_items.extend(
-            (f'{size} samples', int(size)) for size in sorted(v for v in native_buffer_values if int(v) > 0)
+        effective_native_buffer = int(main_window._native_vst_host_target_buffer_size())
+        effective_native_ms = main_window._buffer_frames_duration_ms(
+            effective_native_buffer,
+            main_window._native_vst_host_target_sample_rate(),
         )
-        self._set_combo_items(self.native_host_buffer_combo, native_buffer_items, int(main_window.native_vst_host_buffer_size))
+        native_buffer_items: list[tuple[str, object]] = [
+            (f'Follows playback prebuffer ({effective_native_buffer} samples, {effective_native_ms:.1f} ms)', 0)
+        ]
+        self._set_combo_items(self.native_host_buffer_combo, native_buffer_items, 0)
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        self.refresh_from_mainwindow()
+        self._refresh_timer.start()
+
+    def hideEvent(self, event: QtGui.QHideEvent) -> None:
+        self._refresh_timer.stop()
+        super().hideEvent(event)
 
     def _on_refresh_devices_clicked(self) -> None:
         self.refresh_from_mainwindow()
@@ -4405,24 +4446,28 @@ class AudioSettingsDialog(QtWidgets.QDialog):
         if main_window is None:
             return
         main_window.set_audio_output_device(str(self.output_device_combo.currentData() or ''))
+        self.refresh_from_mainwindow()
 
     def _on_output_sample_rate_changed(self, _index: int) -> None:
         main_window = self._main_window()
         if main_window is None:
             return
         main_window.set_audio_sample_rate(int(self.output_sample_rate_combo.currentData() or 0))
+        self.refresh_from_mainwindow()
 
     def _on_output_sample_format_changed(self, _index: int) -> None:
         main_window = self._main_window()
         if main_window is None:
             return
         main_window.set_audio_sample_format(str(self.output_sample_format_combo.currentData() or 'Auto'))
+        self.refresh_from_mainwindow()
 
     def _on_audio_buffer_changed(self, _index: int) -> None:
         main_window = self._main_window()
         if main_window is None:
             return
         main_window.set_audio_buffer_frames(int(self.audio_buffer_combo.currentData() or 512))
+        self.refresh_from_mainwindow()
 
     def _on_playhead_refresh_changed(self, _index: int) -> None:
         main_window = self._main_window()
@@ -4441,12 +4486,21 @@ class AudioSettingsDialog(QtWidgets.QDialog):
         if main_window is None:
             return
         main_window.set_native_vst_host_sample_rate(int(self.native_host_rate_combo.currentData() or 0))
+        self.refresh_from_mainwindow()
 
     def _on_native_host_buffer_changed(self, _index: int) -> None:
         main_window = self._main_window()
         if main_window is None:
             return
         main_window.set_native_vst_host_buffer_size(int(self.native_host_buffer_combo.currentData() or 0))
+        self.refresh_from_mainwindow()
+
+    def _on_reset_audio_clicked(self) -> None:
+        main_window = self._main_window()
+        if main_window is None:
+            return
+        main_window.reset_audio_engine()
+        self.refresh_from_mainwindow()
 
 
 class FloatingPanelWindow(QtWidgets.QMainWindow):
@@ -4713,6 +4767,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.note_preview_path = RENDER_DIR / "_preview" / "note_preview.wav"
         self._playback_sink: QtMultimedia.QAudioSink | None = None
         self._playback_sink_device: QtCore.QIODevice | None = None
+        self._native_output_bridge: object | None = None
+        self._native_output_queued_frames = 0
+        self._native_output_underruns = 0
+        self._direct_native_transport_row: int | None = None
+        self._direct_native_transport_origin_frame = 0
+        self._direct_native_transport_output_cursor_frame = 0
+        self._direct_native_transport_logical_frame = 0
+        self._direct_native_transport_loop_start_frame = 0
+        self._direct_native_transport_loop_end_frame = 0
+        self._direct_native_transport_lead_frames = 0
         self._live_midi_sink: QtMultimedia.QAudioSink | None = None
         self._live_midi_sink_device: QtCore.QIODevice | None = None
         self._preview_sink: QtMultimedia.QAudioSink | None = None
@@ -4789,6 +4853,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._audio_pump_timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
         self._audio_pump_timer.setInterval(5)
         self._audio_pump_timer.timeout.connect(self._pump_realtime_audio)
+        self._native_output_warm_timer = QtCore.QTimer(self)
+        self._native_output_warm_timer.setSingleShot(True)
+        self._native_output_warm_timer.timeout.connect(self._finish_warm_native_output_bridge)
         self._audio_pump_in_progress = False
         self._live_midi_pending_bytes = bytearray()
         self._live_midi_pump_timer = QtCore.QTimer(self)
@@ -5960,6 +6027,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_locator_overlays()
         self._sync_playback_loop_state()
         self._update_locator_playback_state()
+        QtCore.QTimer.singleShot(0, lambda: self._schedule_native_output_bridge_warm(delay_ms=0))
 
     def set_left_locator_position(self, sec: float) -> None:
         snapped_tick = self._snap_locator_tick(self._transport_seconds_to_tick(sec))
@@ -6057,9 +6125,9 @@ class MainWindow(QtWidgets.QMainWindow):
         description = device.description() or 'System Default Soundcard'
         latency_ms = (self._desired_audio_buffer_frames() / float(max(1, self._playback_sample_rate))) * 1000.0
         return (
-            f'{description} • {self._playback_sample_rate} Hz • '
-            f'{qaudio_sample_format_label(self._playback_sample_format)} • '
-            f'{self._playback_channel_count} ch • {latency_ms:.1f} ms'
+            f'{description} | {self._playback_sample_rate} Hz | '
+            f'{qaudio_sample_format_label(self._playback_sample_format)} | '
+            f'{self._playback_channel_count} ch | {latency_ms:.1f} ms prebuffer'
         )
 
     def _native_vst_host_target_sample_rate(self) -> int:
@@ -6068,17 +6136,101 @@ class MainWindow(QtWidgets.QMainWindow):
             return selected
         return max(1, int(getattr(self, '_playback_sample_rate', 44100)))
 
+    @staticmethod
+    def _buffer_frames_duration_ms(frame_count: int, sample_rate: int) -> float:
+        return (max(1, int(frame_count)) / float(max(1, int(sample_rate)))) * 1000.0
+
+    def _format_frames_and_ms(self, frame_count: int, sample_rate: int | None = None) -> str:
+        frames = max(0, int(frame_count))
+        rate = max(1, int(sample_rate or self._playback_sample_rate or 44100))
+        return f'{frames} samples ({self._buffer_frames_duration_ms(frames, rate):.1f} ms)'
+
+    def _playback_prebuffer_target_summary(self) -> str:
+        return self._format_frames_and_ms(self._desired_audio_buffer_frames(), self._playback_sample_rate)
+
+    def _native_output_driver_block_frames(self, status: dict[str, object] | None = None) -> int:
+        source = status
+        if source is None and self._native_output_bridge_alive():
+            source = self._native_output_status()
+        if isinstance(source, dict):
+            return max(0, int(source.get('buffer_size') or 0))
+        return 0
+
+    def _driver_block_size_summary(self, status: dict[str, object] | None = None) -> str:
+        frames = self._native_output_driver_block_frames(status)
+        if frames > 0:
+            return self._format_frames_and_ms(frames, self._playback_sample_rate)
+        if self._native_output_bridge_supported():
+            return 'Not reported yet'
+        return 'Using Qt output path'
+
+    def _queued_ahead_frames(self, status: dict[str, object] | None = None) -> int:
+        if self._native_output_bridge_alive():
+            source = status if status is not None else self._native_output_status()
+            if isinstance(source, dict):
+                return max(0, int(source.get('queued_audio_frames') or 0))
+            return max(0, int(getattr(self, '_native_output_queued_frames', 0)))
+        return max(0, int(self._estimated_queued_output_frames()))
+
+    def _queued_ahead_summary(self, status: dict[str, object] | None = None) -> str:
+        frames = self._queued_ahead_frames(status)
+        if frames > 0:
+            return self._format_frames_and_ms(frames, self._playback_sample_rate)
+        if getattr(self, '_playback_active', False):
+            return '0 samples (draining / refill pending)'
+        return 'Idle'
+
+    @staticmethod
+    def _absolute_buffer_frame_limit() -> int:
+        # 1000 ms at 192 kHz. Keep a generous absolute ceiling for saved
+        # preferences while the runtime/UI clamps stay tied to the active
+        # sample rate.
+        return 192000
+
+    def _maximum_audio_buffer_frames(self) -> int:
+        return max(64, min(self._absolute_buffer_frame_limit(), int(round(float(max(1, self._playback_sample_rate))))))
+
+    def _maximum_native_vst_host_buffer_size(self) -> int:
+        return max(
+            64,
+            min(
+                self._absolute_buffer_frame_limit(),
+                int(round(float(max(1, self._native_vst_host_target_sample_rate())))),
+            ),
+        )
+
+    @staticmethod
+    def _buffer_choice_values_for_sample_rate(sample_rate: int, *, include_value: int = 0) -> list[int]:
+        rate = max(1, int(sample_rate))
+        max_frames = max(64, min(192000, int(round(float(rate)))))
+        sample_values = {
+            64, 96, 128, 192, 240, 256, 384, 480, 512, 768, 960, 1024,
+            1536, 1920, 2048, 3072, 4096, 6144, 8192, 12288, 16384,
+        }
+        ms_values = {
+            2, 4, 5, 8, 10, 12, 16, 20, 24, 32, 40, 50, 64, 80,
+            100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000,
+        }
+        values = {int(v) for v in sample_values if 64 <= int(v) <= max_frames}
+        for ms in ms_values:
+            values.add(max(64, int(round((float(rate) * float(ms)) / 1000.0))))
+        if int(include_value) > 0:
+            values.add(int(include_value))
+        values.add(max_frames)
+        return sorted(v for v in values if 64 <= int(v) <= max_frames)
+
     def _native_vst_host_target_buffer_size(self) -> int:
-        selected = int(getattr(self, 'native_vst_host_buffer_size', 0) or 0)
-        if selected > 0:
-            return int(clamp(selected, 64, 4096))
-        # In auto mode, follow the main output buffer upward so heavier synths
-        # gain stability when the user raises the playback buffer, while still
-        # keeping a sensible floor for low-latency sessions.
-        return int(clamp(max(512, self._desired_audio_buffer_frames()), 512, 2048))
+        # In auto mode, follow the output-buffer duration upward so the native
+        # host tracks the same latency target even when its sample rate differs
+        # from the main output. There is intentionally a single system buffer:
+        # the VST host follows the main audio engine instead of maintaining its
+        # own separately configurable block size.
+        output_latency_ms = self._buffer_frames_latency_ms(self._desired_audio_buffer_frames())
+        auto_frames = int(round((float(self._native_vst_host_target_sample_rate()) * float(output_latency_ms)) / 1000.0))
+        return int(clamp(max(512, auto_frames), 512, self._maximum_native_vst_host_buffer_size()))
 
     def _buffer_frames_latency_ms(self, frame_count: int) -> float:
-        return (max(1, int(frame_count)) / float(max(1, self._playback_sample_rate))) * 1000.0
+        return self._buffer_frames_duration_ms(frame_count, self._playback_sample_rate)
 
     def _recommended_audio_pump_interval_ms(self, frame_count: int) -> int:
         latency_ms = self._buffer_frames_latency_ms(frame_count)
@@ -6088,12 +6240,14 @@ class MainWindow(QtWidgets.QMainWindow):
         return int(clamp(int(math.floor((latency_ms * 0.4) + 0.5)), 1, 5))
 
     def _preferred_playback_chunk_frames(self) -> int:
-        desired = int(clamp(int(getattr(self, 'audio_buffer_frames', 1024)), 64, 4096))
+        desired = int(self._desired_audio_buffer_frames())
         # Keep chunks at half the buffer size so that at least two chunks
         # fit in the output buffer.  This gives the pump enough headroom to
         # recover from momentary UI-thread stalls without underrunning.
-        # For typical buffers (1024-2048) this yields 512-1024 frame chunks.
-        chunk = max(256, min(1024, desired // 2))
+        # For larger safety buffers, allow chunk sizes up to 4096 frames so
+        # the pump does not need dozens of tiny writes to keep a 500-1000 ms
+        # output buffer filled.
+        chunk = max(256, min(4096, desired // 2))
         # Never exceed the buffer itself (matters for tiny buffers <256).
         return min(chunk, desired)
 
@@ -6164,7 +6318,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return preferred
 
     def _desired_audio_buffer_frames(self) -> int:
-        return int(clamp(int(getattr(self, 'audio_buffer_frames', 1024)), 64, 4096))
+        return int(clamp(int(getattr(self, 'audio_buffer_frames', 1024)), 64, self._maximum_audio_buffer_frames()))
 
     def _playback_audio_format(self) -> QtMultimedia.QAudioFormat:
         fmt = QtMultimedia.QAudioFormat()
@@ -6178,6 +6332,286 @@ class MainWindow(QtWidgets.QMainWindow):
         sink.setBufferFrameCount(self._desired_audio_buffer_frames())
         sink.setVolume(1.0)
         return sink
+
+    def _clear_direct_native_transport_state(self) -> None:
+        self._direct_native_transport_row = None
+        self._direct_native_transport_origin_frame = 0
+        self._direct_native_transport_output_cursor_frame = 0
+        self._direct_native_transport_logical_frame = 0
+        self._direct_native_transport_loop_start_frame = 0
+        self._direct_native_transport_loop_end_frame = 0
+        self._direct_native_transport_lead_frames = 0
+
+    def _direct_native_transport_active(self) -> bool:
+        return self._direct_native_transport_row is not None and self._native_output_bridge_alive()
+
+    def _track_can_use_direct_native_transport(self, track: TrackState, entry: VSTInstrument | None) -> bool:
+        if entry is None or not entry.is_instrument or not entry.host_supported or not self._can_use_native_vst_host(entry):
+            return False
+        if bool(track.vst_fx_chain):
+            return False
+        if abs(float(track.vsti_wet_mix) - 100.0) > 0.001:
+            return False
+        if any(bool(route.get('enabled', False)) for route in self._sanitize_vsti_input_bus_routes(track.vsti_input_bus_routes)):
+            return False
+        if any(bool(route.get('enabled', False)) for route in self._sanitize_vsti_output_bus_routes(track.vsti_output_bus_routes)):
+            return False
+        return True
+
+    def _configure_direct_native_output_mix(self, bridge: object, track: TrackState) -> bool:
+        if bridge is None:
+            return False
+        gain = max(0.0, float(track.volume) * (10.0 ** (float(track.vsti_output_gain_db) / 20.0)))
+        pan = float(clamp(float(track.pan), -1.0, 1.0))
+        try:
+            bridge.command('set_output_mix', gain=gain, pan=pan)
+            setattr(bridge, '_aims_direct_output_gain', gain)
+            setattr(bridge, '_aims_direct_output_pan', pan)
+            return True
+        except Exception:
+            _APP_LOGGER.exception("Failed configuring direct native output mix track=%s", track.name)
+            return False
+
+    def _direct_native_transport_candidate(self) -> tuple[int, TrackState, VSTInstrument] | None:
+        if not self._native_output_bridge_supported():
+            return None
+        if bool(getattr(self.project, 'metronome_enabled', False)):
+            return None
+
+        solo_tracks = self._active_solo_track_indices()
+        candidate: tuple[int, TrackState, VSTInstrument] | None = None
+        sample_track_rows = {int(clip.track_index) for clip in getattr(self.project, 'sample_clips', [])}
+
+        for idx, track in enumerate(self.project.tracks):
+            if not self._track_is_audible(idx, solo_tracks):
+                continue
+
+            if track.track_type == 'sample':
+                if idx in sample_track_rows:
+                    return None
+                continue
+
+            if track.track_type != 'instrument' or not track.notes:
+                continue
+
+            entry = self._rack_vsti_entry(track.rack_vsti) if track.rack_vsti else None
+            if (
+                track.instrument_mode != 'VSTI Rack'
+                or entry is None
+                or not self._track_can_use_direct_native_transport(track, entry)
+            ):
+                return None
+            if candidate is not None:
+                return None
+            candidate = (idx, track, entry)
+
+        return candidate
+
+    def _native_output_bridge_supported(self) -> bool:
+        return bool(NATIVE_VST_HOST_AVAILABLE and NativeVstHostBridge is not None)
+
+    def _native_output_bridge_alive(self) -> bool:
+        bridge = getattr(self, '_native_output_bridge', None)
+        if bridge is None:
+            return False
+        process = getattr(bridge, 'process', None)
+        if process is None:
+            return False
+        poll = getattr(process, 'poll', None)
+        if callable(poll):
+            try:
+                return poll() is None
+            except Exception:
+                return False
+        return True
+
+    def _stop_native_output_bridge(self) -> None:
+        if hasattr(self, '_native_output_warm_timer'):
+            self._native_output_warm_timer.stop()
+        bridge = getattr(self, '_native_output_bridge', None)
+        self._native_output_bridge = None
+        self._native_output_queued_frames = 0
+        self._native_output_underruns = 0
+        self._clear_direct_native_transport_state()
+        if bridge is None:
+            return
+        try:
+            bridge.stop()
+        except Exception:
+            _APP_LOGGER.exception("Failed stopping native realtime output bridge")
+
+    def _ensure_native_output_bridge(
+        self,
+        direct_plugin: tuple[int, TrackState, VSTInstrument] | None = None,
+    ) -> object | None:
+        if not self._native_output_bridge_supported():
+            return None
+
+        target_sample_rate = max(1, int(self._playback_sample_rate))
+        target_buffer_size = max(64, int(self._desired_audio_buffer_frames()))
+        direct_track = direct_plugin[1] if direct_plugin is not None else None
+        direct_entry = direct_plugin[2] if direct_plugin is not None else None
+        desired_plugin_path = (
+            self._normalized_vsti_path(str(direct_entry.path))
+            if direct_entry is not None and str(getattr(direct_entry, 'path', '') or '').strip()
+            else ''
+        )
+        desired_state_path, desired_state_mtime_ns = self._native_vst_host_state_signature(direct_track, direct_entry)
+        desired_bus_signature = (
+            self._native_vst_host_bus_payload_signature(self._native_vst_host_bus_payload(direct_track, direct_entry))
+            if direct_track is not None and direct_entry is not None
+            else None
+        )
+        existing = getattr(self, '_native_output_bridge', None)
+        if (
+            existing is not None
+            and self._native_output_bridge_alive()
+            and int(getattr(existing, 'requested_sample_rate', getattr(existing, 'sample_rate', 0)) or 0) == target_sample_rate
+            and int(getattr(existing, 'requested_buffer_size', getattr(existing, 'buffer_size', 0)) or 0) == target_buffer_size
+        ):
+            existing_plugin_path = self._normalized_vsti_path(str(getattr(existing, 'plugin_path', '') or ''))
+            if existing_plugin_path == desired_plugin_path:
+                if direct_track is not None and direct_entry is not None:
+                    if (
+                        str(getattr(existing, '_aims_loaded_state_path', '') or '') != desired_state_path
+                        or int(getattr(existing, '_aims_loaded_state_mtime_ns', 0) or 0) != int(desired_state_mtime_ns)
+                    ):
+                        self._prime_native_vst_host_bridge_state(existing, direct_track, direct_entry)
+                    if getattr(existing, '_aims_bus_routing_signature', None) != desired_bus_signature:
+                        ok, _status = self._configure_native_vst_host_bridge_buses(existing, direct_track, direct_entry)
+                        if not ok:
+                            self._stop_native_output_bridge()
+                            existing = None
+                        else:
+                            if not self._configure_direct_native_output_mix(existing, direct_track):
+                                self._stop_native_output_bridge()
+                                existing = None
+                            else:
+                                return existing
+                    elif not self._configure_direct_native_output_mix(existing, direct_track):
+                        self._stop_native_output_bridge()
+                        existing = None
+                else:
+                    return existing
+                if existing is not None:
+                    return existing
+            else:
+                self._stop_native_output_bridge()
+                existing = None
+
+        self._stop_native_output_bridge()
+        bridge = NativeVstHostBridge(
+            direct_entry.path if direct_entry is not None else None,
+            bridge_mode=False,
+            hidden=True,
+            sample_rate=target_sample_rate,
+            buffer_size=target_buffer_size,
+        )
+        bridge.requested_sample_rate = target_sample_rate
+        bridge.requested_buffer_size = target_buffer_size
+        bridge.start(startup_timeout=8.0)
+        status = bridge.wait_until_ready(timeout=8.0)
+        if direct_entry is not None and not bool(status.get('plugin_loaded', False)):
+            raise RuntimeError(f'Could not load direct native output plugin: {direct_entry.name}')
+        bridge.sample_rate = int(status.get('sample_rate') or target_sample_rate)
+        bridge.buffer_size = int(status.get('buffer_size') or target_buffer_size)
+        if direct_track is not None and direct_entry is not None:
+            self._prime_native_vst_host_bridge_state(bridge, direct_track, direct_entry)
+            ok, status = self._configure_native_vst_host_bridge_buses(bridge, direct_track, direct_entry)
+            if not ok:
+                try:
+                    bridge.stop()
+                except Exception:
+                    pass
+                raise RuntimeError(f'Could not configure direct native output buses for {direct_entry.name}')
+            if not self._configure_direct_native_output_mix(bridge, direct_track):
+                try:
+                    bridge.stop()
+                except Exception:
+                    pass
+                raise RuntimeError(f'Could not configure direct native output mix for {direct_entry.name}')
+        bridge.clear_audio_queue(reset_counters=True, stream_id='main')
+        bridge.clear_audio_queue(reset_counters=True, stream_id='preview')
+        bridge.clear_audio_queue(reset_counters=True, stream_id='live_midi')
+        self._native_output_bridge = bridge
+        self._native_output_queued_frames = int(status.get('queued_audio_frames') or 0)
+        self._native_output_underruns = int(status.get('audio_queue_underruns') or 0)
+        return bridge
+
+    def _native_output_status(self, bridge: object | None = None) -> dict[str, object] | None:
+        target = bridge or getattr(self, '_native_output_bridge', None)
+        if target is None:
+            return None
+        try:
+            status = target.command('status')
+        except Exception:
+            _APP_LOGGER.exception("Failed reading native realtime output bridge status")
+            self._stop_native_output_bridge()
+            return None
+        self._native_output_queued_frames = int(status.get('queued_audio_frames') or 0)
+        self._native_output_underruns = int(status.get('audio_queue_underruns') or 0)
+        return status
+
+    def _native_output_rendered_sample_frames(self, status: dict[str, object] | None = None) -> int:
+        source = status if status is not None else (self._native_output_status() if self._native_output_bridge_alive() else None)
+        if not isinstance(source, dict):
+            return 0
+        return max(0, int(source.get('rendered_sample_frames') or 0))
+
+    def _native_output_scheduling_lead_frames(
+        self,
+        bridge: object | None = None,
+        status: dict[str, object] | None = None,
+    ) -> int:
+        target = bridge if bridge is not None else getattr(self, '_native_output_bridge', None)
+        if target is None or target is not getattr(self, '_native_output_bridge', None):
+            return 0
+        source = status if isinstance(status, dict) else None
+        driver_block = 0
+        if source is not None:
+            driver_block = max(0, int(source.get('buffer_size') or 0))
+        if driver_block <= 0:
+            driver_block = max(0, int(getattr(target, 'buffer_size', 0) or 0))
+        fallback = max(64, int(round(self._playback_sample_rate * 0.005)))
+        return int(max(64, min(self._playback_chunk_frames, max(driver_block, fallback))))
+
+    @staticmethod
+    def _native_output_stream_entry(status: dict[str, object] | None, stream_id: str) -> dict[str, object] | None:
+        if not isinstance(status, dict):
+            return None
+        raw_streams = status.get('audio_streams')
+        if not isinstance(raw_streams, list):
+            return None
+        for raw in raw_streams:
+            if isinstance(raw, dict) and str(raw.get('stream_id', '')).strip().lower() == str(stream_id).strip().lower():
+                return raw
+        return None
+
+    def _native_output_stream_queued_frames(self, stream_id: str, status: dict[str, object] | None = None) -> int:
+        if str(stream_id).strip().lower() == 'main':
+            source = status if status is not None else self._native_output_status()
+            return int(source.get('queued_audio_frames') or 0) if isinstance(source, dict) else 0
+        source = status if status is not None else self._native_output_status()
+        stream = self._native_output_stream_entry(source, stream_id)
+        return int(stream.get('queued_frames') or 0) if isinstance(stream, dict) else 0
+
+    def _finish_warm_native_output_bridge(self) -> None:
+        if not self._native_output_bridge_supported():
+            return
+        if bool(getattr(self, '_shutdown_complete', False)):
+            return
+        if hasattr(self, 'playback_timer') and self.playback_timer.isActive():
+            return
+        try:
+            self._ensure_native_output_bridge(direct_plugin=self._direct_native_transport_candidate())
+        except Exception:
+            _APP_LOGGER.exception("Failed warming native realtime output bridge")
+
+    def _schedule_native_output_bridge_warm(self, *, delay_ms: int = 120) -> None:
+        if not self._native_output_bridge_supported():
+            return
+        if hasattr(self, '_native_output_warm_timer'):
+            self._native_output_warm_timer.start(max(0, int(delay_ms)))
 
     def _finalize_preview_resource(self, sink: QtMultimedia.QAudioSink, buffer: QtCore.QBuffer) -> None:
         try:
@@ -6205,6 +6639,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._finalize_preview_resource(sink, buffer)
 
     def _close_preview_audio(self) -> None:
+        bridge = getattr(self, '_native_output_bridge', None)
+        if bridge is not None:
+            try:
+                bridge.clear_audio_queue(reset_counters=False, stream_id='preview')
+            except Exception:
+                _APP_LOGGER.exception("Failed clearing preview audio stream")
         sink = self._preview_sink
         buffer = self._preview_buffer_device
         self._preview_sink = None
@@ -6238,12 +6678,21 @@ class MainWindow(QtWidgets.QMainWindow):
             self._finalize_preview_resource(sink, buffer)
 
     def _play_pcm_preview(self, samples: object, sample_rate: int) -> None:
+        self._close_preview_audio()
+        # Note previews should never cold-start the native JUCE output bridge on
+        # the UI thread. If the bridge is already alive, reuse it; otherwise
+        # fall back to the lightweight local preview sink.
+        if self._native_output_bridge_supported() and self._native_output_bridge_alive():
+            try:
+                if self._queue_native_output_stream_audio('preview', samples, sample_rate, clear_first=True):
+                    return
+            except Exception:
+                _APP_LOGGER.exception("Native output preview stream failed, falling back to QAudioSink")
         if sample_rate != self._playback_sample_rate:
             samples = resample_samples(samples, sample_rate, self._playback_sample_rate)
         pcm_bytes = encode_pcm_output_samples(samples, self._playback_sample_format, self._playback_channel_count)
         frame_count = max(1, len(pcm_bytes) // self._playback_bytes_per_frame())
         preview_duration_ms = int((frame_count / float(self._playback_sample_rate)) * 1000.0) + 80
-        self._close_preview_audio()
         buffer = QtCore.QBuffer(self)
         buffer.setData(QtCore.QByteArray(pcm_bytes))
         buffer.open(QtCore.QIODevice.OpenModeFlag.ReadOnly)
@@ -6648,6 +7097,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def _stop_live_midi_audio_sink(self) -> None:
         if hasattr(self, '_live_midi_pump_timer'):
             self._live_midi_pump_timer.stop()
+        bridge = getattr(self, '_native_output_bridge', None)
+        if bridge is not None:
+            try:
+                bridge.clear_audio_queue(reset_counters=False, stream_id='live_midi')
+            except Exception:
+                _APP_LOGGER.exception("Failed clearing live MIDI output stream")
         if self._live_midi_sink is not None:
             try:
                 self._live_midi_sink.stop()
@@ -6711,6 +7166,98 @@ class MainWindow(QtWidgets.QMainWindow):
             [float(value) * right_gain for value in stereo[1]],
         ]
 
+    def _ensure_live_midi_state(self, row: int, track: TrackState) -> LiveMidiHostState:
+        idx = int(row)
+        key = self._track_live_host_key(track, idx)
+        rack_name = str(track.rack_vsti or '')
+        state = self._live_midi_states.get(idx)
+        if state is None or state.key != key or state.rack_name != rack_name:
+            state = LiveMidiHostState(
+                track_index=idx,
+                key=key,
+                rack_name=rack_name,
+            )
+            self._live_midi_states[idx] = state
+        return state
+
+    def _ensure_live_midi_output_active(self) -> None:
+        if not self._live_midi_target_rows():
+            self._stop_live_midi_audio_sink()
+            return
+        self._live_midi_active = True
+        self._schedule_native_output_bridge_warm(delay_ms=0)
+        if hasattr(self, '_live_midi_poll_timer') and not self._live_midi_poll_timer.isActive():
+            self._live_midi_poll_timer.start()
+        if hasattr(self, '_live_midi_pump_timer') and not self._live_midi_pump_timer.isActive():
+            self._live_midi_pump_timer.start()
+        QtCore.QTimer.singleShot(0, self._pump_live_midi_audio)
+
+    def _render_live_midi_chunk_samples(self, frame_count: int) -> object:
+        frame_total = max(1, int(frame_count))
+        if np is not None:
+            mix = np.zeros((2, frame_total), dtype=np.float32)
+        else:
+            mix = [[0.0] * frame_total, [0.0] * frame_total]
+        stale_rows: list[int] = []
+        for idx in self._live_midi_target_rows():
+            info = self._live_midi_track_info(idx)
+            if info is None:
+                stale_rows.append(int(idx))
+                continue
+            _row, track, entry = info
+            if not self._open_native_vst_host_for_track(int(idx), entry, open_editor=False, show_error=False):
+                stale_rows.append(int(idx))
+                continue
+            bridge = self._track_native_vst_host_bridges.get(int(idx))
+            if bridge is None:
+                stale_rows.append(int(idx))
+                continue
+            state = self._ensure_live_midi_state(int(idx), track)
+            try:
+                response = bridge.command('render_audio', frames=frame_total)
+                audio = self._mix_native_vst_render_response(
+                    track,
+                    entry,
+                    response,
+                    frame_total,
+                    return_mono=False,
+                )
+                if np is not None:
+                    audio = np.asarray(self._apply_track_pan_stereo(audio, track.pan), dtype=np.float32)
+                    self._ensure_live_midi_fx_plugins(track, state)
+                    if state.fx_plugins:
+                        reset_flag = bool(state.fx_reset_pending)
+                        for plugin in state.fx_plugins:
+                            audio = np.asarray(
+                                plugin(
+                                    audio,
+                                    self._playback_sample_rate,
+                                    buffer_size=max(64, int(audio.shape[-1])),
+                                    reset=reset_flag,
+                                ),
+                                dtype=np.float32,
+                            )
+                            if audio.ndim == 1:
+                                audio = audio[None, :]
+                    mix += np.asarray(audio, dtype=np.float32)
+                else:
+                    stereo = self._apply_track_pan_stereo(audio, track.pan)
+                    for pos in range(frame_total):
+                        mix[0][pos] += float(stereo[0][pos])
+                        mix[1][pos] += float(stereo[1][pos])
+                state.reset_pending = False
+                state.fx_reset_pending = False
+                state.last_error = ""
+            except Exception as exc:
+                state.last_error = str(exc)
+                stale_rows.append(int(idx))
+                _APP_LOGGER.exception("Live MIDI native host render failed track_index=%s rack=%s", idx, track.rack_vsti)
+        for idx in stale_rows:
+            self._release_live_midi_host(int(idx))
+        if np is not None and isinstance(mix, np.ndarray):
+            return np.clip(mix, -1.0, 1.0).astype(np.float32, copy=False)
+        return self._ensure_stereo_sample_count(mix, frame_total)
+
     def _ensure_live_midi_host_ready(self, row: int | None = None) -> object | None:
         info = self._live_midi_track_info(row)
         if info is None:
@@ -6727,11 +7274,15 @@ class MainWindow(QtWidgets.QMainWindow):
         info = self._live_midi_track_info(row)
         if info is None:
             return False
+        if hasattr(self, 'playback_timer') and self.playback_timer.isActive():
+            self.statusBar().showMessage('Live MIDI monitoring uses the shared JUCE engine when transport is stopped.')
+            return False
         idx, _track, entry = info
         if not self._can_use_native_vst_host(entry):
             return False
         if not self._open_native_vst_host_for_track(idx, entry, open_editor=False, show_error=False):
             return False
+        self._ensure_live_midi_state(idx, self.project.tracks[idx])
         bridge = self._track_native_vst_host_bridges.get(int(idx))
         if bridge is None:
             return False
@@ -6762,6 +7313,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
             else:
                 return False
+            self._ensure_live_midi_output_active()
             return True
         except Exception:
             _APP_LOGGER.exception(
@@ -6785,38 +7337,22 @@ class MainWindow(QtWidgets.QMainWindow):
         bridge = self._track_native_vst_host_bridges.get(int(row))
         if bridge is None:
             return
-        if exhaustive:
-            try:
+        try:
+            if exhaustive:
                 bridge.command('panic')
-            except Exception:
-                _APP_LOGGER.exception("Failed sending native VST panic row=%s", row)
-        channels = [int(clamp(track.midi_channel, 0, 15)) + 1] if track is not None else [1]
-        if exhaustive:
-            channels = list(range(1, 17))
-        for channel in channels:
+                return
+            channel = int(clamp(track.midi_channel, 0, 15)) + 1 if track is not None else 0
+            bridge.command('all_notes_off', channel=channel)
+        except Exception:
+            _APP_LOGGER.exception(
+                "Failed sending native VST %s row=%s",
+                "panic" if exhaustive else "all_notes_off",
+                row,
+            )
             try:
-                bridge.command('all_notes_off', channel=channel)
+                self._stop_native_vst_host_bridge(int(row))
             except Exception:
-                _APP_LOGGER.exception(
-                    "Failed sending native VST all_notes_off row=%s channel=%s",
-                    row,
-                    channel,
-                )
-        if track is None and not exhaustive:
-            return
-        note_numbers = range(128) if exhaustive else sorted({int(clamp(note.pitch, 0, 127)) for note in track.notes})
-        target_channels = [int(clamp(track.midi_channel, 0, 15)) + 1] if track is not None else [1]
-        for channel in target_channels:
-            for note_number in note_numbers:
-                try:
-                    bridge.command('note_off', channel=channel, note=note_number, velocity=0)
-                except Exception:
-                    _APP_LOGGER.exception(
-                        "Failed sending native VST panic note_off row=%s channel=%s note=%s",
-                        row,
-                        channel,
-                        note_number,
-                    )
+                _APP_LOGGER.exception("Failed stopping native VST host bridge after panic failure row=%s", row)
 
     def _dispatch_native_vst_host_message(self, row: int, msg: object, generation: int | None = None) -> None:
         if generation is not None and generation != self._realtime_pump_generation:
@@ -6888,9 +7424,6 @@ class MainWindow(QtWidgets.QMainWindow):
             _APP_LOGGER.exception("Failed scheduling native VST host MIDI batch row=%s", row)
             return False
 
-    def _native_vst_host_scheduling_lead_frames(self) -> int:
-        return 0
-
     def _flush_native_vst_host_pending_messages(self, bridge: object, *, frames: int | None = None) -> None:
         flush_frames = int(
             max(
@@ -6947,6 +7480,24 @@ class MainWindow(QtWidgets.QMainWindow):
             timer.timeout.connect(lambda target_row=row: self._finish_warm_native_vst_host_for_track(target_row))
             self._native_vst_host_warm_timers[row] = timer
         timer.start(max(0, int(delay_ms)))
+
+    def _schedule_native_vst_host_warm_for_row(self, row: int, *, delay_ms: int = 220) -> None:
+        row = int(row)
+        if row < 0 or row >= len(self.project.tracks):
+            return
+        track = self.project.tracks[row]
+        entry = self._rack_vsti_entry(track.rack_vsti) if track.rack_vsti else None
+        if (
+            track.track_type == 'instrument'
+            and track.instrument_mode == 'VSTI Rack'
+            and (bool(track.notes) or bool(track.live_armed))
+            and entry is not None
+            and entry.is_instrument
+            and entry.host_supported
+            and self._can_use_native_vst_host(entry)
+        ):
+            self._warm_native_vst_host_for_track(row, delay_ms=delay_ms)
+            self._schedule_native_output_bridge_warm(delay_ms=delay_ms)
 
     def _preview_note_with_native_vst_host(
         self,
@@ -7052,22 +7603,18 @@ class MainWindow(QtWidgets.QMainWindow):
             _APP_LOGGER.exception("Native VST note preview failed row=%s rack=%s", row, entry.name)
             return False
 
-    def _schedule_native_vst_track_chunk(
+    def _schedule_native_vst_track_chunk_via_bridge(
         self,
         idx: int,
         track: TrackState,
-        entry: VSTInstrument,
+        bridge: object,
         start_frame: int,
         frame_count: int,
         state: RealtimeTrackPlaybackState,
         *,
         output_offset_frames: int = 0,
+        lead_frames: int = 0,
     ) -> bool:
-        if not self._can_use_native_vst_host(entry):
-            return False
-        if not self._open_native_vst_host_for_track(idx, entry, open_editor=False, show_error=False):
-            return False
-        bridge = self._track_native_vst_host_bridges.get(int(idx))
         if bridge is None:
             return False
         if int(start_frame) < int(state.native_host_scheduled_until_frame):
@@ -7080,7 +7627,7 @@ class MainWindow(QtWidgets.QMainWindow):
             frame_count,
             bootstrap_active=bool(state.instrument_reset_pending),
         )
-        queued_output_frames = self._native_vst_host_scheduling_lead_frames() + max(0, int(output_offset_frames))
+        queued_output_frames = max(0, int(lead_frames)) + max(0, int(output_offset_frames))
         target_channel = int(clamp(track.midi_channel, 0, 15)) + 1
         clear_channels = [target_channel] if (state.instrument_reset_pending or state.native_host_epoch_flush_pending) else None
         if not self._schedule_native_vst_host_messages(
@@ -7099,6 +7646,36 @@ class MainWindow(QtWidgets.QMainWindow):
         state.native_host_scheduled_until_frame = max(0, int(start_frame) + max(1, int(frame_count)))
         state.last_error = ""
         return True
+
+    def _schedule_native_vst_track_chunk(
+        self,
+        idx: int,
+        track: TrackState,
+        entry: VSTInstrument,
+        start_frame: int,
+        frame_count: int,
+        state: RealtimeTrackPlaybackState,
+        *,
+        output_offset_frames: int = 0,
+        lead_frames: int = 0,
+    ) -> bool:
+        if not self._can_use_native_vst_host(entry):
+            return False
+        if not self._open_native_vst_host_for_track(idx, entry, open_editor=False, show_error=False):
+            return False
+        bridge = self._track_native_vst_host_bridges.get(int(idx))
+        if bridge is None:
+            return False
+        return self._schedule_native_vst_track_chunk_via_bridge(
+            idx,
+            track,
+            bridge,
+            start_frame,
+            frame_count,
+            state,
+            output_offset_frames=output_offset_frames,
+            lead_frames=lead_frames,
+        )
 
     def _schedule_realtime_native_vst_segment(self, start_frame: int, frame_count: int, *, output_offset_frames: int = 0) -> None:
         if frame_count <= 0:
@@ -7131,122 +7708,40 @@ class MainWindow(QtWidgets.QMainWindow):
                 _APP_LOGGER.warning("Native VST scheduling failed track=%s idx=%s", track.name, idx)
 
     def _render_live_midi_chunk_bytes(self, frame_count: int) -> bytes:
-        states = list(self._live_midi_states.items())
-        if not states:
+        mix = self._render_live_midi_chunk_samples(frame_count)
+        if frame_count <= 0:
             return b''
-        if np is not None:
-            mix = np.zeros((2, max(1, int(frame_count))), dtype=np.float32)
-        else:
-            mix = [[0.0] * max(1, int(frame_count)), [0.0] * max(1, int(frame_count))]
-        duration = max(1, int(frame_count)) / float(max(1, self._playback_sample_rate))
-        buffer_size = self._preferred_vst_buffer_size(frame_count)
-        stale_rows: list[int] = []
-        for idx, state in states:
-            info = self._live_midi_track_info(idx)
-            if info is None or state.plugin is None:
-                stale_rows.append(idx)
-                continue
-            _row, track, _entry = info
-            messages = list(state.pending_messages)
-            state.pending_messages.clear()
-            try:
-                try:
-                    rendered = state.plugin(
-                        messages,
-                        duration=duration,
-                        sample_rate=self._playback_sample_rate,
-                        num_channels=2,
-                        buffer_size=buffer_size,
-                        reset=bool(state.reset_pending),
-                    )
-                except ValueError as exc:
-                    if '2-channel output' not in str(exc) and '1 output channels' not in str(exc):
-                        raise
-                    rendered = state.plugin(
-                        messages,
-                        duration=duration,
-                        sample_rate=self._playback_sample_rate,
-                        num_channels=1,
-                        buffer_size=buffer_size,
-                        reset=bool(state.reset_pending),
-                    )
-                audio = self._ensure_stereo_sample_count(rendered, frame_count)
-                if np is not None and isinstance(audio, np.ndarray):
-                    audio = np.asarray(audio, dtype=np.float32)
-                    gain_linear = max(0.0, float(track.volume)) * (10.0 ** (float(track.vsti_output_gain_db) / 20.0))
-                    audio = np.clip(audio * gain_linear, -1.0, 1.0)
-                    self._ensure_live_midi_fx_plugins(track, state)
-                    if state.fx_plugins:
-                        reset_flag = bool(state.fx_reset_pending)
-                        for plugin in state.fx_plugins:
-                            audio = np.asarray(
-                                plugin(
-                                    audio,
-                                    self._playback_sample_rate,
-                                    buffer_size=max(64, int(audio.shape[-1])),
-                                    reset=reset_flag,
-                                ),
-                                dtype=np.float32,
-                            )
-                            if audio.ndim == 1:
-                                audio = audio[None, :]
-                    audio = self._apply_track_pan_stereo(audio, track.pan)
-                    mix += np.asarray(audio, dtype=np.float32)
-                else:
-                    stereo = self._apply_track_pan_stereo(audio, track.pan)
-                    for pos in range(frame_count):
-                        mix[0][pos] += stereo[0][pos]
-                        mix[1][pos] += stereo[1][pos]
-                state.reset_pending = False
-                state.fx_reset_pending = False
-                state.last_error = ""
-            except Exception as exc:
-                state.last_error = str(exc)
-                stale_rows.append(idx)
-                _APP_LOGGER.exception("Live MIDI host render failed track_index=%s rack=%s", idx, state.rack_name)
-        for idx in stale_rows:
-            self._release_live_midi_host(idx)
-        if np is not None and isinstance(mix, np.ndarray):
-            return encode_pcm_output_samples(np.clip(mix, -1.0, 1.0), self._playback_sample_format, self._playback_channel_count)
-        return encode_pcm_output_samples(self._ensure_stereo_sample_count(mix, frame_count), self._playback_sample_format, self._playback_channel_count)
+        return encode_pcm_output_samples(mix, self._playback_sample_format, self._playback_channel_count)
 
     def _pump_live_midi_audio(self) -> None:
-        if not self._live_midi_active or self._live_midi_sink is None or self._live_midi_sink_device is None:
+        if not self._live_midi_active:
             return
         if self._live_midi_pump_in_progress:
             return
+        if hasattr(self, 'playback_timer') and self.playback_timer.isActive():
+            self._stop_live_midi_audio_sink()
+            return
+        if not self._live_midi_target_rows():
+            self._stop_live_midi_audio_sink()
+            return
         self._live_midi_pump_in_progress = True
-        bytes_per_frame = self._playback_bytes_per_frame()
         try:
-            try:
-                buffer_frames = int(max(self._live_midi_chunk_frames, self._live_midi_sink.bufferFrameCount()))
-            except Exception:
-                buffer_frames = self._live_midi_chunk_frames * 4
-            max_writes = max(8, int(math.ceil(buffer_frames / max(1, self._live_midi_chunk_frames))) * 2 + 2)
+            bridge = self._ensure_native_output_bridge(direct_plugin=self._direct_native_transport_candidate())
+            if bridge is None:
+                raise RuntimeError('Native output bridge is unavailable')
+            status = self._native_output_status(bridge)
+            queued_frames = self._native_output_stream_queued_frames('live_midi', status)
+            target_frames = int(max(self._desired_audio_buffer_frames(), self._live_midi_chunk_frames))
+            max_writes = max(8, int(math.ceil(target_frames / max(1, self._live_midi_chunk_frames))) * 2 + 2)
             writes = 0
-            while writes < max_writes:
-                bytes_free = int(max(0, self._live_midi_sink.bytesFree()))
-                if self._live_midi_pending_bytes:
-                    if bytes_free <= 0:
-                        break
-                    written = self._live_midi_sink_device.write(self._live_midi_pending_bytes)
-                    if written <= 0:
-                        break
-                    del self._live_midi_pending_bytes[:written]
-                    writes += 1
-                    continue
-                free_frames = max(1, int(bytes_free // bytes_per_frame))
-                if bytes_free <= 0:
+            while writes < max_writes and queued_frames < target_frames:
+                chunk_frames = max(1, min(self._live_midi_chunk_frames, target_frames - queued_frames))
+                chunk = self._render_live_midi_chunk_samples(chunk_frames)
+                if self._audio_peak_level(chunk) <= 0.0005 and queued_frames <= 0:
                     break
-                chunk_frames = max(1, min(self._live_midi_chunk_frames, free_frames))
-                chunk = self._render_live_midi_chunk_bytes(chunk_frames)
-                if not chunk:
+                if not self._queue_native_output_stream_audio('live_midi', chunk, self._playback_sample_rate, clear_first=False):
                     break
-                self._live_midi_pending_bytes.extend(chunk)
-                written = self._live_midi_sink_device.write(self._live_midi_pending_bytes)
-                if written <= 0:
-                    break
-                del self._live_midi_pending_bytes[:written]
+                queued_frames += chunk_frames
                 writes += 1
         except Exception as exc:
             _APP_LOGGER.exception("Live MIDI host pump failed")
@@ -7300,7 +7795,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         stale_rows: list[int] = []
         for row, state in list(self._live_midi_states.items()):
-            if state.plugin is None or row < 0 or row >= len(self.project.tracks):
+            if row < 0 or row >= len(self.project.tracks):
                 stale_rows.append(row)
                 continue
             track = self.project.tracks[row]
@@ -7311,11 +7806,12 @@ class MainWindow(QtWidgets.QMainWindow):
             if entry is None:
                 stale_rows.append(row)
                 continue
-            snapshot = self._plugin_parameter_snapshot(state.plugin)
-            if snapshot and snapshot != track.vsti_parameters:
-                self._apply_track_vsti_parameters_live(track, snapshot, editor_plugin=state.plugin)
-                self._save_vsti_plugin_state(state.plugin, track, entry)
-                self._reload_playback_mix_if_running()
+            if state.plugin is not None:
+                snapshot = self._plugin_parameter_snapshot(state.plugin)
+                if snapshot and snapshot != track.vsti_parameters:
+                    self._apply_track_vsti_parameters_live(track, snapshot, editor_plugin=state.plugin)
+                    self._save_vsti_plugin_state(state.plugin, track, entry)
+                    self._reload_playback_mix_if_running()
         for row in stale_rows:
             self._release_live_midi_host(row)
 
@@ -7713,6 +8209,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._playback_generated_total_frames = 0
         self._playback_committed_total_bytes = 0
         self._playback_pending_bytes.clear()
+        self._native_output_queued_frames = 0
         self._loop_declick_pending_frames = 0
         self._realtime_reset_pending = True
         self._clear_realtime_mix_cache()
@@ -7833,17 +8330,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._invalidate_playback_caches()
         current_row = self.current_track_index()
         if 0 <= current_row < len(self.project.tracks):
-            track = self.project.tracks[current_row]
-            entry = self._rack_vsti_entry(track.rack_vsti) if track.rack_vsti else None
-            if (
-                track.track_type == 'instrument'
-                and track.instrument_mode == 'VSTI Rack'
-                and entry is not None
-                and entry.is_instrument
-                and entry.host_supported
-                and self._can_use_native_vst_host(entry)
-            ):
-                self._warm_native_vst_host_for_track(current_row)
+            self._schedule_native_vst_host_warm_for_row(current_row)
         self._schedule_deferred_note_refresh(
             refresh_velocity=True,
             refresh_timeline=True,
@@ -7876,6 +8363,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _stop_realtime_audio_sink(self) -> None:
         self._realtime_pump_generation += 1
         self._audio_pump_timer.stop()
+        bridge = getattr(self, '_native_output_bridge', None)
         if self._playback_sink is not None:
             sink = self._playback_sink
             try:
@@ -7892,7 +8380,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
         self._playback_sink = None
         self._playback_sink_device = None
+        if bridge is not None:
+            try:
+                bridge.clear_audio_queue(reset_counters=True, stream_id='main')
+            except Exception:
+                _APP_LOGGER.exception("Failed clearing native realtime output queue")
+                self._stop_native_output_bridge()
         self._playback_active = False
+        self._native_output_queued_frames = 0
+        self._native_output_underruns = 0
         self._playback_committed_total_bytes = 0
         self._playback_pending_bytes.clear()
         self._loop_declick_pending_frames = 0
@@ -7927,26 +8423,196 @@ class MainWindow(QtWidgets.QMainWindow):
                 state.last_error = ""
         self._clear_realtime_mix_cache()
 
+    def _queue_native_output_chunk(self, bridge: object, frame_count: int) -> int:
+        chunk_frames = max(1, int(frame_count))
+        chunk = self._generate_realtime_chunk_bytes(
+            chunk_frames,
+            sample_format=QtMultimedia.QAudioFormat.SampleFormat.Float,
+            channel_count=2,
+        )
+        if not chunk:
+            return 0
+        response = bridge.queue_audio(chunk, channels=2, stream_id='main')
+        appended_frames = int(response.get('appended_audio_frames') or chunk_frames)
+        if appended_frames != chunk_frames:
+            raise RuntimeError(f'Native output bridge queued {appended_frames} of {chunk_frames} frames')
+        self._native_output_queued_frames = int(response.get('queued_audio_frames') or 0)
+        self._native_output_underruns = int(response.get('audio_queue_underruns') or 0)
+        self._playback_generated_total_frames += chunk_frames
+        self._playback_committed_total_bytes = self._playback_generated_total_frames * self._playback_bytes_per_frame()
+        return chunk_frames
+
+    def _prefill_native_output_frames(self, bridge: object, target_frames: int) -> None:
+        target = max(1, int(target_frames))
+        self._native_output_queued_frames = 0
+        while self._native_output_queued_frames < target:
+            remaining_frames = max(1, target - self._native_output_queued_frames)
+            chunk_frames = max(1, min(self._playback_chunk_frames, remaining_frames))
+            if self._queue_native_output_chunk(bridge, chunk_frames) <= 0:
+                break
+
+    def _queue_native_output_stream_audio(
+        self,
+        stream_id: str,
+        samples: object,
+        sample_rate: int,
+        *,
+        clear_first: bool = False,
+    ) -> bool:
+        direct_plugin = self._direct_native_transport_candidate() if not self._playback_active else None
+        bridge = self._ensure_native_output_bridge(direct_plugin=direct_plugin)
+        if bridge is None:
+            return False
+        target_samples = samples
+        target_sample_rate = max(1, int(sample_rate))
+        if target_sample_rate != self._playback_sample_rate:
+            target_samples = resample_samples(samples, target_sample_rate, self._playback_sample_rate)
+            target_sample_rate = self._playback_sample_rate
+        if np is not None:
+            if isinstance(target_samples, np.ndarray) and target_samples.ndim >= 2:
+                expected = int(target_samples.shape[-1])
+            elif isinstance(target_samples, np.ndarray):
+                expected = int(target_samples.shape[0])
+            elif isinstance(target_samples, (list, tuple)):
+                expected = len(target_samples[0]) if target_samples and isinstance(target_samples[0], (list, tuple)) else len(target_samples)
+            else:
+                expected = 1
+            stereo = np.asarray(self._ensure_stereo_sample_count(target_samples, max(1, int(expected))), dtype=np.float32)
+        else:
+            expected = len(target_samples[0]) if isinstance(target_samples, (list, tuple)) and target_samples and isinstance(target_samples[0], (list, tuple)) else len(target_samples) if isinstance(target_samples, (list, tuple)) else 1
+            stereo = self._ensure_stereo_sample_count(target_samples, max(1, int(expected)))
+        payload = encode_pcm_output_samples(
+            stereo,
+            QtMultimedia.QAudioFormat.SampleFormat.Float,
+            2,
+        )
+        if clear_first:
+            bridge.clear_audio_queue(reset_counters=False, stream_id=str(stream_id))
+        response = bridge.queue_audio(payload, channels=2, stream_id=str(stream_id))
+        return bool(response.get('ok', True))
+
+    def _prepare_direct_native_transport_playback(
+        self,
+        start_tick: int,
+        direct_plugin: tuple[int, TrackState, VSTInstrument],
+    ) -> bool:
+        row, track, entry = direct_plugin
+        bridge = self._ensure_native_output_bridge(direct_plugin=direct_plugin)
+        if bridge is None:
+            return False
+        status = self._native_output_status(bridge)
+        lead_frames = self._native_output_scheduling_lead_frames(bridge, status)
+
+        start_frame = max(0, tick_to_sample_frame(int(start_tick), self._playback_sample_rate, self.project.bpm))
+        loop_start_frame = 0
+        loop_end_frame = 0
+        if self.project.loop_enabled:
+            loop_start_frame, loop_end_frame = self._loop_frame_bounds()
+            if start_frame < loop_start_frame or start_frame >= loop_end_frame:
+                start_frame = loop_start_frame
+
+        bridge.clear_audio_queue(reset_counters=True, stream_id='main')
+        bridge.clear_audio_queue(reset_counters=True, stream_id='preview')
+        bridge.clear_audio_queue(reset_counters=True, stream_id='live_midi')
+        bridge.command('panic')
+
+        self._direct_native_transport_row = int(row)
+        self._direct_native_transport_origin_frame = int(start_frame)
+        self._direct_native_transport_output_cursor_frame = 0
+        self._direct_native_transport_logical_frame = int(start_frame)
+        self._direct_native_transport_loop_start_frame = int(loop_start_frame)
+        self._direct_native_transport_loop_end_frame = int(loop_end_frame)
+        self._direct_native_transport_lead_frames = int(lead_frames)
+        self._playback_logical_origin_frame = int(start_frame)
+
+        state = self._realtime_track_state(int(row), track)
+        state.instrument_reset_pending = True
+        state.loop_bootstrap_pending = False
+        state.native_host_epoch_flush_pending = False
+        state.fx_reset_pending = False
+        state.native_host_scheduled_until_frame = -1
+        state.native_host_loop_epoch = 0
+        state.native_host_render_failed = False
+        state.last_error = ""
+
+        self._playback_active = True
+        self._pump_direct_native_transport()
+        self._audio_pump_timer.start()
+        generation = self._realtime_pump_generation
+        QtCore.QTimer.singleShot(0, lambda g=generation: self._pump_realtime_audio(g))
+        return True
+
+    def _prepare_native_output_playback(self) -> bool:
+        bridge = self._ensure_native_output_bridge()
+        if bridge is None:
+            return False
+        self._clear_direct_native_transport_state()
+        bridge.clear_audio_queue(reset_counters=True, stream_id='main')
+        prefill_target_frames = int(max(self._playback_chunk_frames, self._desired_audio_buffer_frames()))
+        self._prefill_native_output_frames(bridge, prefill_target_frames)
+        bridge.start_audio_stream(stream_id='main')
+        self._playback_active = True
+        self._audio_pump_timer.start()
+        generation = self._realtime_pump_generation
+        QtCore.QTimer.singleShot(0, lambda g=generation: self._pump_realtime_audio(g))
+        return True
+
+    def _prefill_realtime_playback_bytes(self, target_frames: int) -> None:
+        target = max(1, int(target_frames))
+        bytes_per_frame = self._playback_bytes_per_frame()
+        target_bytes = max(bytes_per_frame, target * bytes_per_frame)
+        self._playback_pending_bytes.clear()
+        while len(self._playback_pending_bytes) < target_bytes:
+            remaining_frames = max(
+                1,
+                int(math.ceil((target_bytes - len(self._playback_pending_bytes)) / float(bytes_per_frame))),
+            )
+            chunk_frames = max(1, min(self._playback_chunk_frames, remaining_frames))
+            chunk = self._generate_realtime_chunk_bytes(chunk_frames)
+            if not chunk:
+                break
+            self._playback_pending_bytes.extend(chunk)
+
     def _prepare_realtime_playback(self, start_tick: int) -> bool:
         self._cancel_deferred_realtime_gc()
         self._stop_realtime_audio_sink()
         self._discard_realtime_track_states(schedule_gc=False)
+        self._realtime_reset_pending = True
+        self._reset_realtime_track_states()
+        self._seek_media_to_project_tick(int(start_tick))
+        native_output_attempted = False
+        direct_native_plugin = self._direct_native_transport_candidate()
+        if self._native_output_bridge_supported():
+            native_output_attempted = True
+            try:
+                if direct_native_plugin is not None and self._prepare_direct_native_transport_playback(start_tick, direct_native_plugin):
+                    return True
+                if self._prepare_native_output_playback():
+                    return True
+            except Exception:
+                _APP_LOGGER.exception("Native realtime output bridge failed, falling back to QAudioSink")
+                self._stop_native_output_bridge()
+        if native_output_attempted:
+            self._realtime_reset_pending = True
+            self._reset_realtime_track_states()
+            self._seek_media_to_project_tick(int(start_tick))
+
         sink = self._create_audio_sink()
+        # Build a real pre-roll in memory before starting the sink so larger
+        # output buffers translate into more render headroom instead of simply
+        # asking the sink to grow after playback has already begun.
+        prefill_target_frames = int(max(self._playback_chunk_frames, self._desired_audio_buffer_frames()))
+        self._prefill_realtime_playback_bytes(prefill_target_frames)
+
         sink_device = sink.start()
         if sink_device is None:
+            self._playback_pending_bytes.clear()
             return False
         self._playback_sink = sink
         self._playback_sink_device = sink_device
         self._playback_active = True
-        self._realtime_reset_pending = True
-        self._reset_realtime_track_states()
-        self._seek_media_to_project_tick(int(start_tick))
-        # Pre-fill: pump repeatedly until the output buffer is substantially
-        # filled *before* the timer starts.  This eliminates the initial
-        # stutter that occurred when playback began with an almost-empty
-        # buffer and the first timer tick couldn't generate audio fast enough.
         generation = self._realtime_pump_generation
-        for _prefill_pass in range(8):
+        for _prefill_pass in range(4):
             self._pump_realtime_audio(generation)
             # If the pump encountered a fatal error it calls stop_playback()
             # which clears _playback_active.  Detect that and bail out so
@@ -8434,6 +9100,8 @@ class MainWindow(QtWidgets.QMainWindow):
         return min(8192, base)
 
     def _estimated_queued_output_frames(self) -> int:
+        if self._native_output_bridge_alive():
+            return max(0, int(getattr(self, '_native_output_queued_frames', 0)))
         sink = getattr(self, '_playback_sink', None)
         if sink is None:
             return 0
@@ -8456,9 +9124,28 @@ class MainWindow(QtWidgets.QMainWindow):
     def _current_audible_playback_tick(self) -> int:
         if not getattr(self, '_playback_active', False):
             return int(self.project.playhead_tick)
-        bytes_per_frame = self._playback_bytes_per_frame()
-        committed_frames = max(0, int(self._playback_committed_total_bytes) // bytes_per_frame)
-        audible_generated = max(0, committed_frames - self._estimated_queued_output_frames())
+        if self._direct_native_transport_active():
+            direct_frames = max(
+                0,
+                self._native_output_rendered_sample_frames() - int(getattr(self, '_direct_native_transport_lead_frames', 0) or 0),
+            )
+            if (
+                self.project.loop_enabled
+                and int(self._direct_native_transport_loop_end_frame) > int(self._direct_native_transport_loop_start_frame)
+            ):
+                loop_start_frame = int(self._direct_native_transport_loop_start_frame)
+                loop_end_frame = int(self._direct_native_transport_loop_end_frame)
+                loop_length = max(1, loop_end_frame - loop_start_frame)
+                origin_frame = min(
+                    max(int(self._direct_native_transport_origin_frame), loop_start_frame),
+                    loop_end_frame - 1,
+                )
+                logical_frame = loop_start_frame + ((origin_frame - loop_start_frame + direct_frames) % loop_length)
+            else:
+                logical_frame = int(self._direct_native_transport_origin_frame) + direct_frames
+            return sample_frame_to_tick(logical_frame, self._playback_sample_rate, self.project.bpm)
+        generated_frames = max(0, int(getattr(self, '_playback_generated_total_frames', 0)))
+        audible_generated = max(0, generated_frames - self._estimated_queued_output_frames())
         if not self.project.loop_enabled:
             logical_frame = int(self._playback_logical_origin_frame) + audible_generated
             return sample_frame_to_tick(logical_frame, self._playback_sample_rate, self.project.bpm)
@@ -8581,9 +9268,11 @@ class MainWindow(QtWidgets.QMainWindow):
             [clamp(value, -1.0, 1.0) for value in mix[1]],
         ]
 
-    def _generate_realtime_chunk_bytes(self, frame_count: int) -> bytes:
+    def _generate_realtime_chunk_samples(self, frame_count: int) -> object:
         if frame_count <= 0:
-            return b''
+            if np is not None:
+                return np.zeros((2, 0), dtype=np.float32)
+            return [[], []]
         if np is not None:
             mix = np.zeros((2, frame_count), dtype=np.float32)
         else:
@@ -8654,14 +9343,41 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.project.playhead_tick = sample_frame_to_tick(self._playback_frame_position, self._playback_sample_rate, self.project.bpm)
         self.project.playhead_sec = self._transport_tick_to_seconds(self.project.playhead_tick)
-        return encode_pcm_output_samples(mix, self._playback_sample_format, self._playback_channel_count)
+        if np is not None and isinstance(mix, np.ndarray):
+            return np.clip(mix, -1.0, 1.0).astype(np.float32, copy=False)
+        return [
+            [clamp(value, -1.0, 1.0) for value in mix[0]],
+            [clamp(value, -1.0, 1.0) for value in mix[1]],
+        ]
+
+    def _generate_realtime_chunk_bytes(
+        self,
+        frame_count: int,
+        *,
+        sample_format=None,
+        channel_count: int | None = None,
+    ) -> bytes:
+        mix = self._generate_realtime_chunk_samples(frame_count)
+        if frame_count <= 0:
+            return b''
+        target_sample_format = sample_format if sample_format is not None else self._playback_sample_format
+        target_channel_count = int(channel_count) if channel_count is not None else self._playback_channel_count
+        return encode_pcm_output_samples(mix, target_sample_format, target_channel_count)
 
     def _pump_realtime_audio(self, generation: int | None = None) -> None:
         if generation is not None and generation != self._realtime_pump_generation:
             return
-        if not self._playback_active or self._playback_sink is None or self._playback_sink_device is None:
+        if not self._playback_active:
             return
         if self._audio_pump_in_progress:
+            return
+        if self._direct_native_transport_active():
+            self._pump_direct_native_transport()
+            return
+        if self._native_output_bridge_alive():
+            self._pump_native_output_audio()
+            return
+        if self._playback_sink is None or self._playback_sink_device is None:
             return
         self._audio_pump_in_progress = True
         bytes_per_frame = self._playback_bytes_per_frame()
@@ -8733,6 +9449,123 @@ class MainWindow(QtWidgets.QMainWindow):
         finally:
             self._audio_pump_in_progress = False
 
+    def _pump_direct_native_transport(self) -> None:
+        row = self._direct_native_transport_row
+        bridge = getattr(self, '_native_output_bridge', None)
+        if row is None or bridge is None:
+            return
+        if row < 0 or row >= len(self.project.tracks):
+            self._clear_direct_native_transport_state()
+            return
+
+        track = self.project.tracks[row]
+        entry = self._rack_vsti_entry(track.rack_vsti) if track.rack_vsti else None
+        if entry is None:
+            self._clear_direct_native_transport_state()
+            return
+
+        self._audio_pump_in_progress = True
+        try:
+            status = self._native_output_status(bridge)
+            if status is None:
+                raise RuntimeError('Direct native transport bridge is unavailable')
+
+            current_frame = self._native_output_rendered_sample_frames(status)
+            lead_frames = int(getattr(self, '_direct_native_transport_lead_frames', 0) or self._native_output_scheduling_lead_frames(bridge, status))
+            target_ahead_frames = int(max(
+                self._playback_chunk_frames * 4,
+                self._desired_audio_buffer_frames() * 2,
+            ))
+            target_output_frame = current_frame + target_ahead_frames
+            state = self._realtime_track_state(row, track)
+            if self._realtime_reset_pending:
+                self._realtime_reset_pending = False
+            max_writes = max(16, int(math.ceil(target_ahead_frames / max(1, self._playback_chunk_frames))) * 2 + 4)
+            writes = 0
+
+            while writes < max_writes and self._direct_native_transport_output_cursor_frame < target_output_frame:
+                logical_start = int(self._direct_native_transport_logical_frame)
+                chunk_frames = max(
+                    1,
+                    min(
+                        int(self._playback_chunk_frames),
+                        int(target_output_frame - self._direct_native_transport_output_cursor_frame),
+                    ),
+                )
+                if self.project.loop_enabled:
+                    loop_start = int(self._direct_native_transport_loop_start_frame)
+                    loop_end = int(self._direct_native_transport_loop_end_frame)
+                    if loop_end <= loop_start:
+                        loop_start, loop_end = self._loop_frame_bounds()
+                        self._direct_native_transport_loop_start_frame = int(loop_start)
+                        self._direct_native_transport_loop_end_frame = int(loop_end)
+                    if logical_start < loop_start or logical_start >= loop_end:
+                        logical_start = loop_start
+                        self._direct_native_transport_logical_frame = int(logical_start)
+                    chunk_frames = min(chunk_frames, max(1, int(loop_end - logical_start)))
+
+                base_offset_frames = max(0, int(self._direct_native_transport_output_cursor_frame) - current_frame)
+                if not self._schedule_native_vst_track_chunk_via_bridge(
+                    row,
+                    track,
+                    bridge,
+                    logical_start,
+                    chunk_frames,
+                    state,
+                    output_offset_frames=base_offset_frames,
+                    lead_frames=lead_frames,
+                ):
+                    raise RuntimeError(f'Could not schedule direct native transport block for {entry.name}')
+
+                self._direct_native_transport_output_cursor_frame += int(chunk_frames)
+                self._direct_native_transport_logical_frame = int(logical_start) + int(chunk_frames)
+                if (
+                    self.project.loop_enabled
+                    and int(self._direct_native_transport_loop_end_frame) > int(self._direct_native_transport_loop_start_frame)
+                    and self._direct_native_transport_logical_frame >= int(self._direct_native_transport_loop_end_frame)
+                ):
+                    self._direct_native_transport_logical_frame = int(self._direct_native_transport_loop_start_frame)
+                    state.native_host_loop_epoch += 1
+                writes += 1
+        except Exception as exc:
+            _APP_LOGGER.exception("Direct native transport pump failed")
+            self.stop_playback()
+            self.statusBar().showMessage(f'Direct native transport stopped: {exc}')
+        finally:
+            self._audio_pump_in_progress = False
+
+    def _pump_native_output_audio(self) -> None:
+        bridge = getattr(self, '_native_output_bridge', None)
+        if bridge is None:
+            return
+        self._audio_pump_in_progress = True
+        try:
+            status = self._native_output_status(bridge)
+            if status is None:
+                raise RuntimeError('Native output bridge is unavailable')
+            buffer_frames = int(max(
+                self._playback_chunk_frames,
+                int(status.get('buffer_size') or self._desired_audio_buffer_frames() or self._playback_chunk_frames),
+            ))
+            target_frames = int(max(self._desired_audio_buffer_frames(), buffer_frames))
+            max_writes = max(16, int(math.ceil(target_frames / max(1, self._playback_chunk_frames))) * 2 + 4)
+            writes = 0
+            queued_frames = int(status.get('queued_audio_frames') or 0)
+            self._native_output_queued_frames = queued_frames
+            self._native_output_underruns = int(status.get('audio_queue_underruns') or 0)
+            while writes < max_writes and queued_frames < target_frames:
+                free_frames = max(1, target_frames - queued_frames)
+                chunk_frames = max(1, min(self._playback_chunk_frames, free_frames))
+                self._queue_native_output_chunk(bridge, chunk_frames)
+                queued_frames = int(self._native_output_queued_frames)
+                writes += 1
+        except Exception as exc:
+            _APP_LOGGER.exception("Native realtime output pump failed")
+            self.stop_playback()
+            self.statusBar().showMessage(f'Realtime playback stopped: {exc}')
+        finally:
+            self._audio_pump_in_progress = False
+
     def _on_playback_sink_state_changed(self, state) -> None:
         if state == QtMultimedia.QtAudio.State.StoppedState and self._playback_sink is not None:
             error = self._playback_sink.error()
@@ -8764,23 +9597,24 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def stop_playback(self) -> None:
         should_reset = hasattr(self, 'playback_timer') and (not self.playback_timer.isActive())
+        direct_row = self._direct_native_transport_row
+        direct_track = self.project.tracks[int(direct_row)] if direct_row is not None and 0 <= int(direct_row) < len(self.project.tracks) else None
         if hasattr(self, 'playback_timer'):
             self.playback_timer.stop()
         self._stop_realtime_audio_sink()
         stop_generation = int(self._realtime_pump_generation)
+        bridge = getattr(self, '_native_output_bridge', None)
+        if bridge is not None and direct_row is not None:
+            try:
+                bridge.command('panic')
+            except Exception:
+                _APP_LOGGER.exception("Failed sending direct native transport panic row=%s", direct_row)
+        self._clear_direct_native_transport_state()
         for row in list(getattr(self, '_track_native_vst_host_bridges', {}).keys()):
             track = self.project.tracks[int(row)] if 0 <= int(row) < len(self.project.tracks) else None
             self._panic_native_vst_host_track(int(row), track, exhaustive=True, generation=stop_generation)
-            QtCore.QTimer.singleShot(
-                60,
-                lambda current_row=int(row), current_track=track, current_generation=stop_generation:
-                    self._panic_native_vst_host_track(
-                        current_row,
-                        current_track,
-                        exhaustive=True,
-                        generation=current_generation,
-                    ),
-            )
+        if direct_row is not None and direct_track is not None:
+            self._track_meter_levels[int(direct_row)] = 0.0
         self._discard_realtime_track_states()
         self._realtime_reset_pending = True
         self._refresh_transport_controls()
@@ -8858,6 +9692,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         current_device = self._selected_audio_device()
         preferred = current_device.preferredFormat()
+        output_status = self._native_output_status() if self._native_output_bridge_alive() else None
         self.audio_output_menu.addSeparator()
 
         sample_rate_menu = self.audio_output_menu.addMenu('Output Sample Rate')
@@ -8894,7 +9729,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         native_host_menu = self.audio_output_menu.addMenu('Native VST Host')
         native_host_summary = native_host_menu.addAction(
-            f'Startup Format: {self._native_vst_host_target_sample_rate()} Hz • {self._native_vst_host_target_buffer_size()} samples'
+            f'Startup Format: {self._native_vst_host_target_sample_rate()} Hz | '
+            f'{self._native_vst_host_target_buffer_size()} samples '
+            f'({self._buffer_frames_duration_ms(self._native_vst_host_target_buffer_size(), self._native_vst_host_target_sample_rate()):.1f} ms)'
         )
         native_host_summary.setEnabled(False)
         native_host_menu.addSeparator()
@@ -8918,35 +9755,39 @@ class MainWindow(QtWidgets.QMainWindow):
             action.triggered.connect(lambda _checked=False, r=rate: self.set_native_vst_host_sample_rate(r))
             native_rate_group.addAction(action)
 
-        native_buffer_menu = native_host_menu.addMenu('Buffer Size')
+        native_buffer_menu = native_host_menu.addMenu('Prebuffer Source')
         native_buffer_group = QtGui.QActionGroup(native_buffer_menu)
         native_buffer_group.setExclusive(True)
         follow_output_buffer = native_buffer_menu.addAction(
-            f'0 samples (Auto -> {self._native_vst_host_target_buffer_size()} effective)'
+            f'Follows playback prebuffer ({self._native_vst_host_target_buffer_size()} effective)'
         )
         follow_output_buffer.setCheckable(True)
         follow_output_buffer.setChecked(int(self.native_vst_host_buffer_size) <= 0)
         follow_output_buffer.triggered.connect(lambda _checked=False: self.set_native_vst_host_buffer_size(0))
         native_buffer_group.addAction(follow_output_buffer)
-        native_buffer_sizes = {
-            10, 16, 32, 64, 96, 128, 192, 240, 256, 384, 480, 512, 768, 960, 1024,
-            1536, 1920, 2048, 3072, 4096, int(self._native_vst_host_target_buffer_size()),
-        }
+        native_buffer_sizes = set(
+            self._buffer_choice_values_for_sample_rate(
+                self._native_vst_host_target_sample_rate(),
+                include_value=int(self._native_vst_host_target_buffer_size()),
+            )
+        )
         if int(self.native_vst_host_buffer_size) > 0:
             native_buffer_sizes.add(int(self.native_vst_host_buffer_size))
         for size in sorted(size for size in native_buffer_sizes if int(size) > 0):
-            action = native_buffer_menu.addAction(f'{size} samples')
+            action = native_buffer_menu.addAction(
+                f'{size} samples ({self._buffer_frames_duration_ms(int(size), self._native_vst_host_target_sample_rate()):.1f} ms)'
+            )
             action.setCheckable(True)
             action.setChecked(int(self.native_vst_host_buffer_size) == int(size))
             action.triggered.connect(lambda _checked=False, s=size: self.set_native_vst_host_buffer_size(s))
             native_buffer_group.addAction(action)
 
-        latency_action = self.audio_output_menu.addAction(
-            f'Estimated Output Latency: {(self._desired_audio_buffer_frames() / float(max(1, self._playback_sample_rate))) * 1000.0:.1f} ms'
-        )
+        latency_action = self.audio_output_menu.addAction(f'Playback Prebuffer Target: {self._playback_prebuffer_target_summary()}')
         latency_action.setEnabled(False)
-        buffer_action = self.audio_output_menu.addAction(f'Buffer Length: {self._desired_audio_buffer_frames()} samples')
+        buffer_action = self.audio_output_menu.addAction(f'Driver Block Size: {self._driver_block_size_summary(output_status)}')
         buffer_action.setEnabled(False)
+        queued_action = self.audio_output_menu.addAction(f'Playback Queued Ahead: {self._queued_ahead_summary(output_status)}')
+        queued_action.setEnabled(False)
 
     def open_audio_settings_dialog(self) -> None:
         dialog = self._audio_settings_dialog
@@ -8973,8 +9814,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_audio_buffer_preference()
         self._save_preferences()
         self._release_live_midi_host()
+        self._stop_native_output_bridge()
+        for row in list(getattr(self, '_track_native_vst_host_bridges', {}).keys()):
+            self._stop_native_vst_host_bridge(int(row))
         self._refresh_live_midi_host()
         self._restart_playback_preserving_tick()
+        self._schedule_native_output_bridge_warm(delay_ms=0)
         self.refresh_audio_output_menu()
         self.statusBar().showMessage(f'Audio output set to {self._audio_output_summary()}')
 
@@ -8984,8 +9829,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_audio_buffer_preference()
         self._save_preferences()
         self._release_live_midi_host()
+        self._stop_native_output_bridge()
+        for row in list(getattr(self, '_track_native_vst_host_bridges', {}).keys()):
+            self._stop_native_vst_host_bridge(int(row))
         self._refresh_live_midi_host()
         self._restart_playback_preserving_tick()
+        self._schedule_native_output_bridge_warm(delay_ms=0)
         self.refresh_audio_output_menu()
         self.statusBar().showMessage(f'Output sample rate set to {self._audio_output_summary()}')
 
@@ -8998,26 +9847,34 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_audio_buffer_preference()
         self._save_preferences()
         self._release_live_midi_host()
+        self._stop_native_output_bridge()
+        for row in list(getattr(self, '_track_native_vst_host_bridges', {}).keys()):
+            self._stop_native_vst_host_bridge(int(row))
         self._refresh_live_midi_host()
         self._restart_playback_preserving_tick()
+        self._schedule_native_output_bridge_warm(delay_ms=0)
         self.refresh_audio_output_menu()
         self.statusBar().showMessage(f'Output format set to {self._audio_output_summary()}')
 
     def set_audio_buffer_frames(self, value: int) -> None:
-        self.audio_buffer_frames = int(clamp(value, 64, 4096))
+        self.audio_buffer_frames = int(clamp(value, 64, self._maximum_audio_buffer_frames()))
         self._apply_audio_buffer_preference()
         self._save_preferences()
         self._release_live_midi_host()
+        self._stop_native_output_bridge()
+        for row in list(getattr(self, '_track_native_vst_host_bridges', {}).keys()):
+            self._stop_native_vst_host_bridge(int(row))
         self._refresh_live_midi_host()
         # Restart active playback so the new buffer size actually takes
         # effect.  Simply calling setBufferFrameCount on a running sink
         # is ignored on most platforms, which made the buffer setting
         # appear ineffective at stabilising playback.
         self._restart_playback_preserving_tick()
+        self._schedule_native_output_bridge_warm(delay_ms=0)
         self.refresh_audio_output_menu()
         latency_ms = self._buffer_frames_latency_ms(self.audio_buffer_frames)
         self.statusBar().showMessage(
-            f'Playback audio buffer set to {self.audio_buffer_frames} samples ({latency_ms:.1f} ms, {self._audio_output_summary()})'
+            f'Playback prebuffer set to {self.audio_buffer_frames} samples ({latency_ms:.1f} ms, {self._audio_output_summary()})'
         )
 
     def set_playback_note_length_offset_ticks(self, value: int) -> None:
@@ -9052,15 +9909,12 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def set_native_vst_host_buffer_size(self, value: int) -> None:
-        target = int(value)
-        if target <= 0:
-            self.native_vst_host_buffer_size = 0
-        else:
-            self.native_vst_host_buffer_size = int(clamp(target, 64, 4096))
+        _ = value
+        self.native_vst_host_buffer_size = 0
         self._save_preferences()
         self.refresh_audio_output_menu()
         self.statusBar().showMessage(
-            f'Native VST host buffer set to {self._native_vst_host_target_buffer_size()} samples for new or restarted plugin hosts'
+            f'Native VST host prebuffer now follows playback prebuffer at {self._native_vst_host_target_buffer_size()} samples'
         )
 
     def set_playback_ui_refresh_ms(self, value: int) -> None:
@@ -9071,6 +9925,49 @@ class MainWindow(QtWidgets.QMainWindow):
         self._save_preferences()
         self.refresh_audio_output_menu()
         self.statusBar().showMessage(f'Playhead refresh set to every {self.playback_ui_refresh_ms} ms')
+
+    def reset_audio_engine(self) -> None:
+        was_playing = bool(hasattr(self, 'playback_timer') and self.playback_timer.isActive())
+        resume_tick = int(self.project.playhead_tick)
+
+        if was_playing:
+            self.stop_playback()
+            self._set_playhead_tick_position(resume_tick)
+        else:
+            self._stop_realtime_audio_sink()
+
+        self._close_preview_audio()
+        self._cleanup_finished_preview_resources()
+        for sink, buffer in list(getattr(self, '_preview_resources', [])):
+            try:
+                self._finalize_preview_resource(sink, buffer)
+            except Exception:
+                pass
+        if hasattr(self, '_preview_resources'):
+            self._preview_resources.clear()
+
+        self._release_live_midi_host()
+        self._stop_native_output_bridge()
+        for row in list(getattr(self, '_track_native_vst_host_bridges', {}).keys()):
+            self._stop_native_vst_host_bridge(int(row))
+
+        self._apply_selected_audio_output()
+        self._apply_audio_buffer_preference()
+        self._mark_realtime_track_states_for_reset()
+        self._save_preferences()
+        self._refresh_live_midi_host()
+
+        if was_playing:
+            self.start_playback()
+        else:
+            self._schedule_native_output_bridge_warm(delay_ms=0)
+
+        self.refresh_audio_output_menu()
+        self.statusBar().showMessage(
+            'Audio engine reset and reinitialized with '
+            f'{self._audio_output_summary()} '
+            f'and native host {self._native_vst_host_target_sample_rate()} Hz / {self._native_vst_host_target_buffer_size()} samples'
+        )
 
     def set_prefer_gpu_rendering(self, enabled: bool) -> None:
         self.prefer_gpu_rendering = bool(enabled)
@@ -9220,7 +10117,10 @@ class MainWindow(QtWidgets.QMainWindow):
         return result
 
     def _normalized_vsti_path(self, path: str) -> str:
-        return str(Path(path).expanduser().resolve())
+        normalized = str(path or '').strip()
+        if not normalized:
+            return ''
+        return str(Path(normalized).expanduser().resolve())
 
     def _canonical_bundled_vsti_path(self, path: str) -> str | None:
         try:
@@ -11661,23 +12561,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.selected_audio_output_id = str(payload.get('selected_audio_output_id', '') or '')
         self.selected_audio_sample_rate = self._coerce_int(payload.get('selected_audio_sample_rate', 0), 0, 0, 384000)
         self.selected_audio_sample_format_name = str(payload.get('selected_audio_sample_format_name', 'Auto') or 'Auto')
+        startup_buffer_limit = self._absolute_buffer_frame_limit()
         raw_buffer_frames = payload.get('audio_buffer_frames', None)
         if raw_buffer_frames is not None:
-            self.audio_buffer_frames = self._coerce_int(raw_buffer_frames, 1024, 64, 4096)
+            self.audio_buffer_frames = self._coerce_int(raw_buffer_frames, 1024, 64, startup_buffer_limit)
         else:
-            legacy_buffer_value = self._coerce_int(payload.get('audio_buffer_ms', 80), 80, 8, 4096)
+            legacy_buffer_value = self._coerce_int(payload.get('audio_buffer_ms', 80), 80, 8, startup_buffer_limit)
             legacy_sample_choices = {8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096}
             if legacy_buffer_value in legacy_sample_choices:
-                self.audio_buffer_frames = int(clamp(legacy_buffer_value, 64, 4096))
+                self.audio_buffer_frames = int(clamp(legacy_buffer_value, 64, startup_buffer_limit))
             else:
                 converted_frames = int(round((44100.0 * float(legacy_buffer_value)) / 1000.0))
-                self.audio_buffer_frames = int(clamp(converted_frames, 64, 4096))
+                self.audio_buffer_frames = int(clamp(converted_frames, 64, startup_buffer_limit))
         self.native_vst_host_sample_rate = self._coerce_int(payload.get('native_vst_host_sample_rate', 0), 0, 0, 384000)
-        loaded_native_host_buffer = self._coerce_int(payload.get('native_vst_host_buffer_size', 0), 0, 0, 4096)
+        loaded_native_host_buffer = self._coerce_int(payload.get('native_vst_host_buffer_size', 0), 0, 0, startup_buffer_limit)
         if loaded_native_host_buffer <= 0:
             self.native_vst_host_buffer_size = 0
         else:
-            self.native_vst_host_buffer_size = int(clamp(loaded_native_host_buffer, 64, 4096))
+            self.native_vst_host_buffer_size = int(clamp(loaded_native_host_buffer, 64, startup_buffer_limit))
         self.note_length_offset_ticks = self._coerce_int(payload.get('note_length_offset_ticks', 0), 0, -480, 480)
         refresh_pref = payload.get('playback_ui_refresh_ms', 16)
         try:
@@ -12204,19 +13105,21 @@ class MainWindow(QtWidgets.QMainWindow):
             if track_index < 0 or track_index >= len(self.project.tracks):
                 track_index = self.current_track_index()
             track = self.project.tracks[track_index]
-            playback_active = bool(hasattr(self, 'playback_timer') and self.playback_timer.isActive())
             if not vst.host_supported:
                 detail = vst.host_error or 'This plugin cannot be hosted by the current VST backend.'
                 QtWidgets.QMessageBox.information(self, 'Unsupported VSTI', f'{vst.name} does not have a usable native editor here.\n\n{detail}')
                 return
             if self._can_use_native_vst_host(vst):
-                if self._open_standalone_native_vst_editor(track_index, vst, track):
+                # Reuse the per-track native host bridge so the visible editor and
+                # sequencer playback are driven by the same JUCE host instance.
+                self._close_track_vsti_window(track_index, teardown_host=False)
+                if self._open_native_vst_host_for_track(track_index, vst, open_editor=True, show_error=True):
                     self._update_track_list_item(track_index)
                 else:
                     QtWidgets.QMessageBox.warning(
                         self,
                         'Internal VST host unavailable',
-                        f'Could not open {vst.name} in the standalone VST editor host.',
+                        f'Could not open the native VST editor for {vst.name}.',
                     )
                 return
             QtWidgets.QMessageBox.warning(
@@ -12658,6 +13561,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.instruments.load_track()
         self._invalidate_playback_caches()
         self._reload_playback_mix_if_running()
+        self._schedule_native_vst_host_warm_for_row(row, delay_ms=0)
         QtCore.QTimer.singleShot(0, self._refresh_live_midi_host)
 
     def _assign_general_midi_to_track(self, row: int, instrument_name: str) -> bool:
@@ -13079,6 +13983,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self._stop_realtime_audio_sink()
         except Exception:
             _APP_LOGGER.exception("Failed to stop realtime audio sink during shutdown")
+        try:
+            self._stop_native_output_bridge()
+        except Exception:
+            _APP_LOGGER.exception("Failed to stop native realtime output bridge during shutdown")
         try:
             self._release_live_midi_host()
         except Exception:
@@ -13859,6 +14767,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if track.live_armed:
             if entry is not None and self._can_use_native_vst_host(entry):
                 self._open_native_vst_host_for_track(row, entry, open_editor=False, show_error=False)
+                self._schedule_native_output_bridge_warm(delay_ms=0)
         else:
             self._release_live_midi_host(row)
         self._update_track_list_item(row)
@@ -14053,6 +14962,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.velocity_editor.refresh()
         self.mixer.load_track()
         self.instruments.load_track()
+        self._schedule_native_vst_host_warm_for_row(row, delay_ms=0)
         QtCore.QTimer.singleShot(0, self._refresh_live_midi_host)
 
     def add_track(self, preferred_type: str | None = None, ask: bool = True) -> None:

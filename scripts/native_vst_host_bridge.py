@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import ctypes
 import json
 import os
@@ -163,6 +164,10 @@ class _SubprocessHostBackend:
         self.sample_rate = int(sample_rate) if sample_rate else 0
         self.buffer_size = int(buffer_size) if buffer_size else 0
         self.process: subprocess.Popen[str] | None = None
+        self._socket: socket.socket | None = None
+        self._recv_buffer = bytearray()
+        self._command_timeout = 2.0
+        self._last_command_at = 0.0
 
     def start(self, startup_timeout: float = 10.0) -> None:
         if not HOST_EXE.exists():
@@ -201,38 +206,80 @@ class _SubprocessHostBackend:
 
         raise TimeoutError(f"Timed out waiting for native host on port {self.port}: {last_error}")
 
+    def _close_socket(self) -> None:
+        sock = self._socket
+        self._socket = None
+        self._recv_buffer.clear()
+        if sock is None:
+            return
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+    def _ensure_socket(self) -> socket.socket:
+        if self._socket is not None:
+            return self._socket
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=self._command_timeout)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.settimeout(self._command_timeout)
+        self._socket = sock
+        self._recv_buffer.clear()
+        return sock
+
+    def _read_response_line(self, sock: socket.socket) -> str:
+        while True:
+            newline_index = self._recv_buffer.find(b"\n")
+            if newline_index >= 0:
+                line = bytes(self._recv_buffer[:newline_index])
+                del self._recv_buffer[:newline_index + 1]
+                return line.decode("utf-8", errors="replace").strip()
+            chunk = sock.recv(65536)
+            if not chunk:
+                raise ConnectionError("Native host closed the command socket")
+            self._recv_buffer.extend(chunk)
+
+    def _should_retry_after_transport_error(self) -> bool:
+        last_command_at = float(self._last_command_at or 0.0)
+        if last_command_at <= 0.0:
+            return True
+        return (time.monotonic() - last_command_at) >= 1.5
+
     def command(self, command: str, **payload: Any) -> dict[str, Any]:
         request = {"command": command, **payload}
-        encoded = (json.dumps(request) + "\n").encode("utf-8")
+        encoded = (json.dumps(request, separators=(",", ":")) + "\n").encode("utf-8")
 
-        with socket.create_connection(("127.0.0.1", self.port), timeout=0.5) as sock:
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            sock.settimeout(0.5)
-            sock.sendall(encoded)
-            sock.shutdown(socket.SHUT_WR)
-
-            chunks: list[bytes] = []
-            while True:
-                chunk = sock.recv(65536)
-                if not chunk:
+        attempts = 2 if self._should_retry_after_transport_error() else 1
+        last_transport_error: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                sock = self._ensure_socket()
+                sock.sendall(encoded)
+                raw = self._read_response_line(sock)
+                if not raw:
+                    raise RuntimeError("No response from native host")
+                data = json.loads(raw)
+                if not data.get("ok", False):
+                    raise RuntimeError(data.get("message", "Native host command failed"))
+                self._last_command_at = time.monotonic()
+                return data
+            except (ConnectionError, OSError, TimeoutError, json.JSONDecodeError) as exc:
+                last_transport_error = exc
+                self._close_socket()
+                if attempt + 1 >= attempts:
                     break
-                chunks.append(chunk)
 
-        raw = b"".join(chunks).decode("utf-8", errors="replace").strip()
-        if not raw:
-            raise RuntimeError("No response from native host")
-
-        data = json.loads(raw)
-        if not data.get("ok", False):
-            raise RuntimeError(data.get("message", "Native host command failed"))
-
-        return data
+        if last_transport_error is not None:
+            raise RuntimeError(f"Native host transport failed: {last_transport_error}") from last_transport_error
+        raise RuntimeError("Native host command failed")
 
     def stop(self, timeout: float = 3.0) -> None:
         try:
             self.command("quit")
         except Exception:  # noqa: BLE001
             pass
+        finally:
+            self._close_socket()
 
         if self.process is None:
             return
@@ -306,6 +353,23 @@ class NativeVstHostBridge:
         if self._backend is None:
             raise RuntimeError("Native VST host is not started")
         return self._backend.command(command, **payload)
+
+    def queue_audio(self, audio_f32le: bytes, *, channels: int = 2, stream_id: str = "main") -> dict[str, Any]:
+        if not audio_f32le:
+            return self.command("status")
+        return self.command(
+            "queue_audio",
+            audio_b64=base64.b64encode(audio_f32le).decode("ascii"),
+            channels=max(1, int(channels)),
+            stream_id=str(stream_id or "main"),
+            format="f32le-interleaved",
+        )
+
+    def clear_audio_queue(self, *, reset_counters: bool = False, stream_id: str = "main") -> dict[str, Any]:
+        return self.command("clear_audio_queue", reset_counters=bool(reset_counters), stream_id=str(stream_id or "main"))
+
+    def start_audio_stream(self, *, stream_id: str = "main") -> dict[str, Any]:
+        return self.command("start_audio_stream", stream_id=str(stream_id or "main"))
 
     def stop(self, timeout: float = 3.0) -> None:
         if self._backend is None:
