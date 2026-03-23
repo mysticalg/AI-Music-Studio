@@ -4676,7 +4676,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not getattr(sys, "frozen", False):
             self.vsti_directory.mkdir(parents=True, exist_ok=True)
         self.selected_audio_output_id = ''
-        self.audio_buffer_frames = 512
+        self.audio_buffer_frames = 1024
         self.selected_audio_sample_rate = 0
         self.selected_audio_sample_format_name = 'Auto'
         self.native_vst_host_sample_rate = 0
@@ -4723,7 +4723,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._playback_committed_total_bytes = 0
         self._playback_pending_bytes = bytearray()
         self._playback_logical_origin_frame = 0
-        self._playback_chunk_frames = 256
+        self._playback_chunk_frames = 512
         self._live_midi_chunk_frames = 128
         self._playback_sample_rate = int(getattr(self, '_playback_sample_rate', 44100))
         self._playback_channel_count = int(getattr(self, '_playback_channel_count', 2))
@@ -6087,11 +6087,11 @@ class MainWindow(QtWidgets.QMainWindow):
         return int(clamp(int(math.floor((latency_ms * 0.4) + 0.5)), 1, 5))
 
     def _preferred_playback_chunk_frames(self) -> int:
-        desired = int(clamp(int(getattr(self, 'audio_buffer_frames', 512)), 64, 4096))
+        desired = int(clamp(int(getattr(self, 'audio_buffer_frames', 1024)), 64, 4096))
         # Keep chunks at half the buffer size so that at least two chunks
         # fit in the output buffer.  This gives the pump enough headroom to
         # recover from momentary UI-thread stalls without underrunning.
-        # For typical buffers (512-1024) this yields 256-512 frame chunks.
+        # For typical buffers (1024-2048) this yields 512-1024 frame chunks.
         chunk = max(256, min(1024, desired // 2))
         # Never exceed the buffer itself (matters for tiny buffers <256).
         return min(chunk, desired)
@@ -6163,7 +6163,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return preferred
 
     def _desired_audio_buffer_frames(self) -> int:
-        return int(clamp(int(getattr(self, 'audio_buffer_frames', 512)), 64, 4096))
+        return int(clamp(int(getattr(self, 'audio_buffer_frames', 1024)), 64, 4096))
 
     def _playback_audio_format(self) -> QtMultimedia.QAudioFormat:
         fmt = QtMultimedia.QAudioFormat()
@@ -11653,7 +11653,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.selected_audio_sample_format_name = str(payload.get('selected_audio_sample_format_name', 'Auto') or 'Auto')
         raw_buffer_frames = payload.get('audio_buffer_frames', None)
         if raw_buffer_frames is not None:
-            self.audio_buffer_frames = self._coerce_int(raw_buffer_frames, 512, 64, 4096)
+            self.audio_buffer_frames = self._coerce_int(raw_buffer_frames, 1024, 64, 4096)
         else:
             legacy_buffer_value = self._coerce_int(payload.get('audio_buffer_ms', 80), 80, 8, 4096)
             legacy_sample_choices = {8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096}
