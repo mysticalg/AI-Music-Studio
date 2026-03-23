@@ -992,6 +992,7 @@ class RealtimeTrackPlaybackState:
     fx_reset_pending: bool = True
     native_host_scheduled_until_frame: int = -1
     native_host_loop_epoch: int = 0
+    native_host_render_failed: bool = False
     last_error: str = ""
 
 
@@ -7916,6 +7917,7 @@ class MainWindow(QtWidgets.QMainWindow):
             state.instrument_reset_pending = True
             state.fx_reset_pending = True
             state.native_host_scheduled_until_frame = -1
+            state.native_host_render_failed = False
             if clear_plugins:
                 state.instrument_plugin = None
                 state.fx_plugins = []
@@ -8327,7 +8329,7 @@ class MainWindow(QtWidgets.QMainWindow):
         duration_sec = max(frame_count, 1) / float(sample_rate)
 
         if track.instrument_mode == 'VSTI Rack' and entry is not None and entry.is_instrument and entry.host_supported:
-            if self._can_use_native_vst_host(entry):
+            if self._can_use_native_vst_host(entry) and not state.native_host_render_failed:
                 if not self._open_native_vst_host_for_track(idx, entry, open_editor=False, show_error=False):
                     if np is not None:
                         return np.zeros(max(1, int(frame_count)), dtype=np.float32), sample_rate
@@ -8371,6 +8373,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     return rendered, sample_rate
                 except Exception as exc:
                     state.last_error = str(exc)
+                    state.native_host_render_failed = True
                     _APP_LOGGER.exception("Realtime native VST render failed track_index=%s rack=%s", idx, track.rack_vsti)
                     self._stop_native_vst_host_bridge(idx)
                     if np is not None:

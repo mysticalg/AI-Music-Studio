@@ -117,7 +117,7 @@ class _InProcessHostBackend:
             raise RuntimeError("In-process host is not running")
         request = {"command": command, **payload}
         request_json = json.dumps(request, separators=(",", ":")).encode("utf-8")
-        response_buffer = ctypes.create_string_buffer(65536)
+        response_buffer = ctypes.create_string_buffer(4 * 1024 * 1024)
         ok = self._loaded_dll().aims_vst_host_command(
             ctypes.c_void_p(self.handle),
             request_json,
@@ -206,6 +206,7 @@ class _SubprocessHostBackend:
         encoded = (json.dumps(request) + "\n").encode("utf-8")
 
         with socket.create_connection(("127.0.0.1", self.port), timeout=0.5) as sock:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             sock.settimeout(0.5)
             sock.sendall(encoded)
             sock.shutdown(socket.SHUT_WR)
@@ -269,12 +270,11 @@ class NativeVstHostBridge:
         self.in_process = False
 
     def start(self, startup_timeout: float = 10.0) -> None:
-        # In-process is the default when the DLL is available — it eliminates
-        # TCP connection overhead (~16 ms per command) that makes subprocess
-        # rendering too slow for realtime playback.  Set
-        # AIMS_NATIVE_VST_SUBPROCESS=1 to force the subprocess backend.
-        force_subprocess = str(os.getenv("AIMS_NATIVE_VST_SUBPROCESS", "")).strip().lower() in {"1", "true", "yes", "on"}
-        use_in_process = not force_subprocess and _InProcessHostBackend.available()
+        # Subprocess is the default backend.  The in-process backend (ctypes
+        # DLL calls) can cause heap corruption with some VSTs, so it is
+        # opt-in only.  Set AIMS_NATIVE_VST_IN_PROCESS=1 to enable it.
+        force_in_process = str(os.getenv("AIMS_NATIVE_VST_IN_PROCESS", "")).strip().lower() in {"1", "true", "yes", "on"}
+        use_in_process = force_in_process and _InProcessHostBackend.available()
         if use_in_process:
             backend: _InProcessHostBackend | _SubprocessHostBackend = _InProcessHostBackend(
                 self.plugin_path,
