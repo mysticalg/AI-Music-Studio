@@ -4241,7 +4241,11 @@ class AudioSettingsDialog(QtWidgets.QDialog):
             return
         current_device = main_window._selected_audio_device()
         preferred = current_device.preferredFormat()
-        output_status = main_window._native_output_status() if main_window._native_output_bridge_alive() else None
+        output_status = (
+            main_window._native_output_status(allow_cached=True, max_age_sec=0.25)
+            if main_window._native_output_bridge_alive()
+            else None
+        )
         latency_ms = main_window._buffer_frames_latency_ms(main_window._desired_audio_buffer_frames())
         self.output_summary_label.setText(main_window._audio_output_summary())
         self.output_latency_label.setText(f'{latency_ms:.1f} ms')
@@ -4750,6 +4754,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._playback_active = False
         self._live_midi_active = False
         self._live_midi_direct_output_row: int | None = None
+        self._native_output_status_cache: dict[str, object] | None = None
+        self._native_output_status_cache_at = 0.0
+        self._native_output_status_cache_bridge_id = 0
+        self._pending_native_vst_parameter_updates: dict[int, tuple[object, dict[str, float], int | None]] = {}
         self._realtime_mix_cache: object | None = None
         self._realtime_mix_cache_start_frame = 0
         self._realtime_mix_cache_frame_count = 0
@@ -4784,6 +4792,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._parameter_audition_timer.setSingleShot(True)
         self._parameter_audition_timer.setInterval(120)
         self._parameter_audition_timer.timeout.connect(self._play_pending_parameter_audition)
+        self._native_vst_parameter_flush_timer = QtCore.QTimer(self)
+        self._native_vst_parameter_flush_timer.setSingleShot(True)
+        self._native_vst_parameter_flush_timer.setInterval(24)
+        self._native_vst_parameter_flush_timer.timeout.connect(self._flush_native_vst_parameter_updates)
         self._prerender_mix_refresh_timer = QtCore.QTimer(self)
         self._prerender_mix_refresh_timer.setSingleShot(True)
         self._prerender_mix_refresh_timer.setInterval(90)
@@ -6231,7 +6243,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _native_output_driver_block_frames(self, status: dict[str, object] | None = None) -> int:
         source = status
         if source is None and self._native_output_bridge_alive():
-            source = self._native_output_status()
+            source = self._native_output_status(allow_cached=True, max_age_sec=0.5)
         if isinstance(source, dict):
             return max(0, int(source.get('buffer_size') or 0))
         return 0
@@ -6246,7 +6258,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _queued_ahead_frames(self, status: dict[str, object] | None = None) -> int:
         if self._native_output_bridge_alive():
-            source = status if status is not None else self._native_output_status()
+            source = status if status is not None else self._native_output_status(allow_cached=True, max_age_sec=0.25)
             if isinstance(source, dict):
                 return max(0, int(source.get('queued_audio_frames') or 0))
             return max(0, int(getattr(self, '_native_output_queued_frames', 0)))
@@ -6316,9 +6328,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def _recommended_audio_pump_interval_ms(self, frame_count: int) -> int:
         latency_ms = self._buffer_frames_latency_ms(frame_count)
         # Wake often enough to keep the buffer fed but not so often that the
-        # pump competes with UI events for the main thread.  Cap at 10ms to
-        # give the UI event loop breathing room between pump cycles.
-        return int(clamp(int(math.floor((latency_ms * 0.4) + 0.5)), 2, 10))
+        # pump competes with UI events for the main thread.  Allow up to 16ms
+        # between wakeups so high-latency buffers don't force 100 Hz polling.
+        return int(clamp(int(math.floor((latency_ms * 0.4) + 0.5)), 2, 16))
 
     def _preferred_playback_chunk_frames(self) -> int:
         desired = int(self._desired_audio_buffer_frames())
@@ -6594,7 +6606,11 @@ class MainWindow(QtWidgets.QMainWindow):
         bridge = getattr(self, '_native_output_bridge', None)
         if bridge is not None:
             self._capture_shared_native_output_bridge_state()
+            self._discard_pending_native_vst_bridge_parameter_updates(bridge)
         self._native_output_bridge = None
+        self._native_output_status_cache = None
+        self._native_output_status_cache_at = 0.0
+        self._native_output_status_cache_bridge_id = 0
         self._native_output_queued_frames = 0
         self._native_output_underruns = 0
         self._transport_uses_native_output_bridge = False
@@ -6616,6 +6632,7 @@ class MainWindow(QtWidgets.QMainWindow):
         target_sample_rate = max(1, int(self._native_vst_host_target_sample_rate()))
         target_buffer_size = max(64, int(self._native_vst_host_target_buffer_size()))
         target_audio_device_type = self._native_vst_host_target_audio_device_type()
+        direct_row = int(direct_plugin[0]) if direct_plugin is not None else -1
         direct_track = direct_plugin[1] if direct_plugin is not None else None
         direct_entry = direct_plugin[2] if direct_plugin is not None else None
         desired_plugin_path = (
@@ -6642,12 +6659,33 @@ class MainWindow(QtWidgets.QMainWindow):
             if existing_plugin_path == desired_plugin_path:
                 if direct_track is not None and direct_entry is not None:
                     setattr(existing, '_aims_rack_name', str(direct_entry.name))
+                    desired_gain = max(0.0, float(direct_track.volume) * (10.0 ** (float(direct_track.vsti_output_gain_db) / 20.0)))
+                    desired_pan = float(clamp(float(direct_track.pan), -1.0, 1.0))
+                    parameter_generation = self._track_vsti_parameter_generation(direct_track)
+                    state_matches = (
+                        str(getattr(existing, '_aims_loaded_state_path', '') or '') == desired_state_path
+                        and int(getattr(existing, '_aims_loaded_state_mtime_ns', 0) or 0) == int(desired_state_mtime_ns)
+                    )
+                    buses_match = getattr(existing, '_aims_bus_routing_signature', None) == desired_bus_signature
+                    mix_matches = (
+                        abs(float(getattr(existing, '_aims_direct_output_gain', float('nan'))) - float(desired_gain)) < 1e-6
+                        and abs(float(getattr(existing, '_aims_direct_output_pan', float('nan'))) - float(desired_pan)) < 1e-6
+                    )
+                    parameters_current = (
+                        int(getattr(existing, '_aims_live_parameter_generation', -1) or -1) == int(parameter_generation)
+                        or int(getattr(existing, '_aims_pending_parameter_generation', -1) or -1) == int(parameter_generation)
+                    )
                     if (
-                        str(getattr(existing, '_aims_loaded_state_path', '') or '') != desired_state_path
-                        or int(getattr(existing, '_aims_loaded_state_mtime_ns', 0) or 0) != int(desired_state_mtime_ns)
+                        int(getattr(existing, '_aims_direct_output_row', -1) or -1) == direct_row
+                        and state_matches
+                        and buses_match
+                        and mix_matches
+                        and parameters_current
                     ):
+                        return existing
+                    if not state_matches:
                         self._prime_native_vst_host_bridge_state(existing, direct_track, direct_entry)
-                    if getattr(existing, '_aims_bus_routing_signature', None) != desired_bus_signature:
+                    if not buses_match:
                         ok, _status = self._configure_native_vst_host_bridge_buses(existing, direct_track, direct_entry)
                         if not ok:
                             self._stop_native_output_bridge()
@@ -6657,13 +6695,23 @@ class MainWindow(QtWidgets.QMainWindow):
                                 self._stop_native_output_bridge()
                                 existing = None
                             else:
-                                self._apply_native_vst_bridge_parameter_values(existing, direct_track.vsti_parameters)
+                                setattr(existing, '_aims_direct_output_row', direct_row)
+                                self._queue_native_vst_bridge_parameter_values(
+                                    existing,
+                                    direct_track.vsti_parameters,
+                                    generation=parameter_generation,
+                                )
                                 return existing
                     elif not self._configure_direct_native_output_mix(existing, direct_track):
                         self._stop_native_output_bridge()
                         existing = None
                     else:
-                        self._apply_native_vst_bridge_parameter_values(existing, direct_track.vsti_parameters)
+                        setattr(existing, '_aims_direct_output_row', direct_row)
+                        self._queue_native_vst_bridge_parameter_values(
+                            existing,
+                            direct_track.vsti_parameters,
+                            generation=parameter_generation,
+                        )
                 else:
                     return existing
                 if existing is not None:
@@ -6708,7 +6756,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 except Exception:
                     pass
                 raise RuntimeError(f'Could not configure direct native output mix for {direct_entry.name}')
-            self._apply_native_vst_bridge_parameter_values(bridge, direct_track.vsti_parameters)
+            setattr(bridge, '_aims_direct_output_row', direct_row)
+            self._apply_native_vst_bridge_parameter_values(
+                bridge,
+                direct_track.vsti_parameters,
+                generation=self._track_vsti_parameter_generation(direct_track),
+            )
         bridge.clear_audio_queue(reset_counters=True, stream_id='main')
         bridge.clear_audio_queue(reset_counters=True, stream_id='preview')
         bridge.clear_audio_queue(reset_counters=True, stream_id='live_midi')
@@ -6717,22 +6770,63 @@ class MainWindow(QtWidgets.QMainWindow):
         self._native_output_underruns = int(status.get('audio_queue_underruns') or 0)
         return bridge
 
-    def _native_output_status(self, bridge: object | None = None) -> dict[str, object] | None:
+    def _cache_native_output_status(self, bridge: object, status: dict[str, object] | None) -> dict[str, object] | None:
+        if not isinstance(status, dict):
+            return status
+        self._native_output_status_cache = status
+        self._native_output_status_cache_at = time.perf_counter()
+        self._native_output_status_cache_bridge_id = id(bridge)
+        self._native_output_queued_frames = int(status.get('queued_audio_frames') or 0)
+        self._native_output_underruns = int(status.get('audio_queue_underruns') or 0)
+        return status
+
+    def _cached_native_output_status(
+        self,
+        bridge: object | None = None,
+        *,
+        max_age_sec: float = 0.0,
+    ) -> dict[str, object] | None:
         target = bridge or getattr(self, '_native_output_bridge', None)
         if target is None:
             return None
+        cached = getattr(self, '_native_output_status_cache', None)
+        if not isinstance(cached, dict):
+            return None
+        if int(getattr(self, '_native_output_status_cache_bridge_id', 0) or 0) != id(target):
+            return None
+        age = time.perf_counter() - float(getattr(self, '_native_output_status_cache_at', 0.0) or 0.0)
+        if age > max(0.0, float(max_age_sec)):
+            return None
+        return cached
+
+    def _native_output_status(
+        self,
+        bridge: object | None = None,
+        *,
+        allow_cached: bool = False,
+        max_age_sec: float = 0.0,
+    ) -> dict[str, object] | None:
+        target = bridge or getattr(self, '_native_output_bridge', None)
+        if target is None:
+            return None
+        if allow_cached:
+            cached = self._cached_native_output_status(target, max_age_sec=max_age_sec)
+            if cached is not None:
+                return cached
         try:
             status = target.command('status')
         except Exception:
             _APP_LOGGER.exception("Failed reading native realtime output bridge status")
             self._stop_native_output_bridge()
             return None
-        self._native_output_queued_frames = int(status.get('queued_audio_frames') or 0)
-        self._native_output_underruns = int(status.get('audio_queue_underruns') or 0)
-        return status
+        return self._cache_native_output_status(target, status)
 
     def _native_output_rendered_sample_frames(self, status: dict[str, object] | None = None) -> int:
-        source = status if status is not None else (self._native_output_status() if self._native_output_bridge_alive() else None)
+        source = status
+        if source is None and self._native_output_bridge_alive():
+            source = self._cached_native_output_status(max_age_sec=0.25)
+            if source is None:
+                source = self._native_output_status()
         if not isinstance(source, dict):
             return 0
         return max(0, int(source.get('rendered_sample_frames') or 0))
@@ -6768,9 +6862,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _native_output_stream_queued_frames(self, stream_id: str, status: dict[str, object] | None = None) -> int:
         if str(stream_id).strip().lower() == 'main':
-            source = status if status is not None else self._native_output_status()
+            source = status if status is not None else self._native_output_status(allow_cached=True, max_age_sec=0.25)
             return int(source.get('queued_audio_frames') or 0) if isinstance(source, dict) else 0
-        source = status if status is not None else self._native_output_status()
+        source = status if status is not None else self._native_output_status(allow_cached=True, max_age_sec=0.25)
         stream = self._native_output_stream_entry(source, stream_id)
         return int(stream.get('queued_frames') or 0) if isinstance(stream, dict) else 0
 
@@ -6977,6 +7071,9 @@ class MainWindow(QtWidgets.QMainWindow):
         setattr(bridge, '_aims_loaded_state_mtime_ns', state_mtime_ns)
         setattr(bridge, '_aims_live_parameter_signature', None)
         setattr(bridge, '_aims_live_parameter_values', None)
+        setattr(bridge, '_aims_live_parameter_generation', None)
+        setattr(bridge, '_aims_pending_parameter_signature', None)
+        setattr(bridge, '_aims_pending_parameter_generation', None)
         if not state_path:
             return True
         if getattr(bridge, '_aims_supports_load_state', True) is False:
@@ -7313,6 +7410,47 @@ class MainWindow(QtWidgets.QMainWindow):
                         bridge.command('panic')
         except Exception:
             _APP_LOGGER.exception("Failed clearing direct live MIDI output row=%s", active_row)
+        finally:
+            self._live_midi_direct_output_row = None
+
+    def _silence_shared_native_output_bridge(self, *, exhaustive: bool = False) -> bool:
+        bridge = getattr(self, '_native_output_bridge', None)
+        if bridge is None or not self._native_output_bridge_alive():
+            self._live_midi_direct_output_row = None
+            return False
+
+        target_channels: list[int] = []
+        for row in (self._direct_native_transport_row, self._live_midi_direct_output_row):
+            if row is None or not (0 <= int(row) < len(self.project.tracks)):
+                continue
+            track = self.project.tracks[int(row)]
+            channel = int(clamp(track.midi_channel, 0, 15)) + 1
+            if channel > 0 and channel not in target_channels:
+                target_channels.append(channel)
+
+        for stream_id in ('main', 'preview', 'live_midi'):
+            try:
+                bridge.clear_audio_queue(reset_counters=False, stream_id=stream_id)
+            except Exception:
+                _APP_LOGGER.exception("Failed clearing shared native output stream=%s during stop", stream_id)
+
+        sent_targeted = False
+        try:
+            for channel in target_channels:
+                bridge.command('all_notes_off', channel=channel)
+                sent_targeted = True
+            if exhaustive or not sent_targeted:
+                bridge.command('panic')
+            return True
+        except Exception:
+            _APP_LOGGER.exception("Failed silencing shared native output bridge")
+            if not exhaustive:
+                try:
+                    bridge.command('panic')
+                    return True
+                except Exception:
+                    _APP_LOGGER.exception("Failed sending shared native output panic fallback")
+            return False
         finally:
             self._live_midi_direct_output_row = None
 
@@ -10101,6 +10239,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def stop_playback(self) -> None:
         should_reset = hasattr(self, 'playback_timer') and (not self.playback_timer.isActive())
         direct_row = self._direct_native_transport_row
+        live_direct_row = self._live_midi_direct_output_row
         direct_track = self.project.tracks[int(direct_row)] if direct_row is not None and 0 <= int(direct_row) < len(self.project.tracks) else None
         if direct_row is not None and direct_track is not None:
             self._capture_shared_native_output_bridge_state()
@@ -10108,12 +10247,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.playback_timer.stop()
         self._stop_realtime_audio_sink()
         stop_generation = int(self._realtime_pump_generation)
-        bridge = getattr(self, '_native_output_bridge', None)
-        if bridge is not None and direct_row is not None:
-            try:
-                bridge.command('panic')
-            except Exception:
-                _APP_LOGGER.exception("Failed sending direct native transport panic row=%s", direct_row)
+        if direct_row is not None or live_direct_row is not None:
+            self._silence_shared_native_output_bridge(exhaustive=direct_row is not None)
         self._clear_direct_native_transport_state()
         for row in list(getattr(self, '_track_native_vst_host_bridges', {}).keys()):
             track = self.project.tracks[int(row)] if 0 <= int(row) < len(self.project.tracks) else None
@@ -10197,7 +10332,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         current_device = self._selected_audio_device()
         preferred = current_device.preferredFormat()
-        output_status = self._native_output_status() if self._native_output_bridge_alive() else None
+        output_status = self._native_output_status(allow_cached=True, max_age_sec=0.25) if self._native_output_bridge_alive() else None
         self.audio_output_menu.addSeparator()
 
         sample_rate_menu = self.audio_output_menu.addMenu('Output Sample Rate')
@@ -11242,19 +11377,110 @@ class MainWindow(QtWidgets.QMainWindow):
             return None
         return state.instrument_plugin
 
-    def _apply_native_vst_bridge_parameter_values(self, bridge: object | None, values: dict[str, float]) -> bool:
-        if bridge is None or not values:
-            return False
-        if getattr(bridge, '_aims_supports_set_parameters', True) is False:
-            return False
+    @staticmethod
+    def _track_vsti_parameter_generation(track: TrackState) -> int:
+        return int(getattr(track, '_aims_vsti_parameter_generation', 0) or 0)
 
-        sanitized = {
+    @staticmethod
+    def _mark_track_vsti_parameters_dirty(track: TrackState) -> int:
+        generation = int(getattr(track, '_aims_vsti_parameter_generation', 0) or 0) + 1
+        setattr(track, '_aims_vsti_parameter_generation', generation)
+        return generation
+
+    @staticmethod
+    def _sanitize_native_vst_bridge_parameter_values(values: dict[str, float] | None) -> dict[str, float]:
+        return {
             str(key): max(0.0, min(100.0, safe_finite_float(value, 0.0)))
             for key, value in dict(values or {}).items()
         }
-        signature = tuple(sorted((key, round(float(value), 4)) for key, value in sanitized.items()))
+
+    @staticmethod
+    def _native_vst_bridge_parameter_signature(values: dict[str, float]) -> tuple[tuple[str, float], ...]:
+        return tuple(sorted((str(key), round(float(value), 4)) for key, value in dict(values or {}).items()))
+
+    def _discard_pending_native_vst_bridge_parameter_updates(self, bridge: object | None) -> None:
+        if bridge is None:
+            return
+        pending = getattr(self, '_pending_native_vst_parameter_updates', None)
+        if isinstance(pending, dict):
+            pending.pop(id(bridge), None)
+        setattr(bridge, '_aims_pending_parameter_signature', None)
+        setattr(bridge, '_aims_pending_parameter_generation', None)
+
+    def _flush_native_vst_parameter_updates(self) -> None:
+        pending = dict(getattr(self, '_pending_native_vst_parameter_updates', {}) or {})
+        self._pending_native_vst_parameter_updates = {}
+        for bridge, values, generation in pending.values():
+            self._apply_native_vst_bridge_parameter_values(bridge, values, generation=generation)
+
+    def _queue_native_vst_bridge_parameter_values(
+        self,
+        bridge: object | None,
+        values: dict[str, float],
+        *,
+        generation: int | None = None,
+    ) -> bool:
+        if bridge is None:
+            return False
+        sanitized = self._sanitize_native_vst_bridge_parameter_values(values)
+        signature = self._native_vst_bridge_parameter_signature(sanitized)
         if getattr(bridge, '_aims_live_parameter_signature', None) == signature:
+            if generation is not None:
+                setattr(bridge, '_aims_live_parameter_generation', int(generation))
+            self._discard_pending_native_vst_bridge_parameter_updates(bridge)
             return True
+        if not sanitized:
+            setattr(bridge, '_aims_live_parameter_signature', signature)
+            setattr(bridge, '_aims_live_parameter_values', {})
+            if generation is not None:
+                setattr(bridge, '_aims_live_parameter_generation', int(generation))
+            self._discard_pending_native_vst_bridge_parameter_updates(bridge)
+            return True
+        if getattr(bridge, '_aims_supports_set_parameters', True) is False:
+            return False
+        if getattr(bridge, '_aims_pending_parameter_signature', None) == signature:
+            pending = getattr(self, '_pending_native_vst_parameter_updates', None)
+            if isinstance(pending, dict):
+                pending[id(bridge)] = (bridge, sanitized, None if generation is None else int(generation))
+            if generation is not None:
+                setattr(bridge, '_aims_pending_parameter_generation', int(generation))
+            return True
+        pending = getattr(self, '_pending_native_vst_parameter_updates', None)
+        if not isinstance(pending, dict):
+            self._pending_native_vst_parameter_updates = {}
+            pending = self._pending_native_vst_parameter_updates
+        pending[id(bridge)] = (bridge, sanitized, None if generation is None else int(generation))
+        setattr(bridge, '_aims_pending_parameter_signature', signature)
+        setattr(bridge, '_aims_pending_parameter_generation', None if generation is None else int(generation))
+        if hasattr(self, '_native_vst_parameter_flush_timer') and not self._native_vst_parameter_flush_timer.isActive():
+            self._native_vst_parameter_flush_timer.start()
+        return True
+
+    def _apply_native_vst_bridge_parameter_values(
+        self,
+        bridge: object | None,
+        values: dict[str, float],
+        *,
+        generation: int | None = None,
+    ) -> bool:
+        if bridge is None:
+            return False
+        sanitized = self._sanitize_native_vst_bridge_parameter_values(values)
+        signature = self._native_vst_bridge_parameter_signature(sanitized)
+        if getattr(bridge, '_aims_live_parameter_signature', None) == signature:
+            if generation is not None:
+                setattr(bridge, '_aims_live_parameter_generation', int(generation))
+            self._discard_pending_native_vst_bridge_parameter_updates(bridge)
+            return True
+        if not sanitized:
+            setattr(bridge, '_aims_live_parameter_signature', signature)
+            setattr(bridge, '_aims_live_parameter_values', {})
+            if generation is not None:
+                setattr(bridge, '_aims_live_parameter_generation', int(generation))
+            self._discard_pending_native_vst_bridge_parameter_updates(bridge)
+            return True
+        if getattr(bridge, '_aims_supports_set_parameters', True) is False:
+            return False
 
         cached_values_raw = getattr(bridge, '_aims_live_parameter_values', None)
         cached_values = {
@@ -11268,6 +11494,9 @@ class MainWindow(QtWidgets.QMainWindow):
         }
         if not changed_values and set(cached_values.keys()) == set(sanitized.keys()):
             setattr(bridge, '_aims_live_parameter_signature', signature)
+            if generation is not None:
+                setattr(bridge, '_aims_live_parameter_generation', int(generation))
+            self._discard_pending_native_vst_bridge_parameter_updates(bridge)
             return True
 
         payload = dict(changed_values or sanitized)
@@ -11289,6 +11518,9 @@ class MainWindow(QtWidgets.QMainWindow):
             cached_values.update(changed_values or sanitized)
             setattr(bridge, '_aims_live_parameter_signature', signature)
             setattr(bridge, '_aims_live_parameter_values', dict(cached_values))
+            if generation is not None:
+                setattr(bridge, '_aims_live_parameter_generation', int(generation))
+            self._discard_pending_native_vst_bridge_parameter_updates(bridge)
             return True
         except Exception as exc:
             if 'Unknown command: set_parameters' in str(exc):
@@ -11314,10 +11546,11 @@ class MainWindow(QtWidgets.QMainWindow):
         track_index = self._track_index_for_object(track)
         if track_index < 0:
             return
+        parameter_generation = self._track_vsti_parameter_generation(track)
 
         bridge = self._track_native_vst_host_bridges.get(track_index)
         if bridge is not None and self._native_vst_host_bridge_alive(track_index):
-            self._apply_native_vst_bridge_parameter_values(bridge, values)
+            self._queue_native_vst_bridge_parameter_values(bridge, values, generation=parameter_generation)
 
         if include_output_bridge:
             direct_candidate = self._direct_native_transport_candidate()
@@ -11331,7 +11564,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 and (direct_row == track_index or direct_candidate_row == track_index or live_direct_row == track_index)
                 and self._normalized_vsti_path(str(getattr(direct_bridge, 'plugin_path', '') or '')) == self._normalized_vsti_path(entry.path)
             ):
-                self._apply_native_vst_bridge_parameter_values(direct_bridge, values)
+                self._queue_native_vst_bridge_parameter_values(direct_bridge, values, generation=parameter_generation)
 
     def _apply_track_vsti_parameters_live(
         self,
@@ -11340,14 +11573,17 @@ class MainWindow(QtWidgets.QMainWindow):
         *,
         editor_plugin=None,
     ) -> None:
-        sanitized = {
-            str(key): max(0.0, min(100.0, safe_finite_float(value, 0.0)))
-            for key, value in dict(values or {}).items()
-        }
+        sanitized = self._sanitize_native_vst_bridge_parameter_values(values)
         prerender_playback_active = bool(getattr(self, '_playback_active', False)) and bool(
             getattr(self, '_use_prerendered_transport_mix', False)
         )
+        previous_signature = self._native_vst_bridge_parameter_signature(
+            self._sanitize_native_vst_bridge_parameter_values(track.vsti_parameters)
+        )
+        current_signature = self._native_vst_bridge_parameter_signature(sanitized)
         track.vsti_parameters = sanitized
+        if current_signature != previous_signature:
+            self._mark_track_vsti_parameters_dirty(track)
         self._sync_native_vst_host_parameters(
             track,
             sanitized,
@@ -11899,7 +12135,7 @@ class MainWindow(QtWidgets.QMainWindow):
         original_vsti_parameters = dict(track.vsti_parameters)
         live_update_timer = QtCore.QTimer(dialog)
         live_update_timer.setSingleShot(True)
-        live_update_timer.setInterval(12)
+        live_update_timer.setInterval(24)
 
         def apply_live_changes() -> None:
             for apply_change in apply_changes:
@@ -12465,6 +12701,7 @@ class MainWindow(QtWidgets.QMainWindow):
         track = self.project.tracks[row] if 0 <= row < len(self.project.tracks) else None
         entry = self._rack_vsti_entry(track.rack_vsti) if track is not None and track.rack_vsti else None
         self._capture_native_vst_host_bridge_state(row, bridge=bridge, track=track, entry=entry)
+        self._discard_pending_native_vst_bridge_parameter_updates(bridge)
         self._track_native_vst_host_bridges.pop(row, None)
         try:
             bridge.stop()
