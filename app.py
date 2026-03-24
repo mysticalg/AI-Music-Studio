@@ -6482,6 +6482,28 @@ class MainWindow(QtWidgets.QMainWindow):
             _APP_LOGGER.exception("Failed configuring direct native output mix track=%s", track.name)
             return False
 
+    def _open_shared_native_output_bridge_editor(self, row: int, track: TrackState, entry: VSTInstrument) -> bool:
+        bridge = self._ensure_native_output_bridge(direct_plugin=(int(row), track, entry))
+        if bridge is None:
+            return False
+        try:
+            bridge.command('open_editor')
+            return True
+        except Exception:
+            _APP_LOGGER.exception("Failed opening shared native output editor row=%s rack=%s", row, entry.name)
+            return False
+
+    def _handoff_track_editor_to_shared_output_bridge(self, row: int, track: TrackState, entry: VSTInstrument) -> bool:
+        row = int(row)
+        bridge = self._track_native_vst_host_bridges.get(row)
+        editor_visible = self._native_vst_host_editor_visible(row)
+        if not editor_visible and bridge is None:
+            return False
+        if bridge is not None and self._native_vst_host_bridge_alive(row):
+            self._capture_native_vst_host_bridge_state(row, bridge=bridge, track=track, entry=entry)
+        self._close_track_vsti_window(row, teardown_host=True)
+        return self._open_shared_native_output_bridge_editor(row, track, entry)
+
     def _direct_native_transport_candidate(self) -> tuple[int, TrackState, VSTInstrument] | None:
         if not self._native_output_bridge_supported():
             return None
@@ -6535,10 +6557,43 @@ class MainWindow(QtWidgets.QMainWindow):
                 return False
         return True
 
+    def _shared_native_output_bridge_track_info(self) -> tuple[int, object, TrackState, VSTInstrument] | None:
+        bridge = getattr(self, '_native_output_bridge', None)
+        if bridge is None or not self._native_output_bridge_alive():
+            return None
+        candidate_rows: list[int] = []
+        direct_row = getattr(self, '_direct_native_transport_row', None)
+        if direct_row is not None:
+            candidate_rows.append(int(direct_row))
+        live_row = getattr(self, '_live_midi_direct_output_row', None)
+        if live_row is not None and int(live_row) not in candidate_rows:
+            candidate_rows.append(int(live_row))
+        plugin_path = self._normalized_vsti_path(str(getattr(bridge, 'plugin_path', '') or ''))
+        for row in candidate_rows:
+            if row < 0 or row >= len(self.project.tracks):
+                continue
+            track = self.project.tracks[row]
+            entry = self._rack_vsti_entry(track.rack_vsti) if track.rack_vsti else None
+            if entry is None:
+                continue
+            if self._normalized_vsti_path(str(entry.path)) != plugin_path:
+                continue
+            return row, bridge, track, entry
+        return None
+
+    def _capture_shared_native_output_bridge_state(self) -> bool:
+        info = self._shared_native_output_bridge_track_info()
+        if info is None:
+            return False
+        row, bridge, track, entry = info
+        return self._capture_native_vst_host_bridge_state(row, bridge=bridge, track=track, entry=entry)
+
     def _stop_native_output_bridge(self) -> None:
         if hasattr(self, '_native_output_warm_timer'):
             self._native_output_warm_timer.stop()
         bridge = getattr(self, '_native_output_bridge', None)
+        if bridge is not None:
+            self._capture_shared_native_output_bridge_state()
         self._native_output_bridge = None
         self._native_output_queued_frames = 0
         self._native_output_underruns = 0
@@ -7466,6 +7521,8 @@ class MainWindow(QtWidgets.QMainWindow):
                         self._live_midi_poll_timer.stop()
                     if previous_direct_row != int(direct_idx):
                         self.statusBar().showMessage(f'Live monitoring routed directly through JUCE for {direct_entry.name}')
+                    if previous_direct_row != int(direct_idx) and self._native_vst_host_editor_visible(int(direct_idx)):
+                        self._handoff_track_editor_to_shared_output_bridge(int(direct_idx), direct_track, direct_entry)
                     return True
                 except Exception:
                     self._live_midi_direct_output_row = None
@@ -8816,6 +8873,9 @@ class MainWindow(QtWidgets.QMainWindow):
         state.native_host_render_failed = False
         state.last_error = ""
 
+        if self._native_vst_host_editor_visible(int(row)):
+            self._handoff_track_editor_to_shared_output_bridge(int(row), track, entry)
+
         self._transport_uses_native_output_bridge = True
         self._playback_active = True
         self._pump_direct_native_transport()
@@ -10042,6 +10102,8 @@ class MainWindow(QtWidgets.QMainWindow):
         should_reset = hasattr(self, 'playback_timer') and (not self.playback_timer.isActive())
         direct_row = self._direct_native_transport_row
         direct_track = self.project.tracks[int(direct_row)] if direct_row is not None and 0 <= int(direct_row) < len(self.project.tracks) else None
+        if direct_row is not None and direct_track is not None:
+            self._capture_shared_native_output_bridge_state()
         if hasattr(self, 'playback_timer'):
             self.playback_timer.stop()
         self._stop_realtime_audio_sink()
@@ -11213,10 +11275,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if rack_name:
             parameter_names = [str(name) for name in self.vsti_parameter_names_for_rack(rack_name)]
             parameter_index_by_name = {name: idx for idx, name in enumerate(parameter_names, start=1)}
-            for key, value in payload.items():
+            alias_payload: dict[str, float] = {}
+            for key, value in list(payload.items()):
                 parameter_index = parameter_index_by_name.get(str(key))
                 if parameter_index is not None:
-                    payload.setdefault(f'Param {parameter_index}', float(value))
+                    alias_payload.setdefault(f'Param {parameter_index}', float(value))
+            payload.update(alias_payload)
 
         try:
             response = bridge.command('set_parameters', parameters=payload)
@@ -12615,6 +12679,8 @@ class MainWindow(QtWidgets.QMainWindow):
         row = int(row)
         native_bridge_active = self._native_vst_host_bridge_alive(row)
         bridge = self._track_native_vst_host_bridges.get(row) if native_bridge_active else None
+        shared_info = self._shared_native_output_bridge_track_info()
+        shared_bridge = shared_info[1] if shared_info is not None and int(shared_info[0]) == row else None
         self._remember_native_vsti_window_bounds(row)
         dialog = self._track_vsti_windows.pop(row, None)
         if dialog is None:
@@ -12646,6 +12712,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     bridge.command('close_editor')
                 except Exception:
                     _APP_LOGGER.exception("Failed closing native VST editor for row=%s", row)
+        elif shared_bridge is not None:
+            try:
+                shared_bridge.command('close_editor')
+            except Exception:
+                _APP_LOGGER.exception("Failed closing shared native VST editor for row=%s", row)
         close_event = self._track_native_vsti_close_events.pop(row, None)
         if close_event is not None:
             try:
@@ -12660,6 +12731,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
 
     def _focus_track_native_vsti_window(self, row: int) -> bool:
+        shared_info = self._shared_native_output_bridge_track_info()
+        if shared_info is not None and int(shared_info[0]) == int(row):
+            try:
+                shared_info[1].command('open_editor')
+                return True
+            except Exception:
+                _APP_LOGGER.exception("Failed focusing shared native VST editor for row=%s", row)
         bridge = self._track_native_vst_host_bridges.get(int(row))
         if bridge is not None and self._native_vst_host_bridge_alive(int(row)):
             try:
@@ -12704,6 +12782,14 @@ class MainWindow(QtWidgets.QMainWindow):
         process = self._track_native_vsti_processes.get(row)
         if process is not None and process.state() != QtCore.QProcess.ProcessState.NotRunning:
             return True
+        shared_info = self._shared_native_output_bridge_track_info()
+        if shared_info is not None and int(shared_info[0]) == row:
+            _shared_row, shared_bridge, _shared_track, _shared_entry = shared_info
+            try:
+                status = shared_bridge.command('status')
+            except Exception:
+                return True
+            return bool(status.get('editor_open', False))
         bridge = self._track_native_vst_host_bridges.get(row)
         if bridge is None or not self._native_vst_host_bridge_alive(row):
             return False
@@ -13712,10 +13798,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.information(self, 'Unsupported VSTI', f'{vst.name} does not have a usable native editor here.\n\n{detail}')
                 return
             if self._can_use_native_vst_host(vst):
-                # Reuse the per-track native host bridge so the visible editor and
-                # sequencer playback are driven by the same JUCE host instance.
-                self._close_track_vsti_window(track_index, teardown_host=False)
-                if self._open_native_vst_host_for_track(track_index, vst, open_editor=True, show_error=True):
+                shared_info = self._shared_native_output_bridge_track_info()
+                if (
+                    shared_info is not None
+                    and int(shared_info[0]) == int(track_index)
+                    and self._normalized_vsti_path(str(shared_info[3].path)) == self._normalized_vsti_path(str(vst.path))
+                ):
+                    self._close_track_vsti_window(track_index, teardown_host=True)
+                    opened = self._open_shared_native_output_bridge_editor(track_index, track, vst)
+                else:
+                    self._close_track_vsti_window(track_index, teardown_host=False)
+                    opened = self._open_native_vst_host_for_track(track_index, vst, open_editor=True, show_error=True)
+                if opened:
                     self._update_track_list_item(track_index)
                 else:
                     QtWidgets.QMessageBox.warning(
