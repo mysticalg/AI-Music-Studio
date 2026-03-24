@@ -331,6 +331,7 @@ class NativeVstHostBridge:
         buffer_size: int | None = None,
         audio_device_type: str | None = None,
         audio_output_device_name: str | None = None,
+        prefer_in_process: bool | None = None,
     ) -> None:
         self.plugin_path = plugin_path
         self.port = port or _find_free_port()
@@ -342,6 +343,7 @@ class NativeVstHostBridge:
         self.buffer_size = int(buffer_size) if buffer_size else 0
         self.audio_device_type = str(audio_device_type or "").strip()
         self.audio_output_device_name = str(audio_output_device_name or "").strip()
+        self.prefer_in_process = None if prefer_in_process is None else bool(prefer_in_process)
         self._backend: _InProcessHostBackend | _SubprocessHostBackend | None = None
         self.process: Any = None
         self.in_process = False
@@ -351,31 +353,43 @@ class NativeVstHostBridge:
         # DLL calls) can cause heap corruption with some VSTs, so it is
         # opt-in only.  Set AIMS_NATIVE_VST_IN_PROCESS=1 to enable it.
         force_in_process = str(os.getenv("AIMS_NATIVE_VST_IN_PROCESS", "")).strip().lower() in {"1", "true", "yes", "on"}
-        use_in_process = force_in_process and _InProcessHostBackend.available()
+        use_in_process = _InProcessHostBackend.available() and (
+            force_in_process if self.prefer_in_process is None else bool(self.prefer_in_process)
+        )
+
+        in_process_backend = _InProcessHostBackend(
+            self.plugin_path,
+            restore_last_plugin_on_startup=self.restore_last_plugin_on_startup,
+            open_editor=self.open_editor,
+            sample_rate=self.sample_rate,
+            buffer_size=self.buffer_size,
+            audio_device_type=self.audio_device_type,
+            audio_output_device_name=self.audio_output_device_name,
+        )
+        subprocess_backend = _SubprocessHostBackend(
+            self.plugin_path,
+            port=self.port,
+            restore_last_plugin_on_startup=self.restore_last_plugin_on_startup,
+            open_editor=self.open_editor,
+            bridge_mode=self.bridge_mode,
+            hidden=self.hidden,
+            sample_rate=self.sample_rate,
+            buffer_size=self.buffer_size,
+            audio_device_type=self.audio_device_type,
+            audio_output_device_name=self.audio_output_device_name,
+        )
+
+        backend: _InProcessHostBackend | _SubprocessHostBackend
         if use_in_process:
-            backend: _InProcessHostBackend | _SubprocessHostBackend = _InProcessHostBackend(
-                self.plugin_path,
-                restore_last_plugin_on_startup=self.restore_last_plugin_on_startup,
-                open_editor=self.open_editor,
-                sample_rate=self.sample_rate,
-                buffer_size=self.buffer_size,
-                audio_device_type=self.audio_device_type,
-                audio_output_device_name=self.audio_output_device_name,
-            )
+            try:
+                in_process_backend.start(startup_timeout=startup_timeout)
+                backend = in_process_backend
+            except Exception:
+                backend = subprocess_backend
+                backend.start(startup_timeout=startup_timeout)
         else:
-            backend = _SubprocessHostBackend(
-                self.plugin_path,
-                port=self.port,
-                restore_last_plugin_on_startup=self.restore_last_plugin_on_startup,
-                open_editor=self.open_editor,
-                bridge_mode=self.bridge_mode,
-                hidden=self.hidden,
-                sample_rate=self.sample_rate,
-                buffer_size=self.buffer_size,
-                audio_device_type=self.audio_device_type,
-                audio_output_device_name=self.audio_output_device_name,
-            )
-        backend.start(startup_timeout=startup_timeout)
+            backend = subprocess_backend
+            backend.start(startup_timeout=startup_timeout)
         self._backend = backend
         self.process = getattr(backend, "process", None)
         self.in_process = isinstance(backend, _InProcessHostBackend)

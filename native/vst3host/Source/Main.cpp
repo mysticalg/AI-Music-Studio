@@ -444,6 +444,8 @@ public:
                 || command == "all_notes_off" || command == "panic"
                 || command == "start_graph_transport"
                 || command == "stop_graph_transport"
+                || command == "set_graph_slot_mix"
+                || command == "set_graph_transport_state"
                 || command == "set_graph_slot_parameters"
                 || command == "queue_audio" || command == "clear_audio_queue"
                 || command == "start_audio_stream")
@@ -869,6 +871,102 @@ private:
             return response;
         }
 
+        if (command == "set_graph_slot_mix")
+        {
+            const auto slotIndex = static_cast<int>(object->hasProperty("slot_index")
+                ? object->getProperty("slot_index")
+                : juce::var(-1));
+            if (!juce::isPositiveAndBelow(slotIndex, static_cast<int>(persistentGraphSlots.size())))
+                return makeResponse(false, "Graph slot not loaded");
+
+            auto& slot = persistentGraphSlots[static_cast<size_t>(slotIndex)];
+            if (slot.plugin == nullptr)
+                return makeResponse(false, "Graph slot not loaded");
+
+            const auto gain = object->hasProperty("gain")
+                ? static_cast<float>(static_cast<double>(object->getProperty("gain")))
+                : slot.gain;
+            const auto pan = object->hasProperty("pan")
+                ? static_cast<float>(static_cast<double>(object->getProperty("pan")))
+                : slot.pan;
+
+            {
+                juce::ScopedLock lock(pluginLock);
+                slot.gain = juce::jmax(0.0f, gain);
+                slot.pan = juce::jlimit(-1.0f, 1.0f, pan);
+            }
+
+            auto response = makeResponse(true, "Graph slot mix updated");
+            appendStatusFields(response);
+            setResponseField(response, "graph_editor_slot", slotIndex);
+            setResponseField(response, "gain", static_cast<double>(slot.gain));
+            setResponseField(response, "pan", static_cast<double>(slot.pan));
+            return response;
+        }
+
+        if (command == "set_graph_transport_state")
+        {
+            const auto slotMixesVar = object->getProperty("slot_mixes");
+            const auto resetSlotsVar = object->getProperty("reset_slots");
+            const auto baseOffsetFrames = juce::jmax<int64_t>(
+                0,
+                static_cast<int64_t>(object->hasProperty("base_offset_frames")
+                    ? static_cast<double>(object->getProperty("base_offset_frames"))
+                    : 0.0)
+            );
+
+            juce::String error;
+            int updatedMixCount = 0;
+            int scheduledCount = 0;
+            {
+                juce::ScopedLock lock(pluginLock);
+                if (slotMixesVar.isArray())
+                {
+                    auto* slotMixesArray = slotMixesVar.getArray();
+                    for (const auto& slotVar : *slotMixesArray)
+                    {
+                        auto* slotObject = slotVar.getDynamicObject();
+                        if (slotObject == nullptr)
+                            continue;
+
+                        const auto slotIndex = static_cast<int>(slotObject->hasProperty("slot_index")
+                            ? slotObject->getProperty("slot_index")
+                            : juce::var(-1));
+                        if (!juce::isPositiveAndBelow(slotIndex, static_cast<int>(persistentGraphSlots.size())))
+                            return makeResponse(false, "Graph slot not loaded");
+
+                        auto& slot = persistentGraphSlots[static_cast<size_t>(slotIndex)];
+                        if (slot.plugin == nullptr)
+                            return makeResponse(false, "Graph slot not loaded");
+
+                        const auto gain = slotObject->hasProperty("gain")
+                            ? static_cast<float>(static_cast<double>(slotObject->getProperty("gain")))
+                            : slot.gain;
+                        const auto pan = slotObject->hasProperty("pan")
+                            ? static_cast<float>(static_cast<double>(slotObject->getProperty("pan")))
+                            : slot.pan;
+
+                        slot.gain = juce::jmax(0.0f, gain);
+                        slot.pan = juce::jlimit(-1.0f, 1.0f, pan);
+                        ++updatedMixCount;
+                    }
+                }
+
+                if (resetSlotsVar.isArray())
+                {
+                    if (!schedulePersistentGraphMidi(resetSlotsVar, baseOffsetFrames, scheduledCount, error))
+                        return makeResponse(false, error.isNotEmpty() ? error : "Could not update graph transport state");
+                }
+            }
+
+            auto response = makeResponse(true, "Graph transport state updated");
+            appendStatusFields(response);
+            setResponseField(response, "updated_slot_mix_count", updatedMixCount);
+            setResponseField(response, "scheduled_count", scheduledCount);
+            setResponseField(response, "base_offset_frames", static_cast<double>(baseOffsetFrames));
+            return response;
+        }
+
         if (command == "schedule_graph_midi")
         {
             const auto baseOffsetFrames = juce::jmax<int64_t>(
@@ -984,6 +1082,7 @@ private:
             if (!eventsVar.isArray())
                 return makeResponse(false, "schedule_midi requires an events array");
             const auto currentFrame = renderedSampleFrames.load();
+            const auto resetFrame = currentFrame + baseOffsetFrames;
             juce::Array<int> resetChannels;
 
             if (clearChannelsVar.isArray())
@@ -993,7 +1092,7 @@ private:
                     for (const auto& channelVar : *clearArray)
                     {
                         const auto channel = clampMidiChannel(static_cast<int>(channelVar));
-                        clearScheduledMidiEvents(channel, loopEpoch);
+                        clearScheduledMidiEvents(channel, loopEpoch, resetFrame);
                     }
                 }
             }
@@ -1005,7 +1104,7 @@ private:
                     for (const auto& channelVar : *resetArray)
                     {
                         const auto channel = clampMidiChannel(static_cast<int>(channelVar));
-                        clearScheduledMidiEvents(channel, loopEpoch);
+                        clearScheduledMidiEvents(channel, loopEpoch, resetFrame);
                         resetChannels.addIfNotAlreadyThere(channel);
                     }
                 }
@@ -1016,7 +1115,7 @@ private:
             {
                 juce::ScopedLock lock(scheduledMidiLock);
                 for (const auto channel : resetChannels)
-                    scheduledCount += appendScheduledPanicEvents(scheduledMidiEvents, channel, currentFrame + baseOffsetFrames, loopEpoch);
+                    scheduledCount += appendScheduledPanicEvents(scheduledMidiEvents, channel, resetFrame, loopEpoch);
                 for (const auto& eventVar : *array)
                 {
                     auto* eventObject = eventVar.getDynamicObject();
@@ -1033,6 +1132,20 @@ private:
                     const auto velocity = clampMidiVelocity(static_cast<float>(eventObject->hasProperty("velocity")
                                                                                   ? static_cast<double>(eventObject->getProperty("velocity"))
                                                                                   : 0.0));
+                    const auto controller = juce::jlimit(
+                        0,
+                        127,
+                        static_cast<int>(eventObject->hasProperty("control")
+                            ? eventObject->getProperty("control")
+                            : juce::var(0))
+                    );
+                    const auto controllerValue = juce::jlimit(
+                        0,
+                        127,
+                        static_cast<int>(eventObject->hasProperty("value")
+                            ? eventObject->getProperty("value")
+                            : juce::var(0))
+                    );
                     const auto sampleOffset = juce::jmax<int64_t>(
                         0,
                         static_cast<int64_t>(eventObject->hasProperty("sample_offset")
@@ -1048,6 +1161,8 @@ private:
                         message = juce::MidiMessage::noteOn(channel, note, velocity);
                     else if (type == "note_off")
                         message = juce::MidiMessage::noteOff(channel, note, velocity);
+                    else if (type == "control_change")
+                        message = juce::MidiMessage::controllerEvent(channel, controller, controllerValue);
                     else
                         continue;
 
@@ -1065,6 +1180,9 @@ private:
                                 return existing.message.getNoteNumber() == message.getNoteNumber();
                             if (existing.message.isNoteOff() && message.isNoteOff())
                                 return existing.message.getNoteNumber() == message.getNoteNumber();
+                            if (existing.message.isController() && message.isController())
+                                return existing.message.getControllerNumber() == message.getControllerNumber()
+                                    && existing.message.getControllerValue() == message.getControllerValue();
                             return false;
                         }
                     );
@@ -1846,12 +1964,9 @@ private:
         {
             if (event.frame < blockStart)
             {
-                if (! event.message.isNoteOn())
-                {
-                    auto lateEvent = event;
-                    lateEvent.frame = blockStart;
-                    ready.add(lateEvent);
-                }
+                auto lateEvent = event;
+                lateEvent.frame = blockStart;
+                ready.add(lateEvent);
             }
             else if (event.frame < blockEnd)
             {
@@ -1882,7 +1997,9 @@ private:
         }
     }
 
-    void clearScheduledMidiEvents(int channel = 0, int64_t beforeLoopEpoch = -1)
+    void clearScheduledMidiEvents(int channel = 0,
+                                  int64_t beforeLoopEpoch = -1,
+                                  int64_t minFrame = -1)
     {
         juce::ScopedLock lock(scheduledMidiLock);
         if (channel <= 0)
@@ -1897,7 +2014,9 @@ private:
         const auto targetChannel = clampMidiChannel(channel);
         for (const auto& event : scheduledMidiEvents)
         {
-            if (event.message.getChannel() != targetChannel || (beforeLoopEpoch >= 0 && event.loopEpoch >= beforeLoopEpoch))
+            if (event.message.getChannel() != targetChannel
+                || (beforeLoopEpoch >= 0 && event.loopEpoch >= beforeLoopEpoch)
+                || (minFrame >= 0 && event.frame < minFrame))
                 keep.add(event);
         }
         scheduledMidiEvents.swapWith(keep);
@@ -2540,7 +2659,8 @@ private:
 
     void clearPersistentGraphScheduledEvents(PersistentGraphSlot& slot,
                                              int channel = 0,
-                                             int64_t beforeLoopEpoch = -1)
+                                             int64_t beforeLoopEpoch = -1,
+                                             int64_t minFrame = -1)
     {
         if (channel <= 0)
         {
@@ -2553,7 +2673,8 @@ private:
         for (const auto& event : slot.scheduledEvents)
         {
             if (event.message.getChannel() != targetChannel
-                || (beforeLoopEpoch >= 0 && event.loopEpoch >= beforeLoopEpoch))
+                || (beforeLoopEpoch >= 0 && event.loopEpoch >= beforeLoopEpoch)
+                || (minFrame >= 0 && event.frame < minFrame))
             {
                 keep.add(event);
             }
@@ -2608,12 +2729,9 @@ private:
         {
             if (event.frame < blockStart)
             {
-                if (! event.message.isNoteOn())
-                {
-                    auto lateEvent = event;
-                    lateEvent.frame = blockStart;
-                    ready.add(lateEvent);
-                }
+                auto lateEvent = event;
+                lateEvent.frame = blockStart;
+                ready.add(lateEvent);
             }
             else if (event.frame < blockEnd)
             {
@@ -2657,6 +2775,7 @@ private:
         }
 
         const auto currentFrame = renderedSampleFrames.load();
+        const auto resetFrame = currentFrame + baseOffsetFrames;
         scheduledCount = 0;
 
         for (const auto& slotVar : *slotsArray)
@@ -2697,7 +2816,7 @@ private:
                 if (auto* clearArray = clearChannelsVar.getArray())
                 {
                     for (const auto& channelVar : *clearArray)
-                        clearPersistentGraphScheduledEvents(slot, static_cast<int>(channelVar), loopEpoch);
+                        clearPersistentGraphScheduledEvents(slot, static_cast<int>(channelVar), loopEpoch, resetFrame);
                 }
             }
 
@@ -2708,14 +2827,14 @@ private:
                     for (const auto& channelVar : *resetArray)
                     {
                         const auto channel = clampMidiChannel(static_cast<int>(channelVar));
-                        clearPersistentGraphScheduledEvents(slot, channel, loopEpoch);
+                        clearPersistentGraphScheduledEvents(slot, channel, loopEpoch, resetFrame);
                         resetChannels.addIfNotAlreadyThere(channel);
                     }
                 }
             }
 
             for (const auto channel : resetChannels)
-                scheduledCount += appendScheduledPanicEvents(slot.scheduledEvents, channel, currentFrame + baseOffsetFrames, loopEpoch);
+                scheduledCount += appendScheduledPanicEvents(slot.scheduledEvents, channel, resetFrame, loopEpoch);
 
             auto* eventsArray = eventsVar.getArray();
             if (eventsArray == nullptr)
@@ -2737,6 +2856,20 @@ private:
                 const auto velocity = clampMidiVelocity(static_cast<float>(eventObject->hasProperty("velocity")
                     ? static_cast<double>(eventObject->getProperty("velocity"))
                     : 0.0));
+                const auto controller = juce::jlimit(
+                    0,
+                    127,
+                    static_cast<int>(eventObject->hasProperty("control")
+                        ? eventObject->getProperty("control")
+                        : juce::var(0))
+                );
+                const auto controllerValue = juce::jlimit(
+                    0,
+                    127,
+                    static_cast<int>(eventObject->hasProperty("value")
+                        ? eventObject->getProperty("value")
+                        : juce::var(0))
+                );
                 const auto sampleOffset = juce::jmax<int64_t>(
                     0,
                     static_cast<int64_t>(eventObject->hasProperty("sample_offset")
@@ -2752,6 +2885,8 @@ private:
                     message = juce::MidiMessage::noteOn(channel, note, velocity);
                 else if (type == "note_off")
                     message = juce::MidiMessage::noteOff(channel, note, velocity);
+                else if (type == "control_change")
+                    message = juce::MidiMessage::controllerEvent(channel, controller, controllerValue);
                 else
                     continue;
 
@@ -2769,6 +2904,9 @@ private:
                             return existing.message.getNoteNumber() == message.getNoteNumber();
                         if (existing.message.isNoteOff() && message.isNoteOff())
                             return existing.message.getNoteNumber() == message.getNoteNumber();
+                        if (existing.message.isController() && message.isController())
+                            return existing.message.getControllerNumber() == message.getControllerNumber()
+                                && existing.message.getControllerValue() == message.getControllerValue();
                         return false;
                     }
                 );
@@ -3192,6 +3330,20 @@ private:
                     const auto velocity = clampMidiVelocity(static_cast<float>(
                         eventObject->hasProperty("velocity") ? static_cast<double>(eventObject->getProperty("velocity")) : 0.0
                     ));
+                    const auto controller = juce::jlimit(
+                        0,
+                        127,
+                        static_cast<int>(eventObject->hasProperty("control")
+                            ? eventObject->getProperty("control")
+                            : juce::var(0))
+                    );
+                    const auto controllerValue = juce::jlimit(
+                        0,
+                        127,
+                        static_cast<int>(eventObject->hasProperty("value")
+                            ? eventObject->getProperty("value")
+                            : juce::var(0))
+                    );
                     const auto sampleOffset = juce::jlimit<int64_t>(
                         0,
                         juce::jmax<int64_t>(0, numSamples - 1),
@@ -3208,6 +3360,8 @@ private:
                         message = juce::MidiMessage::noteOn(channel, note, velocity);
                     else if (type == "note_off")
                         message = juce::MidiMessage::noteOff(channel, note, velocity);
+                    else if (type == "control_change")
+                        message = juce::MidiMessage::controllerEvent(channel, controller, controllerValue);
                     else
                         continue;
 
