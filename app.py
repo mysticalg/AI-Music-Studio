@@ -8998,13 +8998,15 @@ class MainWindow(QtWidgets.QMainWindow):
             start_frame,
             frame_count,
             bootstrap_active=bool(state.instrument_reset_pending or state.loop_bootstrap_pending),
+            loop_restart_active=bool(state.loop_bootstrap_pending),
         )
         queued_output_frames = max(0, int(lead_frames)) + max(0, int(output_offset_frames))
         target_channel = int(clamp(track.midi_channel, 0, 15)) + 1
+        # A normal loop wrap already schedules fresh MIDI for the new epoch.
+        # Forcing an all-notes-off at the same frame can click on some VSTs.
         reset_channels = [target_channel] if (
             state.instrument_reset_pending
             or state.native_host_epoch_flush_pending
-            or state.loop_bootstrap_pending
         ) else None
         if not self._schedule_native_vst_host_messages(
             idx,
@@ -9049,6 +9051,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 start_frame,
                 frame_count,
                 bootstrap_active=bool(state.instrument_reset_pending or state.loop_bootstrap_pending),
+                loop_restart_active=bool(state.loop_bootstrap_pending),
             )
             payload_events: list[dict[str, object]] = []
             for offset, order, msg in events:
@@ -9059,10 +9062,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 encoded['priority'] = int(order)
                 payload_events.append(encoded)
             target_channel = int(clamp(track.midi_channel, 0, 15)) + 1
+            # Keep true resets for startup/edit flushes, but avoid per-loop
+            # panic bursts that can distort the first note after wrap.
             reset_channels = [target_channel] if (
                 state.instrument_reset_pending
                 or state.native_host_epoch_flush_pending
-                or state.loop_bootstrap_pending
             ) else None
             if not payload_events and not reset_channels:
                 state.native_host_scheduled_until_frame = max(0, int(start_frame) + max(1, int(frame_count)))
@@ -9113,22 +9117,22 @@ class MainWindow(QtWidgets.QMainWindow):
         if current_frame > int(self._graph_native_transport_output_cursor_frame):
             advanced_frames = int(current_frame - int(self._graph_native_transport_output_cursor_frame))
             self._graph_native_transport_output_cursor_frame = int(current_frame)
+            next_logical_frame, loop_start, loop_end, wraps = self._advance_native_transport_logical_frame(
+                int(self._graph_native_transport_logical_frame),
+                advanced_frames,
+                int(self._graph_native_transport_loop_start_frame),
+                int(self._graph_native_transport_loop_end_frame),
+            )
+            self._graph_native_transport_logical_frame = int(next_logical_frame)
             if self.project.loop_enabled:
-                loop_start = int(self._graph_native_transport_loop_start_frame)
-                loop_end = int(self._graph_native_transport_loop_end_frame)
-                if loop_end <= loop_start:
-                    loop_start, loop_end = self._loop_frame_bounds()
-                    self._graph_native_transport_loop_start_frame = int(loop_start)
-                    self._graph_native_transport_loop_end_frame = int(loop_end)
-                loop_length = max(1, int(loop_end - loop_start))
-                logical_start = int(self._graph_native_transport_logical_frame)
-                if logical_start < loop_start or logical_start >= loop_end:
-                    logical_start = loop_start
-                self._graph_native_transport_logical_frame = int(
-                    loop_start + ((logical_start - loop_start + advanced_frames) % loop_length)
-                )
-            else:
-                self._graph_native_transport_logical_frame = int(self._graph_native_transport_logical_frame) + int(advanced_frames)
+                self._graph_native_transport_loop_start_frame = int(loop_start)
+                self._graph_native_transport_loop_end_frame = int(loop_end)
+                if wraps > 0:
+                    restart_states = [
+                        self._realtime_track_state(row, track)
+                        for _slot_index, row, track, _entry in slot_tracks
+                    ]
+                    self._mark_transport_states_for_loop_restart(restart_states, wraps=wraps)
 
         solo_tracks = self._active_solo_track_indices()
         audible_slot_tracks = [
@@ -9147,10 +9151,18 @@ class MainWindow(QtWidgets.QMainWindow):
             0,
             int(getattr(self, '_graph_native_transport_schedule_padding_frames', 0) or 0),
         )
-        target_ahead_frames = int(
+        base_target_ahead_frames = int(
             max(
                 self._playback_chunk_frames * 4,
                 self._shared_native_output_queue_target_frames(source_status),
+            )
+        )
+        target_ahead_frames = int(
+            self._native_transport_target_ahead_frames(
+                base_target_ahead_frames,
+                int(self._graph_native_transport_logical_frame),
+                int(self._graph_native_transport_loop_start_frame),
+                int(self._graph_native_transport_loop_end_frame),
             )
         )
         target_output_frame = current_frame + target_ahead_frames + startup_padding_frames
@@ -9603,6 +9615,51 @@ class MainWindow(QtWidgets.QMainWindow):
             state.native_host_loop_epoch += 1
             self._clear_realtime_track_window_cache(state)
         self._clear_realtime_mix_cache()
+
+    def _mark_transport_states_for_loop_restart(
+        self,
+        states: list[RealtimeTrackPlaybackState],
+        *,
+        wraps: int = 1,
+    ) -> None:
+        wrap_count = max(1, int(wraps))
+        changed = False
+        for state in states:
+            if state is None:
+                continue
+            state.loop_bootstrap_pending = True
+            state.native_host_epoch_flush_pending = False
+            state.native_host_scheduled_until_frame = -1
+            state.native_host_loop_epoch += wrap_count
+            self._clear_realtime_track_window_cache(state)
+            changed = True
+        if changed:
+            self._clear_realtime_mix_cache()
+
+    def _advance_native_transport_logical_frame(
+        self,
+        logical_frame: int,
+        advanced_frames: int,
+        loop_start_frame: int,
+        loop_end_frame: int,
+    ) -> tuple[int, int, int, int]:
+        frames = max(0, int(advanced_frames))
+        loop_start = int(loop_start_frame)
+        loop_end = int(loop_end_frame)
+        if not self.project.loop_enabled or frames <= 0:
+            return int(logical_frame) + frames, loop_start, loop_end, 0
+        if loop_end <= loop_start:
+            loop_start, loop_end = self._loop_frame_bounds()
+        loop_length = max(0, int(loop_end - loop_start))
+        if loop_length <= 0:
+            return int(logical_frame) + frames, loop_start, loop_end, 0
+        start_frame = int(logical_frame)
+        if start_frame < loop_start or start_frame >= loop_end:
+            start_frame = loop_start
+        offset = max(0, int(start_frame - loop_start))
+        total = offset + frames
+        wraps = int(total // loop_length)
+        return loop_start + (total % loop_length), loop_start, loop_end, wraps
 
     def _prioritize_note_offs_for_edit(self) -> None:
         if not bool(hasattr(self, 'playback_timer') and self.playback_timer.isActive()):
@@ -10818,6 +10875,7 @@ class MainWindow(QtWidgets.QMainWindow):
         frame_count: int,
         *,
         bootstrap_active: bool,
+        loop_restart_active: bool = False,
     ) -> list[tuple[int, int, mido.Message]]:
         chunk_start_frame = max(0, int(start_frame))
         chunk_frame_count = max(1, int(frame_count))
@@ -10828,6 +10886,7 @@ class MainWindow(QtWidgets.QMainWindow):
             _loop_start_frame, computed_loop_end_frame = self._loop_frame_bounds()
             loop_end_frame = int(computed_loop_end_frame)
         events: list[tuple[int, int, mido.Message]] = []
+        loop_restart_releases: set[tuple[int, int]] = set()
 
         note_off_advance_frames = 1
         for note in track.notes:
@@ -10856,6 +10915,23 @@ class MainWindow(QtWidgets.QMainWindow):
                 ))
             elif chunk_start_frame <= note_start_frame < chunk_end_frame:
                 note_on_offset = note_start_frame - chunk_start_frame
+                note_key = (
+                    int(clamp(track.midi_channel, 0, 15)),
+                    int(clamp(note.pitch, 0, 127)),
+                )
+                if loop_restart_active and note_on_offset == 0 and note_key not in loop_restart_releases:
+                    loop_restart_releases.add(note_key)
+                    events.append((
+                        0,
+                        0,
+                        mido.Message(
+                            'note_off',
+                            channel=note_key[0],
+                            note=note_key[1],
+                            velocity=0,
+                            time=0.0,
+                        )
+                    ))
                 events.append((
                     note_on_offset,
                     2,
@@ -11346,6 +11422,39 @@ class MainWindow(QtWidgets.QMainWindow):
     def _current_audible_playback_sec(self) -> float:
         return self._transport_tick_to_seconds(self._current_audible_playback_tick())
 
+    def _native_transport_target_ahead_frames(
+        self,
+        base_target_frames: int,
+        logical_start_frame: int,
+        loop_start_frame: int,
+        loop_end_frame: int,
+    ) -> int:
+        target = max(1, int(base_target_frames))
+        if not self.project.loop_enabled:
+            return target
+        loop_start = int(loop_start_frame)
+        loop_end = int(loop_end_frame)
+        if loop_end <= loop_start:
+            loop_start, loop_end = self._loop_frame_bounds()
+        loop_length = max(0, int(loop_end - loop_start))
+        if loop_length <= 0:
+            return target
+        logical_frame = int(logical_start_frame)
+        if logical_frame < loop_start or logical_frame >= loop_end:
+            logical_frame = loop_start
+        max_guard_frames = max(target, 131072)
+        frames_until_wrap = max(1, int(loop_end - logical_frame))
+        if frames_until_wrap > max_guard_frames:
+            return target
+        post_wrap_frames = max(
+            self._playback_chunk_frames * 4,
+            min(loop_length, self._playback_chunk_frames * 8),
+        )
+        return max(
+            target,
+            min(max_guard_frames, frames_until_wrap + int(post_wrap_frames)),
+        )
+
     def _current_audible_playback_tick(self) -> int:
         if not getattr(self, '_playback_active', False):
             return int(self.project.playhead_tick)
@@ -11827,15 +11936,37 @@ class MainWindow(QtWidgets.QMainWindow):
                 raise RuntimeError('Direct native transport bridge is unavailable')
 
             current_frame = self._native_output_rendered_sample_frames(status)
+            if current_frame > int(self._direct_native_transport_output_cursor_frame):
+                advanced_frames = int(current_frame - int(self._direct_native_transport_output_cursor_frame))
+                self._direct_native_transport_output_cursor_frame = int(current_frame)
+                next_logical_frame, loop_start, loop_end, wraps = self._advance_native_transport_logical_frame(
+                    int(self._direct_native_transport_logical_frame),
+                    advanced_frames,
+                    int(self._direct_native_transport_loop_start_frame),
+                    int(self._direct_native_transport_loop_end_frame),
+                )
+                self._direct_native_transport_logical_frame = int(next_logical_frame)
+                if self.project.loop_enabled:
+                    self._direct_native_transport_loop_start_frame = int(loop_start)
+                    self._direct_native_transport_loop_end_frame = int(loop_end)
+                    if wraps > 0:
+                        state = self._realtime_track_state(row, track)
+                        self._mark_transport_states_for_loop_restart([state], wraps=wraps)
             lead_frames = int(getattr(self, '_direct_native_transport_lead_frames', 0) or self._native_output_scheduling_lead_frames(bridge, status))
             startup_padding_frames = max(
                 0,
                 int(getattr(self, '_direct_native_transport_schedule_padding_frames', 0) or 0),
             )
-            target_ahead_frames = int(max(
+            base_target_ahead_frames = int(max(
                 self._playback_chunk_frames * 4,
                 self._desired_audio_buffer_frames() * 2,
             ))
+            target_ahead_frames = self._native_transport_target_ahead_frames(
+                base_target_ahead_frames,
+                int(self._direct_native_transport_logical_frame),
+                int(self._direct_native_transport_loop_start_frame),
+                int(self._direct_native_transport_loop_end_frame),
+            )
             target_output_frame = current_frame + target_ahead_frames + startup_padding_frames
             state = self._realtime_track_state(row, track)
             if self._realtime_reset_pending:
