@@ -40,16 +40,20 @@ class _InProcessHostBackend:
         self,
         plugin_path: str | None = None,
         *,
+        restore_last_plugin_on_startup: bool = True,
         open_editor: bool = False,
         sample_rate: int | None = None,
         buffer_size: int | None = None,
         audio_device_type: str | None = None,
+        audio_output_device_name: str | None = None,
     ) -> None:
         self.plugin_path = plugin_path
+        self.restore_last_plugin_on_startup = bool(restore_last_plugin_on_startup)
         self.open_editor = bool(open_editor)
         self.sample_rate = int(sample_rate) if sample_rate else 0
         self.buffer_size = int(buffer_size) if buffer_size else 0
         self.audio_device_type = str(audio_device_type or "").strip()
+        self.audio_output_device_name = str(audio_output_device_name or "").strip()
         self.handle: int | None = None
         self.process = self
 
@@ -66,8 +70,11 @@ class _InProcessHostBackend:
             dll.aims_vst_host_create.argtypes = [
                 ctypes.c_char_p,
                 ctypes.c_int,
+                ctypes.c_int,
                 ctypes.c_double,
                 ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_char_p,
                 ctypes.c_char_p,
                 ctypes.c_int,
             ]
@@ -89,9 +96,12 @@ class _InProcessHostBackend:
         error_buffer = ctypes.create_string_buffer(4096)
         handle = dll.aims_vst_host_create(
             (self.plugin_path or "").encode("utf-8"),
+            int(self.restore_last_plugin_on_startup),
             int(self.open_editor),
             float(self.sample_rate),
             int(self.buffer_size),
+            self.audio_device_type.encode("utf-8"),
+            self.audio_output_device_name.encode("utf-8"),
             error_buffer,
             len(error_buffer),
         )
@@ -152,21 +162,25 @@ class _SubprocessHostBackend:
         plugin_path: str | None = None,
         *,
         port: int | None = None,
+        restore_last_plugin_on_startup: bool = True,
         open_editor: bool = False,
         bridge_mode: bool = True,
         hidden: bool = True,
         sample_rate: int | None = None,
         buffer_size: int | None = None,
         audio_device_type: str | None = None,
+        audio_output_device_name: str | None = None,
     ) -> None:
         self.plugin_path = plugin_path
         self.port = port or _find_free_port()
+        self.restore_last_plugin_on_startup = bool(restore_last_plugin_on_startup)
         self.open_editor = open_editor
         self.bridge_mode = bool(bridge_mode)
         self.hidden = bool(hidden)
         self.sample_rate = int(sample_rate) if sample_rate else 0
         self.buffer_size = int(buffer_size) if buffer_size else 0
         self.audio_device_type = str(audio_device_type or "").strip()
+        self.audio_output_device_name = str(audio_output_device_name or "").strip()
         self.process: subprocess.Popen[str] | None = None
         self._socket: socket.socket | None = None
         self._recv_buffer = bytearray()
@@ -184,12 +198,16 @@ class _SubprocessHostBackend:
             args.append("--hidden")
         if self.plugin_path:
             args.extend(["--plugin", self.plugin_path])
+        elif not self.restore_last_plugin_on_startup:
+            args.append("--no-restore-last-plugin")
         if self.sample_rate > 0:
             args.extend(["--sample-rate", str(self.sample_rate)])
         if self.buffer_size > 0:
             args.extend(["--buffer-size", str(self.buffer_size)])
         if self.audio_device_type:
             args.extend(["--audio-device-type", self.audio_device_type])
+        if self.audio_output_device_name:
+            args.extend(["--audio-output-device", self.audio_output_device_name])
         if self.open_editor:
             args.append("--open-editor")
 
@@ -305,21 +323,25 @@ class NativeVstHostBridge:
         plugin_path: str | None = None,
         *,
         port: int | None = None,
+        restore_last_plugin_on_startup: bool = True,
         open_editor: bool = False,
         bridge_mode: bool = True,
         hidden: bool = True,
         sample_rate: int | None = None,
         buffer_size: int | None = None,
         audio_device_type: str | None = None,
+        audio_output_device_name: str | None = None,
     ) -> None:
         self.plugin_path = plugin_path
         self.port = port or _find_free_port()
+        self.restore_last_plugin_on_startup = bool(restore_last_plugin_on_startup)
         self.open_editor = open_editor
         self.bridge_mode = bool(bridge_mode)
         self.hidden = bool(hidden)
         self.sample_rate = int(sample_rate) if sample_rate else 0
         self.buffer_size = int(buffer_size) if buffer_size else 0
         self.audio_device_type = str(audio_device_type or "").strip()
+        self.audio_output_device_name = str(audio_output_device_name or "").strip()
         self._backend: _InProcessHostBackend | _SubprocessHostBackend | None = None
         self.process: Any = None
         self.in_process = False
@@ -333,21 +355,25 @@ class NativeVstHostBridge:
         if use_in_process:
             backend: _InProcessHostBackend | _SubprocessHostBackend = _InProcessHostBackend(
                 self.plugin_path,
+                restore_last_plugin_on_startup=self.restore_last_plugin_on_startup,
                 open_editor=self.open_editor,
                 sample_rate=self.sample_rate,
                 buffer_size=self.buffer_size,
                 audio_device_type=self.audio_device_type,
+                audio_output_device_name=self.audio_output_device_name,
             )
         else:
             backend = _SubprocessHostBackend(
                 self.plugin_path,
                 port=self.port,
+                restore_last_plugin_on_startup=self.restore_last_plugin_on_startup,
                 open_editor=self.open_editor,
                 bridge_mode=self.bridge_mode,
                 hidden=self.hidden,
                 sample_rate=self.sample_rate,
                 buffer_size=self.buffer_size,
                 audio_device_type=self.audio_device_type,
+                audio_output_device_name=self.audio_output_device_name,
             )
         backend.start(startup_timeout=startup_timeout)
         self._backend = backend

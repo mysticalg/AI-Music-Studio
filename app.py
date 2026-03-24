@@ -28,7 +28,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import mido
-from PySide6 import QtCore, QtGui, QtMultimedia, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 try:
     import shiboken6
 except Exception:
@@ -58,6 +58,11 @@ PITCH_MAX = 84
 BLACK_KEY_PITCH_CLASSES = {1, 3, 6, 8, 10}
 OPENAI_API_URL = "https://api.openai.com/v1/responses"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-codex")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434"))
+PCM_SAMPLE_FORMAT_UINT8 = "uint8"
+PCM_SAMPLE_FORMAT_INT16 = "int16"
+PCM_SAMPLE_FORMAT_INT32 = "int32"
+PCM_SAMPLE_FORMAT_FLOAT = "float32"
 APP_NAME = "AI Music Studio"
 PROJECT_FILE_EXTENSION = ".aims"
 PROJECT_FILE_FILTER = "AI Music Studio Project (*.aims);;JSON files (*.json);;All files (*)"
@@ -739,36 +744,23 @@ def encode_wav_samples(samples: object, sample_rate: int = 44100) -> bytes:
     return buffer.getvalue()
 
 
-def qaudio_sample_format_label(sample_format) -> str:
+def pcm_sample_format_label(sample_format: str | object) -> str:
     labels = {
-        QtMultimedia.QAudioFormat.SampleFormat.UInt8: "8-bit Unsigned",
-        QtMultimedia.QAudioFormat.SampleFormat.Int16: "16-bit Integer",
-        QtMultimedia.QAudioFormat.SampleFormat.Int32: "32-bit Integer",
-        QtMultimedia.QAudioFormat.SampleFormat.Float: "32-bit Float",
+        PCM_SAMPLE_FORMAT_UINT8: "8-bit Unsigned",
+        PCM_SAMPLE_FORMAT_INT16: "16-bit Integer",
+        PCM_SAMPLE_FORMAT_INT32: "32-bit Integer",
+        PCM_SAMPLE_FORMAT_FLOAT: "32-bit Float",
     }
-    return labels.get(sample_format, "Unknown")
+    return labels.get(str(sample_format or "").strip().casefold(), "Unknown")
 
 
-def qaudio_sample_format_bytes(sample_format) -> int:
+def pcm_sample_format_bytes(sample_format: str | object) -> int:
     return {
-        QtMultimedia.QAudioFormat.SampleFormat.UInt8: 1,
-        QtMultimedia.QAudioFormat.SampleFormat.Int16: 2,
-        QtMultimedia.QAudioFormat.SampleFormat.Int32: 4,
-        QtMultimedia.QAudioFormat.SampleFormat.Float: 4,
-    }.get(sample_format, 2)
-
-
-def qaudio_sample_format_from_name(name: str | object):
-    if not name:
-        return None
-    key = str(name).strip().upper()
-    mapping = {
-        "UINT8": QtMultimedia.QAudioFormat.SampleFormat.UInt8,
-        "INT16": QtMultimedia.QAudioFormat.SampleFormat.Int16,
-        "INT32": QtMultimedia.QAudioFormat.SampleFormat.Int32,
-        "FLOAT": QtMultimedia.QAudioFormat.SampleFormat.Float,
-    }
-    return mapping.get(key)
+        PCM_SAMPLE_FORMAT_UINT8: 1,
+        PCM_SAMPLE_FORMAT_INT16: 2,
+        PCM_SAMPLE_FORMAT_INT32: 4,
+        PCM_SAMPLE_FORMAT_FLOAT: 4,
+    }.get(str(sample_format or "").strip().casefold(), 2)
 
 
 def encode_pcm_output_samples(
@@ -810,12 +802,12 @@ def encode_pcm_output_samples(
             for ch in range(2, channels):
                 interleaved[:, ch] = left if (ch % 2) == 0 else right
 
-        if sample_format == QtMultimedia.QAudioFormat.SampleFormat.UInt8:
+        if sample_format == PCM_SAMPLE_FORMAT_UINT8:
             encoded = np.clip((interleaved * 127.5) + 127.5, 0.0, 255.0).astype(np.uint8, copy=False)
             return encoded.tobytes()
-        if sample_format == QtMultimedia.QAudioFormat.SampleFormat.Int32:
+        if sample_format == PCM_SAMPLE_FORMAT_INT32:
             return (interleaved * 2147483647.0).astype("<i4", copy=False).tobytes()
-        if sample_format == QtMultimedia.QAudioFormat.SampleFormat.Float:
+        if sample_format == PCM_SAMPLE_FORMAT_FLOAT:
             return interleaved.astype("<f4", copy=False).tobytes()
         return (interleaved * 32767.0).astype("<i2", copy=False).tobytes()
 
@@ -843,19 +835,15 @@ def encode_pcm_output_samples(
             for ch in range(2, channels):
                 values.append(left if (ch % 2) == 0 else right)
         for value in values:
-            if sample_format == QtMultimedia.QAudioFormat.SampleFormat.UInt8:
+            if sample_format == PCM_SAMPLE_FORMAT_UINT8:
                 frames.extend(struct.pack("<B", int(clamp((value * 127.5) + 127.5, 0.0, 255.0))))
-            elif sample_format == QtMultimedia.QAudioFormat.SampleFormat.Int32:
+            elif sample_format == PCM_SAMPLE_FORMAT_INT32:
                 frames.extend(struct.pack("<i", int(clamp(value, -1.0, 1.0) * 2147483647)))
-            elif sample_format == QtMultimedia.QAudioFormat.SampleFormat.Float:
+            elif sample_format == PCM_SAMPLE_FORMAT_FLOAT:
                 frames.extend(struct.pack("<f", clamp(value, -1.0, 1.0)))
             else:
                 frames.extend(struct.pack("<h", int(clamp(value, -1.0, 1.0) * 32767)))
     return bytes(frames)
-
-
-def encode_pcm16_stereo_samples(samples: object) -> bytes:
-    return encode_pcm_output_samples(samples, QtMultimedia.QAudioFormat.SampleFormat.Int16, 2)
 
 
 @dataclasses.dataclass
@@ -1014,27 +1002,71 @@ class ProjectState:
         self.playhead_sec = tick_to_seconds(self.playhead_tick, self.bpm)
 
 
-class OpenAIClient:
-    AUTH_PATH = Path('.openai_auth.json')
+class AIClient:
+    AUTH_PATH = APP_DATA_DIR / 'ai_auth.json'
+    LEGACY_AUTH_PATHS = [Path('.ai_auth.json'), Path('.openai_auth.json')]
+    PROVIDER_OPENAI = 'openai'
+    PROVIDER_OLLAMA = 'ollama'
 
     def __init__(self) -> None:
+        self.provider = self.PROVIDER_OPENAI
+        self.remote_model = str(OPENAI_MODEL or 'gpt-5-codex').strip()
+        self.ollama_base_url = self._normalize_ollama_base_url(OLLAMA_BASE_URL)
+        self.ollama_model = ''
         self.api_key = os.getenv("OPENAI_API_KEY", "")
         self.oauth_access_token = ""
         self.oauth_refresh_token = ""
         self.oauth_expires_at = 0.0
         self._load_saved_auth()
 
+    @classmethod
+    def _normalize_provider(cls, provider: object) -> str:
+        raw = str(provider or '').strip().lower()
+        if raw in {cls.PROVIDER_OLLAMA, 'local', 'ollama_local'}:
+            return cls.PROVIDER_OLLAMA
+        return cls.PROVIDER_OPENAI
+
+    @staticmethod
+    def _normalize_ollama_base_url(base_url: object) -> str:
+        raw = str(base_url or OLLAMA_BASE_URL or 'http://127.0.0.1:11434').strip()
+        if not raw:
+            raw = 'http://127.0.0.1:11434'
+        return raw.rstrip('/')
+
+    def apply_settings(
+        self,
+        *,
+        provider: object | None = None,
+        remote_model: object | None = None,
+        ollama_base_url: object | None = None,
+        ollama_model: object | None = None,
+    ) -> None:
+        if provider is not None:
+            self.provider = self._normalize_provider(provider)
+        if remote_model is not None:
+            value = str(remote_model or '').strip()
+            self.remote_model = value or str(OPENAI_MODEL or 'gpt-5-codex').strip()
+        if ollama_base_url is not None:
+            self.ollama_base_url = self._normalize_ollama_base_url(ollama_base_url)
+        if ollama_model is not None:
+            self.ollama_model = str(ollama_model or '').strip()
+
     def _load_saved_auth(self) -> None:
-        if not self.AUTH_PATH.exists():
+        search_paths = [self.AUTH_PATH, *self.LEGACY_AUTH_PATHS]
+        for path in search_paths:
+            if not path.exists():
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding='utf-8'))
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            self.api_key = str(payload.get('api_key', self.api_key) or self.api_key)
+            self.oauth_access_token = str(payload.get('oauth_access_token', '') or '')
+            self.oauth_refresh_token = str(payload.get('oauth_refresh_token', '') or '')
+            self.oauth_expires_at = float(payload.get('oauth_expires_at', 0.0) or 0.0)
             return
-        try:
-            payload = json.loads(self.AUTH_PATH.read_text())
-        except Exception:
-            return
-        self.api_key = payload.get('api_key', self.api_key)
-        self.oauth_access_token = payload.get('oauth_access_token', '')
-        self.oauth_refresh_token = payload.get('oauth_refresh_token', '')
-        self.oauth_expires_at = float(payload.get('oauth_expires_at', 0.0) or 0.0)
 
     def _save_auth(self) -> None:
         payload = {
@@ -1043,20 +1075,46 @@ class OpenAIClient:
             'oauth_refresh_token': self.oauth_refresh_token,
             'oauth_expires_at': self.oauth_expires_at,
         }
-        self.AUTH_PATH.write_text(json.dumps(payload, indent=2))
+        self.AUTH_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self.AUTH_PATH.write_text(json.dumps(payload, indent=2), encoding='utf-8')
 
     def is_enabled(self) -> bool:
+        if self.provider == self.PROVIDER_OLLAMA:
+            return bool(self.ollama_model and self.ollama_base_url)
         return bool(self.api_key or self.oauth_access_token)
 
+    def remote_model_choices(self) -> list[str]:
+        choices: list[str] = []
+        for value in (self.remote_model, os.getenv('OPENAI_MODEL', ''), 'gpt-5-codex'):
+            model_name = str(value or '').strip()
+            if model_name and model_name not in choices:
+                choices.append(model_name)
+        return choices
+
     def auth_status(self) -> str:
+        if self.provider == self.PROVIDER_OLLAMA:
+            if self.ollama_model:
+                return f'AI provider: Local Ollama ({self.ollama_model})'
+            return f'AI provider: Local Ollama at {self.ollama_base_url} (no model selected)'
         if self.oauth_access_token:
             if self.oauth_expires_at > time.time():
                 mins = int((self.oauth_expires_at - time.time()) / 60)
-                return f"OpenAI connected via OAuth (expires in ~{max(0, mins)} min)"
-            return "OpenAI connected via OAuth"
+                return f'AI provider: Remote OpenAI via OAuth (expires in ~{max(0, mins)} min)'
+            return 'AI provider: Remote OpenAI via OAuth'
         if self.api_key:
-            return "OpenAI connected via API key"
-        return "OpenAI not connected"
+            return 'AI provider: Remote OpenAI via API key'
+        return 'AI provider: Remote OpenAI not connected'
+
+    def set_provider(self, provider: object) -> None:
+        self.provider = self._normalize_provider(provider)
+
+    def set_remote_model(self, model: object) -> None:
+        self.remote_model = str(model or '').strip() or str(OPENAI_MODEL or 'gpt-5-codex').strip()
+
+    def set_ollama_connection(self, base_url: object, model: object | None = None) -> None:
+        self.ollama_base_url = self._normalize_ollama_base_url(base_url)
+        if model is not None:
+            self.ollama_model = str(model or '').strip()
 
     def set_api_key(self, api_key: str) -> None:
         self.api_key = api_key.strip()
@@ -1083,56 +1141,138 @@ class OpenAIClient:
         token = self.oauth_access_token or self.api_key
         return f"Bearer {token}"
 
-    def run_json_prompt(self, system_instruction: str, user_instruction: str) -> dict:
-        if not self.is_enabled():
-            raise RuntimeError("OpenAI is not connected. Use Settings > OpenAI to connect via API key or OAuth.")
+    def _request_json(
+        self,
+        url: str,
+        *,
+        payload: dict[str, object] | None = None,
+        headers: dict[str, str] | None = None,
+        method: str = 'POST',
+        timeout: int = 60,
+        error_prefix: str = 'AI request',
+    ) -> dict:
+        body = None if payload is None else json.dumps(payload).encode('utf-8')
+        request_headers = {'Content-Type': 'application/json'}
+        if headers:
+            request_headers.update(headers)
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers=request_headers,
+            method=method,
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                raw = response.read().decode('utf-8')
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode('utf-8', errors='ignore')
+            raise RuntimeError(f'{error_prefix} API error: {exc.code} {detail}') from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f'{error_prefix} network error: {exc}') from exc
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f'{error_prefix} returned invalid JSON: {raw[:300]}') from exc
+        if not isinstance(parsed, dict):
+            raise RuntimeError(f'{error_prefix} returned an unexpected response.')
+        return parsed
 
+    def _openai_run_json_prompt(self, system_instruction: str, user_instruction: str) -> dict:
+        if not (self.api_key or self.oauth_access_token):
+            raise RuntimeError('Remote OpenAI is not connected. Open Settings > AI > AI Settings to connect via API key or OAuth.')
         payload = {
-            "model": OPENAI_MODEL,
+            "model": self.remote_model or OPENAI_MODEL,
             "input": [
                 {"role": "system", "content": system_instruction},
                 {"role": "user", "content": user_instruction},
             ],
         }
-
-        req = urllib.request.Request(
+        result = self._request_json(
             OPENAI_API_URL,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": self._authorization_header(),
-                "Content-Type": "application/json",
-            },
-            method="POST",
+            payload=payload,
+            headers={"Authorization": self._authorization_header()},
+            method='POST',
+            timeout=60,
+            error_prefix='OpenAI',
         )
-
-        try:
-            with urllib.request.urlopen(req, timeout=60) as response:
-                raw = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="ignore")
-            raise RuntimeError(f"OpenAI API error: {exc.code} {detail}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"OpenAI network error: {exc}") from exc
-
-        result = json.loads(raw)
-        text = result.get("output_text", "").strip()
+        text = str(result.get("output_text", "") or '').strip()
         if not text:
             for item in result.get("output", []):
+                if not isinstance(item, dict):
+                    continue
                 for content in item.get("content", []):
-                    if content.get("type") == "output_text":
-                        text += content.get("text", "")
-
+                    if isinstance(content, dict) and content.get("type") == "output_text":
+                        text += str(content.get("text", "") or '')
         if not text:
             raise RuntimeError("No text returned by OpenAI response.")
-
         try:
             return json.loads(text)
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"Model response was not valid JSON: {text[:300]}") from exc
 
+    def _ollama_endpoint(self, endpoint: str, base_url: str | None = None) -> str:
+        target_base = self._normalize_ollama_base_url(base_url or self.ollama_base_url)
+        clean_endpoint = str(endpoint or '').strip().lstrip('/')
+        if not clean_endpoint:
+            clean_endpoint = 'api/tags'
+        if target_base.endswith('/api'):
+            return f'{target_base}/{clean_endpoint.removeprefix("api/")}'
+        return f'{target_base}/{clean_endpoint}'
 
-class OpenAIComposer:
-    def __init__(self, client: OpenAIClient) -> None:
+    def available_ollama_models(self, base_url: str | None = None) -> list[str]:
+        response = self._request_json(
+            self._ollama_endpoint('api/tags', base_url),
+            method='GET',
+            payload=None,
+            timeout=8,
+            error_prefix='Ollama',
+        )
+        models: list[str] = []
+        for raw_model in response.get('models', []):
+            if not isinstance(raw_model, dict):
+                continue
+            name = str(raw_model.get('name') or raw_model.get('model') or '').strip()
+            if name and name not in models:
+                models.append(name)
+        return models
+
+    def _ollama_run_json_prompt(self, system_instruction: str, user_instruction: str) -> dict:
+        model_name = str(self.ollama_model or '').strip()
+        if not model_name:
+            raise RuntimeError('Local Ollama model is not selected. Open Settings > AI > AI Settings and choose an Ollama model.')
+        payload = {
+            'model': model_name,
+            'messages': [
+                {'role': 'system', 'content': system_instruction},
+                {'role': 'user', 'content': user_instruction},
+            ],
+            'format': 'json',
+            'stream': False,
+        }
+        result = self._request_json(
+            self._ollama_endpoint('api/chat'),
+            payload=payload,
+            method='POST',
+            timeout=120,
+            error_prefix='Ollama',
+        )
+        message = result.get('message', {})
+        text = str(message.get('content', '') if isinstance(message, dict) else '').strip()
+        if not text:
+            raise RuntimeError('No text returned by Ollama response.')
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f'Model response was not valid JSON: {text[:300]}') from exc
+
+    def run_json_prompt(self, system_instruction: str, user_instruction: str) -> dict:
+        if self.provider == self.PROVIDER_OLLAMA:
+            return self._ollama_run_json_prompt(system_instruction, user_instruction)
+        return self._openai_run_json_prompt(system_instruction, user_instruction)
+
+
+class AIComposer:
+    def __init__(self, client: AIClient) -> None:
         self.client = client
 
     def compose(self, prompt: str, bars: int, bpm: int) -> dict:
@@ -1163,7 +1303,7 @@ class InstrumentIntelligence:
         "drums": "noise_kit",
     }
 
-    def __init__(self, client: OpenAIClient) -> None:
+    def __init__(self, client: AIClient) -> None:
         self.client = client
 
     def gm_instrument_name(self, program: int) -> str:
@@ -3995,7 +4135,7 @@ class SampleLibraryWidget(QtWidgets.QListWidget):
 class OpenAIConnectDialog(QtWidgets.QDialog):
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle('Connect OpenAI')
+        self.setWindowTitle('Connect Remote OpenAI')
         self.resize(620, 420)
         self.code_verifier = ''
 
@@ -4094,6 +4234,234 @@ class OpenAIConnectDialog(QtWidgets.QDialog):
         }
 
 
+class AISettingsDialog(QtWidgets.QDialog):
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle('AI Settings')
+        self.setModal(False)
+        self.setWindowFlag(QtCore.Qt.WindowType.Tool, True)
+        self.resize(720, 520)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(12)
+
+        intro = QtWidgets.QLabel(
+            'Choose whether AI features use a remote OpenAI model or a local Ollama model. '
+            'Compose, track assistance, and instrument classification all follow this selection.'
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        self.status_label = QtWidgets.QLabel()
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet('font-weight: 600;')
+        layout.addWidget(self.status_label)
+
+        provider_group = QtWidgets.QGroupBox('Provider')
+        provider_form = QtWidgets.QFormLayout(provider_group)
+        provider_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.provider_combo = QtWidgets.QComboBox()
+        self.provider_combo.addItem('Remote OpenAI', AIClient.PROVIDER_OPENAI)
+        self.provider_combo.addItem('Local Ollama', AIClient.PROVIDER_OLLAMA)
+        provider_form.addRow('Mode', self.provider_combo)
+        layout.addWidget(provider_group)
+
+        remote_group = QtWidgets.QGroupBox('Remote OpenAI')
+        remote_form = QtWidgets.QFormLayout(remote_group)
+        remote_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.remote_model_combo = QtWidgets.QComboBox()
+        self.remote_model_combo.setEditable(True)
+        self.remote_status_label = QtWidgets.QLabel()
+        self.remote_status_label.setWordWrap(True)
+        remote_button_row = QtWidgets.QHBoxLayout()
+        remote_button_row.setContentsMargins(0, 0, 0, 0)
+        self.connect_openai_btn = QtWidgets.QPushButton('Connect OpenAI...')
+        self.disconnect_openai_btn = QtWidgets.QPushButton('Disconnect')
+        remote_button_row.addWidget(self.connect_openai_btn)
+        remote_button_row.addWidget(self.disconnect_openai_btn)
+        remote_button_row.addStretch(1)
+        remote_buttons_widget = QtWidgets.QWidget()
+        remote_buttons_widget.setLayout(remote_button_row)
+        remote_form.addRow('Model', self.remote_model_combo)
+        remote_form.addRow('Connection', self.remote_status_label)
+        remote_form.addRow('', remote_buttons_widget)
+        layout.addWidget(remote_group)
+
+        local_group = QtWidgets.QGroupBox('Local Ollama')
+        local_form = QtWidgets.QFormLayout(local_group)
+        local_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.ollama_base_url_input = QtWidgets.QLineEdit()
+        self.ollama_model_combo = QtWidgets.QComboBox()
+        self.ollama_model_combo.setEditable(True)
+        self.refresh_ollama_models_btn = QtWidgets.QPushButton('Refresh Models')
+        self.ollama_status_label = QtWidgets.QLabel()
+        self.ollama_status_label.setWordWrap(True)
+        model_row = QtWidgets.QHBoxLayout()
+        model_row.setContentsMargins(0, 0, 0, 0)
+        model_row.addWidget(self.ollama_model_combo, 1)
+        model_row.addWidget(self.refresh_ollama_models_btn)
+        model_widget = QtWidgets.QWidget()
+        model_widget.setLayout(model_row)
+        hint_label = QtWidgets.QLabel('Uses GET /api/tags for model discovery and POST /api/chat for local AI responses.')
+        hint_label.setWordWrap(True)
+        hint_label.setStyleSheet('color: #9fb1c4; font-size: 11px;')
+        local_form.addRow('Endpoint', self.ollama_base_url_input)
+        local_form.addRow('Model', model_widget)
+        local_form.addRow('Status', self.ollama_status_label)
+        local_form.addRow('', hint_label)
+        layout.addWidget(local_group)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.close)
+        layout.addWidget(buttons)
+
+        self._remote_group = remote_group
+        self._local_group = local_group
+        self._ollama_model_names: list[str] = []
+
+        self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
+        self.remote_model_combo.currentTextChanged.connect(self._on_remote_model_changed)
+        if self.remote_model_combo.lineEdit() is not None:
+            self.remote_model_combo.lineEdit().editingFinished.connect(self._commit_remote_model)
+        self.connect_openai_btn.clicked.connect(self._on_connect_openai_clicked)
+        self.disconnect_openai_btn.clicked.connect(self._on_disconnect_openai_clicked)
+        self.ollama_base_url_input.editingFinished.connect(self._on_ollama_base_url_changed)
+        self.ollama_model_combo.currentTextChanged.connect(self._on_ollama_model_changed)
+        if self.ollama_model_combo.lineEdit() is not None:
+            self.ollama_model_combo.lineEdit().editingFinished.connect(self._commit_ollama_model)
+        self.refresh_ollama_models_btn.clicked.connect(self._on_refresh_ollama_models_clicked)
+
+    def _main_window(self) -> 'MainWindow | None':
+        parent = self.parent()
+        return parent if isinstance(parent, MainWindow) else None
+
+    @staticmethod
+    def _set_editable_combo_items(combo: QtWidgets.QComboBox, values: list[str], current_value: str) -> None:
+        blocker = QtCore.QSignalBlocker(combo)
+        combo.clear()
+        for value in values:
+            combo.addItem(value, value)
+        if combo.findText(current_value) < 0 and current_value:
+            combo.addItem(current_value, current_value)
+        combo.setCurrentText(current_value)
+        del blocker
+
+    def refresh_from_mainwindow(self, *, refresh_ollama_models: bool = False) -> None:
+        main_window = self._main_window()
+        if main_window is None:
+            return
+        client = main_window.ai_client
+        blocker = QtCore.QSignalBlocker(self.provider_combo)
+        index = self.provider_combo.findData(client.provider)
+        self.provider_combo.setCurrentIndex(index if index >= 0 else 0)
+        del blocker
+
+        self._set_editable_combo_items(self.remote_model_combo, client.remote_model_choices(), client.remote_model)
+        self.ollama_base_url_input.setText(client.ollama_base_url)
+
+        status_lines = [client.auth_status()]
+        if refresh_ollama_models:
+            try:
+                self._ollama_model_names = client.available_ollama_models(client.ollama_base_url)
+                if not client.ollama_model and self._ollama_model_names:
+                    main_window.set_ai_ollama_settings(client.ollama_base_url, self._ollama_model_names[0], save=True)
+                    client = main_window.ai_client
+                if self._ollama_model_names:
+                    self.ollama_status_label.setText(f'Connected to Ollama at {client.ollama_base_url}. {len(self._ollama_model_names)} model(s) available.')
+                else:
+                    self.ollama_status_label.setText(f'Connected to Ollama at {client.ollama_base_url}, but no models were reported.')
+            except Exception as exc:
+                self._ollama_model_names = []
+                self.ollama_status_label.setText(f'Could not query Ollama: {exc}')
+        elif not self._ollama_model_names:
+            self.ollama_status_label.setText(
+                f'Ollama endpoint: {client.ollama_base_url}. Click "Refresh Models" to populate local model choices.'
+            )
+
+        ollama_items = list(self._ollama_model_names)
+        if client.ollama_model and client.ollama_model not in ollama_items:
+            ollama_items.insert(0, client.ollama_model)
+        if not ollama_items:
+            ollama_items = ['']
+        self._set_editable_combo_items(self.ollama_model_combo, ollama_items, client.ollama_model)
+        if client.oauth_access_token:
+            self.remote_status_label.setText('Connected to remote OpenAI via OAuth.')
+        elif client.api_key:
+            self.remote_status_label.setText('Connected to remote OpenAI via API key.')
+        else:
+            self.remote_status_label.setText('Remote OpenAI is not connected yet. Use the buttons below if you want cloud AI responses.')
+        self.status_label.setText('\n'.join(status_lines))
+        is_remote = client.provider == AIClient.PROVIDER_OPENAI
+        self._remote_group.setEnabled(True)
+        self._local_group.setEnabled(True)
+        self._remote_group.setFlat(not is_remote)
+        self._local_group.setFlat(is_remote)
+
+    def _on_provider_changed(self, _index: int) -> None:
+        main_window = self._main_window()
+        if main_window is None:
+            return
+        main_window.set_ai_provider(self.provider_combo.currentData())
+        self.refresh_from_mainwindow(refresh_ollama_models=False)
+
+    def _commit_remote_model(self) -> None:
+        main_window = self._main_window()
+        if main_window is None:
+            return
+        main_window.set_ai_remote_model(self.remote_model_combo.currentText())
+        self.refresh_from_mainwindow(refresh_ollama_models=False)
+
+    def _on_remote_model_changed(self, _text: str) -> None:
+        main_window = self._main_window()
+        if main_window is None:
+            return
+        if self.remote_model_combo.currentText().strip():
+            main_window.set_ai_remote_model(self.remote_model_combo.currentText(), save=True)
+
+    def _on_connect_openai_clicked(self) -> None:
+        main_window = self._main_window()
+        if main_window is None:
+            return
+        main_window.connect_openai()
+        self.refresh_from_mainwindow(refresh_ollama_models=False)
+
+    def _on_disconnect_openai_clicked(self) -> None:
+        main_window = self._main_window()
+        if main_window is None:
+            return
+        main_window.disconnect_openai()
+        self.refresh_from_mainwindow(refresh_ollama_models=False)
+
+    def _on_ollama_base_url_changed(self) -> None:
+        main_window = self._main_window()
+        if main_window is None:
+            return
+        main_window.set_ai_ollama_settings(self.ollama_base_url_input.text(), self.ollama_model_combo.currentText(), save=True)
+        self.refresh_from_mainwindow(refresh_ollama_models=False)
+
+    def _commit_ollama_model(self) -> None:
+        main_window = self._main_window()
+        if main_window is None:
+            return
+        main_window.set_ai_ollama_settings(self.ollama_base_url_input.text(), self.ollama_model_combo.currentText(), save=True)
+        self.refresh_from_mainwindow(refresh_ollama_models=False)
+
+    def _on_ollama_model_changed(self, _text: str) -> None:
+        main_window = self._main_window()
+        if main_window is None:
+            return
+        if self.ollama_model_combo.currentText().strip():
+            main_window.set_ai_ollama_settings(self.ollama_base_url_input.text(), self.ollama_model_combo.currentText(), save=True)
+
+    def _on_refresh_ollama_models_clicked(self) -> None:
+        main_window = self._main_window()
+        if main_window is None:
+            return
+        main_window.set_ai_ollama_settings(self.ollama_base_url_input.text(), self.ollama_model_combo.currentText(), save=True)
+        self.refresh_from_mainwindow(refresh_ollama_models=True)
+
+
 class AudioSettingsDialog(QtWidgets.QDialog):
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -4108,7 +4476,7 @@ class AudioSettingsDialog(QtWidgets.QDialog):
         layout.setSpacing(12)
 
         intro = QtWidgets.QLabel(
-            'All playback and output settings live here so device, buffering, and timing preferences can be adjusted in one place.'
+            'All audible playback now runs through the JUCE engine, so device, sample rate, and buffer changes apply everywhere.'
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -4128,7 +4496,7 @@ class AudioSettingsDialog(QtWidgets.QDialog):
         body_layout.setContentsMargins(4, 4, 4, 4)
         body_layout.setSpacing(12)
 
-        output_group = QtWidgets.QGroupBox('Output Device')
+        output_group = QtWidgets.QGroupBox('JUCE Output')
         output_form = QtWidgets.QFormLayout(output_group)
         output_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.output_device_combo = QtWidgets.QComboBox()
@@ -4148,47 +4516,50 @@ class AudioSettingsDialog(QtWidgets.QDialog):
         output_form.addRow('Device', device_widget)
         output_form.addRow('Sample rate', self.output_sample_rate_combo)
         output_form.addRow('Bit depth / format', self.output_sample_format_combo)
-        output_form.addRow('Playback prebuffer target', self.output_latency_label)
-        output_form.addRow('Playback prebuffer', self.output_buffer_frames_label)
-        output_form.addRow('Driver block size', self.output_driver_block_label)
-        output_form.addRow('Playback queued ahead', self.output_queued_ahead_label)
+        self.audio_buffer_combo = QtWidgets.QComboBox()
+        output_form.addRow('Queue target', self.audio_buffer_combo)
+        output_form.addRow('Queue latency', self.output_latency_label)
+        output_form.addRow('Actual device buffer', self.output_buffer_frames_label)
+        output_form.addRow('Reported device block', self.output_driver_block_label)
+        output_form.addRow('Output queued ahead', self.output_queued_ahead_label)
         body_layout.addWidget(output_group)
 
-        playback_group = QtWidgets.QGroupBox('Playback')
+        playback_group = QtWidgets.QGroupBox('Transport UI')
         playback_form = QtWidgets.QFormLayout(playback_group)
         playback_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
-        self.audio_buffer_combo = QtWidgets.QComboBox()
         self.playhead_refresh_combo = QtWidgets.QComboBox()
         self.note_length_offset_spin = QtWidgets.QSpinBox()
         self.note_length_offset_spin.setRange(-480, 480)
         self.note_length_offset_spin.setSingleStep(1)
         self.note_length_offset_spin.setSuffix(' ticks')
-        playback_form.addRow('Playback prebuffer', self.audio_buffer_combo)
         playback_form.addRow('Playhead refresh', self.playhead_refresh_combo)
         playback_form.addRow('Note length offset', self.note_length_offset_spin)
         body_layout.addWidget(playback_group)
 
-        native_group = QtWidgets.QGroupBox('Native VST Host')
+        native_group = QtWidgets.QGroupBox('JUCE Host')
         native_form = QtWidgets.QFormLayout(native_group)
         native_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.native_host_summary_label = QtWidgets.QLabel()
         self.native_host_summary_label.setWordWrap(True)
+        self.native_host_timing_label = QtWidgets.QLabel()
+        self.native_host_timing_label.setWordWrap(True)
         self.native_host_device_type_combo = QtWidgets.QComboBox()
-        self.native_host_rate_combo = QtWidgets.QComboBox()
         self.native_host_buffer_combo = QtWidgets.QComboBox()
         self.prerender_vst_playback_check = QtWidgets.QCheckBox('Use prerendered VST playback for transport')
         self.prerender_vst_playback_check.setToolTip(
             'Render VST transport audio to PCM ahead of playback instead of using the direct JUCE callback transport path.'
         )
         native_form.addRow('Startup format', self.native_host_summary_label)
+        native_form.addRow('Shared timing', self.native_host_timing_label)
         native_form.addRow('Driver backend', self.native_host_device_type_combo)
-        native_form.addRow('Sample rate', self.native_host_rate_combo)
-        native_form.addRow('Buffer size', self.native_host_buffer_combo)
+        native_form.addRow('Device buffer request', self.native_host_buffer_combo)
         native_form.addRow('Playback mode', self.prerender_vst_playback_check)
         self.native_host_device_type_combo.setToolTip(
             'Choose the JUCE audio backend used by native VST hosting, including ASIO when it is available on this machine.'
         )
-        self.native_host_buffer_combo.setToolTip('Choose the native JUCE host buffer size, or leave it following the playback prebuffer.')
+        self.native_host_buffer_combo.setToolTip(
+            'Request the actual JUCE device block size. If left following the queue target, the host will request the same size as the output queue target.'
+        )
         body_layout.addWidget(native_group)
         body_layout.addStretch(1)
 
@@ -4208,7 +4579,6 @@ class AudioSettingsDialog(QtWidgets.QDialog):
         self.playhead_refresh_combo.currentIndexChanged.connect(self._on_playhead_refresh_changed)
         self.note_length_offset_spin.valueChanged.connect(self._on_note_length_offset_changed)
         self.native_host_device_type_combo.currentIndexChanged.connect(self._on_native_host_device_type_changed)
-        self.native_host_rate_combo.currentIndexChanged.connect(self._on_native_host_rate_changed)
         self.native_host_buffer_combo.currentIndexChanged.connect(self._on_native_host_buffer_changed)
         self.prerender_vst_playback_check.toggled.connect(self._on_prerender_vst_playback_toggled)
         self.reset_audio_btn.clicked.connect(self._on_reset_audio_clicked)
@@ -4239,18 +4609,26 @@ class AudioSettingsDialog(QtWidgets.QDialog):
         main_window = self._main_window()
         if main_window is None:
             return
-        current_device = main_window._selected_audio_device()
-        preferred = current_device.preferredFormat()
         output_status = (
             main_window._native_output_status(allow_cached=True, max_age_sec=0.25)
             if main_window._native_output_bridge_alive()
             else None
         )
+        if output_status is None and refresh_controls:
+            output_status = main_window._cached_native_vst_host_audio_status(
+                main_window._native_vst_host_target_audio_device_type(),
+                main_window._native_output_target_audio_device_name(),
+            )
+        if output_status is None and refresh_controls:
+            output_status = main_window._probe_native_vst_host_audio_driver_status(
+                main_window._native_vst_host_target_audio_device_type(),
+                main_window._native_output_target_audio_device_name(),
+            )
         latency_ms = main_window._buffer_frames_latency_ms(main_window._desired_audio_buffer_frames())
         self.output_summary_label.setText(main_window._audio_output_summary())
         self.output_latency_label.setText(f'{latency_ms:.1f} ms')
         self.output_buffer_frames_label.setText(
-            main_window._playback_prebuffer_target_summary()
+            main_window._actual_output_buffer_summary(output_status)
         )
         self.output_driver_block_label.setText(
             main_window._driver_block_size_summary(output_status)
@@ -4261,28 +4639,30 @@ class AudioSettingsDialog(QtWidgets.QDialog):
         self.native_host_summary_label.setText(
             main_window._native_vst_host_startup_summary()
         )
+        self.native_host_timing_label.setText(
+            f'Sample rate shared with JUCE output: {main_window._native_vst_host_target_sample_rate()} Hz | '
+            f'queue target {main_window._output_queue_target_summary()}'
+        )
         if not refresh_controls:
             return
 
-        device_items = [('System Default Soundcard', '')]
-        for device in QtMultimedia.QMediaDevices.audioOutputs():
-            device_items.append((device.description(), bytes(device.id()).hex()))
-        self._set_combo_items(self.output_device_combo, device_items, main_window.selected_audio_output_id)
+        device_items = [('System Default Output', '')]
+        device_items.extend((device_name, device_name) for device_name in main_window._available_native_output_devices())
+        self._set_combo_items(self.output_device_combo, device_items, getattr(main_window, 'selected_audio_output_name', ''))
 
-        sample_rate_items: list[tuple[str, object]] = [(f'Auto (Preferred {preferred.sampleRate()} Hz)', 0)]
-        sample_rate_items.extend((f'{rate} Hz', int(rate)) for rate in main_window._available_audio_sample_rates(current_device))
+        sample_rate_items: list[tuple[str, object]] = [(f'Auto (Host Default {main_window._playback_sample_rate} Hz)', 0)]
+        sample_rate_items.extend((f'{rate} Hz', int(rate)) for rate in main_window._available_audio_sample_rates())
         self._set_combo_items(self.output_sample_rate_combo, sample_rate_items, int(main_window.selected_audio_sample_rate))
 
         sample_format_items: list[tuple[str, object]] = [
-            (f'Auto (Preferred {qaudio_sample_format_label(preferred.sampleFormat())})', 'Auto'),
+            ('32-bit Float (JUCE)', 'Float'),
         ]
-        for sample_format in main_window._available_audio_sample_formats(current_device):
-            sample_format_items.append((qaudio_sample_format_label(sample_format), getattr(sample_format, 'name', 'Int16')))
         self._set_combo_items(
             self.output_sample_format_combo,
             sample_format_items,
-            str(main_window.selected_audio_sample_format_name or 'Auto'),
+            'Float',
         )
+        self.output_sample_format_combo.setEnabled(False)
 
         native_driver_items = [('Auto / Host Default', '')]
         native_driver_items.extend(
@@ -4293,6 +4673,27 @@ class AudioSettingsDialog(QtWidgets.QDialog):
             self.native_host_device_type_combo,
             native_driver_items,
             main_window.native_vst_host_audio_device_type,
+        )
+
+        effective_native_buffer = int(main_window._native_vst_host_target_buffer_size())
+        effective_native_rate = int(main_window._native_vst_host_target_sample_rate())
+        native_buffer_items: list[tuple[str, object]] = [
+            (
+                f'Follow queue target ({main_window._output_queue_target_summary()})',
+                0,
+            )
+        ]
+        native_buffer_items.extend(
+            (
+                f'{int(size)} samples ({main_window._buffer_frames_duration_ms(int(size), effective_native_rate):.1f} ms)',
+                int(size),
+            )
+            for size in main_window._available_native_vst_host_buffer_sizes()
+        )
+        self._set_combo_items(
+            self.native_host_buffer_combo,
+            native_buffer_items,
+            int(main_window.native_vst_host_buffer_size),
         )
 
         audio_buffer_values = set(
@@ -4318,37 +4719,6 @@ class AudioSettingsDialog(QtWidgets.QDialog):
         self.note_length_offset_spin.setValue(int(main_window.note_length_offset_ticks))
         del blocker
 
-        native_rate_values = set(main_window._available_audio_sample_rates(current_device))
-        native_rate_values.add(int(main_window._playback_sample_rate))
-        if int(main_window.native_vst_host_sample_rate) > 0:
-            native_rate_values.add(int(main_window.native_vst_host_sample_rate))
-        native_rate_items: list[tuple[str, object]] = [(f'Follow Output ({main_window._playback_sample_rate} Hz)', 0)]
-        native_rate_items.extend((f'{rate} Hz', int(rate)) for rate in sorted(v for v in native_rate_values if int(v) > 0))
-        self._set_combo_items(self.native_host_rate_combo, native_rate_items, int(main_window.native_vst_host_sample_rate))
-
-        effective_native_buffer = int(main_window._native_vst_host_target_buffer_size())
-        effective_native_ms = main_window._buffer_frames_duration_ms(
-            effective_native_buffer,
-            main_window._native_vst_host_target_sample_rate(),
-        )
-        native_buffer_values = set(
-            main_window._buffer_choice_values_for_sample_rate(
-                main_window._native_vst_host_target_sample_rate(),
-                include_value=int(main_window.native_vst_host_buffer_size or effective_native_buffer),
-            )
-        )
-        native_buffer_items: list[tuple[str, object]] = [
-            (f'Follows playback prebuffer ({effective_native_buffer} samples, {effective_native_ms:.1f} ms)', 0)
-        ]
-        native_buffer_items.extend(
-            (
-                f'{int(size)} samples ({main_window._buffer_frames_duration_ms(int(size), main_window._native_vst_host_target_sample_rate()):.1f} ms)',
-                int(size),
-            )
-            for size in sorted(v for v in native_buffer_values if int(v) > 0)
-        )
-        self._set_combo_items(self.native_host_buffer_combo, native_buffer_items, int(main_window.native_vst_host_buffer_size))
-
         prerender_blocker = QtCore.QSignalBlocker(self.prerender_vst_playback_check)
         self.prerender_vst_playback_check.setChecked(bool(getattr(main_window, 'prefer_prerendered_vst_playback', False)))
         del prerender_blocker
@@ -4370,28 +4740,28 @@ class AudioSettingsDialog(QtWidgets.QDialog):
         if main_window is None:
             return
         main_window.set_audio_output_device(str(self.output_device_combo.currentData() or ''))
-        self.refresh_from_mainwindow()
+        self.refresh_from_mainwindow(refresh_controls=False)
 
     def _on_output_sample_rate_changed(self, _index: int) -> None:
         main_window = self._main_window()
         if main_window is None:
             return
         main_window.set_audio_sample_rate(int(self.output_sample_rate_combo.currentData() or 0))
-        self.refresh_from_mainwindow()
+        self.refresh_from_mainwindow(refresh_controls=False)
 
     def _on_output_sample_format_changed(self, _index: int) -> None:
         main_window = self._main_window()
         if main_window is None:
             return
         main_window.set_audio_sample_format(str(self.output_sample_format_combo.currentData() or 'Auto'))
-        self.refresh_from_mainwindow()
+        self.refresh_from_mainwindow(refresh_controls=False)
 
     def _on_audio_buffer_changed(self, _index: int) -> None:
         main_window = self._main_window()
         if main_window is None:
             return
         main_window.set_audio_buffer_frames(int(self.audio_buffer_combo.currentData() or 512))
-        self.refresh_from_mainwindow()
+        self.refresh_from_mainwindow(refresh_controls=False)
 
     def _on_playhead_refresh_changed(self, _index: int) -> None:
         main_window = self._main_window()
@@ -4405,40 +4775,33 @@ class AudioSettingsDialog(QtWidgets.QDialog):
             return
         main_window.set_playback_note_length_offset_ticks(int(value))
 
-    def _on_native_host_rate_changed(self, _index: int) -> None:
-        main_window = self._main_window()
-        if main_window is None:
-            return
-        main_window.set_native_vst_host_sample_rate(int(self.native_host_rate_combo.currentData() or 0))
-        self.refresh_from_mainwindow()
-
     def _on_native_host_device_type_changed(self, _index: int) -> None:
         main_window = self._main_window()
         if main_window is None:
             return
         main_window.set_native_vst_host_audio_device_type(str(self.native_host_device_type_combo.currentData() or ''))
-        self.refresh_from_mainwindow()
+        self.refresh_from_mainwindow(refresh_controls=False)
 
     def _on_native_host_buffer_changed(self, _index: int) -> None:
         main_window = self._main_window()
         if main_window is None:
             return
         main_window.set_native_vst_host_buffer_size(int(self.native_host_buffer_combo.currentData() or 0))
-        self.refresh_from_mainwindow()
+        self.refresh_from_mainwindow(refresh_controls=False)
 
     def _on_prerender_vst_playback_toggled(self, checked: bool) -> None:
         main_window = self._main_window()
         if main_window is None:
             return
         main_window.set_prefer_prerendered_vst_playback(bool(checked))
-        self.refresh_from_mainwindow()
+        self.refresh_from_mainwindow(refresh_controls=False)
 
     def _on_reset_audio_clicked(self) -> None:
         main_window = self._main_window()
         if main_window is None:
             return
         main_window.reset_audio_engine()
-        self.refresh_from_mainwindow()
+        self.refresh_from_mainwindow(refresh_controls=False)
 
 
 class FloatingPanelWindow(QtWidgets.QMainWindow):
@@ -4651,8 +5014,8 @@ class MainWindow(QtWidgets.QMainWindow):
         configure_app_logging()
         self._windows_timer_resolution_active = False
         self.project = ProjectState()
-        self.ai_client = OpenAIClient()
-        self.composer = OpenAIComposer(self.ai_client)
+        self.ai_client = AIClient()
+        self.composer = AIComposer(self.ai_client)
         self.instrument_ai = InstrumentIntelligence(self.ai_client)
         self.renderer = AISynthRenderer()
         self.vsti_plugin_metadata: dict[str, list[str]] = {}
@@ -4663,10 +5026,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.user_vsti_directory.mkdir(parents=True, exist_ok=True)
         if not getattr(sys, "frozen", False):
             self.vsti_directory.mkdir(parents=True, exist_ok=True)
+        self.selected_audio_output_name = ''
         self.selected_audio_output_id = ''
         self.audio_buffer_frames = 1024
         self.selected_audio_sample_rate = 0
-        self.selected_audio_sample_format_name = 'Auto'
+        self.selected_audio_sample_format_name = 'Float'
         self.native_vst_host_audio_device_type = ''
         self.native_vst_host_sample_rate = 0
         self.native_vst_host_buffer_size = 0
@@ -4700,9 +5064,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_selected_audio_output()
         self.playback_mix_path = RENDER_DIR / "_playback_mix.wav"
         self.note_preview_path = RENDER_DIR / "_preview" / "note_preview.wav"
-        self._playback_sink: QtMultimedia.QAudioSink | None = None
-        self._playback_sink_device: QtCore.QIODevice | None = None
         self._native_output_bridge: object | None = None
+        self._native_vst_graph_render_bridge: object | None = None
         self._native_output_queued_frames = 0
         self._native_output_underruns = 0
         self._direct_native_transport_row: int | None = None
@@ -4712,11 +5075,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._direct_native_transport_loop_start_frame = 0
         self._direct_native_transport_loop_end_frame = 0
         self._direct_native_transport_lead_frames = 0
-        self._live_midi_sink: QtMultimedia.QAudioSink | None = None
-        self._live_midi_sink_device: QtCore.QIODevice | None = None
-        self._preview_sink: QtMultimedia.QAudioSink | None = None
-        self._preview_buffer_device: QtCore.QBuffer | None = None
-        self._preview_resources: list[tuple[QtMultimedia.QAudioSink, QtCore.QBuffer]] = []
+        self._graph_native_transport_rows: list[int] = []
+        self._graph_native_transport_origin_frame = 0
+        self._graph_native_transport_output_cursor_frame = 0
+        self._graph_native_transport_logical_frame = 0
+        self._graph_native_transport_loop_start_frame = 0
+        self._graph_native_transport_loop_end_frame = 0
+        self._graph_native_transport_lead_frames = 0
         self._last_track_preview_notes: dict[int, tuple[int, int, int]] = {}
         self._pending_parameter_audition_row: int | None = None
         self._native_vst_host_audio_status_cache: dict[str, dict[str, object]] = {}
@@ -4726,6 +5091,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._playback_mix_start_frame = 0
         self._playback_mix_frame_count = 0
         self._use_prerendered_transport_mix = False
+        self._auto_forced_prerender_vst_transport = False
         self._pending_prerender_mix_refresh = False
         self._pending_prerender_mix_clear_track_audio = False
         self._pending_prerender_mix_reason = ''
@@ -4734,6 +5100,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._playback_committed_total_bytes = 0
         self._playback_pending_bytes = bytearray()
         self._playback_logical_origin_frame = 0
+        self._shared_native_output_origin_rendered_frames = 0
         self._playback_chunk_frames = 512
         self._live_midi_chunk_frames = 128
         self._playback_sample_rate = int(getattr(self, '_playback_sample_rate', 44100))
@@ -4741,7 +5108,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._playback_sample_format = getattr(
             self,
             '_playback_sample_format',
-            QtMultimedia.QAudioFormat.SampleFormat.Int16,
+            PCM_SAMPLE_FORMAT_FLOAT,
         )
         self._apply_audio_buffer_preference()
         _APP_LOGGER.info(
@@ -4749,7 +5116,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.project.bpm,
             self._playback_sample_rate,
             self._playback_channel_count,
-            qaudio_sample_format_label(self._playback_sample_format),
+            pcm_sample_format_label(self._playback_sample_format),
         )
         self._playback_active = False
         self._live_midi_active = False
@@ -4761,8 +5128,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._realtime_mix_cache: object | None = None
         self._realtime_mix_cache_start_frame = 0
         self._realtime_mix_cache_frame_count = 0
+        self._realtime_transport_vsti_count = 0
         self._realtime_track_states: dict[int, RealtimeTrackPlaybackState] = {}
         self._live_midi_states: dict[int, LiveMidiHostState] = {}
+        self._ai_settings_dialog: AISettingsDialog | None = None
         self._audio_settings_dialog: AudioSettingsDialog | None = None
         self._track_vsti_windows: dict[int, QtWidgets.QDialog] = {}
         self._track_native_vsti_close_events: dict[int, threading.Event] = {}
@@ -4819,6 +5188,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._native_output_warm_timer = QtCore.QTimer(self)
         self._native_output_warm_timer.setSingleShot(True)
         self._native_output_warm_timer.timeout.connect(self._finish_warm_native_output_bridge)
+        if self._native_output_bridge_supported():
+            QtCore.QTimer.singleShot(0, lambda: self._schedule_native_output_bridge_warm(delay_ms=0))
         self._audio_pump_in_progress = False
         self._live_midi_pending_bytes = bytearray()
         self._live_midi_pump_timer = QtCore.QTimer(self)
@@ -4840,6 +5211,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.track_list.currentRowChanged.connect(self._track_changed)
         self.track_list.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.track_list.customContextMenuRequested.connect(self._show_track_context_menu_from_list)
+        self.track_list.installEventFilter(self)
         self.track_list.viewport().installEventFilter(self)
         self.last_added_track_type = 'instrument'
 
@@ -4899,7 +5271,7 @@ class MainWindow(QtWidgets.QMainWindow):
         import_sample_btn.clicked.connect(self.import_sample)
         place_sample_btn = QtWidgets.QPushButton("Place Selected Sample On Timeline")
         place_sample_btn.clicked.connect(self.place_selected_sample)
-        ai_btn = QtWidgets.QPushButton("AI Compose (OpenAI Codex)")
+        ai_btn = QtWidgets.QPushButton("AI Compose")
         ai_btn.clicked.connect(self.compose_with_ai)
 
         
@@ -5042,20 +5414,24 @@ class MainWindow(QtWidgets.QMainWindow):
         assign_track_instrument.triggered.connect(self.assign_instrument_to_selected_track)
         tracks_menu.addAction(assign_track_instrument)
 
-        openai_menu = settings.addMenu('OpenAI')
+        openai_menu = settings.addMenu('AI')
+        open_ai_settings = QtGui.QAction('AI Settings...', self)
+        open_ai_settings.triggered.connect(self.open_ai_settings_dialog)
         connect_openai = QtGui.QAction('Connect', self)
         connect_openai.triggered.connect(self.connect_openai)
         disconnect_openai = QtGui.QAction('Disconnect', self)
         disconnect_openai.triggered.connect(self.disconnect_openai)
-        codex_tracks = QtGui.QAction('Prompt Codex About Tracks', self)
+        codex_tracks = QtGui.QAction('Prompt AI About Tracks', self)
         codex_tracks.triggered.connect(self.codex_track_assistant)
+        openai_menu.addAction(open_ai_settings)
+        openai_menu.addSeparator()
         openai_menu.addAction(connect_openai)
         openai_menu.addAction(disconnect_openai)
         openai_menu.addSeparator()
         openai_menu.addAction(codex_tracks)
-        self.openai_status_action = QtGui.QAction(self.ai_client.auth_status(), self)
-        self.openai_status_action.setEnabled(False)
-        openai_menu.addAction(self.openai_status_action)
+        self.ai_status_action = QtGui.QAction(self.ai_client.auth_status(), self)
+        self.ai_status_action.setEnabled(False)
+        openai_menu.addAction(self.ai_status_action)
 
         samples_menu = settings.addMenu('Sample Paths')
         add_sample_path = QtGui.QAction('Add Sample Folder', self)
@@ -6080,30 +6456,54 @@ class MainWindow(QtWidgets.QMainWindow):
         self._realtime_mix_cache_start_frame = 0
         self._realtime_mix_cache_frame_count = 0
 
-    def _selected_audio_device(self) -> QtMultimedia.QAudioDevice:
-        if self.selected_audio_output_id:
-            for device in QtMultimedia.QMediaDevices.audioOutputs():
-                if bytes(device.id()).hex() == self.selected_audio_output_id:
-                    return device
-        return QtMultimedia.QMediaDevices.defaultAudioOutput()
+    def _native_output_target_audio_device_name(self) -> str:
+        return str(getattr(self, 'selected_audio_output_name', '') or '').strip()
 
     def _requested_audio_sample_format(self):
-        return qaudio_sample_format_from_name(self.selected_audio_sample_format_name)
+        return PCM_SAMPLE_FORMAT_FLOAT
 
     def _playback_bytes_per_frame(self) -> int:
-        return max(1, int(self._playback_channel_count) * qaudio_sample_format_bytes(getattr(self, '_playback_sample_format', QtMultimedia.QAudioFormat.SampleFormat.Int16)))
+        return max(1, int(self._playback_channel_count) * pcm_sample_format_bytes(getattr(self, '_playback_sample_format', PCM_SAMPLE_FORMAT_FLOAT)))
 
     def _audio_output_summary(self) -> str:
-        device = self._selected_audio_device()
-        description = device.description() or 'System Default Soundcard'
-        latency_ms = (self._desired_audio_buffer_frames() / float(max(1, self._playback_sample_rate))) * 1000.0
+        status = None
+        if self._native_output_bridge_alive():
+            status = self._native_output_status(allow_cached=True, max_age_sec=0.25)
+        if status is None:
+            status = self._cached_native_vst_host_audio_status(
+                self._native_vst_host_target_audio_device_type(),
+                self._native_output_target_audio_device_name(),
+            )
+        description = (
+            str(status.get('audio_device_name') if isinstance(status, dict) else '') or self._native_output_target_audio_device_name()
+        ).strip() or 'System Default Output'
+        actual_frames = int(self._actual_output_buffer_frames(status))
+        queue_target_frames = int(self._output_queue_target_frames())
+        actual_latency_ms = (actual_frames / float(max(1, self._playback_sample_rate))) * 1000.0
+        buffer_suffix = f'device block {actual_frames} samples ({actual_latency_ms:.1f} ms)'
+        if queue_target_frames != actual_frames:
+            buffer_suffix += f', queue target {self._format_frames_and_ms(queue_target_frames, self._playback_sample_rate)}'
         return (
             f'{description} | {self._playback_sample_rate} Hz | '
-            f'{qaudio_sample_format_label(self._playback_sample_format)} | '
-            f'{self._playback_channel_count} ch | {latency_ms:.1f} ms prebuffer'
+            f'{pcm_sample_format_label(self._playback_sample_format)} | '
+            f'{self._playback_channel_count} ch | {buffer_suffix}'
+        )
+
+    def _native_vst_host_uses_output_sample_rate(self) -> bool:
+        return True
+
+    def _native_vst_host_uses_output_buffer_size(self) -> bool:
+        return False
+
+    def _native_vst_host_uses_output_timing(self) -> bool:
+        return bool(
+            self._native_vst_host_uses_output_sample_rate()
+            and self._native_vst_host_uses_output_buffer_size()
         )
 
     def _native_vst_host_target_sample_rate(self) -> int:
+        if self._native_vst_host_uses_output_sample_rate():
+            return max(1, int(getattr(self, '_playback_sample_rate', 44100)))
         selected = int(getattr(self, 'native_vst_host_sample_rate', 0) or 0)
         if selected > 0:
             return selected
@@ -6126,9 +6526,21 @@ class MainWindow(QtWidgets.QMainWindow):
     def _clear_native_vst_host_audio_status_cache(self) -> None:
         self._native_vst_host_audio_status_cache = {}
 
-    def _cached_native_vst_host_audio_status(self, audio_device_type: str | None = None) -> dict[str, object] | None:
+    @staticmethod
+    def _native_vst_host_audio_status_cache_key(
+        audio_device_type: str | None = None,
+        audio_output_device_name: str | None = None,
+    ) -> str:
+        return f'{str(audio_device_type or "").strip().casefold()}|{str(audio_output_device_name or "").strip().casefold()}'
+
+    def _cached_native_vst_host_audio_status(
+        self,
+        audio_device_type: str | None = None,
+        audio_output_device_name: str | None = None,
+    ) -> dict[str, object] | None:
         requested = str(audio_device_type or '').strip()
-        cache_key = requested.casefold()
+        requested_output_name = str(audio_output_device_name or '').strip()
+        cache_key = self._native_vst_host_audio_status_cache_key(requested, requested_output_name)
         cached = getattr(self, '_native_vst_host_audio_status_cache', {}).get(cache_key)
         if isinstance(cached, dict):
             return dict(cached)
@@ -6137,10 +6549,14 @@ class MainWindow(QtWidgets.QMainWindow):
         requested_bridge_type = str(
             getattr(bridge, 'requested_audio_device_type', getattr(bridge, 'audio_device_type', '')) or ''
         ).strip()
+        requested_bridge_output_name = str(
+            getattr(bridge, 'requested_audio_output_device_name', getattr(bridge, 'audio_output_device_name', '')) or ''
+        ).strip()
         if (
             bridge is not None
             and self._native_output_bridge_alive()
-            and (not requested or requested_bridge_type.casefold() == cache_key)
+            and (not requested or requested_bridge_type.casefold() == requested.casefold())
+            and (not requested_output_name or requested_bridge_output_name.casefold() == requested_output_name.casefold())
         ):
             status = self._native_output_status(bridge)
             if isinstance(status, dict) and status.get('available_audio_device_types'):
@@ -6148,12 +6564,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 return dict(status)
         return None
 
-    def _probe_native_vst_host_audio_driver_status(self, audio_device_type: str | None = None) -> dict[str, object] | None:
+    def _probe_native_vst_host_audio_driver_status(
+        self,
+        audio_device_type: str | None = None,
+        audio_output_device_name: str | None = None,
+    ) -> dict[str, object] | None:
         if not self._native_output_bridge_supported():
             return None
 
         requested = str(audio_device_type or '').strip()
-        cached = self._cached_native_vst_host_audio_status(requested)
+        requested_output_name = str(audio_output_device_name or '').strip()
+        cached = self._cached_native_vst_host_audio_status(requested, requested_output_name)
         if cached is not None:
             return cached
 
@@ -6165,23 +6586,28 @@ class MainWindow(QtWidgets.QMainWindow):
         ):
             return {
                 'audio_device_type': requested,
+                'audio_device_name': requested_output_name,
                 'available_audio_device_types': self._fallback_native_vst_host_audio_device_types(),
                 'available_audio_output_devices': [],
             }
 
         bridge = NativeVstHostBridge(
             open_editor=False,
+            restore_last_plugin_on_startup=False,
             bridge_mode=False,
             hidden=True,
             sample_rate=self._native_vst_host_target_sample_rate(),
             buffer_size=max(64, int(self._native_vst_host_target_buffer_size())),
             audio_device_type=requested or None,
+            audio_output_device_name=requested_output_name or None,
         )
         try:
             bridge.start(startup_timeout=8.0)
             status = bridge.command('status')
             if isinstance(status, dict):
-                self._native_vst_host_audio_status_cache[requested.casefold()] = dict(status)
+                self._native_vst_host_audio_status_cache[
+                    self._native_vst_host_audio_status_cache_key(requested, requested_output_name)
+                ] = dict(status)
                 return status
         except Exception:
             _APP_LOGGER.exception("Native VST audio backend probe failed requested_type=%s", requested or '<default>')
@@ -6191,6 +6617,55 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
         return None
+
+    def _available_native_output_devices(self) -> list[str]:
+        names: list[str] = []
+        status = self._probe_native_vst_host_audio_driver_status(
+            self._native_vst_host_target_audio_device_type(),
+            self._native_output_target_audio_device_name(),
+        )
+        if isinstance(status, dict):
+            raw_names = status.get('available_audio_output_devices')
+            if isinstance(raw_names, list):
+                for raw in raw_names:
+                    name = str(raw or '').strip()
+                    if name and name not in names:
+                        names.append(name)
+        selected = self._native_output_target_audio_device_name()
+        if selected and selected not in names:
+            names.append(selected)
+        return names
+
+    def _available_native_vst_host_buffer_sizes(self) -> list[int]:
+        values: set[int] = set()
+        status = self._probe_native_vst_host_audio_driver_status(
+            self._native_vst_host_target_audio_device_type(),
+            self._native_output_target_audio_device_name(),
+        )
+        if isinstance(status, dict):
+            raw_values = status.get('available_audio_buffer_sizes')
+            if isinstance(raw_values, list):
+                for raw in raw_values:
+                    try:
+                        size = int(raw)
+                    except Exception:
+                        continue
+                    if size > 0:
+                        values.add(size)
+        selected = int(getattr(self, 'native_vst_host_buffer_size', 0) or 0)
+        effective = int(self._native_vst_host_target_buffer_size())
+        if selected > 0:
+            values.add(selected)
+        if effective > 0:
+            values.add(effective)
+        if not values:
+            values.update(
+                self._buffer_choice_values_for_sample_rate(
+                    self._native_vst_host_target_sample_rate(),
+                    include_value=effective,
+                )
+            )
+        return sorted(size for size in values if int(size) > 0)
 
     def _available_native_vst_host_audio_device_types(self) -> list[str]:
         names: list[str] = []
@@ -6222,20 +6697,54 @@ class MainWindow(QtWidgets.QMainWindow):
     def _playback_prebuffer_target_summary(self) -> str:
         return self._format_frames_and_ms(self._desired_audio_buffer_frames(), self._playback_sample_rate)
 
+    def _output_queue_target_frames(self) -> int:
+        return max(64, int(self._desired_audio_buffer_frames()))
+
+    def _output_queue_target_summary(self) -> str:
+        return self._format_frames_and_ms(self._output_queue_target_frames(), self._playback_sample_rate)
+
+    def _actual_output_buffer_frames(self, status: dict[str, object] | None = None) -> int:
+        actual = self._native_output_driver_block_frames(status)
+        if actual > 0:
+            return actual
+        bridge = getattr(self, '_native_output_bridge', None)
+        bridge_block = int(getattr(bridge, 'buffer_size', 0) or 0)
+        if bridge_block > 0:
+            return bridge_block
+        cached = self._cached_native_vst_host_audio_status(
+            self._native_vst_host_target_audio_device_type(),
+            self._native_output_target_audio_device_name(),
+        )
+        if isinstance(cached, dict):
+            cached_block = int(cached.get('buffer_size') or 0)
+            if cached_block > 0:
+                return cached_block
+        return int(self._native_vst_host_target_buffer_size())
+
+    def _actual_output_buffer_summary(self, status: dict[str, object] | None = None) -> str:
+        return self._format_frames_and_ms(self._actual_output_buffer_frames(status), self._playback_sample_rate)
+
     def _native_vst_host_startup_summary(self) -> str:
         target_buffer = int(self._native_vst_host_target_buffer_size())
         target_rate = int(self._native_vst_host_target_sample_rate())
         target_ms = self._buffer_frames_duration_ms(target_buffer, target_rate)
-        status = self._cached_native_vst_host_audio_status(self._native_vst_host_target_audio_device_type())
+        status = self._cached_native_vst_host_audio_status(
+            self._native_vst_host_target_audio_device_type(),
+            self._native_output_target_audio_device_name(),
+        )
         driver_name = self._native_vst_host_target_audio_device_type() or str(
             status.get('audio_device_type') if isinstance(status, dict) else ''
         ).strip() or 'Host default driver'
         device_name = str(status.get('audio_device_name') if isinstance(status, dict) else '').strip()
-        if int(getattr(self, 'native_vst_host_buffer_size', 0) or 0) > 0:
-            mode = 'manual native host buffer'
-        else:
-            mode = 'follows playback prebuffer'
-        summary = f'{driver_name} | {target_rate} Hz, {target_buffer} samples ({target_ms:.1f} ms, {mode})'
+        actual_block = int(self._actual_output_buffer_frames(status))
+        buffer_label = (
+            f'device request follows queue target {target_buffer} samples ({target_ms:.1f} ms)'
+            if self._native_vst_host_uses_output_buffer_size() or int(getattr(self, "native_vst_host_buffer_size", 0) or 0) <= 0
+            else f'device request {target_buffer} samples ({target_ms:.1f} ms)'
+        )
+        summary = f'{driver_name} | {target_rate} Hz, {buffer_label}'
+        if actual_block > 0 and actual_block != target_buffer:
+            summary += f' | device block {actual_block} samples ({self._buffer_frames_duration_ms(actual_block, target_rate):.1f} ms)'
         if device_name:
             summary += f' | {device_name}'
         return summary
@@ -6244,6 +6753,11 @@ class MainWindow(QtWidgets.QMainWindow):
         source = status
         if source is None and self._native_output_bridge_alive():
             source = self._native_output_status(allow_cached=True, max_age_sec=0.5)
+        if source is None:
+            source = self._cached_native_vst_host_audio_status(
+                self._native_vst_host_target_audio_device_type(),
+                self._native_output_target_audio_device_name(),
+            )
         if isinstance(source, dict):
             return max(0, int(source.get('buffer_size') or 0))
         return 0
@@ -6254,7 +6768,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return self._format_frames_and_ms(frames, self._playback_sample_rate)
         if self._native_output_bridge_supported():
             return 'Not reported yet'
-        return 'Using Qt output path'
+        return 'Native output unavailable'
 
     def _queued_ahead_frames(self, status: dict[str, object] | None = None) -> int:
         if self._native_output_bridge_alive():
@@ -6312,6 +6826,8 @@ class MainWindow(QtWidgets.QMainWindow):
         return sorted(v for v in values if 64 <= int(v) <= max_frames)
 
     def _native_vst_host_target_buffer_size(self) -> int:
+        if self._native_vst_host_uses_output_buffer_size():
+            return int(clamp(self._desired_audio_buffer_frames(), 64, self._maximum_native_vst_host_buffer_size()))
         selected = int(getattr(self, 'native_vst_host_buffer_size', 0) or 0)
         if selected > 0:
             return int(clamp(selected, 64, self._maximum_native_vst_host_buffer_size()))
@@ -6333,25 +6849,57 @@ class MainWindow(QtWidgets.QMainWindow):
         return int(clamp(int(math.floor((latency_ms * 0.4) + 0.5)), 2, 16))
 
     def _preferred_playback_chunk_frames(self) -> int:
-        desired = int(self._desired_audio_buffer_frames())
-        # Keep chunks at half the buffer size so that at least two chunks
-        # fit in the output buffer.  This gives the pump enough headroom to
-        # recover from momentary UI-thread stalls without underrunning.
-        # For larger safety buffers, allow chunk sizes up to 4096 frames so
-        # the pump does not need dozens of tiny writes to keep a 500-1000 ms
-        # output buffer filled.
-        chunk = max(256, min(4096, desired // 2))
-        # Never exceed the buffer itself (matters for tiny buffers <256).
-        return min(chunk, desired)
+        driver_block = max(64, int(self._actual_output_buffer_frames()))
+        requested_queue = max(64, int(self._output_queue_target_frames()))
+        if bool(getattr(self, '_use_prerendered_transport_mix', False)):
+            # Once transport is already running from a prerendered PCM mix,
+            # keep chunk sizing close to the actual device cadence instead of
+            # the much larger realtime synth-render fallback blocks.
+            preferred = max(driver_block, min(requested_queue, driver_block * 2))
+            return int(clamp(preferred, 128, 4096))
+        # Size queued PCM work from the actual JUCE device block instead of the
+        # requested UI buffer so Windows-shared devices that clamp to larger
+        # blocks do not force dozens of tiny Python-side renders per second.
+        active_vsti = max(0, int(getattr(self, '_realtime_transport_vsti_count', 0) or 0))
+        if active_vsti >= 2:
+            driver_block = max(
+                driver_block,
+                int(driver_block * min(6, active_vsti * 2)),
+                int(max(1024, requested_queue // 4)),
+            )
+        elif requested_queue > driver_block:
+            driver_block = max(driver_block, int(min(4096, max(512, requested_queue // 4))))
+        return int(clamp(driver_block, 128, 8192))
 
     def _preferred_live_midi_chunk_frames(self) -> int:
-        desired = max(64, int(self._native_vst_host_target_buffer_size()))
+        desired = max(
+            64,
+            int(self._native_output_driver_block_frames()) or int(self._native_vst_host_target_buffer_size()),
+        )
         # Live monitoring needs to stay responsive, but rendering in fixed
         # 128-frame blocks scales terribly once the user raises the buffer.
         # Follow the chosen output buffer upward so high-latency settings trade
         # a little extra monitoring latency for much fewer bridge render calls.
         chunk = max(128, min(2048, max(128, desired // 4)))
         return min(chunk, desired)
+
+    def _shared_native_output_queue_target_frames(self, status: dict[str, object] | None = None) -> int:
+        device_block = max(64, int(self._actual_output_buffer_frames(status)))
+        chunk_frames = max(128, int(self._playback_chunk_frames))
+        requested_queue = max(64, int(self._output_queue_target_frames()))
+        if bool(getattr(self, '_use_prerendered_transport_mix', False)):
+            target = max(device_block * 2, chunk_frames * 2, requested_queue)
+        else:
+            target = max(device_block * 3, chunk_frames * 2, requested_queue)
+        active_vsti = max(0, int(getattr(self, '_realtime_transport_vsti_count', 0) or 0))
+        if active_vsti >= 2 and not bool(getattr(self, '_use_prerendered_transport_mix', False)):
+            target = max(
+                target,
+                requested_queue,
+                chunk_frames * (active_vsti + 2),
+                int(self._playback_sample_rate * min(0.35, 0.1 + (0.1 * active_vsti))),
+            )
+        return int(target)
 
     def _desired_live_midi_queue_frames(self, status: dict[str, object] | None = None) -> int:
         driver_block = max(
@@ -6364,87 +6912,33 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         return int(clamp(target, 256, 65536))
 
-    def _available_audio_sample_rates(self, device: QtMultimedia.QAudioDevice | None = None) -> list[int]:
-        target = device or self._selected_audio_device()
-        minimum = max(8000, int(target.minimumSampleRate()))
-        maximum = max(minimum, int(target.maximumSampleRate()))
-        common = [22050, 32000, 44100, 48000, 88200, 96000, 176400, 192000]
-        rates = [rate for rate in common if minimum <= rate <= maximum]
-        preferred_rate = int(target.preferredFormat().sampleRate())
-        if minimum <= preferred_rate <= maximum and preferred_rate not in rates:
-            rates.append(preferred_rate)
-        if not rates:
-            rates.append(preferred_rate)
-        return sorted(set(rates))
-
-    def _available_audio_sample_formats(self, device: QtMultimedia.QAudioDevice | None = None) -> list:
-        target = device or self._selected_audio_device()
-        formats = list(target.supportedSampleFormats())
-        preferred = target.preferredFormat().sampleFormat()
-        if preferred not in formats:
-            formats.append(preferred)
-        order = {
-            QtMultimedia.QAudioFormat.SampleFormat.UInt8: 0,
-            QtMultimedia.QAudioFormat.SampleFormat.Int16: 1,
-            QtMultimedia.QAudioFormat.SampleFormat.Int32: 2,
-            QtMultimedia.QAudioFormat.SampleFormat.Float: 3,
-        }
-        return sorted(set(formats), key=lambda item: order.get(item, 99))
-
-    def _build_audio_format(self, sample_rate: int, sample_format, channel_count: int) -> QtMultimedia.QAudioFormat:
-        fmt = QtMultimedia.QAudioFormat()
-        fmt.setSampleRate(max(1, int(sample_rate)))
-        fmt.setChannelCount(max(1, int(channel_count)))
-        fmt.setSampleFormat(sample_format)
-        return fmt
-
-    def _resolved_audio_output_format(self, device: QtMultimedia.QAudioDevice | None = None) -> QtMultimedia.QAudioFormat:
-        target = device or self._selected_audio_device()
-        preferred = target.preferredFormat()
-        preferred_rate = max(1, int(preferred.sampleRate()))
-        preferred_channels = max(1, int(preferred.channelCount()))
-        preferred_format = preferred.sampleFormat()
-        requested_rate = int(self.selected_audio_sample_rate) if int(self.selected_audio_sample_rate) > 0 else preferred_rate
-        requested_format = self._requested_audio_sample_format() or preferred_format
-
-        seen: set[tuple[int, int, str]] = set()
-        candidates: list[QtMultimedia.QAudioFormat] = []
-
-        def add_candidate(rate: int, sample_format, channels: int) -> None:
-            key = (int(rate), int(channels), getattr(sample_format, 'name', str(sample_format)))
-            if key in seen:
-                return
-            seen.add(key)
-            candidates.append(self._build_audio_format(rate, sample_format, channels))
-
-        for rate in (requested_rate, preferred_rate):
-            for sample_format in (requested_format, preferred_format, QtMultimedia.QAudioFormat.SampleFormat.Float, QtMultimedia.QAudioFormat.SampleFormat.Int16):
-                add_candidate(rate, sample_format, 2)
-                add_candidate(rate, sample_format, preferred_channels)
-
-        for candidate in candidates:
-            try:
-                if target.isFormatSupported(candidate):
-                    return candidate
-            except Exception:
-                continue
-        return preferred
+    def _available_audio_sample_rates(self, device: object | None = None) -> list[int]:
+        _ = device
+        rates = {22050, 32000, 44100, 48000, 88200, 96000, 176400, 192000}
+        status = self._probe_native_vst_host_audio_driver_status(
+            self._native_vst_host_target_audio_device_type(),
+            self._native_output_target_audio_device_name(),
+        )
+        if isinstance(status, dict):
+            raw_values = status.get('available_audio_sample_rates')
+            if isinstance(raw_values, list):
+                for raw in raw_values:
+                    try:
+                        rate = int(raw)
+                    except Exception:
+                        continue
+                    if rate > 0:
+                        rates.add(rate)
+        current_rate = int(getattr(self, '_playback_sample_rate', 0) or 0)
+        selected_rate = int(getattr(self, 'selected_audio_sample_rate', 0) or 0)
+        if current_rate > 0:
+            rates.add(current_rate)
+        if selected_rate > 0:
+            rates.add(selected_rate)
+        return sorted(rate for rate in rates if int(rate) > 0)
 
     def _desired_audio_buffer_frames(self) -> int:
         return int(clamp(int(getattr(self, 'audio_buffer_frames', 1024)), 64, self._maximum_audio_buffer_frames()))
-
-    def _playback_audio_format(self) -> QtMultimedia.QAudioFormat:
-        fmt = QtMultimedia.QAudioFormat()
-        fmt.setSampleRate(self._playback_sample_rate)
-        fmt.setChannelCount(self._playback_channel_count)
-        fmt.setSampleFormat(self._playback_sample_format)
-        return fmt
-
-    def _create_audio_sink(self) -> QtMultimedia.QAudioSink:
-        sink = QtMultimedia.QAudioSink(self._selected_audio_device(), self._playback_audio_format(), self)
-        sink.setBufferFrameCount(self._desired_audio_buffer_frames())
-        sink.setVolume(1.0)
-        return sink
 
     def _clear_direct_native_transport_state(self) -> None:
         self._direct_native_transport_row = None
@@ -6457,6 +6951,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _direct_native_transport_active(self) -> bool:
         return self._direct_native_transport_row is not None and self._native_output_bridge_alive()
+
+    def _clear_graph_native_transport_state(self) -> None:
+        self._graph_native_transport_rows = []
+        self._graph_native_transport_origin_frame = 0
+        self._graph_native_transport_output_cursor_frame = 0
+        self._graph_native_transport_logical_frame = 0
+        self._graph_native_transport_loop_start_frame = 0
+        self._graph_native_transport_loop_end_frame = 0
+        self._graph_native_transport_lead_frames = 0
+
+    def _graph_native_transport_active(self) -> bool:
+        return bool(getattr(self, '_graph_native_transport_rows', [])) and self._native_output_bridge_alive()
+
+    def _graph_native_transport_row_set(self) -> set[int]:
+        return {int(row) for row in getattr(self, '_graph_native_transport_rows', []) if int(row) >= 0}
 
     def _track_can_use_direct_native_transport(self, track: TrackState, entry: VSTInstrument | None) -> bool:
         if entry is None or not entry.is_instrument or not entry.host_supported or not self._can_use_native_vst_host(entry):
@@ -6551,11 +7060,29 @@ class MainWindow(QtWidgets.QMainWindow):
 
         return candidate
 
+    def _graph_native_transport_candidates(self) -> list[tuple[int, TrackState, VSTInstrument]]:
+        if not self._native_output_bridge_supported():
+            return []
+        solo_tracks = self._active_solo_track_indices()
+        candidates: list[tuple[int, TrackState, VSTInstrument]] = []
+        for idx, track in enumerate(self.project.tracks):
+            if not self._track_is_audible(idx, solo_tracks):
+                continue
+            if track.track_type != 'instrument' or not track.notes:
+                continue
+            entry = self._rack_vsti_entry(track.rack_vsti) if track.rack_vsti else None
+            if not self._track_can_use_native_vst_graph_prerender(track, entry):
+                continue
+            if entry is None:
+                continue
+            candidates.append((idx, track, entry))
+        return candidates if len(candidates) >= 2 else []
+
     def _native_output_bridge_supported(self) -> bool:
         return bool(NATIVE_VST_HOST_AVAILABLE and NativeVstHostBridge is not None)
 
-    def _native_output_bridge_alive(self) -> bool:
-        bridge = getattr(self, '_native_output_bridge', None)
+    @staticmethod
+    def _native_bridge_process_alive(bridge: object | None) -> bool:
         if bridge is None:
             return False
         process = getattr(bridge, 'process', None)
@@ -6568,6 +7095,59 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 return False
         return True
+
+    def _native_output_bridge_alive(self) -> bool:
+        return self._native_bridge_process_alive(getattr(self, '_native_output_bridge', None))
+
+    def _native_vst_graph_render_bridge_alive(self) -> bool:
+        return self._native_bridge_process_alive(getattr(self, '_native_vst_graph_render_bridge', None))
+
+    def _active_native_vst_graph_bridge(self) -> object | None:
+        output_bridge = getattr(self, '_native_output_bridge', None)
+        if (
+            output_bridge is not None
+            and self._native_output_bridge_alive()
+            and self._graph_native_transport_active()
+            and bool(getattr(output_bridge, '_aims_graph_track_rows', []) or [])
+        ):
+            return output_bridge
+        render_bridge = getattr(self, '_native_vst_graph_render_bridge', None)
+        if render_bridge is not None and self._native_vst_graph_render_bridge_alive():
+            return render_bridge
+        return None
+
+    def _native_vst_graph_bridge_slot_index(
+        self,
+        row: int,
+        entry: VSTInstrument | None,
+        bridge: object | None = None,
+    ) -> int:
+        bridge = bridge if bridge is not None else self._active_native_vst_graph_bridge()
+        if bridge is None or entry is None:
+            return -1
+        rows = list(getattr(bridge, '_aims_graph_track_rows', []) or [])
+        paths = list(getattr(bridge, '_aims_graph_track_paths', []) or [])
+        target_path = self._normalized_vsti_path(str(getattr(entry, 'path', '') or ''))
+        for index, mapped_row in enumerate(rows):
+            if int(mapped_row) != int(row):
+                continue
+            mapped_path = self._normalized_vsti_path(str(paths[index] if index < len(paths) else ''))
+            if mapped_path and mapped_path != target_path:
+                continue
+            return int(index)
+        return -1
+
+    def _open_native_vst_graph_bridge_editor(self, row: int, track: TrackState, entry: VSTInstrument) -> bool:
+        bridge = self._active_native_vst_graph_bridge()
+        slot_index = self._native_vst_graph_bridge_slot_index(row, entry)
+        if bridge is None or slot_index < 0:
+            return False
+        try:
+            bridge.command('open_graph_slot_editor', slot_index=int(slot_index))
+            return True
+        except Exception:
+            _APP_LOGGER.exception("Failed opening native graph editor row=%s rack=%s", row, entry.name)
+            return False
 
     def _shared_native_output_bridge_track_info(self) -> tuple[int, object, TrackState, VSTInstrument] | None:
         bridge = getattr(self, '_native_output_bridge', None)
@@ -6603,6 +7183,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _stop_native_output_bridge(self) -> None:
         if hasattr(self, '_native_output_warm_timer'):
             self._native_output_warm_timer.stop()
+        self._stop_native_vst_graph_render_bridge()
         bridge = getattr(self, '_native_output_bridge', None)
         if bridge is not None:
             self._capture_shared_native_output_bridge_state()
@@ -6615,12 +7196,68 @@ class MainWindow(QtWidgets.QMainWindow):
         self._native_output_underruns = 0
         self._transport_uses_native_output_bridge = False
         self._clear_direct_native_transport_state()
+        self._clear_graph_native_transport_state()
         if bridge is None:
             return
         try:
             bridge.stop()
         except Exception:
             _APP_LOGGER.exception("Failed stopping native realtime output bridge")
+
+    def _stop_native_vst_graph_render_bridge(self) -> None:
+        bridge = getattr(self, '_native_vst_graph_render_bridge', None)
+        self._native_vst_graph_render_bridge = None
+        if bridge is None:
+            return
+        try:
+            bridge.stop()
+        except Exception:
+            _APP_LOGGER.exception("Failed stopping native VST graph render bridge")
+
+    def _ensure_native_vst_graph_render_bridge(self) -> object | None:
+        if not self._native_output_bridge_supported():
+            return None
+
+        target_sample_rate = max(1, int(self._native_vst_host_target_sample_rate()))
+        target_buffer_size = max(64, int(self._native_vst_host_target_buffer_size()))
+        target_audio_device_type = self._native_vst_host_target_audio_device_type()
+        target_audio_output_device_name = self._native_output_target_audio_device_name()
+        existing = getattr(self, '_native_vst_graph_render_bridge', None)
+        if (
+            existing is not None
+            and self._native_vst_graph_render_bridge_alive()
+            and int(getattr(existing, 'requested_sample_rate', getattr(existing, 'sample_rate', 0)) or 0) == target_sample_rate
+            and int(getattr(existing, 'requested_buffer_size', getattr(existing, 'buffer_size', 0)) or 0) == target_buffer_size
+            and str(getattr(existing, 'requested_audio_device_type', getattr(existing, 'audio_device_type', '')) or '').strip().casefold()
+            == target_audio_device_type.casefold()
+            and str(getattr(existing, 'requested_audio_output_device_name', getattr(existing, 'audio_output_device_name', '')) or '').strip().casefold()
+            == target_audio_output_device_name.casefold()
+        ):
+            return existing
+
+        self._stop_native_vst_graph_render_bridge()
+        bridge = NativeVstHostBridge(
+            open_editor=False,
+            restore_last_plugin_on_startup=False,
+            bridge_mode=False,
+            hidden=True,
+            sample_rate=target_sample_rate,
+            buffer_size=target_buffer_size,
+            audio_device_type=target_audio_device_type or None,
+            audio_output_device_name=target_audio_output_device_name or None,
+        )
+        bridge.requested_sample_rate = target_sample_rate
+        bridge.requested_buffer_size = target_buffer_size
+        bridge.requested_audio_device_type = target_audio_device_type
+        bridge.requested_audio_output_device_name = target_audio_output_device_name
+        bridge.start(startup_timeout=8.0)
+        status = bridge.wait_until_ready(timeout=8.0)
+        bridge.sample_rate = int(status.get('sample_rate') or target_sample_rate)
+        bridge.buffer_size = int(status.get('buffer_size') or target_buffer_size)
+        bridge.audio_device_type = str(status.get('audio_device_type') or target_audio_device_type or '')
+        bridge.audio_output_device_name = str(status.get('audio_device_name') or target_audio_output_device_name or '')
+        self._native_vst_graph_render_bridge = bridge
+        return bridge
 
     def _ensure_native_output_bridge(
         self,
@@ -6632,6 +7269,7 @@ class MainWindow(QtWidgets.QMainWindow):
         target_sample_rate = max(1, int(self._native_vst_host_target_sample_rate()))
         target_buffer_size = max(64, int(self._native_vst_host_target_buffer_size()))
         target_audio_device_type = self._native_vst_host_target_audio_device_type()
+        target_audio_output_device_name = self._native_output_target_audio_device_name()
         direct_row = int(direct_plugin[0]) if direct_plugin is not None else -1
         direct_track = direct_plugin[1] if direct_plugin is not None else None
         direct_entry = direct_plugin[2] if direct_plugin is not None else None
@@ -6654,6 +7292,8 @@ class MainWindow(QtWidgets.QMainWindow):
             and int(getattr(existing, 'requested_buffer_size', getattr(existing, 'buffer_size', 0)) or 0) == target_buffer_size
             and str(getattr(existing, 'requested_audio_device_type', getattr(existing, 'audio_device_type', '')) or '').strip().casefold()
             == target_audio_device_type.casefold()
+            and str(getattr(existing, 'requested_audio_output_device_name', getattr(existing, 'audio_output_device_name', '')) or '').strip().casefold()
+            == target_audio_output_device_name.casefold()
         ):
             existing_plugin_path = self._normalized_vsti_path(str(getattr(existing, 'plugin_path', '') or ''))
             if existing_plugin_path == desired_plugin_path:
@@ -6723,17 +7363,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self._stop_native_output_bridge()
         bridge = NativeVstHostBridge(
             direct_entry.path if direct_entry is not None else None,
+            restore_last_plugin_on_startup=direct_entry is not None,
             bridge_mode=False,
             hidden=True,
             sample_rate=target_sample_rate,
             buffer_size=target_buffer_size,
             audio_device_type=target_audio_device_type or None,
+            audio_output_device_name=target_audio_output_device_name or None,
         )
         if direct_entry is not None:
             setattr(bridge, '_aims_rack_name', str(direct_entry.name))
         bridge.requested_sample_rate = target_sample_rate
         bridge.requested_buffer_size = target_buffer_size
         bridge.requested_audio_device_type = target_audio_device_type
+        bridge.requested_audio_output_device_name = target_audio_output_device_name
         bridge.start(startup_timeout=8.0)
         status = bridge.wait_until_ready(timeout=8.0)
         if direct_entry is not None and not bool(status.get('plugin_loaded', False)):
@@ -6741,6 +7384,7 @@ class MainWindow(QtWidgets.QMainWindow):
         bridge.sample_rate = int(status.get('sample_rate') or target_sample_rate)
         bridge.buffer_size = int(status.get('buffer_size') or target_buffer_size)
         bridge.audio_device_type = str(status.get('audio_device_type') or target_audio_device_type or '')
+        bridge.audio_output_device_name = str(status.get('audio_device_name') or target_audio_output_device_name or '')
         if direct_track is not None and direct_entry is not None:
             self._prime_native_vst_host_bridge_state(bridge, direct_track, direct_entry)
             ok, status = self._configure_native_vst_host_bridge_buses(bridge, direct_track, direct_entry)
@@ -6766,8 +7410,8 @@ class MainWindow(QtWidgets.QMainWindow):
         bridge.clear_audio_queue(reset_counters=True, stream_id='preview')
         bridge.clear_audio_queue(reset_counters=True, stream_id='live_midi')
         self._native_output_bridge = bridge
-        self._native_output_queued_frames = int(status.get('queued_audio_frames') or 0)
-        self._native_output_underruns = int(status.get('audio_queue_underruns') or 0)
+        self._cache_native_output_status(bridge, status)
+        self._apply_audio_buffer_preference()
         return bridge
 
     def _cache_native_output_status(self, bridge: object, status: dict[str, object] | None) -> dict[str, object] | None:
@@ -6831,6 +7475,38 @@ class MainWindow(QtWidgets.QMainWindow):
             return 0
         return max(0, int(source.get('rendered_sample_frames') or 0))
 
+    def _shared_native_output_elapsed_frames(self, status: dict[str, object] | None = None) -> int:
+        rendered_frames = self._native_output_rendered_sample_frames(status)
+        origin_frames = int(getattr(self, '_shared_native_output_origin_rendered_frames', 0) or 0)
+        return max(0, rendered_frames - origin_frames)
+
+    def _shared_native_output_logical_frame(
+        self,
+        *,
+        include_queued: bool = False,
+        status: dict[str, object] | None = None,
+    ) -> int:
+        elapsed_frames = self._shared_native_output_elapsed_frames(status)
+        if include_queued:
+            queued_frames = max(0, int(getattr(self, '_native_output_queued_frames', 0) or 0))
+            if queued_frames <= 0:
+                queued_frames = max(0, int(self._native_output_stream_queued_frames('main', status)))
+            elapsed_frames += queued_frames
+        if not self.project.loop_enabled:
+            return int(self._playback_logical_origin_frame) + elapsed_frames
+
+        loop_start_frame, loop_end_frame = self._loop_frame_bounds()
+        loop_length = max(1, loop_end_frame - loop_start_frame)
+        origin_frame = int(self._playback_logical_origin_frame)
+        origin_frame = min(max(origin_frame, loop_start_frame), loop_end_frame - 1)
+        origin_offset = origin_frame - loop_start_frame
+        return loop_start_frame + ((origin_offset + elapsed_frames) % loop_length)
+
+    def _sync_shared_native_output_playback_position(self, status: dict[str, object] | None = None) -> None:
+        self._playback_frame_position = int(
+            self._shared_native_output_logical_frame(include_queued=True, status=status)
+        )
+
     def _native_output_scheduling_lead_frames(
         self,
         bridge: object | None = None,
@@ -6890,31 +7566,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, '_native_output_warm_timer'):
             self._native_output_warm_timer.start(max(0, int(delay_ms)))
 
-    def _finalize_preview_resource(self, sink: QtMultimedia.QAudioSink, buffer: QtCore.QBuffer) -> None:
-        try:
-            self._preview_resources.remove((sink, buffer))
-        except ValueError:
-            pass
-        try:
-            sink.stop()
-        except Exception:
-            pass
-        sink.deleteLater()
-        buffer.deleteLater()
-
-    def _cleanup_finished_preview_resources(self) -> None:
-        stopped_state = QtMultimedia.QtAudio.State.StoppedState
-        active_resources = list(self._preview_resources)
-        for sink, buffer in active_resources:
-            try:
-                state = sink.state()
-            except RuntimeError:
-                state = stopped_state
-            except Exception:
-                state = stopped_state
-            if state == stopped_state:
-                self._finalize_preview_resource(sink, buffer)
-
     def _close_preview_audio(self) -> None:
         bridge = getattr(self, '_native_output_bridge', None)
         if bridge is not None:
@@ -6922,62 +7573,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 bridge.clear_audio_queue(reset_counters=False, stream_id='preview')
             except Exception:
                 _APP_LOGGER.exception("Failed clearing preview audio stream")
-        sink = self._preview_sink
-        buffer = self._preview_buffer_device
-        self._preview_sink = None
-        self._preview_buffer_device = None
-        if sink is None or buffer is None:
-            self._cleanup_finished_preview_resources()
-            return
-        if (sink, buffer) not in self._preview_resources:
-            self._preview_resources.append((sink, buffer))
-        try:
-            sink.stop()
-        except Exception:
-            self._finalize_preview_resource(sink, buffer)
-            return
-        QtCore.QTimer.singleShot(250, self._cleanup_finished_preview_resources)
-
-    def _on_preview_sink_state_changed(self, sink: QtMultimedia.QAudioSink, buffer: QtCore.QBuffer, state) -> None:
-        if state == QtMultimedia.QtAudio.State.IdleState and self._preview_sink is sink:
-            self._preview_sink = None
-            self._preview_buffer_device = None
-            if (sink, buffer) not in self._preview_resources:
-                self._preview_resources.append((sink, buffer))
-            try:
-                sink.stop()
-            except Exception:
-                self._finalize_preview_resource(sink, buffer)
-                return
-            QtCore.QTimer.singleShot(0, self._cleanup_finished_preview_resources)
-            return
-        if state == QtMultimedia.QtAudio.State.StoppedState:
-            self._finalize_preview_resource(sink, buffer)
 
     def _play_pcm_preview(self, samples: object, sample_rate: int) -> None:
         self._close_preview_audio()
-        # Note previews should never cold-start the native JUCE output bridge on
-        # the UI thread. If the bridge is already alive, reuse it; otherwise
-        # fall back to the lightweight local preview sink.
-        if self._native_output_bridge_supported() and self._native_output_bridge_alive():
-            try:
-                if self._queue_native_output_stream_audio('preview', samples, sample_rate, clear_first=True):
-                    return
-            except Exception:
-                _APP_LOGGER.exception("Native output preview stream failed, falling back to QAudioSink")
-        if sample_rate != self._playback_sample_rate:
-            samples = resample_samples(samples, sample_rate, self._playback_sample_rate)
-        pcm_bytes = encode_pcm_output_samples(samples, self._playback_sample_format, self._playback_channel_count)
-        frame_count = max(1, len(pcm_bytes) // self._playback_bytes_per_frame())
-        preview_duration_ms = int((frame_count / float(self._playback_sample_rate)) * 1000.0) + 80
-        buffer = QtCore.QBuffer(self)
-        buffer.setData(QtCore.QByteArray(pcm_bytes))
-        buffer.open(QtCore.QIODevice.OpenModeFlag.ReadOnly)
-        sink = self._create_audio_sink()
-        sink.start(buffer)
-        self._preview_buffer_device = buffer
-        self._preview_sink = sink
-        QtCore.QTimer.singleShot(preview_duration_ms, lambda current_sink=sink: self._close_preview_audio() if self._preview_sink is current_sink else None)
+        if not self._native_output_bridge_supported():
+            self.statusBar().showMessage('Preview unavailable: JUCE/native output is not available')
+            return
+        try:
+            bridge = self._ensure_native_output_bridge()
+            if bridge is None or not self._queue_native_output_stream_audio('preview', samples, sample_rate, clear_first=True):
+                raise RuntimeError('Could not start the JUCE preview stream')
+        except Exception as exc:
+            _APP_LOGGER.exception("Native output preview stream failed")
+            self.statusBar().showMessage(f'Preview unavailable: {exc}')
 
     def _track_live_host_key(self, track: TrackState, idx: int) -> tuple[object, ...]:
         instrument_entry = self._rack_vsti_entry(track.rack_vsti) if track.rack_vsti else None
@@ -7434,6 +8042,12 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 _APP_LOGGER.exception("Failed clearing shared native output stream=%s during stop", stream_id)
 
+        if self._graph_native_transport_active():
+            try:
+                bridge.command('stop_graph_transport', panic=bool(exhaustive))
+            except Exception:
+                _APP_LOGGER.exception("Failed stopping graph transport on shared native output bridge")
+
         sent_targeted = False
         try:
             for channel in target_channels:
@@ -7463,13 +8077,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 bridge.clear_audio_queue(reset_counters=False, stream_id='live_midi')
             except Exception:
                 _APP_LOGGER.exception("Failed clearing live MIDI output stream")
-        if self._live_midi_sink is not None:
-            try:
-                self._live_midi_sink.stop()
-            except Exception:
-                pass
-        self._live_midi_sink = None
-        self._live_midi_sink_device = None
         self._live_midi_active = False
         self._live_midi_pending_bytes.clear()
         self._live_midi_pump_in_progress = False
@@ -8022,13 +8629,13 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         queued_output_frames = max(0, int(lead_frames)) + max(0, int(output_offset_frames))
         target_channel = int(clamp(track.midi_channel, 0, 15)) + 1
-        clear_channels = [target_channel] if (state.instrument_reset_pending or state.native_host_epoch_flush_pending) else None
+        reset_channels = [target_channel] if (state.instrument_reset_pending or state.native_host_epoch_flush_pending) else None
         if not self._schedule_native_vst_host_messages(
             idx,
             bridge,
             events,
             queued_output_frames,
-            clear_channels=clear_channels,
+            reset_channels=reset_channels,
             loop_epoch=state.native_host_loop_epoch,
         ):
             return False
@@ -8039,6 +8646,154 @@ class MainWindow(QtWidgets.QMainWindow):
         state.native_host_scheduled_until_frame = max(0, int(start_frame) + max(1, int(frame_count)))
         state.last_error = ""
         return True
+
+    def _schedule_native_vst_graph_transport_chunk_via_bridge(
+        self,
+        bridge: object,
+        tracks: list[tuple[int, TrackState, VSTInstrument]],
+        start_frame: int,
+        frame_count: int,
+        *,
+        output_offset_frames: int = 0,
+        lead_frames: int = 0,
+    ) -> bool:
+        if bridge is None or not tracks:
+            return False
+        base_offset_frames = max(0, int(lead_frames)) + max(0, int(output_offset_frames))
+        slot_payloads: list[dict[str, object]] = []
+        for slot_index, (idx, track, entry) in enumerate(tracks):
+            state = self._realtime_track_state(idx, track)
+            if int(start_frame) < int(state.native_host_scheduled_until_frame):
+                state.native_host_scheduled_until_frame = -1
+                if not state.instrument_reset_pending:
+                    state.native_host_epoch_flush_pending = True
+            events = self._collect_chunk_midi_events(
+                track,
+                start_frame,
+                frame_count,
+                bootstrap_active=bool(state.instrument_reset_pending),
+            )
+            payload_events: list[dict[str, object]] = []
+            for offset, order, msg in events:
+                encoded = self._native_vst_host_message_payload(msg)
+                if encoded is None:
+                    continue
+                encoded['sample_offset'] = max(0, int(offset))
+                encoded['priority'] = int(order)
+                payload_events.append(encoded)
+            target_channel = int(clamp(track.midi_channel, 0, 15)) + 1
+            reset_channels = [target_channel] if (state.instrument_reset_pending or state.native_host_epoch_flush_pending) else None
+            if not payload_events and not reset_channels:
+                state.native_host_scheduled_until_frame = max(0, int(start_frame) + max(1, int(frame_count)))
+                continue
+            slot_payload: dict[str, object] = {
+                'slot_index': int(slot_index),
+                'loop_epoch': max(0, int(state.native_host_loop_epoch)),
+                'events': payload_events,
+            }
+            if reset_channels:
+                slot_payload['reset_channels'] = [max(1, min(16, int(channel))) for channel in reset_channels]
+            slot_payloads.append(slot_payload)
+            state.instrument_reset_pending = False
+            state.loop_bootstrap_pending = False
+            state.native_host_epoch_flush_pending = False
+            state.fx_reset_pending = False
+            state.native_host_scheduled_until_frame = max(0, int(start_frame) + max(1, int(frame_count)))
+            state.last_error = ""
+        if not slot_payloads:
+            return True
+        try:
+            bridge.command(
+                'schedule_graph_midi',
+                base_offset_frames=max(0, int(base_offset_frames)),
+                slots=slot_payloads,
+            )
+            return True
+        except Exception:
+            _APP_LOGGER.exception("Failed scheduling native VST graph MIDI batch track_count=%s", len(tracks))
+            return False
+
+    def _pump_graph_native_transport(self, *, status: dict[str, object] | None = None) -> None:
+        bridge = getattr(self, '_native_output_bridge', None)
+        if bridge is None or not self._graph_native_transport_active():
+            return
+
+        graph_rows = list(getattr(self, '_graph_native_transport_rows', []) or [])
+        tracks: list[tuple[int, TrackState, VSTInstrument]] = []
+        for row in graph_rows:
+            if row < 0 or row >= len(self.project.tracks):
+                continue
+            track = self.project.tracks[int(row)]
+            entry = self._rack_vsti_entry(track.rack_vsti) if track.rack_vsti else None
+            if entry is None:
+                continue
+            tracks.append((int(row), track, entry))
+        if not tracks:
+            self._clear_graph_native_transport_state()
+            return
+
+        source_status = status if isinstance(status, dict) else self._native_output_status(bridge)
+        if source_status is None:
+            raise RuntimeError('Graph native transport bridge is unavailable')
+        current_frame = self._native_output_rendered_sample_frames(source_status)
+        lead_frames = int(
+            getattr(self, '_graph_native_transport_lead_frames', 0)
+            or self._native_output_scheduling_lead_frames(bridge, source_status)
+        )
+        target_ahead_frames = int(
+            max(
+                self._playback_chunk_frames * 4,
+                self._shared_native_output_queue_target_frames(source_status),
+            )
+        )
+        target_output_frame = current_frame + target_ahead_frames
+        max_writes = max(4, int(math.ceil(target_ahead_frames / max(1, self._playback_chunk_frames))) + 2)
+        writes = 0
+
+        while writes < max_writes and self._graph_native_transport_output_cursor_frame < target_output_frame:
+            logical_start = int(self._graph_native_transport_logical_frame)
+            chunk_frames = max(
+                1,
+                min(
+                    int(self._playback_chunk_frames),
+                    int(target_output_frame - self._graph_native_transport_output_cursor_frame),
+                ),
+            )
+            if self.project.loop_enabled:
+                loop_start = int(self._graph_native_transport_loop_start_frame)
+                loop_end = int(self._graph_native_transport_loop_end_frame)
+                if loop_end <= loop_start:
+                    loop_start, loop_end = self._loop_frame_bounds()
+                    self._graph_native_transport_loop_start_frame = int(loop_start)
+                    self._graph_native_transport_loop_end_frame = int(loop_end)
+                if logical_start < loop_start or logical_start >= loop_end:
+                    logical_start = loop_start
+                    self._graph_native_transport_logical_frame = int(logical_start)
+                chunk_frames = min(chunk_frames, max(1, int(loop_end - logical_start)))
+
+            base_offset_frames = max(0, int(self._graph_native_transport_output_cursor_frame) - current_frame)
+            if not self._schedule_native_vst_graph_transport_chunk_via_bridge(
+                bridge,
+                tracks,
+                logical_start,
+                chunk_frames,
+                output_offset_frames=base_offset_frames,
+                lead_frames=lead_frames,
+            ):
+                raise RuntimeError('Could not schedule native graph transport block')
+
+            self._graph_native_transport_output_cursor_frame += int(chunk_frames)
+            self._graph_native_transport_logical_frame = int(logical_start) + int(chunk_frames)
+            if (
+                self.project.loop_enabled
+                and int(self._graph_native_transport_loop_end_frame) > int(self._graph_native_transport_loop_start_frame)
+                and self._graph_native_transport_logical_frame >= int(self._graph_native_transport_loop_end_frame)
+            ):
+                self._graph_native_transport_logical_frame = int(self._graph_native_transport_loop_start_frame)
+                for row, track, _entry in tracks:
+                    state = self._realtime_track_state(row, track)
+                    state.native_host_loop_epoch += 1
+            writes += 1
 
     def _schedule_native_vst_track_chunk(
         self,
@@ -8602,6 +9357,36 @@ class MainWindow(QtWidgets.QMainWindow):
         self._playback_committed_total_bytes = 0
         self._playback_pending_bytes.clear()
         self._native_output_queued_frames = 0
+        if bool(getattr(self, '_transport_uses_native_output_bridge', False)) and not self._direct_native_transport_active():
+            bridge = getattr(self, '_native_output_bridge', None)
+            if bridge is not None:
+                try:
+                    bridge.clear_audio_queue(reset_counters=True, stream_id='main')
+                    status = self._native_output_status(bridge)
+                    self._shared_native_output_origin_rendered_frames = self._native_output_rendered_sample_frames(status)
+                    if self._graph_native_transport_active():
+                        bridge.command('stop_graph_transport', panic=True)
+                        bridge.command('start_graph_transport')
+                        self._graph_native_transport_origin_frame = int(self._playback_frame_position)
+                        self._graph_native_transport_output_cursor_frame = int(self._native_output_rendered_sample_frames(status))
+                        self._graph_native_transport_logical_frame = int(self._playback_frame_position)
+                        if self.project.loop_enabled:
+                            loop_start_frame, loop_end_frame = self._loop_frame_bounds()
+                        else:
+                            loop_start_frame, loop_end_frame = 0, 0
+                        self._graph_native_transport_loop_start_frame = int(loop_start_frame)
+                        self._graph_native_transport_loop_end_frame = int(loop_end_frame)
+                        for row in self._graph_native_transport_row_set():
+                            if 0 <= int(row) < len(self.project.tracks):
+                                state = self._realtime_track_state(int(row), self.project.tracks[int(row)])
+                                state.instrument_reset_pending = True
+                                state.loop_bootstrap_pending = False
+                                state.native_host_epoch_flush_pending = False
+                                state.fx_reset_pending = False
+                                state.native_host_scheduled_until_frame = -1
+                                state.native_host_loop_epoch = 0
+                except Exception:
+                    _APP_LOGGER.exception("Failed seeking shared native output transport")
         self._loop_declick_pending_frames = 0
         self._realtime_reset_pending = True
         self._clear_realtime_mix_cache()
@@ -8678,7 +9463,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _restart_playback_preserving_tick(self) -> None:
         if not self.playback_timer.isActive():
             return
-        current_tick = int(self.project.playhead_tick)
+        current_tick = int(self._current_audible_playback_tick())
         self.stop_playback()
         self._set_playhead_tick_position(current_tick)
         self.start_playback()
@@ -8716,7 +9501,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         queued_frames = max(0, int(self._estimated_queued_output_frames()))
-        target_frames = max(1, int(self._desired_audio_buffer_frames()))
+        target_frames = max(1, int(self._shared_native_output_queue_target_frames()))
         minimum_headroom = max(self._playback_chunk_frames, target_frames // 2)
         if queued_frames < minimum_headroom and self._playback_active:
             self._prerender_mix_refresh_timer.start(30)
@@ -8841,24 +9626,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._realtime_pump_generation += 1
         self._audio_pump_timer.stop()
         bridge = getattr(self, '_native_output_bridge', None)
-        if self._playback_sink is not None:
-            sink = self._playback_sink
-            try:
-                # `reset()` drops any queued audio immediately, which keeps
-                # pre-rendered General MIDI output from audibly trailing after Stop.
-                reset = getattr(sink, 'reset', None)
-                if callable(reset):
-                    reset()
-            except Exception:
-                pass
-            try:
-                sink.stop()
-            except Exception:
-                pass
-        self._playback_sink = None
-        self._playback_sink_device = None
         if bridge is not None:
             try:
+                if self._graph_native_transport_active():
+                    bridge.command('stop_graph_transport', panic=True)
                 bridge.clear_audio_queue(reset_counters=True, stream_id='main')
             except Exception:
                 _APP_LOGGER.exception("Failed clearing native realtime output queue")
@@ -8866,10 +9637,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._playback_active = False
         self._native_output_queued_frames = 0
         self._native_output_underruns = 0
+        self._shared_native_output_origin_rendered_frames = 0
+        self._realtime_transport_vsti_count = 0
+        self._auto_forced_prerender_vst_transport = False
         self._playback_committed_total_bytes = 0
         self._playback_pending_bytes.clear()
         self._loop_declick_pending_frames = 0
         self._audio_pump_in_progress = False
+        self._clear_graph_native_transport_state()
         self._track_meter_levels = {idx: 0.0 for idx in range(len(self.project.tracks))}
         if hasattr(self, 'mixer'):
             self.mixer.refresh_meters()
@@ -8901,11 +9676,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 state.last_error = ""
         self._clear_realtime_mix_cache()
 
-    def _queue_native_output_chunk(self, bridge: object, frame_count: int) -> int:
+    def _queue_native_output_chunk(
+        self,
+        bridge: object,
+        frame_count: int,
+        *,
+        status: dict[str, object] | None = None,
+    ) -> int:
         chunk_frames = max(1, int(frame_count))
+        self._sync_shared_native_output_playback_position(status)
         chunk = self._generate_realtime_chunk_bytes(
             chunk_frames,
-            sample_format=QtMultimedia.QAudioFormat.SampleFormat.Float,
+            sample_format=PCM_SAMPLE_FORMAT_FLOAT,
             channel_count=2,
         )
         if not chunk:
@@ -8959,7 +9741,7 @@ class MainWindow(QtWidgets.QMainWindow):
             stereo = self._ensure_stereo_sample_count(target_samples, max(1, int(expected)))
         payload = encode_pcm_output_samples(
             stereo,
-            QtMultimedia.QAudioFormat.SampleFormat.Float,
+            PCM_SAMPLE_FORMAT_FLOAT,
             2,
         )
         if clear_first:
@@ -8994,12 +9776,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._direct_native_transport_row = int(row)
         self._direct_native_transport_origin_frame = int(start_frame)
-        self._direct_native_transport_output_cursor_frame = 0
+        self._direct_native_transport_output_cursor_frame = int(self._native_output_rendered_sample_frames(status))
         self._direct_native_transport_logical_frame = int(start_frame)
         self._direct_native_transport_loop_start_frame = int(loop_start_frame)
         self._direct_native_transport_loop_end_frame = int(loop_end_frame)
         self._direct_native_transport_lead_frames = int(lead_frames)
         self._playback_logical_origin_frame = int(start_frame)
+        self._shared_native_output_origin_rendered_frames = int(self._native_output_rendered_sample_frames(status))
 
         state = self._realtime_track_state(int(row), track)
         state.instrument_reset_pending = True
@@ -9022,19 +9805,105 @@ class MainWindow(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(0, lambda g=generation: self._pump_realtime_audio(g))
         return True
 
+    def _prepare_graph_native_transport_playback(
+        self,
+        start_tick: int,
+        graph_tracks: list[tuple[int, TrackState, VSTInstrument]],
+    ) -> bool:
+        if not graph_tracks:
+            return False
+        bridge = self._ensure_native_output_bridge()
+        if bridge is None:
+            return False
+        self._clear_direct_native_transport_state()
+        self._clear_graph_native_transport_state()
+        self._configure_native_vst_graph_bridge(bridge, graph_tracks)
+        try:
+            bridge.command('stop_graph_transport', panic=True)
+        except Exception:
+            _APP_LOGGER.exception("Failed resetting graph transport before playback start")
+        bridge.clear_audio_queue(reset_counters=True, stream_id='main')
+        bridge.clear_audio_queue(reset_counters=True, stream_id='preview')
+        bridge.clear_audio_queue(reset_counters=True, stream_id='live_midi')
+        status = self._native_output_status(bridge)
+        if status is None:
+            raise RuntimeError('Graph native transport bridge is unavailable')
+        start_frame = max(0, tick_to_sample_frame(int(start_tick), self._playback_sample_rate, self.project.bpm))
+        loop_start_frame = 0
+        loop_end_frame = 0
+        if self.project.loop_enabled:
+            loop_start_frame, loop_end_frame = self._loop_frame_bounds()
+            if start_frame < loop_start_frame or start_frame >= loop_end_frame:
+                start_frame = loop_start_frame
+
+        lead_frames = self._native_output_scheduling_lead_frames(bridge, status)
+        self._graph_native_transport_rows = [int(row) for row, _track, _entry in graph_tracks]
+        self._graph_native_transport_origin_frame = int(start_frame)
+        self._graph_native_transport_output_cursor_frame = int(self._native_output_rendered_sample_frames(status))
+        self._graph_native_transport_logical_frame = int(start_frame)
+        self._graph_native_transport_loop_start_frame = int(loop_start_frame)
+        self._graph_native_transport_loop_end_frame = int(loop_end_frame)
+        self._graph_native_transport_lead_frames = int(lead_frames)
+        self._playback_logical_origin_frame = int(start_frame)
+        self._shared_native_output_origin_rendered_frames = int(self._native_output_rendered_sample_frames(status))
+        self._playback_frame_position = int(start_frame)
+
+        for row, track, entry in graph_tracks:
+            state = self._realtime_track_state(int(row), track)
+            state.instrument_reset_pending = True
+            state.loop_bootstrap_pending = False
+            state.native_host_epoch_flush_pending = False
+            state.fx_reset_pending = False
+            state.native_host_scheduled_until_frame = -1
+            state.native_host_loop_epoch = 0
+            state.native_host_render_failed = False
+            state.last_error = ""
+            if self._native_vst_host_editor_visible(int(row)):
+                self._close_track_vsti_window(int(row), teardown_host=True)
+                self._open_native_vst_graph_bridge_editor(int(row), track, entry)
+
+        bridge.command('start_graph_transport')
+        self._transport_uses_native_output_bridge = True
+        self._playback_active = True
+        self._pump_graph_native_transport(status=status)
+        self._pump_native_output_audio()
+        bridge.start_audio_stream(stream_id='main')
+        self._audio_pump_timer.start()
+        generation = self._realtime_pump_generation
+        QtCore.QTimer.singleShot(0, lambda g=generation: self._pump_realtime_audio(g))
+        return True
+
     def _prepare_native_output_playback(self) -> bool:
         bridge = self._ensure_native_output_bridge()
         if bridge is None:
             return False
         self._clear_direct_native_transport_state()
         bridge.clear_audio_queue(reset_counters=True, stream_id='main')
-        bridge.start_audio_stream(stream_id='main')
+        status = self._native_output_status(bridge)
+        self._shared_native_output_origin_rendered_frames = self._native_output_rendered_sample_frames(status)
+        self._playback_frame_position = int(self._playback_logical_origin_frame)
         self._transport_uses_native_output_bridge = True
         self._playback_active = True
+        requested_queue = int(self._output_queue_target_frames())
+        actual_block = int(self._actual_output_buffer_frames(status))
+        should_prefill = (
+            requested_queue > max(1024, actual_block * 2)
+            or int(getattr(self, '_realtime_transport_vsti_count', 0) or 0) >= 2
+        )
+        if bool(getattr(self, '_use_prerendered_transport_mix', False)):
+            self._pump_native_output_audio()
+        bridge.start_audio_stream(stream_id='main')
+        if should_prefill and not bool(getattr(self, '_use_prerendered_transport_mix', False)):
+            self._pump_native_output_audio()
         self._audio_pump_timer.start()
         generation = self._realtime_pump_generation
         QtCore.QTimer.singleShot(0, lambda g=generation: self._pump_realtime_audio(g))
         return True
+
+    def _should_force_prerendered_transport_playback(self) -> bool:
+        if bool(getattr(self, 'prefer_prerendered_vst_playback', False)):
+            return False
+        return int(getattr(self, '_realtime_transport_vsti_count', 0) or 0) >= 2
 
     def _prepare_realtime_playback(self, start_tick: int) -> bool:
         self._cancel_deferred_realtime_gc()
@@ -9043,14 +9912,31 @@ class MainWindow(QtWidgets.QMainWindow):
         self._realtime_reset_pending = True
         self._reset_realtime_track_states()
         self._seek_media_to_project_tick(int(start_tick))
+        self._realtime_transport_vsti_count = self._active_realtime_vsti_track_count()
+        self._apply_audio_buffer_preference()
         self._transport_uses_native_output_bridge = False
         self._use_prerendered_transport_mix = False
-        if bool(getattr(self, 'prefer_prerendered_vst_playback', False)):
+        self._auto_forced_prerender_vst_transport = False
+        if not bool(getattr(self, 'prefer_prerendered_vst_playback', False)):
+            graph_tracks = self._graph_native_transport_candidates()
+            if graph_tracks:
+                try:
+                    if self._prepare_graph_native_transport_playback(int(start_tick), graph_tracks):
+                        return True
+                except Exception:
+                    _APP_LOGGER.exception("Failed starting native graph transport, falling back to existing transport modes")
+                    self._stop_native_output_bridge()
+        force_prerender = self._should_force_prerendered_transport_playback()
+        if bool(getattr(self, 'prefer_prerendered_vst_playback', False)) or force_prerender:
             try:
                 self._use_prerendered_transport_mix = self._build_playback_mix()
+                self._auto_forced_prerender_vst_transport = bool(force_prerender and self._use_prerendered_transport_mix)
             except Exception:
                 self._use_prerendered_transport_mix = False
+                self._auto_forced_prerender_vst_transport = False
                 _APP_LOGGER.exception("Failed building prerendered transport mix")
+            if self._use_prerendered_transport_mix:
+                self._apply_audio_buffer_preference()
         else:
             direct_plugin = self._direct_native_transport_candidate()
             if direct_plugin is not None:
@@ -9061,18 +9947,15 @@ class MainWindow(QtWidgets.QMainWindow):
                     _APP_LOGGER.exception("Failed starting direct JUCE transport, falling back to PCM playback")
                     self._stop_native_output_bridge()
                     self._clear_direct_native_transport_state()
-        sink = self._create_audio_sink()
-        sink_device = sink.start()
-        if sink_device is None:
-            self._playback_pending_bytes.clear()
-            return False
-        self._playback_sink = sink
-        self._playback_sink_device = sink_device
-        self._playback_active = True
-        generation = self._realtime_pump_generation
-        self._audio_pump_timer.start()
-        QtCore.QTimer.singleShot(0, lambda g=generation: self._pump_realtime_audio(g))
-        return True
+        if self._native_output_bridge_supported():
+            try:
+                if self._prepare_native_output_playback():
+                    return True
+            except Exception:
+                _APP_LOGGER.exception("Failed starting shared JUCE output transport")
+                self._stop_native_output_bridge()
+        self._playback_pending_bytes.clear()
+        return False
 
     def _sample_audio_cache_key(self, path: str) -> str:
         clip_path = Path(path)
@@ -9319,8 +10202,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _realtime_vst_cache_window_frames(self, frame_count: int) -> int:
         target = max(1, int(frame_count))
-        base = max(target, int(self._playback_sample_rate // 2))
-        return min(32768, max(4096, base))
+        active_vsti = max(0, int(getattr(self, '_realtime_transport_vsti_count', 0) or 0))
+        requested_queue = max(64, int(self._output_queue_target_frames()))
+        window_seconds = 0.5 if active_vsti <= 1 else min(1.5, 0.5 * active_vsti)
+        base = max(target, int(self._playback_sample_rate * window_seconds))
+        if active_vsti >= 2:
+            base = max(base, requested_queue * 2)
+        return min(131072, max(4096, base))
 
     def _render_native_vst_realtime_window(
         self,
@@ -9610,35 +10498,24 @@ class MainWindow(QtWidgets.QMainWindow):
         return count
 
     def _realtime_render_ahead_frames(self) -> int:
-        output_buffer = max(128, int(self._desired_audio_buffer_frames()))
-        # Keep render batches small to avoid blocking the main thread.
-        # Large render-ahead values cause cache-miss stalls that starve
-        # both the audio output and the UI event loop.  Render just one
-        # buffer's worth so each cache miss completes quickly.
+        output_buffer = max(128, int(self._actual_output_buffer_frames()))
+        requested_queue = max(64, int(self._output_queue_target_frames()))
         base = max(
             self._playback_chunk_frames,
             output_buffer,
         )
-        return min(2048, base)
+        active_vsti = max(0, int(getattr(self, '_realtime_transport_vsti_count', 0) or 0))
+        if active_vsti >= 2:
+            base = max(
+                base,
+                min(16384, max(self._playback_chunk_frames * 2, output_buffer * 4, requested_queue // 2)),
+            )
+        return min(8192, base)
 
     def _estimated_queued_output_frames(self) -> int:
         if bool(getattr(self, '_transport_uses_native_output_bridge', False)) and self._native_output_bridge_alive():
             return max(0, int(getattr(self, '_native_output_queued_frames', 0)))
-        sink = getattr(self, '_playback_sink', None)
-        if sink is None:
-            return 0
-        bytes_per_frame = self._playback_bytes_per_frame()
-        try:
-            buffer_frames = int(max(0, sink.bufferFrameCount()))
-        except Exception:
-            buffer_frames = 0
-        try:
-            free_frames = int(max(0, sink.bytesFree()) // bytes_per_frame)
-        except Exception:
-            free_frames = 0
-        if buffer_frames <= 0:
-            return 0
-        return max(0, buffer_frames - free_frames)
+        return 0
 
     def _current_audible_playback_sec(self) -> float:
         return self._transport_tick_to_seconds(self._current_audible_playback_tick())
@@ -9666,6 +10543,9 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 logical_frame = int(self._direct_native_transport_origin_frame) + direct_frames
             return sample_frame_to_tick(logical_frame, self._playback_sample_rate, self.project.bpm)
+        if bool(getattr(self, '_transport_uses_native_output_bridge', False)) and self._native_output_bridge_alive():
+            logical_frame = self._shared_native_output_logical_frame(include_queued=False)
+            return sample_frame_to_tick(logical_frame, self._playback_sample_rate, self.project.bpm)
         generated_frames = max(0, int(getattr(self, '_playback_generated_total_frames', 0)))
         audible_generated = max(0, generated_frames - self._estimated_queued_output_frames())
         if not self.project.loop_enabled:
@@ -9681,8 +10561,22 @@ class MainWindow(QtWidgets.QMainWindow):
         return sample_frame_to_tick(logical_frame, self._playback_sample_rate, self.project.bpm)
 
     def _prerender_playback_window_frames(self) -> int:
-        target_frames = max(1, int(self._desired_audio_buffer_frames()))
-        return max(target_frames, self._playback_chunk_frames * 2)
+        target_frames = max(1, int(self._shared_native_output_queue_target_frames()))
+        window_frames = max(target_frames, self._playback_chunk_frames * 2)
+        active_vsti = max(0, int(getattr(self, '_realtime_transport_vsti_count', 0) or 0))
+        if active_vsti >= 2 and (
+            bool(getattr(self, '_auto_forced_prerender_vst_transport', False))
+            or bool(getattr(self, 'prefer_prerendered_vst_playback', False))
+        ):
+            # For multi-VST prerender transport, avoid rebuilding short
+            # windows on the UI thread mid-playback.  Build the whole
+            # remaining transport span up front and stream from that cached
+            # PCM instead.
+            window_frames = max(
+                window_frames,
+                int(math.ceil(max(0.0, self._playback_mix_duration_seconds()) * float(max(1, self._playback_sample_rate)))),
+            )
+        return window_frames
 
     def _empty_stereo_playback_samples(self, frame_count: int) -> object:
         count = max(0, int(frame_count))
@@ -9809,8 +10703,11 @@ class MainWindow(QtWidgets.QMainWindow):
                         mix[channel][pos] += metronome[channel][pos]
 
         solo_tracks = self._active_solo_track_indices()
+        graph_rows = self._graph_native_transport_row_set() if self._graph_native_transport_active() else set()
         for idx, track in enumerate(self.project.tracks):
             if not self._track_is_audible(idx, solo_tracks):
+                continue
+            if idx in graph_rows:
                 continue
             if track.track_type == 'instrument' and not track.notes:
                 continue
@@ -10019,19 +10916,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if bool(getattr(self, '_transport_uses_native_output_bridge', False)) and self._native_output_bridge_alive():
             self._pump_native_output_audio()
             return
-        if self._playback_sink is None or self._playback_sink_device is None:
-            return
-        self._audio_pump_in_progress = True
-        bytes_per_frame = self._playback_bytes_per_frame()
-        try:
-            buffer_frames = int(max(self._playback_chunk_frames, self._playback_sink.bufferFrameCount()))
-        except Exception:
-            buffer_frames = self._playback_chunk_frames * 4
-        # Allow a few writes per pump cycle to keep the buffer fed without
-        # monopolising the main thread.  Excessive writes cause UI stalls
-        # that are worse than the occasional audio glitch they prevent.
-        max_writes = max(4, int(math.ceil(buffer_frames / max(1, self._playback_chunk_frames))) + 2)
-        writes = 0
+        self.stop_playback()
+        self.statusBar().showMessage('Realtime playback stopped: JUCE/native output stream is unavailable')
+        return
         try:
             # IdleState means the output buffer has drained completely but
             # the sink is still running.  There is no need to call start()
@@ -10041,11 +10928,11 @@ class MainWindow(QtWidgets.QMainWindow):
             # device; the sink will resume playing automatically once the
             # buffer is refilled.
             try:
-                sink_state = self._playback_sink.state()
-                if sink_state == QtMultimedia.QtAudio.State.IdleState and self._playback_committed_total_bytes > 0:
+                sink_state = None
+                if False and sink_state and self._playback_committed_total_bytes > 0:
                     _APP_LOGGER.debug("Audio sink idle (buffer drained) — refilling")
-                elif sink_state == QtMultimedia.QtAudio.State.StoppedState:
-                    error = self._playback_sink.error()
+                elif False:
+                    error = 'unavailable'
                     raise RuntimeError(f"Audio sink stopped unexpectedly: {error}")
             except RuntimeError:
                 raise
@@ -10053,11 +10940,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
 
             while writes < max_writes:
-                bytes_free = int(max(0, self._playback_sink.bytesFree()))
+                bytes_free = 0
                 if self._playback_pending_bytes:
                     if bytes_free <= 0:
                         break
-                    written = self._playback_sink_device.write(self._playback_pending_bytes)
+                    written = 0
                     if written <= 0:
                         break
                     del self._playback_pending_bytes[:written]
@@ -10076,7 +10963,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     break
                 self._playback_pending_bytes.extend(chunk)
 
-                written = self._playback_sink_device.write(self._playback_pending_bytes)
+                written = 0
                 if written <= 0:
                     break
                 del self._playback_pending_bytes[:written]
@@ -10184,11 +11071,10 @@ class MainWindow(QtWidgets.QMainWindow):
             status = self._native_output_status(bridge)
             if status is None:
                 raise RuntimeError('Native output bridge is unavailable')
-            buffer_frames = int(max(
-                self._playback_chunk_frames,
-                int(status.get('buffer_size') or self._desired_audio_buffer_frames() or self._playback_chunk_frames),
-            ))
-            target_frames = int(max(self._desired_audio_buffer_frames(), buffer_frames))
+            if self._graph_native_transport_active():
+                self._pump_graph_native_transport(status=status)
+            buffer_frames = int(max(self._playback_chunk_frames, self._actual_output_buffer_frames(status)))
+            target_frames = int(max(buffer_frames, self._shared_native_output_queue_target_frames(status)))
             max_writes = max(4, int(math.ceil(target_frames / max(1, self._playback_chunk_frames))) + 2)
             writes = 0
             queued_frames = int(status.get('queued_audio_frames') or 0)
@@ -10197,7 +11083,7 @@ class MainWindow(QtWidgets.QMainWindow):
             while writes < max_writes and queued_frames < target_frames:
                 free_frames = max(1, target_frames - queued_frames)
                 chunk_frames = max(1, min(self._playback_chunk_frames, free_frames))
-                self._queue_native_output_chunk(bridge, chunk_frames)
+                self._queue_native_output_chunk(bridge, chunk_frames, status=status)
                 queued_frames = int(self._native_output_queued_frames)
                 writes += 1
         except Exception as exc:
@@ -10207,13 +11093,6 @@ class MainWindow(QtWidgets.QMainWindow):
         finally:
             self._audio_pump_in_progress = False
 
-    def _on_playback_sink_state_changed(self, state) -> None:
-        if state == QtMultimedia.QtAudio.State.StoppedState and self._playback_sink is not None:
-            error = self._playback_sink.error()
-            if error != QtMultimedia.QtAudio.Error.NoError:
-                _APP_LOGGER.warning("Playback sink stopped with error=%s", error)
-                self.statusBar().showMessage(f'Playback audio stopped: {error}')
-
     def start_playback(self) -> None:
         self._sync_playback_loop_state()
         start_tick = int(self.project.playhead_tick)
@@ -10222,7 +11101,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if start_tick < loop_start_tick or start_tick >= loop_end_tick:
                 start_tick = loop_start_tick
         if not self._prepare_realtime_playback(start_tick):
-            QtWidgets.QMessageBox.warning(self, 'Playback unavailable', 'Could not start the realtime audio output stream.')
+            QtWidgets.QMessageBox.warning(self, 'Playback unavailable', 'Could not start the JUCE/native audio output stream.')
             return
         self._set_playhead_tick_position(start_tick)
         self.playback_timer.start()
@@ -10234,7 +11113,14 @@ class MainWindow(QtWidgets.QMainWindow):
             bool(self.project.loop_enabled),
             self._audio_output_summary(),
         )
-        self.statusBar().showMessage(f'Playback started at {self.project.bpm} BPM (realtime)')
+        if bool(getattr(self, '_auto_forced_prerender_vst_transport', False)):
+            self.statusBar().showMessage(
+                f'Playback started at {self.project.bpm} BPM (multi-VST prerender fallback)'
+            )
+        elif self._graph_native_transport_active():
+            self.statusBar().showMessage(f'Playback started at {self.project.bpm} BPM (native graph transport)')
+        else:
+            self.statusBar().showMessage(f'Playback started at {self.project.bpm} BPM (realtime)')
 
     def stop_playback(self) -> None:
         should_reset = hasattr(self, 'playback_timer') and (not self.playback_timer.isActive())
@@ -10317,33 +11203,30 @@ class MainWindow(QtWidgets.QMainWindow):
 
         default_action = self.audio_output_menu.addAction('System Default Soundcard')
         default_action.setCheckable(True)
-        default_action.setChecked(not self.selected_audio_output_id)
+        default_action.setChecked(not self.selected_audio_output_name)
         default_action.triggered.connect(lambda: self.set_audio_output_device(''))
         group.addAction(default_action)
 
         self.audio_output_menu.addSeparator()
-        for device in QtMultimedia.QMediaDevices.audioOutputs():
-            action = self.audio_output_menu.addAction(device.description())
+        for device_name in self._available_native_output_devices():
+            action = self.audio_output_menu.addAction(device_name)
             action.setCheckable(True)
-            device_id = bytes(device.id()).hex()
-            action.setChecked(self.selected_audio_output_id == device_id)
-            action.triggered.connect(lambda _checked=False, d=device: self.set_audio_output_device(bytes(d.id()).hex()))
+            action.setChecked(self.selected_audio_output_name == device_name)
+            action.triggered.connect(lambda _checked=False, name=device_name: self.set_audio_output_device(name))
             group.addAction(action)
 
-        current_device = self._selected_audio_device()
-        preferred = current_device.preferredFormat()
         output_status = self._native_output_status(allow_cached=True, max_age_sec=0.25) if self._native_output_bridge_alive() else None
         self.audio_output_menu.addSeparator()
 
         sample_rate_menu = self.audio_output_menu.addMenu('Output Sample Rate')
         sample_rate_group = QtGui.QActionGroup(sample_rate_menu)
         sample_rate_group.setExclusive(True)
-        auto_rate_action = sample_rate_menu.addAction(f'Auto (Preferred {preferred.sampleRate()} Hz)')
+        auto_rate_action = sample_rate_menu.addAction(f'Auto (Host Default {self._playback_sample_rate} Hz)')
         auto_rate_action.setCheckable(True)
         auto_rate_action.setChecked(int(self.selected_audio_sample_rate) <= 0)
         auto_rate_action.triggered.connect(lambda _checked=False: self.set_audio_sample_rate(0))
         sample_rate_group.addAction(auto_rate_action)
-        for rate in self._available_audio_sample_rates(current_device):
+        for rate in self._available_audio_sample_rates():
             action = sample_rate_menu.addAction(f'{rate} Hz')
             action.setCheckable(True)
             action.setChecked(int(self.selected_audio_sample_rate) == int(rate))
@@ -10351,69 +11234,36 @@ class MainWindow(QtWidgets.QMainWindow):
             sample_rate_group.addAction(action)
 
         sample_format_menu = self.audio_output_menu.addMenu('Output Bit Depth / Format')
-        sample_format_group = QtGui.QActionGroup(sample_format_menu)
-        sample_format_group.setExclusive(True)
-        auto_format_action = sample_format_menu.addAction(f'Auto (Preferred {qaudio_sample_format_label(preferred.sampleFormat())})')
-        auto_format_action.setCheckable(True)
-        auto_format_action.setChecked(str(self.selected_audio_sample_format_name).strip().upper() == 'AUTO')
-        auto_format_action.triggered.connect(lambda _checked=False: self.set_audio_sample_format('Auto'))
-        sample_format_group.addAction(auto_format_action)
-        for sample_format in self._available_audio_sample_formats(current_device):
-            action = sample_format_menu.addAction(qaudio_sample_format_label(sample_format))
-            action.setCheckable(True)
-            action.setChecked(str(self.selected_audio_sample_format_name).strip().upper() == getattr(sample_format, 'name', ''))
-            action.triggered.connect(
-                lambda _checked=False, name=getattr(sample_format, 'name', 'Int16'): self.set_audio_sample_format(name)
-            )
-            sample_format_group.addAction(action)
+        float_action = sample_format_menu.addAction('32-bit Float (JUCE)')
+        float_action.setEnabled(False)
 
         native_host_menu = self.audio_output_menu.addMenu('Native VST Host')
+        effective_native_rate = self._native_vst_host_target_sample_rate()
+        effective_native_buffer = self._native_vst_host_target_buffer_size()
+        effective_native_buffer_ms = self._buffer_frames_duration_ms(effective_native_buffer, effective_native_rate)
         native_host_summary = native_host_menu.addAction(
-            f'Startup Format: {self._native_vst_host_target_sample_rate()} Hz | '
-            f'{self._native_vst_host_target_buffer_size()} samples '
-            f'({self._buffer_frames_duration_ms(self._native_vst_host_target_buffer_size(), self._native_vst_host_target_sample_rate()):.1f} ms)'
+            f'Startup Format: {effective_native_rate} Hz | '
+            f'{effective_native_buffer} samples ({effective_native_buffer_ms:.1f} ms)'
         )
         native_host_summary.setEnabled(False)
         native_host_menu.addSeparator()
 
-        native_rate_menu = native_host_menu.addMenu('Sample Rate')
-        native_rate_group = QtGui.QActionGroup(native_rate_menu)
-        native_rate_group.setExclusive(True)
-        follow_output_rate = native_rate_menu.addAction(f'Follow Output ({self._playback_sample_rate} Hz)')
-        follow_output_rate.setCheckable(True)
-        follow_output_rate.setChecked(int(self.native_vst_host_sample_rate) <= 0)
-        follow_output_rate.triggered.connect(lambda _checked=False: self.set_native_vst_host_sample_rate(0))
-        native_rate_group.addAction(follow_output_rate)
-        native_sample_rates = set(self._available_audio_sample_rates(current_device))
-        native_sample_rates.add(int(self._playback_sample_rate))
-        if int(self.native_vst_host_sample_rate) > 0:
-            native_sample_rates.add(int(self.native_vst_host_sample_rate))
-        for rate in sorted(rate for rate in native_sample_rates if int(rate) > 0):
-            action = native_rate_menu.addAction(f'{rate} Hz')
-            action.setCheckable(True)
-            action.setChecked(int(self.native_vst_host_sample_rate) == int(rate))
-            action.triggered.connect(lambda _checked=False, r=rate: self.set_native_vst_host_sample_rate(r))
-            native_rate_group.addAction(action)
+        native_rate_action = native_host_menu.addAction(
+            f'Sample Rate: Follows Output ({effective_native_rate} Hz)'
+        )
+        native_rate_action.setEnabled(False)
 
-        native_buffer_menu = native_host_menu.addMenu('Prebuffer Source')
+        native_buffer_menu = native_host_menu.addMenu('Device Buffer Request')
         native_buffer_group = QtGui.QActionGroup(native_buffer_menu)
         native_buffer_group.setExclusive(True)
         follow_output_buffer = native_buffer_menu.addAction(
-            f'Follows playback prebuffer ({self._native_vst_host_target_buffer_size()} effective)'
+            f'Follow Queue Target ({self._output_queue_target_summary()})'
         )
         follow_output_buffer.setCheckable(True)
         follow_output_buffer.setChecked(int(self.native_vst_host_buffer_size) <= 0)
         follow_output_buffer.triggered.connect(lambda _checked=False: self.set_native_vst_host_buffer_size(0))
         native_buffer_group.addAction(follow_output_buffer)
-        native_buffer_sizes = set(
-            self._buffer_choice_values_for_sample_rate(
-                self._native_vst_host_target_sample_rate(),
-                include_value=int(self._native_vst_host_target_buffer_size()),
-            )
-        )
-        if int(self.native_vst_host_buffer_size) > 0:
-            native_buffer_sizes.add(int(self.native_vst_host_buffer_size))
-        for size in sorted(size for size in native_buffer_sizes if int(size) > 0):
+        for size in self._available_native_vst_host_buffer_sizes():
             action = native_buffer_menu.addAction(
                 f'{size} samples ({self._buffer_frames_duration_ms(int(size), self._native_vst_host_target_sample_rate()):.1f} ms)'
             )
@@ -10422,11 +11272,11 @@ class MainWindow(QtWidgets.QMainWindow):
             action.triggered.connect(lambda _checked=False, s=size: self.set_native_vst_host_buffer_size(s))
             native_buffer_group.addAction(action)
 
-        latency_action = self.audio_output_menu.addAction(f'Playback Prebuffer Target: {self._playback_prebuffer_target_summary()}')
+        latency_action = self.audio_output_menu.addAction(f'Output Queue Target: {self._output_queue_target_summary()}')
         latency_action.setEnabled(False)
         buffer_action = self.audio_output_menu.addAction(f'Driver Block Size: {self._driver_block_size_summary(output_status)}')
         buffer_action.setEnabled(False)
-        queued_action = self.audio_output_menu.addAction(f'Playback Queued Ahead: {self._queued_ahead_summary(output_status)}')
+        queued_action = self.audio_output_menu.addAction(f'Output Queued Ahead: {self._queued_ahead_summary(output_status)}')
         queued_action.setEnabled(False)
 
     def open_audio_settings_dialog(self) -> None:
@@ -10441,15 +11291,48 @@ class MainWindow(QtWidgets.QMainWindow):
         dialog.raise_()
         dialog.activateWindow()
 
+    def open_ai_settings_dialog(self) -> None:
+        dialog = self._ai_settings_dialog
+        if dialog is None:
+            dialog = AISettingsDialog(self)
+            dialog.destroyed.connect(lambda *_args: setattr(self, '_ai_settings_dialog', None))
+            self._ai_settings_dialog = dialog
+        dialog.refresh_from_mainwindow(refresh_ollama_models=not bool(getattr(dialog, '_ollama_model_names', [])))
+        self._center_dialog(dialog)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def set_ai_provider(self, provider: object, *, save: bool = True) -> None:
+        self.ai_client.set_provider(provider)
+        if save:
+            self._save_preferences()
+        self.refresh_ai_status()
+
+    def set_ai_remote_model(self, model: object, *, save: bool = True) -> None:
+        self.ai_client.set_remote_model(model)
+        if save:
+            self._save_preferences()
+        self.refresh_ai_status()
+
+    def set_ai_ollama_settings(self, base_url: object, model: object | None = None, *, save: bool = True) -> None:
+        self.ai_client.set_ollama_connection(base_url, model)
+        if save:
+            self._save_preferences()
+        self.refresh_ai_status()
+
     def set_audio_output_device(self, device_id: str) -> None:
-        self.selected_audio_output_id = device_id
-        device_name = 'system default soundcard'
-        for device in QtMultimedia.QMediaDevices.audioOutputs():
-            if bytes(device.id()).hex() == device_id:
-                device_name = device.description()
+        requested = str(device_id or '').strip()
+        normalized = ''
+        for available_name in self._available_native_output_devices():
+            if available_name.strip().casefold() == requested.casefold():
+                normalized = available_name
                 break
-        if device_id and device_name == 'system default soundcard':
-            self.selected_audio_output_id = ''
+        if not normalized and requested:
+            normalized = requested
+        self.selected_audio_output_name = normalized
+        self.selected_audio_output_id = ''
+        self._clear_native_vst_host_audio_status_cache()
         self._apply_selected_audio_output()
         self._apply_audio_buffer_preference()
         self._save_preferences()
@@ -10461,10 +11344,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._restart_playback_preserving_tick()
         self._schedule_native_output_bridge_warm(delay_ms=0)
         self.refresh_audio_output_menu()
-        self.statusBar().showMessage(f'Audio output set to {self._audio_output_summary()}')
+        target_name = self.selected_audio_output_name or 'system default output'
+        self.statusBar().showMessage(f'Audio output set to {target_name} ({self._audio_output_summary()})')
 
     def set_audio_sample_rate(self, value: int) -> None:
         self.selected_audio_sample_rate = max(0, int(value))
+        if self._native_vst_host_uses_output_sample_rate():
+            self.native_vst_host_sample_rate = 0
+        self._clear_native_vst_host_audio_status_cache()
         self._apply_selected_audio_output()
         self._apply_audio_buffer_preference()
         self._save_preferences()
@@ -10479,10 +11366,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(f'Output sample rate set to {self._audio_output_summary()}')
 
     def set_audio_sample_format(self, value: str) -> None:
-        sample_format_name = str(value or 'Auto').strip() or 'Auto'
-        if sample_format_name.upper() != 'AUTO' and qaudio_sample_format_from_name(sample_format_name) is None:
-            sample_format_name = 'Auto'
-        self.selected_audio_sample_format_name = sample_format_name
+        _ = value
+        self.selected_audio_sample_format_name = 'Float'
         self._apply_selected_audio_output()
         self._apply_audio_buffer_preference()
         self._save_preferences()
@@ -10494,10 +11379,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._restart_playback_preserving_tick()
         self._schedule_native_output_bridge_warm(delay_ms=0)
         self.refresh_audio_output_menu()
-        self.statusBar().showMessage(f'Output format set to {self._audio_output_summary()}')
+        self.statusBar().showMessage('Output format locked to 32-bit Float for the JUCE engine')
 
     def set_audio_buffer_frames(self, value: int) -> None:
         self.audio_buffer_frames = int(clamp(value, 64, self._maximum_audio_buffer_frames()))
+        if self._native_vst_host_uses_output_buffer_size():
+            self.native_vst_host_buffer_size = 0
         self._apply_audio_buffer_preference()
         self._save_preferences()
         self._release_live_midi_host()
@@ -10514,7 +11401,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_audio_output_menu()
         latency_ms = self._buffer_frames_latency_ms(self.audio_buffer_frames)
         self.statusBar().showMessage(
-            f'Playback prebuffer set to {self.audio_buffer_frames} samples ({latency_ms:.1f} ms, {self._audio_output_summary()})'
+            f'Output queue target set to {self.audio_buffer_frames} samples ({latency_ms:.1f} ms, {self._audio_output_summary()})'
         )
 
     def set_playback_note_length_offset_ticks(self, value: int) -> None:
@@ -10541,7 +11428,19 @@ class MainWindow(QtWidgets.QMainWindow):
             self.set_playback_note_length_offset_ticks(int(value))
 
     def set_native_vst_host_sample_rate(self, value: int) -> None:
-        self.native_vst_host_sample_rate = max(0, int(value))
+        target = max(0, int(value))
+        if self._native_vst_host_uses_output_sample_rate():
+            self.native_vst_host_sample_rate = 0
+            if target > 0 and target != int(self.selected_audio_sample_rate):
+                self.set_audio_sample_rate(target)
+                return
+            self._save_preferences()
+            self.refresh_audio_output_menu()
+            self.statusBar().showMessage(
+                f'JUCE host sample rate follows the shared output rate at {self._native_vst_host_target_sample_rate()} Hz'
+            )
+            return
+        self.native_vst_host_sample_rate = target
         self._clear_native_vst_host_audio_status_cache()
         self._apply_audio_buffer_preference()
         self._save_preferences()
@@ -10550,15 +11449,34 @@ class MainWindow(QtWidgets.QMainWindow):
         for row in list(getattr(self, '_track_native_vst_host_bridges', {}).keys()):
             self._stop_native_vst_host_bridge(int(row))
         self._refresh_live_midi_host()
+        self._restart_playback_preserving_tick()
         self._schedule_native_output_bridge_warm(delay_ms=0)
         self.refresh_audio_output_menu()
-        self.statusBar().showMessage(
-            f'Native VST host sample rate set to {self._native_vst_host_target_sample_rate()} Hz for new or restarted plugin hosts'
-        )
+        if self._native_vst_host_uses_output_sample_rate():
+            self.statusBar().showMessage(
+                f'Native VST host sample rate now follows the main output at {self._native_vst_host_target_sample_rate()} Hz'
+            )
+        else:
+            self.statusBar().showMessage(
+                f'Native VST host sample rate set to {self._native_vst_host_target_sample_rate()} Hz for new or restarted plugin hosts'
+            )
 
     def set_native_vst_host_buffer_size(self, value: int) -> None:
         target = int(value)
-        if target <= 0:
+        if self._native_vst_host_uses_output_buffer_size():
+            self.native_vst_host_buffer_size = 0
+            if target > 0 and target != int(self.audio_buffer_frames):
+                self.set_audio_buffer_frames(target)
+                return
+            self._save_preferences()
+            self.refresh_audio_output_menu()
+            self.statusBar().showMessage(
+                f'JUCE host buffer follows the shared output buffer at '
+                f'{self._native_vst_host_target_buffer_size()} samples '
+                f'({self._buffer_frames_duration_ms(self._native_vst_host_target_buffer_size(), self._native_vst_host_target_sample_rate()):.1f} ms)'
+            )
+            return
+        elif target <= 0:
             self.native_vst_host_buffer_size = 0
         else:
             self.native_vst_host_buffer_size = int(clamp(target, 64, self._maximum_native_vst_host_buffer_size()))
@@ -10570,16 +11488,23 @@ class MainWindow(QtWidgets.QMainWindow):
         for row in list(getattr(self, '_track_native_vst_host_bridges', {}).keys()):
             self._stop_native_vst_host_bridge(int(row))
         self._refresh_live_midi_host()
+        self._restart_playback_preserving_tick()
         self._schedule_native_output_bridge_warm(delay_ms=0)
         self.refresh_audio_output_menu()
-        if self.native_vst_host_buffer_size > 0:
+        if self._native_vst_host_uses_output_buffer_size():
+            self.statusBar().showMessage(
+                f'Native VST host buffer now follows the main output buffer at '
+                f'{self._native_vst_host_target_buffer_size()} samples '
+                f'({self._buffer_frames_duration_ms(self._native_vst_host_target_buffer_size(), self._native_vst_host_target_sample_rate()):.1f} ms)'
+            )
+        elif self.native_vst_host_buffer_size > 0:
             self.statusBar().showMessage(
                 f'Native VST host buffer set to {self._native_vst_host_target_buffer_size()} samples '
                 f'({self._buffer_frames_duration_ms(self._native_vst_host_target_buffer_size(), self._native_vst_host_target_sample_rate()):.1f} ms)'
             )
         else:
             self.statusBar().showMessage(
-                f'Native VST host buffer now follows playback prebuffer at {self._native_vst_host_target_buffer_size()} samples'
+                f'Native VST host buffer now follows the output queue target at {self._native_vst_host_target_buffer_size()} samples'
             )
 
     def set_native_vst_host_audio_device_type(self, value: str) -> None:
@@ -10599,6 +11524,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for row in list(getattr(self, '_track_native_vst_host_bridges', {}).keys()):
             self._stop_native_vst_host_bridge(int(row))
         self._refresh_live_midi_host()
+        self._restart_playback_preserving_tick()
         self._schedule_native_output_bridge_warm(delay_ms=0)
         self.refresh_audio_output_menu()
         driver_label = normalized or 'host default driver'
@@ -10636,15 +11562,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._stop_realtime_audio_sink()
 
         self._close_preview_audio()
-        self._cleanup_finished_preview_resources()
-        for sink, buffer in list(getattr(self, '_preview_resources', [])):
-            try:
-                self._finalize_preview_resource(sink, buffer)
-            except Exception:
-                pass
-        if hasattr(self, '_preview_resources'):
-            self._preview_resources.clear()
-
         self._release_live_midi_host()
         self._stop_native_output_bridge()
         for row in list(getattr(self, '_track_native_vst_host_bridges', {}).keys()):
@@ -10675,11 +11592,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(f'Prefer GPU rendering {state}. Restart the app to apply.')
 
     def _apply_selected_audio_output(self) -> None:
-        device = self._selected_audio_device()
-        resolved = self._resolved_audio_output_format(device)
-        self._playback_sample_rate = max(1, int(resolved.sampleRate()))
-        self._playback_channel_count = max(1, int(resolved.channelCount()))
-        self._playback_sample_format = resolved.sampleFormat()
+        status = self._cached_native_vst_host_audio_status(
+            self._native_vst_host_target_audio_device_type(),
+            self._native_output_target_audio_device_name(),
+        )
+        requested_rate = int(getattr(self, 'selected_audio_sample_rate', 0) or 0)
+        reported_rate = int(status.get('sample_rate') if isinstance(status, dict) else 0)
+        self._playback_sample_rate = max(1, requested_rate or reported_rate or 48000)
+        self._playback_channel_count = 2
+        self._playback_sample_format = PCM_SAMPLE_FORMAT_FLOAT
+        self.selected_audio_sample_format_name = 'Float'
         if hasattr(self, 'renderer'):
             self.renderer.sample_rate = self._playback_sample_rate
         if hasattr(self, '_sample_audio_cache'):
@@ -10698,11 +11620,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self._audio_pump_timer.setInterval(playback_interval_ms)
         if hasattr(self, '_live_midi_pump_timer'):
             self._live_midi_pump_timer.setInterval(live_interval_ms)
-        if getattr(self, '_playback_sink', None) is not None:
-            try:
-                self._playback_sink.setBufferFrameCount(self._desired_audio_buffer_frames())
-            except Exception:
-                pass
 
     def _rack_vsti_path(self, rack_name: str) -> str:
         for vst in self.project.vsti_rack:
@@ -11056,6 +11973,7 @@ class MainWindow(QtWidgets.QMainWindow):
             sample_rate=self._native_vst_host_target_sample_rate(),
             buffer_size=max(64, int(self._native_vst_host_target_buffer_size())),
             audio_device_type=self._native_vst_host_target_audio_device_type() or None,
+            audio_output_device_name=self._native_output_target_audio_device_name() or None,
         )
         try:
             bridge.start(startup_timeout=8.0)
@@ -11565,6 +12483,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 and self._normalized_vsti_path(str(getattr(direct_bridge, 'plugin_path', '') or '')) == self._normalized_vsti_path(entry.path)
             ):
                 self._queue_native_vst_bridge_parameter_values(direct_bridge, values, generation=parameter_generation)
+
+        graph_bridge = self._active_native_vst_graph_bridge()
+        graph_slot_index = self._native_vst_graph_bridge_slot_index(track_index, entry, bridge=graph_bridge)
+        if graph_bridge is not None and graph_slot_index >= 0:
+            try:
+                graph_bridge.command(
+                    'set_graph_slot_parameters',
+                    slot_index=int(graph_slot_index),
+                    parameters=dict(values),
+                )
+            except Exception:
+                _APP_LOGGER.exception(
+                    "Failed syncing active graph transport parameters row=%s rack=%s",
+                    track_index,
+                    track.rack_vsti,
+                )
 
     def _apply_track_vsti_parameters_live(
         self,
@@ -12730,6 +13664,7 @@ class MainWindow(QtWidgets.QMainWindow):
         desired_sample_rate = self._native_vst_host_target_sample_rate()
         desired_buffer_size = self._native_vst_host_target_buffer_size()
         desired_audio_device_type = self._native_vst_host_target_audio_device_type()
+        desired_audio_output_device_name = self._native_output_target_audio_device_name()
         desired_state_path, desired_state_mtime_ns = self._native_vst_host_state_signature(track, entry)
         desired_bus_signature = self._native_vst_host_bus_payload_signature(self._native_vst_host_bus_payload(track, entry))
         existing = self._track_native_vst_host_bridges.get(row)
@@ -12738,6 +13673,9 @@ class MainWindow(QtWidgets.QMainWindow):
         existing_buffer_size = int(getattr(existing, 'buffer_size', 0) or 0)
         existing_audio_device_type = str(
             getattr(existing, 'requested_audio_device_type', getattr(existing, 'audio_device_type', '')) or ''
+        ).strip()
+        existing_audio_output_device_name = str(
+            getattr(existing, 'requested_audio_output_device_name', getattr(existing, 'audio_output_device_name', '')) or ''
         ).strip()
         existing_state_path = str(getattr(existing, '_aims_loaded_state_path', '') or '')
         existing_state_mtime_ns = int(getattr(existing, '_aims_loaded_state_mtime_ns', 0) or 0)
@@ -12752,6 +13690,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._stop_native_vst_host_bridge(row)
                     existing = None
                 elif existing_audio_device_type.casefold() != desired_audio_device_type.casefold():
+                    self._stop_native_vst_host_bridge(row)
+                    existing = None
+                elif existing_audio_output_device_name.casefold() != desired_audio_output_device_name.casefold():
                     self._stop_native_vst_host_bridge(row)
                     existing = None
                 elif existing_state_path != desired_state_path or existing_state_mtime_ns != desired_state_mtime_ns:
@@ -12796,15 +13737,18 @@ class MainWindow(QtWidgets.QMainWindow):
                     sample_rate=desired_sample_rate,
                     buffer_size=desired_buffer_size,
                     audio_device_type=desired_audio_device_type or None,
+                    audio_output_device_name=self._native_output_target_audio_device_name() or None,
                 )
                 setattr(bridge, '_aims_rack_name', str(entry.name))
                 bridge.requested_audio_device_type = desired_audio_device_type
+                bridge.requested_audio_output_device_name = self._native_output_target_audio_device_name()
                 bridge.start()
                 self._prime_native_vst_host_bridge_state(bridge, track, entry)
                 ok, status = self._configure_native_vst_host_bridge_buses(bridge, track, entry)
                 if not ok:
                     raise RuntimeError('Could not configure plugin bus layout')
                 bridge.audio_device_type = str(status.get('audio_device_type') if isinstance(status, dict) else '') or desired_audio_device_type
+                bridge.audio_output_device_name = str(status.get('audio_device_name') if isinstance(status, dict) else '') or self._native_output_target_audio_device_name()
                 self._apply_native_vst_bridge_parameter_values(bridge, track.vsti_parameters)
                 self._track_native_vst_host_bridges[row] = bridge
                 self._native_vst_host_retry_after.pop(row, None)
@@ -13199,6 +14143,129 @@ class MainWindow(QtWidgets.QMainWindow):
         self._track_playback_audio_cache[cache_id] = (cached_data, sr)
         return cached_data, sr
 
+    def _track_can_use_native_vst_graph_prerender(self, track: TrackState, entry: VSTInstrument | None) -> bool:
+        if track.track_type != 'instrument' or not track.notes:
+            return False
+        if track.instrument_mode != 'VSTI Rack' or entry is None or not entry.is_instrument or not entry.host_supported:
+            return False
+        if not self._can_use_native_vst_host(entry):
+            return False
+        if bool(track.vst_fx_chain):
+            return False
+        if abs(float(track.vsti_wet_mix) - 100.0) > 0.001:
+            return False
+        if any(bool(route.get('enabled', False)) for route in self._sanitize_vsti_input_bus_routes(track.vsti_input_bus_routes)):
+            return False
+        if any(bool(route.get('enabled', False)) for route in self._sanitize_vsti_output_bus_routes(track.vsti_output_bus_routes)):
+            return False
+        return True
+
+    def _build_native_vst_graph_payload_tracks(
+        self,
+        tracks: list[tuple[int, TrackState, VSTInstrument]],
+        *,
+        start_frame: int | None = None,
+        frame_count: int | None = None,
+        bootstrap_active: bool = False,
+    ) -> tuple[list[dict[str, object]], list[int], list[str]]:
+        include_events = start_frame is not None and frame_count is not None
+        payload_tracks: list[dict[str, object]] = []
+        graph_track_rows: list[int] = []
+        graph_track_paths: list[str] = []
+        for idx, track, entry in tracks:
+            state_path = self._effective_vsti_state_path(track, entry)
+            gain = max(0.0, float(track.volume) * (10.0 ** (float(track.vsti_output_gain_db) / 20.0)))
+            payload_track: dict[str, object] = {
+                'name': str(track.name or entry.name),
+                'plugin_path': str(entry.path),
+                'state_path': str(state_path) if state_path is not None and state_path.exists() else '',
+                'parameters': dict(track.vsti_parameters),
+                'gain': float(gain),
+                'pan': float(clamp(float(track.pan), -1.0, 1.0)),
+            }
+            if include_events:
+                payload_events: list[dict[str, object]] = []
+                events = self._collect_chunk_midi_events(
+                    track,
+                    int(start_frame),
+                    int(frame_count),
+                    bootstrap_active=bool(bootstrap_active),
+                )
+                for sample_offset, priority, message in events:
+                    if message.type not in {'note_on', 'note_off'}:
+                        continue
+                    velocity = float(getattr(message, 'velocity', 0) or 0)
+                    payload_events.append(
+                        {
+                            'sample_offset': int(max(0, sample_offset)),
+                            'priority': int(priority),
+                            'type': str(message.type),
+                            'channel': int(clamp(int(getattr(message, 'channel', 0) or 0) + 1, 1, 16)),
+                            'note': int(clamp(int(getattr(message, 'note', 60) or 60), 0, 127)),
+                            'velocity': max(0.0, min(1.0, velocity / 127.0)),
+                        }
+                    )
+                payload_track['events'] = payload_events
+            payload_tracks.append(payload_track)
+            graph_track_rows.append(int(idx))
+            graph_track_paths.append(self._normalized_vsti_path(str(entry.path)))
+        return payload_tracks, graph_track_rows, graph_track_paths
+
+    def _configure_native_vst_graph_bridge(
+        self,
+        bridge: object,
+        tracks: list[tuple[int, TrackState, VSTInstrument]],
+    ) -> bool:
+        if bridge is None or not tracks:
+            return False
+        payload_tracks, graph_track_rows, graph_track_paths = self._build_native_vst_graph_payload_tracks(tracks)
+        bridge.command('configure_plugin_graph', tracks=payload_tracks)
+        bridge._aims_graph_track_rows = list(graph_track_rows)
+        bridge._aims_graph_track_paths = list(graph_track_paths)
+        return True
+
+    def _render_native_vst_graph_mix_window(
+        self,
+        tracks: list[tuple[int, TrackState, VSTInstrument]],
+        start_frame: int,
+        frame_count: int,
+        sample_rate: int,
+    ) -> object | None:
+        if not tracks or not self._native_output_bridge_supported():
+            return None
+
+        try:
+            bridge = self._ensure_native_vst_graph_render_bridge()
+            if bridge is None:
+                return None
+            payload_tracks, graph_track_rows, graph_track_paths = self._build_native_vst_graph_payload_tracks(
+                tracks,
+                start_frame=int(start_frame),
+                frame_count=int(frame_count),
+                bootstrap_active=True,
+            )
+            self._configure_native_vst_graph_bridge(bridge, tracks)
+
+            response = bridge.command(
+                'render_plugin_graph',
+                frames=max(1, int(frame_count)),
+                tracks=payload_tracks,
+            )
+            if response.get('track_errors'):
+                raise RuntimeError(str(response.get('track_errors')))
+            decoded = self._decode_native_vst_bus_audio(
+                {
+                    'audio_b64': response.get('audio_b64', ''),
+                    'channels': int(response.get('channels', 2) or 2),
+                },
+                max(1, int(frame_count)),
+            )
+            return self._ensure_stereo_sample_count(decoded, max(1, int(frame_count)))
+        except Exception:
+            _APP_LOGGER.exception("Native VST graph prerender failed track_count=%s", len(tracks))
+            self._stop_native_vst_graph_render_bridge()
+            return None
+
     def _project_content_end_seconds(self) -> float:
         duration_sec = max(float(self.project.right_locator_sec), float(self.project.playhead_sec))
         sec_per_tick = 60.0 / max(1, self.project.bpm) / TICKS_PER_BEAT
@@ -13315,6 +14382,9 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             mix = [[0.0] * requested_frames, [0.0] * requested_frames]
         has_sources = False
+        prerender_track_audio: dict[int, tuple[object, int]] = {}
+        audible_instrument_tracks: list[tuple[int, TrackState]] = []
+        graph_rendered_track_indices: set[int] = set()
 
         if bool(getattr(self.project, 'metronome_enabled', False)):
             click = self._render_metronome_segment(window_start, requested_frames)
@@ -13335,9 +14405,67 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
             if track.mute:
                 continue
+            audible_instrument_tracks.append((idx, track))
 
+        if audible_instrument_tracks:
+            show_progress = bool(
+                getattr(self, '_auto_forced_prerender_vst_transport', False)
+                or getattr(self, 'prefer_prerendered_vst_playback', False)
+            )
+            native_graph_tracks: list[tuple[int, TrackState, VSTInstrument]] = []
+            for idx, track in audible_instrument_tracks:
+                entry = self._rack_vsti_entry(track.rack_vsti) if track.rack_vsti else None
+                if self._track_can_use_native_vst_graph_prerender(track, entry):
+                    native_graph_tracks.append((idx, track, entry))
+
+            if native_graph_tracks:
+                if show_progress:
+                    self.statusBar().showMessage(
+                        f'Building shared VST playback mix ({len(native_graph_tracks)} synths)'
+                    )
+                    QtWidgets.QApplication.processEvents(
+                        QtCore.QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents,
+                        5,
+                    )
+                graph_mix = self._render_native_vst_graph_mix_window(
+                    native_graph_tracks,
+                    window_start,
+                    requested_frames,
+                    sample_rate,
+                )
+                if graph_mix is not None:
+                    graph_rendered_track_indices = {idx for idx, _track, _entry in native_graph_tracks}
+                    if np is not None and isinstance(mix, np.ndarray) and isinstance(graph_mix, np.ndarray):
+                        mix[:, :requested_frames] += graph_mix[:, :requested_frames]
+                    else:
+                        for channel in range(2):
+                            for i in range(requested_frames):
+                                mix[channel][i] += graph_mix[channel][i]
+                    has_sources = True
+
+            remaining_prerender_tracks = [
+                (idx, track)
+                for idx, track in audible_instrument_tracks
+                if idx not in graph_rendered_track_indices
+            ]
+            total_tracks = len(remaining_prerender_tracks)
+            for render_index, (idx, track) in enumerate(remaining_prerender_tracks, start=1):
+                has_sources = True
+                if show_progress and total_tracks > 1:
+                    self.statusBar().showMessage(
+                        f'Building VST playback mix {render_index}/{total_tracks}: {track.name}'
+                    )
+                    QtWidgets.QApplication.processEvents(
+                        QtCore.QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents,
+                        5,
+                    )
+                prerender_track_audio[idx] = self._get_track_playback_audio(idx, track, sample_rate)
+
+        for idx, track in audible_instrument_tracks:
+            if idx in graph_rendered_track_indices:
+                continue
             has_sources = True
-            data, sr = self._get_track_playback_audio(idx, track, sample_rate)
+            data, sr = prerender_track_audio.get(idx, self._get_track_playback_audio(idx, track, sample_rate))
             if sr != sample_rate:
                 data = resample_samples(data, sr, sample_rate)
 
@@ -13521,9 +14649,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.project.vsti_paths = [p for p in payload.get('vsti_paths', []) if isinstance(p, str)]
         self.project.vsti_folder_paths = [p for p in payload.get('vsti_folder_paths', []) if isinstance(p, str)]
         self.project.sample_paths = [p for p in payload.get('sample_paths', []) if isinstance(p, str)]
+        self.ai_client.apply_settings(
+            provider=payload.get('ai_provider', self.ai_client.provider),
+            remote_model=payload.get('ai_remote_model', self.ai_client.remote_model),
+            ollama_base_url=payload.get('ai_ollama_base_url', self.ai_client.ollama_base_url),
+            ollama_model=payload.get('ai_ollama_model', self.ai_client.ollama_model),
+        )
+        self.selected_audio_output_name = str(payload.get('selected_audio_output_name', '') or '').strip()
         self.selected_audio_output_id = str(payload.get('selected_audio_output_id', '') or '')
         self.selected_audio_sample_rate = self._coerce_int(payload.get('selected_audio_sample_rate', 0), 0, 0, 384000)
-        self.selected_audio_sample_format_name = str(payload.get('selected_audio_sample_format_name', 'Auto') or 'Auto')
+        self.selected_audio_sample_format_name = 'Float'
         startup_buffer_limit = self._absolute_buffer_frame_limit()
         raw_buffer_frames = payload.get('audio_buffer_frames', None)
         if raw_buffer_frames is not None:
@@ -13543,6 +14678,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.native_vst_host_buffer_size = 0
         else:
             self.native_vst_host_buffer_size = int(clamp(loaded_native_host_buffer, 64, startup_buffer_limit))
+        if self._native_vst_host_uses_output_sample_rate():
+            self.native_vst_host_sample_rate = 0
+        if self._native_vst_host_uses_output_buffer_size():
+            self.native_vst_host_buffer_size = 0
         self.prefer_prerendered_vst_playback = bool(payload.get('prefer_prerendered_vst_playback', False))
         self.note_length_offset_ticks = self._coerce_int(payload.get('note_length_offset_ticks', 0), 0, -480, 480)
         refresh_pref = payload.get('playback_ui_refresh_ms', 16)
@@ -13653,13 +14792,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 for v in self.project.vsti_rack
             ],
             'sample_paths': self.project.sample_paths,
-            'selected_audio_output_id': self.selected_audio_output_id,
+            'ai_provider': self.ai_client.provider,
+            'ai_remote_model': self.ai_client.remote_model,
+            'ai_ollama_base_url': self.ai_client.ollama_base_url,
+            'ai_ollama_model': self.ai_client.ollama_model,
+            'selected_audio_output_name': self.selected_audio_output_name,
+            'selected_audio_output_id': '',
             'selected_audio_sample_rate': self.selected_audio_sample_rate,
-            'selected_audio_sample_format_name': self.selected_audio_sample_format_name,
+            'selected_audio_sample_format_name': 'Float',
             'audio_buffer_frames': self.audio_buffer_frames,
             'native_vst_host_audio_device_type': self.native_vst_host_audio_device_type,
-            'native_vst_host_sample_rate': self.native_vst_host_sample_rate,
-            'native_vst_host_buffer_size': self.native_vst_host_buffer_size,
+            'native_vst_host_sample_rate': 0 if self._native_vst_host_uses_output_sample_rate() else self.native_vst_host_sample_rate,
+            'native_vst_host_buffer_size': 0 if self._native_vst_host_uses_output_buffer_size() else self.native_vst_host_buffer_size,
             'prefer_prerendered_vst_playback': self.prefer_prerendered_vst_playback,
             'note_length_offset_ticks': self.note_length_offset_ticks,
             'playback_ui_refresh_ms': self.playback_ui_refresh_ms,
@@ -14036,7 +15180,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             if self._can_use_native_vst_host(vst):
                 shared_info = self._shared_native_output_bridge_track_info()
+                graph_editor_opened = False
                 if (
+                    bool(getattr(self, '_playback_active', False))
+                    and (
+                        bool(getattr(self, '_use_prerendered_transport_mix', False))
+                        or self._graph_native_transport_active()
+                    )
+                ):
+                    graph_editor_opened = self._open_native_vst_graph_bridge_editor(track_index, track, vst)
+                if graph_editor_opened:
+                    self._close_track_vsti_window(track_index, teardown_host=True)
+                    opened = True
+                elif (
                     shared_info is not None
                     and int(shared_info[0]) == int(track_index)
                     and self._normalized_vsti_path(str(shared_info[3].path)) == self._normalized_vsti_path(str(vst.path))
@@ -14453,9 +15609,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self.mixer.load_track()
         self._populate_track_list()
 
+    def refresh_ai_status(self) -> None:
+        if hasattr(self, 'ai_status_action'):
+            self.ai_status_action.setText(self.ai_client.auth_status())
+        dialog = getattr(self, '_ai_settings_dialog', None)
+        if dialog is not None and qt_object_is_alive(dialog):
+            dialog.refresh_from_mainwindow(refresh_ollama_models=False)
+
     def refresh_openai_status(self) -> None:
-        if hasattr(self, 'openai_status_action'):
-            self.openai_status_action.setText(self.ai_client.auth_status())
+        self.refresh_ai_status()
 
     def on_track_instrument_changed(self, previous_rack_vsti: str | None = None) -> None:
         current_idx = self.current_track_index()
@@ -14597,8 +15759,8 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, 'OpenAI connection failed', str(exc))
             return
-        self.refresh_openai_status()
-        self.statusBar().showMessage('OpenAI connected successfully')
+        self.refresh_ai_status()
+        self.statusBar().showMessage('Remote OpenAI connected successfully')
 
     def _exchange_oauth_code(self, payload: dict) -> None:
         if not payload['token_url'] or not payload['auth_code'] or not payload.get('client_id'):
@@ -14641,18 +15803,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def disconnect_openai(self) -> None:
         self.ai_client.clear_auth()
-        self.refresh_openai_status()
-        self.statusBar().showMessage('OpenAI disconnected')
+        self.refresh_ai_status()
+        self.statusBar().showMessage('Remote OpenAI disconnected')
 
     def codex_track_assistant(self) -> None:
         if not self.ai_client.is_enabled():
-            QtWidgets.QMessageBox.information(self, 'OpenAI not connected', 'Connect OpenAI first via Settings > OpenAI > Connect.')
+            QtWidgets.QMessageBox.information(self, 'AI not configured', 'Open Settings > AI > AI Settings and choose a local Ollama or remote OpenAI model first.')
             return
 
         prompt, ok = QtWidgets.QInputDialog.getMultiLineText(
             self,
-            'Codex Track Assistant',
-            'Describe how Codex should modify existing tracks:',
+            'AI Track Assistant',
+            'Describe how AI should modify existing tracks:',
             'Rename tracks, set mute/solo, and adjust instrument modes for arrangement cleanup.',
         )
         if not ok or not prompt.strip():
@@ -14682,7 +15844,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             result = self.ai_client.run_json_prompt(system_instruction, user_instruction)
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, 'Codex assistant failed', str(exc))
+            QtWidgets.QMessageBox.critical(self, 'AI track assistant failed', str(exc))
             return
 
         changed = 0
@@ -14717,7 +15879,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.timeline.refresh()
             self.mixer.load_track()
             self.instruments.load_track()
-        self.statusBar().showMessage(f'Codex applied {changed} track updates')
+        self.statusBar().showMessage(f'AI applied {changed} track updates')
 
     def sample_track_indices(self) -> list[int]:
         return [i for i, track in enumerate(self.project.tracks) if track.track_type == 'sample']
@@ -14953,21 +16115,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 _APP_LOGGER.exception("Failed to stop standalone VST editor process during shutdown for row=%s", row)
             finally:
                 self._track_native_vsti_processes.pop(int(row), None)
-        for sink, buffer in list(getattr(self, '_preview_resources', [])):
-            try:
-                sink.stop()
-            except Exception:
-                pass
-            try:
-                sink.deleteLater()
-            except Exception:
-                pass
-            try:
-                buffer.deleteLater()
-            except Exception:
-                pass
-        if hasattr(self, '_preview_resources'):
-            self._preview_resources.clear()
         try:
             self._reset_realtime_track_states(clear_plugins=True)
         except Exception:
@@ -14996,7 +16143,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not ok:
             return
 
-        self.statusBar().showMessage("Requesting OpenAI Codex composition...")
+        self.statusBar().showMessage(f"Requesting AI composition via {self.ai_client.auth_status()}...")
         try:
             result = self.composer.compose(prompt=prompt.strip(), bars=bars, bpm=self.project.bpm)
             self._apply_ai_result(result)
@@ -15412,6 +16559,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 if item is None:
                     self.add_track(preferred_type=self.last_added_track_type, ask=False)
                     return True
+        if watched in {self.track_list, self.track_list.viewport()} and event.type() == QtCore.QEvent.Type.KeyPress:
+            if isinstance(event, QtGui.QKeyEvent) and event.key() in {QtCore.Qt.Key.Key_Delete, QtCore.Qt.Key.Key_Backspace}:
+                if self.track_list.hasFocus() or watched is self.track_list.viewport():
+                    self.delete_track(self.current_track_index())
+                    return True
         return super().eventFilter(watched, event)
 
     def current_track_index(self) -> int:
@@ -15456,14 +16608,106 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _apply_track_row_visuals(self, widget: QtWidgets.QWidget, track: TrackState, row: int) -> None:
         color = track_display_color(track, row)
+        selected_row = self.track_list.currentRow() if hasattr(self, 'track_list') else -1
+        if selected_row < 0:
+            selected_row = int(getattr(self, '_selected_track_index', -1))
+        solo_tracks = self._active_solo_track_indices()
+        is_selected = int(row) == int(selected_row)
+        is_audible = self._track_is_audible(row, solo_tracks)
+        is_muted = bool(track.mute)
+        is_solo = bool(track.solo)
+
+        def rgba(qcolor: QtGui.QColor, alpha: int) -> str:
+            alpha_value = max(0, min(255, int(alpha)))
+            return f"rgba({qcolor.red()}, {qcolor.green()}, {qcolor.blue()}, {alpha_value})"
+
+        def style_button(
+            button: QtWidgets.QToolButton | None,
+            accent_hex: str,
+            checked: bool,
+            *,
+            inactive_dim: bool = False,
+        ) -> None:
+            if button is None:
+                return
+            accent = QtGui.QColor(accent_hex)
+            if checked:
+                background = rgba(accent, 224)
+                border = accent.lighter(145).name()
+                text = track_text_color(accent).name()
+            else:
+                background = '#1a2029' if not inactive_dim else '#171c24'
+                border = '#344255' if not inactive_dim else '#273140'
+                text = '#d9e3ef' if not inactive_dim else '#8594a7'
+            button.setStyleSheet(
+                f"""
+                QToolButton {{
+                    background: {background};
+                    border: 1px solid {border};
+                    border-radius: 6px;
+                    color: {text};
+                    font-weight: 700;
+                    padding: 0 1px;
+                }}
+                QToolButton:hover {{
+                    border-color: {accent.lighter(155).name()};
+                }}
+                """
+            )
+
+        row_background = '#131821'
+        row_border = '#233041'
+        label_color = color.lighter(138)
+        label_weight = 600
+        swatch_color = QtGui.QColor(color)
+
+        if is_muted:
+            row_background = rgba(QtGui.QColor('#a94b5c'), 54)
+            row_border = '#a94b5c'
+            label_color = QtGui.QColor('#ffc6cf')
+            swatch_color = swatch_color.darker(150)
+        elif not is_audible:
+            row_background = '#11161d'
+            row_border = '#24303f'
+            label_color = QtGui.QColor('#7d8da1')
+            swatch_color = swatch_color.darker(165)
+            label_weight = 500
+        elif is_solo:
+            row_background = rgba(QtGui.QColor('#d6a329'), 38)
+            row_border = '#d6a329'
+            label_color = QtGui.QColor('#ffe199')
+        elif is_selected:
+            row_background = rgba(color, 52)
+            row_border = color.lighter(150).name()
+            label_color = color.lighter(165)
+
+        widget.setStyleSheet(
+            f"""
+            QWidget#track_row_widget {{
+                background: {row_background};
+                border: 1px solid {row_border};
+                border-radius: 7px;
+            }}
+            """
+        )
         swatch = widget.findChild(QtWidgets.QFrame, 'track_row_color')
         if swatch is not None:
             swatch.setStyleSheet(
-                f"background-color: {color.name()}; border: 1px solid {color.darker(180).name()}; border-radius: 5px;"
+                f"background-color: {swatch_color.name()}; border: 1px solid {swatch_color.darker(180).name()}; border-radius: 5px;"
             )
         label = widget.findChild(QtWidgets.QLabel, 'track_row_label')
         if label is not None:
-            label.setStyleSheet(f"color: {color.lighter(135).name()};")
+            label.setStyleSheet(f"color: {label_color.name()}; font-weight: {label_weight};")
+        style_button(widget.findChild(QtWidgets.QToolButton, 'track_row_arm_btn'), '#2ec27e', bool(track.live_armed), inactive_dim=not is_audible)
+        style_button(widget.findChild(QtWidgets.QToolButton, 'track_row_vst_btn'), '#45b7ff', self._track_vsti_window_visible(row), inactive_dim=not is_audible)
+        style_button(widget.findChild(QtWidgets.QToolButton, 'track_row_mute_btn'), '#c94f62', is_muted)
+        style_button(widget.findChild(QtWidgets.QToolButton, 'track_row_solo_btn'), '#d6a329', is_solo, inactive_dim=not is_audible and not is_solo)
+
+    def _refresh_track_list_visuals(self) -> None:
+        if not hasattr(self, 'track_list'):
+            return
+        for row in range(min(self.track_list.count(), len(self.project.tracks))):
+            self._update_track_list_item(row)
 
     def _set_track_color(self, row: int, color: QtGui.QColor | str | None) -> None:
         if row < 0 or row >= len(self.project.tracks):
@@ -15556,6 +16800,9 @@ class MainWindow(QtWidgets.QMainWindow):
         menu.addSeparator()
         duplicate_action = menu.addAction('Duplicate Track')
         duplicate_action.triggered.connect(lambda _checked=False, idx=row: self.duplicate_track(idx))
+        delete_action = menu.addAction('Delete Track')
+        delete_action.setEnabled(len(self.project.tracks) > 1)
+        delete_action.triggered.connect(lambda _checked=False, idx=row: self.delete_track(idx))
 
         menu.exec(global_pos)
 
@@ -15814,6 +17061,7 @@ class MainWindow(QtWidgets.QMainWindow):
             arm_btn.setText('A')
             arm_btn.setCheckable(True)
             arm_btn.setChecked(bool(track.live_armed))
+            arm_btn.setFixedSize(28, 24)
             arm_btn.setToolTip(f'Arm live host for {track.rack_vsti}')
             arm_btn.toggled.connect(lambda checked, idx=row: self._on_track_live_arm_toggled(idx, checked))
             layout.addWidget(arm_btn)
@@ -15825,22 +17073,27 @@ class MainWindow(QtWidgets.QMainWindow):
             vst_btn.setText('V')
             vst_btn.setCheckable(True)
             vst_btn.setChecked(self._track_vsti_window_visible(row))
+            vst_btn.setFixedSize(28, 24)
             vst_btn.setToolTip(f'Show/hide VST window for {track.rack_vsti}')
             vst_btn.toggled.connect(lambda checked, idx=row: self._toggle_track_vsti_window(idx, checked))
             layout.addWidget(vst_btn)
 
         mute_btn = QtWidgets.QToolButton()
+        mute_btn.setObjectName('track_row_mute_btn')
         mute_btn.setText('M')
         mute_btn.setCheckable(True)
         mute_btn.setChecked(track.mute)
+        mute_btn.setFixedSize(28, 24)
         mute_btn.setToolTip('Mute track')
         mute_btn.toggled.connect(lambda checked, idx=row: self._on_track_mute_toggled(idx, checked))
         layout.addWidget(mute_btn)
 
         solo_btn = QtWidgets.QToolButton()
+        solo_btn.setObjectName('track_row_solo_btn')
         solo_btn.setText('S')
         solo_btn.setCheckable(True)
         solo_btn.setChecked(track.solo)
+        solo_btn.setFixedSize(28, 24)
         solo_btn.setToolTip('Solo track')
         solo_btn.toggled.connect(lambda checked, idx=row: self._on_track_solo_toggled(idx, checked))
         layout.addWidget(solo_btn)
@@ -15886,18 +17139,29 @@ class MainWindow(QtWidgets.QMainWindow):
             track = self.project.tracks[row]
             vst_btn.setToolTip(f'Show/hide VST window for {track.rack_vsti}' if track.rack_vsti else 'Show/hide VST window')
             vst_btn.blockSignals(False)
+        mute_btn = widget.findChild(QtWidgets.QToolButton, 'track_row_mute_btn')
+        if mute_btn is not None:
+            mute_btn.blockSignals(True)
+            mute_btn.setChecked(bool(self.project.tracks[row].mute))
+            mute_btn.blockSignals(False)
+        solo_btn = widget.findChild(QtWidgets.QToolButton, 'track_row_solo_btn')
+        if solo_btn is not None:
+            solo_btn.blockSignals(True)
+            solo_btn.setChecked(bool(self.project.tracks[row].solo))
+            solo_btn.blockSignals(False)
         self._apply_track_row_visuals(widget, self.project.tracks[row], row)
 
     def _on_track_mute_toggled(self, row: int, checked: bool) -> None:
         if self._track_list_rebuilding or row < 0 or row >= len(self.project.tracks):
             return
         self.project.tracks[row].mute = bool(checked)
-        if checked:
-            self._force_note_off_for_track(row)
         if row == self.current_track_index():
             self.mixer.load_track()
+        if checked:
+            self._force_note_off_for_track(row)
+        self._refresh_track_list_visuals()
         self._invalidate_playback_caches(clear_track_audio=False)
-        self._reload_playback_mix_if_running()
+        self._restart_native_transport_for_audibility_change()
 
     def _on_track_solo_toggled(self, row: int, checked: bool) -> None:
         if self._track_list_rebuilding or row < 0 or row >= len(self.project.tracks):
@@ -15905,8 +17169,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.project.tracks[row].solo = bool(checked)
         if row == self.current_track_index():
             self.mixer.load_track()
+        solo_tracks = self._active_solo_track_indices()
+        for idx in range(len(self.project.tracks)):
+            if not self._track_is_audible(idx, solo_tracks):
+                self._force_note_off_for_track(idx)
+        self._refresh_track_list_visuals()
         self._invalidate_playback_caches(clear_track_audio=False)
-        self._reload_playback_mix_if_running()
+        self._restart_native_transport_for_audibility_change()
 
     def _update_selected_track_list_item(self) -> None:
         if not self.project.tracks:
@@ -15945,6 +17214,49 @@ class MainWindow(QtWidgets.QMainWindow):
         self.instruments.load_track()
         self._schedule_native_vst_host_warm_for_row(row, delay_ms=0)
         QtCore.QTimer.singleShot(0, self._refresh_live_midi_host)
+        self._refresh_track_list_visuals()
+
+    def _restart_native_transport_for_audibility_change(self) -> None:
+        if not hasattr(self, 'playback_timer') or not self.playback_timer.isActive():
+            return
+        if self._graph_native_transport_active() or self._direct_native_transport_active():
+            self._restart_playback_preserving_tick()
+            return
+        self._reload_playback_mix_if_running()
+
+    def _normalize_track_input_routes_after_deletion(self, removed_row: int) -> None:
+        for track in self.project.tracks:
+            updated_routes: list[dict[str, object]] = []
+            for route in self._sanitize_vsti_input_bus_routes(track.vsti_input_bus_routes):
+                updated = dict(route)
+                source_track_index = int(updated.get('source_track_index', -1) or -1)
+                if source_track_index == int(removed_row):
+                    updated['source_track_index'] = -1
+                    updated['enabled'] = False
+                elif source_track_index > int(removed_row):
+                    updated['source_track_index'] = source_track_index - 1
+                updated_routes.append(updated)
+            track.vsti_input_bus_routes = updated_routes
+
+    def _prepare_for_track_structure_change(self) -> tuple[bool, int]:
+        playback_was_active = bool(hasattr(self, 'playback_timer') and self.playback_timer.isActive())
+        current_tick = int(self._current_audible_playback_tick() if playback_was_active else self.project.playhead_tick)
+        if playback_was_active:
+            self.stop_playback()
+        self._close_preview_audio()
+        self._release_live_midi_host()
+        open_rows = (
+            {int(row) for row in getattr(self, '_track_vsti_windows', {}).keys()}
+            | {int(row) for row in getattr(self, '_track_native_vst_host_bridges', {}).keys()}
+        )
+        for open_row in sorted(open_rows, reverse=True):
+            self._close_track_vsti_window(int(open_row), teardown_host=True)
+            self._stop_native_vst_host_bridge(int(open_row))
+        self._stop_native_output_bridge()
+        self._track_native_vsti_hwnds.clear()
+        self._discard_realtime_track_states(schedule_gc=False)
+        self._track_meter_levels = {}
+        return playback_was_active, current_tick
 
     def add_track(self, preferred_type: str | None = None, ask: bool = True) -> None:
         track_type = preferred_type or self.last_added_track_type or 'instrument'
@@ -16034,6 +17346,62 @@ class MainWindow(QtWidgets.QMainWindow):
         self.arrangement_overview.refresh()
         self._reload_playback_mix_if_running()
         self.statusBar().showMessage(f'Duplicated track "{source.name}"')
+
+    def delete_track(self, row: int, *, confirm: bool = True) -> None:
+        row = int(row)
+        if row < 0 or row >= len(self.project.tracks):
+            return
+        if len(self.project.tracks) <= 1:
+            QtWidgets.QMessageBox.information(self, 'Delete Track', 'At least one track must remain in the project.')
+            return
+
+        track = self.project.tracks[row]
+        if confirm:
+            note_count = len(track.notes) if track.track_type == 'instrument' else 0
+            clip_count = sum(1 for clip in self.project.sample_clips if int(clip.track_index) == row)
+            detail_parts: list[str] = []
+            if note_count > 0:
+                detail_parts.append(f'{note_count} MIDI note{"s" if note_count != 1 else ""}')
+            if clip_count > 0:
+                detail_parts.append(f'{clip_count} sample clip{"s" if clip_count != 1 else ""}')
+            detail_text = ''
+            if detail_parts:
+                detail_text = '\n\nThis will also remove ' + ' and '.join(detail_parts) + '.'
+            result = QtWidgets.QMessageBox.question(
+                self,
+                'Delete Track',
+                f'Delete "{track.name}"?{detail_text}',
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.No,
+            )
+            if result != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+
+        playback_was_active, current_tick = self._prepare_for_track_structure_change()
+        removed_name = str(track.name)
+        self.project.tracks.pop(row)
+        self.project.sample_clips = [
+            dataclasses.replace(
+                clip,
+                track_index=(int(clip.track_index) - 1 if int(clip.track_index) > row else int(clip.track_index)),
+            )
+            for clip in self.project.sample_clips
+            if int(clip.track_index) != row
+        ]
+        self._normalize_track_input_routes_after_deletion(row)
+        self._invalidate_playback_caches()
+        self.rebuild_midi_sections()
+        self._populate_track_list()
+        self.track_list.setCurrentRow(max(0, min(row, len(self.project.tracks) - 1)))
+        self.piano_roll.refresh()
+        self.velocity_editor.refresh()
+        self.timeline.refresh()
+        self.sample_timeline.refresh()
+        self.arrangement_overview.refresh()
+        if playback_was_active:
+            self._set_playhead_tick_position(current_tick)
+            self.start_playback()
+        self.statusBar().showMessage(f'Deleted track "{removed_name}"')
 
     def new_project(self) -> None:
         self._reset_project_runtime_state()

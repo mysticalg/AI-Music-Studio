@@ -11,6 +11,7 @@
 #include <cstring>
 #include <mutex>
 #include <utility>
+#include <vector>
 
 namespace
 {
@@ -241,12 +242,14 @@ public:
     HostComponent(juce::PropertiesFile& settings,
                   const juce::String& startupPluginPath,
                   const juce::String& startupStatePath,
+                  bool restoreLastPluginOnStartup,
                   bool shouldOpenEditorOnStartup,
                   int requestedCommandPort,
                   bool bridgeModeEnabled,
                   double startupSampleRate,
                   int startupBufferSize,
-                  const juce::String& startupAudioDeviceType)
+                  const juce::String& startupAudioDeviceType,
+                  const juce::String& startupAudioOutputDeviceName)
         : appSettings(settings),
           bridgeMode(bridgeModeEnabled),
           managedStateFile(startupStatePath.isNotEmpty() ? juce::File(startupStatePath) : juce::File()),
@@ -302,7 +305,7 @@ public:
         if (!bridgeMode)
         {
             initialiseAudio();
-            restoreAudioPreferences(startupSampleRate, startupBufferSize, startupAudioDeviceType);
+            restoreAudioPreferences(startupSampleRate, startupBufferSize, startupAudioDeviceType, startupAudioOutputDeviceName);
         }
         else
         {
@@ -319,8 +322,9 @@ public:
         updateDeviceLabel();
         updateButtons();
 
-        const auto startupPath = startupPluginPath.isNotEmpty() ? startupPluginPath
-                                                                : appSettings.getValue("last_plugin_path");
+        const auto startupPath = startupPluginPath.isNotEmpty()
+            ? startupPluginPath
+            : (restoreLastPluginOnStartup ? appSettings.getValue("last_plugin_path") : juce::String());
         if (startupPath.isNotEmpty())
         {
             loadPlugin(startupPath);
@@ -350,6 +354,8 @@ public:
             deviceManager.removeAudioCallback(this);
             deviceManager.closeAudioDevice();
         }
+        closeGraphEditorWindow();
+        clearPersistentPluginGraph();
         closeEditorWindow();
         unloadPlugin();
     }
@@ -430,10 +436,15 @@ public:
         {
             const auto command = requestObject->getProperty("command")
                                      .toString().trim().toLowerCase();
-            if (command == "render_audio" || command == "schedule_midi"
+            if (command == "render_audio" || command == "render_plugin_graph"
+                || command == "schedule_midi"
+                || command == "schedule_graph_midi"
                 || command == "status" || command == "ping"
                 || command == "note_on" || command == "note_off"
                 || command == "all_notes_off" || command == "panic"
+                || command == "start_graph_transport"
+                || command == "stop_graph_transport"
+                || command == "set_graph_slot_parameters"
                 || command == "queue_audio" || command == "clear_audio_queue"
                 || command == "start_audio_stream")
             {
@@ -480,6 +491,29 @@ private:
         int64_t inputFrames = 0;
         int64_t outputFrames = 0;
         int64_t underruns = 0;
+    };
+
+    struct PersistentGraphSlot
+    {
+        juce::String name;
+        juce::String pluginPath;
+        juce::String statePath;
+        juce::String parameterSignature;
+        std::unique_ptr<juce::AudioPluginInstance> plugin;
+        juce::Array<ScheduledMidiEvent> scheduledEvents;
+        float gain = 1.0f;
+        float pan = 0.0f;
+    };
+
+    struct OfflineGraphTrack
+    {
+        juce::String name;
+        juce::String pluginPath;
+        PersistentGraphSlot* slot = nullptr;
+        juce::AudioPluginInstance* plugin = nullptr;
+        float gain = 1.0f;
+        float pan = 0.0f;
+        std::vector<ScheduledMidiEvent> events;
     };
 
     juce::var handleRemoteCommand(const juce::var& request)
@@ -606,6 +640,94 @@ private:
             return response;
         }
 
+        if (command == "configure_plugin_graph")
+        {
+            juce::Array<juce::var> trackErrors;
+            juce::String error;
+            if (!configurePersistentPluginGraph(object->getProperty("tracks"), trackErrors, error))
+            {
+                auto response = makeResponse(false, error.isNotEmpty() ? error : "Could not configure plugin graph");
+                if (!trackErrors.isEmpty())
+                    setResponseField(response, "track_errors", juce::var(trackErrors));
+                return response;
+            }
+
+            auto response = makeResponse(true, "Plugin graph configured");
+            appendStatusFields(response);
+            setResponseField(response, "graph_slot_count", static_cast<int>(persistentGraphSlots.size()));
+            if (!trackErrors.isEmpty())
+                setResponseField(response, "track_errors", juce::var(trackErrors));
+            return response;
+        }
+
+        if (command == "clear_plugin_graph")
+        {
+            clearPersistentPluginGraph();
+            auto response = makeResponse(true, "Plugin graph cleared");
+            appendStatusFields(response);
+            return response;
+        }
+
+        if (command == "start_graph_transport")
+        {
+            graphTransportEnabled.store(true);
+            auto response = makeResponse(true, "Graph transport started");
+            appendStatusFields(response);
+            return response;
+        }
+
+        if (command == "stop_graph_transport")
+        {
+            const auto sendPanic = static_cast<bool>(object->hasProperty("panic")
+                ? object->getProperty("panic")
+                : juce::var(true));
+            {
+                juce::ScopedLock lock(pluginLock);
+                graphTransportEnabled.store(false);
+                for (auto& slot : persistentGraphSlots)
+                {
+                    if (slot.plugin == nullptr)
+                        continue;
+                    slot.scheduledEvents.clear();
+                    if (sendPanic)
+                        panicPersistentGraphSlot(slot, 0);
+                    slot.plugin->reset();
+                }
+            }
+            auto response = makeResponse(true, "Graph transport stopped");
+            appendStatusFields(response);
+            return response;
+        }
+
+        if (command == "open_graph_slot_editor")
+        {
+            const auto slotIndex = static_cast<int>(object->hasProperty("slot_index")
+                ? object->getProperty("slot_index")
+                : juce::var(-1));
+            if (!juce::isPositiveAndBelow(slotIndex, static_cast<int>(persistentGraphSlots.size()))
+                || persistentGraphSlots[static_cast<size_t>(slotIndex)].plugin == nullptr)
+            {
+                return makeResponse(false, "Graph slot not loaded");
+            }
+
+            juce::MessageManager::callAsync([this, slotIndex]
+            {
+                openGraphEditorWindow(slotIndex);
+            });
+            auto response = makeResponse(true, "Graph editor opened");
+            appendStatusFields(response);
+            setResponseField(response, "graph_editor_slot", slotIndex);
+            return response;
+        }
+
+        if (command == "close_graph_editor")
+        {
+            closeGraphEditorWindow();
+            auto response = makeResponse(true, "Graph editor closed");
+            appendStatusFields(response);
+            return response;
+        }
+
         if (command == "note_on")
         {
             const auto note = clampMidiNote(static_cast<int>(object->getProperty("note")));
@@ -704,6 +826,76 @@ private:
             return response;
         }
 
+        if (command == "set_graph_slot_parameters")
+        {
+            const auto slotIndex = static_cast<int>(object->hasProperty("slot_index")
+                ? object->getProperty("slot_index")
+                : juce::var(-1));
+            if (!juce::isPositiveAndBelow(slotIndex, static_cast<int>(persistentGraphSlots.size())))
+                return makeResponse(false, "Graph slot not loaded");
+
+            auto& slot = persistentGraphSlots[static_cast<size_t>(slotIndex)];
+            if (slot.plugin == nullptr)
+                return makeResponse(false, "Graph slot not loaded");
+
+            juce::String error;
+            int appliedCount = 0;
+            juce::StringArray unmatchedParameters;
+            {
+                juce::ScopedLock lock(pluginLock);
+                if (!applyRequestedParameterValuesToPlugin(
+                        *slot.plugin,
+                        object->getProperty("parameters"),
+                        error,
+                        appliedCount,
+                        unmatchedParameters))
+                {
+                    return makeResponse(false, error.isNotEmpty() ? error : "Could not update graph slot parameters");
+                }
+            }
+
+            slot.parameterSignature = parameterPayloadSignature(object->getProperty("parameters"));
+            auto response = makeResponse(true, "Graph slot parameters updated");
+            appendStatusFields(response);
+            setResponseField(response, "graph_editor_slot", slotIndex);
+            setResponseField(response, "applied_parameter_count", appliedCount);
+            if (!unmatchedParameters.isEmpty())
+            {
+                juce::Array<juce::var> unmatched;
+                for (const auto& name : unmatchedParameters)
+                    unmatched.add(name);
+                setResponseField(response, "unmatched_parameters", juce::var(unmatched));
+            }
+            return response;
+        }
+
+        if (command == "schedule_graph_midi")
+        {
+            const auto baseOffsetFrames = juce::jmax<int64_t>(
+                0,
+                static_cast<int64_t>(object->hasProperty("base_offset_frames")
+                    ? static_cast<double>(object->getProperty("base_offset_frames"))
+                    : 0.0)
+            );
+            const auto slotsVar = object->getProperty("slots");
+            if (!slotsVar.isArray())
+                return makeResponse(false, "schedule_graph_midi requires a slots array");
+
+            juce::String error;
+            int scheduledCount = 0;
+            {
+                juce::ScopedLock lock(pluginLock);
+                if (!schedulePersistentGraphMidi(slotsVar, baseOffsetFrames, scheduledCount, error))
+                    return makeResponse(false, error.isNotEmpty() ? error : "Could not schedule graph MIDI");
+            }
+
+            auto response = makeResponse(true, "Scheduled graph MIDI events");
+            appendStatusFields(response);
+            setResponseField(response, "scheduled_count", scheduledCount);
+            setResponseField(response, "base_offset_frames", static_cast<double>(baseOffsetFrames));
+            return response;
+        }
+
         if (command == "queue_audio")
         {
             const auto audioBase64 = object->getProperty("audio_b64").toString();
@@ -791,6 +983,8 @@ private:
             const auto eventsVar = object->getProperty("events");
             if (!eventsVar.isArray())
                 return makeResponse(false, "schedule_midi requires an events array");
+            const auto currentFrame = renderedSampleFrames.load();
+            juce::Array<int> resetChannels;
 
             if (clearChannelsVar.isArray())
             {
@@ -812,16 +1006,17 @@ private:
                     {
                         const auto channel = clampMidiChannel(static_cast<int>(channelVar));
                         clearScheduledMidiEvents(channel, loopEpoch);
-                        enqueuePanicMessages(channel);
+                        resetChannels.addIfNotAlreadyThere(channel);
                     }
                 }
             }
 
-            const auto currentFrame = renderedSampleFrames.load();
             int scheduledCount = 0;
             if (auto* array = eventsVar.getArray())
             {
                 juce::ScopedLock lock(scheduledMidiLock);
+                for (const auto channel : resetChannels)
+                    scheduledCount += appendScheduledPanicEvents(scheduledMidiEvents, channel, currentFrame + baseOffsetFrames, loopEpoch);
                 for (const auto& eventVar : *array)
                 {
                     auto* eventObject = eventVar.getDynamicObject();
@@ -918,6 +1113,19 @@ private:
             return response;
         }
 
+        if (command == "render_plugin_graph")
+        {
+            const auto requestedFrames = static_cast<int>(object->hasProperty("frames")
+                ? object->getProperty("frames")
+                : juce::var(currentBlockSize));
+            const auto frames = juce::jlimit(1, 262144, requestedFrames);
+            auto response = renderOfflinePluginGraph(object->getProperty("tracks"), frames);
+            setResponseField(response, "sample_rate", currentSampleRate);
+            setResponseField(response, "buffer_size", currentBlockSize);
+            setResponseField(response, "frames", frames);
+            return response;
+        }
+
         if (command == "quit")
         {
             juce::JUCEApplication::getInstance()->systemRequestedQuit();
@@ -938,6 +1146,9 @@ private:
         juce::String audioDeviceName;
         juce::StringArray availableAudioDeviceTypes;
         juce::StringArray availableAudioOutputDevices;
+        juce::Array<juce::var> availableAudioSampleRates;
+        juce::Array<juce::var> availableAudioBufferSizes;
+        juce::Array<juce::var> graphSlots;
 
         {
             juce::ScopedLock lock(pluginLock);
@@ -967,13 +1178,33 @@ private:
                     parameterNames.addIfNotAlreadyThere(parameterName);
                 }
             }
+            for (int index = 0; index < static_cast<int>(persistentGraphSlots.size()); ++index)
+            {
+                const auto& slot = persistentGraphSlots[static_cast<size_t>(index)];
+                if (slot.plugin == nullptr)
+                    continue;
+                auto* slotObject = new juce::DynamicObject();
+                slotObject->setProperty("slot_index", index);
+                slotObject->setProperty("name", slot.name);
+                slotObject->setProperty("plugin_path", slot.pluginPath);
+                slotObject->setProperty("state_path", slot.statePath);
+                slotObject->setProperty("gain", slot.gain);
+                slotObject->setProperty("pan", slot.pan);
+                graphSlots.add(juce::var(slotObject));
+            }
         }
 
         if (audioInitialised)
         {
             audioDeviceType = deviceManager.getCurrentAudioDeviceType();
             if (auto* device = deviceManager.getCurrentAudioDevice())
+            {
                 audioDeviceName = device->getName();
+                for (const auto rate : device->getAvailableSampleRates())
+                    availableAudioSampleRates.add(static_cast<int>(std::round(rate)));
+                for (const auto size : device->getAvailableBufferSizes())
+                    availableAudioBufferSizes.add(size);
+            }
             for (auto* type : const_cast<juce::AudioDeviceManager&>(deviceManager).getAvailableDeviceTypes())
             {
                 if (type == nullptr || ! isUsableAudioDeviceType(*type))
@@ -1001,12 +1232,20 @@ private:
         setResponseField(response, "bridge_mode", bridgeMode);
         setResponseField(response, "plugin_output_gain", pluginOutputGain.load());
         setResponseField(response, "plugin_output_pan", pluginOutputPan.load());
+        setResponseField(response, "graph_slot_count", static_cast<int>(graphSlots.size()));
+        setResponseField(response, "graph_slots", juce::var(graphSlots));
+        setResponseField(response, "graph_editor_open", graphEditorWindow != nullptr);
+        setResponseField(response, "graph_editor_slot", graphEditorSlotIndex);
+        setResponseField(response, "graph_transport_enabled", static_cast<bool>(graphTransportEnabled.load()));
+        setResponseField(response, "graph_scheduled_event_count", totalPersistentGraphScheduledEventCount());
         setResponseField(response, "input_buses", describeBuses(true));
         setResponseField(response, "output_buses", describeBuses(false));
         setResponseField(response, "audio_device_type", audioDeviceType);
         setResponseField(response, "audio_device_name", audioDeviceName);
         setResponseField(response, "available_audio_device_types", juce::var(availableAudioDeviceTypes));
         setResponseField(response, "available_audio_output_devices", juce::var(availableAudioOutputDevices));
+        setResponseField(response, "available_audio_sample_rates", juce::var(availableAudioSampleRates));
+        setResponseField(response, "available_audio_buffer_sizes", juce::var(availableAudioBufferSizes));
         setResponseField(response, "audio_stream_enabled", static_cast<bool>(audioStreamEnabled.load()));
         setResponseField(response, "queued_audio_frames", queuedStreamAudioFrames(kMainAudioStreamId));
         setResponseField(response, "queued_audio_channels", queuedStreamAudioChannels(kMainAudioStreamId));
@@ -1090,7 +1329,8 @@ private:
 
     void restoreAudioPreferences(double startupSampleRate,
                                  int startupBufferSize,
-                                 const juce::String& startupDeviceType = {})
+                                 const juce::String& startupDeviceType = {},
+                                 const juce::String& startupOutputDeviceName = {})
     {
         if (!audioInitialised)
             return;
@@ -1107,7 +1347,9 @@ private:
         const auto wantedBuffer = startupBufferSize > 0
             ? startupBufferSize
             : appSettings.getIntValue("audio_buffer_size", 0);
-        const auto wantedOutputDevice = appSettings.getValue("audio_output_device_name").trim();
+        const auto wantedOutputDevice = startupOutputDeviceName.isNotEmpty()
+            ? startupOutputDeviceName.trim()
+            : appSettings.getValue("audio_output_device_name").trim();
         if (auto* device = deviceManager.getCurrentAudioDevice())
         {
             auto setup = deviceManager.getAudioDeviceSetup();
@@ -1445,11 +1687,13 @@ private:
         }
         keyboardState.reset();
         preparePluginForPlayback();
+        preparePersistentPluginGraphForPlayback();
     }
 
     void audioDeviceStopped() override
     {
         releasePluginResources();
+        releasePersistentPluginGraphResources();
     }
 
     void audioDeviceIOCallbackWithContext(const float* const* /*inputChannelData*/,
@@ -1474,6 +1718,8 @@ private:
                 plugin->processBlock(buffer, midi);
                 applyPluginOutputMix(buffer);
             }
+            if (graphTransportEnabled.load())
+                processPersistentPluginGraphTransport(buffer, numSamples, renderedSampleFrames.load());
         }
 
         mixQueuedAudioStreamsIntoBuffer(buffer);
@@ -1483,8 +1729,17 @@ private:
 
     void applyPluginOutputMix(juce::AudioBuffer<float>& buffer)
     {
-        const auto gain = juce::jmax(0.0f, pluginOutputGain.load());
-        const auto pan = juce::jlimit(-1.0f, 1.0f, pluginOutputPan.load());
+        applyOutputMixToBuffer(
+            buffer,
+            juce::jmax(0.0f, pluginOutputGain.load()),
+            juce::jlimit(-1.0f, 1.0f, pluginOutputPan.load())
+        );
+    }
+
+    static void applyOutputMixToBuffer(juce::AudioBuffer<float>& buffer, float gain, float pan)
+    {
+        gain = juce::jmax(0.0f, gain);
+        pan = juce::jlimit(-1.0f, 1.0f, pan);
         const auto angle = (pan + 1.0f) * juce::MathConstants<float>::pi * 0.25f;
         const auto leftGain = std::cos(angle) * gain;
         const auto rightGain = std::sin(angle) * gain;
@@ -1540,6 +1795,45 @@ private:
         keyboardState.allNotesOff(clampMidiChannel(channel));
     }
 
+    int appendScheduledPanicEvents(juce::Array<ScheduledMidiEvent>& destination,
+                                   int channel,
+                                   int64_t targetFrame,
+                                   int64_t loopEpoch)
+    {
+        int added = 0;
+        const auto enqueueChannel = [&](int midiChannel)
+        {
+            const juce::MidiMessage messages[] = {
+                juce::MidiMessage::controllerEvent(midiChannel, 64, 0),
+                juce::MidiMessage::controllerEvent(midiChannel, 66, 0),
+                juce::MidiMessage::controllerEvent(midiChannel, 67, 0),
+                juce::MidiMessage::controllerEvent(midiChannel, 120, 0),
+                juce::MidiMessage::controllerEvent(midiChannel, 123, 0),
+            };
+            for (const auto& message : messages)
+            {
+                destination.add({
+                    targetFrame,
+                    0,
+                    scheduledMidiSequence.fetch_add(1),
+                    loopEpoch,
+                    message,
+                });
+                ++added;
+            }
+        };
+
+        if (channel <= 0)
+        {
+            for (int midiChannel = 1; midiChannel <= 16; ++midiChannel)
+                enqueueChannel(midiChannel);
+            return added;
+        }
+
+        enqueueChannel(clampMidiChannel(channel));
+        return added;
+    }
+
     void appendScheduledMidiMessages(juce::MidiBuffer& destination, int numSamples)
     {
         const auto blockStart = renderedSampleFrames.load();
@@ -1552,7 +1846,7 @@ private:
         {
             if (event.frame < blockStart)
             {
-                if (event.message.isNoteOff())
+                if (! event.message.isNoteOn())
                 {
                     auto lateEvent = event;
                     lateEvent.frame = blockStart;
@@ -2056,6 +2350,15 @@ private:
         return true;
     }
 
+    static bool loadPluginStateIntoInstance(juce::AudioPluginInstance& plugin, const juce::File& stateFile)
+    {
+        juce::MemoryBlock rawState;
+        if (!stateFile.loadFileAsData(rawState) || rawState.getSize() == 0)
+            return false;
+        plugin.setStateInformation(rawState.getData(), static_cast<int>(rawState.getSize()));
+        return true;
+    }
+
     bool savePluginStateToFile(const juce::File& stateFile)
     {
         juce::MemoryBlock rawState;
@@ -2092,7 +2395,29 @@ private:
             return false;
         }
 
-        auto parameters = pluginInstance->getParameters();
+        return applyRequestedParameterValuesToPlugin(
+            *pluginInstance,
+            parametersVar,
+            error,
+            appliedCount,
+            unmatchedParameters
+        );
+    }
+
+    static bool applyRequestedParameterValuesToPlugin(juce::AudioPluginInstance& plugin,
+                                                      const juce::var& parametersVar,
+                                                      juce::String& error,
+                                                      int& appliedCount,
+                                                      juce::StringArray& unmatchedParameters)
+    {
+        auto* parameterObject = parametersVar.getDynamicObject();
+        if (parameterObject == nullptr)
+        {
+            error = "set_parameters requires an object payload";
+            return false;
+        }
+
+        auto parameters = plugin.getParameters();
         auto resolveParameterIndex = [&parameters](const juce::String& rawName) -> int
         {
             const auto requestedName = rawName.trim();
@@ -2156,7 +2481,483 @@ private:
         }
 
         if (appliedCount > 0)
-            pluginInstance->updateHostDisplay();
+            plugin.updateHostDisplay();
+        return true;
+    }
+
+    static juce::String parameterPayloadSignature(const juce::var& parametersVar)
+    {
+        auto* parameterObject = parametersVar.getDynamicObject();
+        if (parameterObject == nullptr)
+            return {};
+
+        juce::StringArray entries;
+        for (const auto& property : parameterObject->getProperties())
+        {
+            const auto name = property.name.toString().trim();
+            if (name.isEmpty())
+                continue;
+            const auto value = juce::String(static_cast<double>(property.value), 6);
+            entries.add(name + "=" + value);
+        }
+        entries.sort(true);
+        return entries.joinIntoString("|");
+    }
+
+    void releasePersistentGraphSlot(PersistentGraphSlot& slot)
+    {
+        if (slot.plugin != nullptr)
+        {
+            slot.plugin->suspendProcessing(true);
+            slot.plugin->releaseResources();
+        }
+        slot.plugin.reset();
+        slot.name.clear();
+        slot.pluginPath.clear();
+        slot.statePath.clear();
+        slot.parameterSignature.clear();
+        slot.scheduledEvents.clear();
+        slot.gain = 1.0f;
+        slot.pan = 0.0f;
+    }
+
+    void clearPersistentPluginGraph()
+    {
+        closeGraphEditorWindow();
+        graphTransportEnabled.store(false);
+        for (auto& slot : persistentGraphSlots)
+            releasePersistentGraphSlot(slot);
+        persistentGraphSlots.clear();
+    }
+
+    int totalPersistentGraphScheduledEventCount() const
+    {
+        int total = 0;
+        for (const auto& slot : persistentGraphSlots)
+            total += slot.scheduledEvents.size();
+        return total;
+    }
+
+    void clearPersistentGraphScheduledEvents(PersistentGraphSlot& slot,
+                                             int channel = 0,
+                                             int64_t beforeLoopEpoch = -1)
+    {
+        if (channel <= 0)
+        {
+            slot.scheduledEvents.clear();
+            return;
+        }
+
+        juce::Array<ScheduledMidiEvent> keep;
+        const auto targetChannel = clampMidiChannel(channel);
+        for (const auto& event : slot.scheduledEvents)
+        {
+            if (event.message.getChannel() != targetChannel
+                || (beforeLoopEpoch >= 0 && event.loopEpoch >= beforeLoopEpoch))
+            {
+                keep.add(event);
+            }
+        }
+        slot.scheduledEvents.swapWith(keep);
+    }
+
+    void panicPersistentGraphSlot(PersistentGraphSlot& slot, int channel)
+    {
+        if (slot.plugin == nullptr)
+            return;
+
+        const auto enqueueChannel = [](juce::MidiBuffer& midi, int midiChannel)
+        {
+            midi.addEvent(juce::MidiMessage::controllerEvent(midiChannel, 64, 0), 0);
+            midi.addEvent(juce::MidiMessage::controllerEvent(midiChannel, 66, 0), 0);
+            midi.addEvent(juce::MidiMessage::controllerEvent(midiChannel, 67, 0), 0);
+            midi.addEvent(juce::MidiMessage::controllerEvent(midiChannel, 120, 0), 0);
+            midi.addEvent(juce::MidiMessage::controllerEvent(midiChannel, 123, 0), 0);
+        };
+
+        const auto channelCount = juce::jmax(
+            2,
+            juce::jmax(slot.plugin->getTotalNumInputChannels(), slot.plugin->getTotalNumOutputChannels())
+        );
+        const auto blockSamples = juce::jmax(64, currentBlockSize > 0 ? currentBlockSize : 512);
+        juce::AudioBuffer<float> processBuffer(channelCount, blockSamples);
+        processBuffer.clear();
+        juce::MidiBuffer midi;
+        if (channel <= 0)
+        {
+            for (int midiChannel = 1; midiChannel <= 16; ++midiChannel)
+                enqueueChannel(midi, midiChannel);
+        }
+        else
+        {
+            enqueueChannel(midi, clampMidiChannel(channel));
+        }
+        slot.plugin->processBlock(processBuffer, midi);
+    }
+
+    void appendPersistentGraphScheduledMidiMessages(PersistentGraphSlot& slot,
+                                                    juce::MidiBuffer& destination,
+                                                    int64_t blockStart,
+                                                    int numSamples)
+    {
+        const auto blockEnd = blockStart + juce::jmax(1, numSamples);
+        juce::Array<ScheduledMidiEvent> keep;
+        juce::Array<ScheduledMidiEvent> ready;
+
+        for (const auto& event : slot.scheduledEvents)
+        {
+            if (event.frame < blockStart)
+            {
+                if (! event.message.isNoteOn())
+                {
+                    auto lateEvent = event;
+                    lateEvent.frame = blockStart;
+                    ready.add(lateEvent);
+                }
+            }
+            else if (event.frame < blockEnd)
+            {
+                ready.add(event);
+            }
+            else
+            {
+                keep.add(event);
+            }
+        }
+        slot.scheduledEvents.swapWith(keep);
+
+        std::sort(ready.begin(), ready.end(), [](const ScheduledMidiEvent& a, const ScheduledMidiEvent& b)
+        {
+            if (a.frame != b.frame)
+                return a.frame < b.frame;
+            if (a.priority != b.priority)
+                return a.priority < b.priority;
+            return a.sequence < b.sequence;
+        });
+
+        for (const auto& event : ready)
+        {
+            const auto samplePosition = static_cast<int>(
+                juce::jlimit<int64_t>(0, juce::jmax(0, numSamples - 1), event.frame - blockStart)
+            );
+            destination.addEvent(event.message, samplePosition);
+        }
+    }
+
+    bool schedulePersistentGraphMidi(const juce::var& slotsVar,
+                                     int64_t baseOffsetFrames,
+                                     int& scheduledCount,
+                                     juce::String& error)
+    {
+        auto* slotsArray = slotsVar.getArray();
+        if (slotsArray == nullptr)
+        {
+            error = "schedule_graph_midi requires a slots array";
+            return false;
+        }
+
+        const auto currentFrame = renderedSampleFrames.load();
+        scheduledCount = 0;
+
+        for (const auto& slotVar : *slotsArray)
+        {
+            auto* slotObject = slotVar.getDynamicObject();
+            if (slotObject == nullptr)
+                continue;
+
+            const auto slotIndex = static_cast<int>(slotObject->hasProperty("slot_index")
+                ? slotObject->getProperty("slot_index")
+                : juce::var(-1));
+            if (!juce::isPositiveAndBelow(slotIndex, static_cast<int>(persistentGraphSlots.size())))
+            {
+                error = "Graph slot not loaded";
+                return false;
+            }
+
+            auto& slot = persistentGraphSlots[static_cast<size_t>(slotIndex)];
+            if (slot.plugin == nullptr)
+            {
+                error = "Graph slot not loaded";
+                return false;
+            }
+
+            const auto loopEpoch = juce::jmax<int64_t>(
+                0,
+                static_cast<int64_t>(slotObject->hasProperty("loop_epoch")
+                    ? static_cast<double>(slotObject->getProperty("loop_epoch"))
+                    : 0.0)
+            );
+            const auto clearChannelsVar = slotObject->getProperty("clear_channels");
+            const auto resetChannelsVar = slotObject->getProperty("reset_channels");
+            const auto eventsVar = slotObject->getProperty("events");
+            juce::Array<int> resetChannels;
+
+            if (clearChannelsVar.isArray())
+            {
+                if (auto* clearArray = clearChannelsVar.getArray())
+                {
+                    for (const auto& channelVar : *clearArray)
+                        clearPersistentGraphScheduledEvents(slot, static_cast<int>(channelVar), loopEpoch);
+                }
+            }
+
+            if (resetChannelsVar.isArray())
+            {
+                if (auto* resetArray = resetChannelsVar.getArray())
+                {
+                    for (const auto& channelVar : *resetArray)
+                    {
+                        const auto channel = clampMidiChannel(static_cast<int>(channelVar));
+                        clearPersistentGraphScheduledEvents(slot, channel, loopEpoch);
+                        resetChannels.addIfNotAlreadyThere(channel);
+                    }
+                }
+            }
+
+            for (const auto channel : resetChannels)
+                scheduledCount += appendScheduledPanicEvents(slot.scheduledEvents, channel, currentFrame + baseOffsetFrames, loopEpoch);
+
+            auto* eventsArray = eventsVar.getArray();
+            if (eventsArray == nullptr)
+                continue;
+
+            for (const auto& eventVar : *eventsArray)
+            {
+                auto* eventObject = eventVar.getDynamicObject();
+                if (eventObject == nullptr)
+                    continue;
+
+                const auto type = eventObject->getProperty("type").toString().trim().toLowerCase();
+                const auto channel = clampMidiChannel(static_cast<int>(eventObject->hasProperty("channel")
+                    ? eventObject->getProperty("channel")
+                    : juce::var(kDefaultMidiChannel)));
+                const auto note = clampMidiNote(static_cast<int>(eventObject->hasProperty("note")
+                    ? eventObject->getProperty("note")
+                    : juce::var(60)));
+                const auto velocity = clampMidiVelocity(static_cast<float>(eventObject->hasProperty("velocity")
+                    ? static_cast<double>(eventObject->getProperty("velocity"))
+                    : 0.0));
+                const auto sampleOffset = juce::jmax<int64_t>(
+                    0,
+                    static_cast<int64_t>(eventObject->hasProperty("sample_offset")
+                        ? static_cast<double>(eventObject->getProperty("sample_offset"))
+                        : 0.0)
+                );
+                const auto priority = static_cast<int>(eventObject->hasProperty("priority")
+                    ? eventObject->getProperty("priority")
+                    : juce::var(0));
+
+                juce::MidiMessage message;
+                if (type == "note_on")
+                    message = juce::MidiMessage::noteOn(channel, note, velocity);
+                else if (type == "note_off")
+                    message = juce::MidiMessage::noteOff(channel, note, velocity);
+                else
+                    continue;
+
+                const auto targetFrame = currentFrame + baseOffsetFrames + sampleOffset;
+                const auto isDuplicate = std::any_of(
+                    slot.scheduledEvents.begin(),
+                    slot.scheduledEvents.end(),
+                    [&](const ScheduledMidiEvent& existing)
+                    {
+                        if (existing.loopEpoch != loopEpoch || existing.frame != targetFrame)
+                            return false;
+                        if (existing.message.getChannel() != message.getChannel())
+                            return false;
+                        if (existing.message.isNoteOn() && message.isNoteOn())
+                            return existing.message.getNoteNumber() == message.getNoteNumber();
+                        if (existing.message.isNoteOff() && message.isNoteOff())
+                            return existing.message.getNoteNumber() == message.getNoteNumber();
+                        return false;
+                    }
+                );
+                if (isDuplicate)
+                    continue;
+
+                slot.scheduledEvents.add({
+                    targetFrame,
+                    priority,
+                    scheduledMidiSequence.fetch_add(1),
+                    loopEpoch,
+                    message,
+                });
+                ++scheduledCount;
+            }
+        }
+
+        return true;
+    }
+
+    void preparePersistentPluginGraphForPlayback()
+    {
+        for (auto& slot : persistentGraphSlots)
+        {
+            if (slot.plugin == nullptr)
+                continue;
+            slot.plugin->setRateAndBufferSizeDetails(currentSampleRate, currentBlockSize);
+            slot.plugin->prepareToPlay(currentSampleRate, currentBlockSize);
+            slot.plugin->suspendProcessing(false);
+        }
+    }
+
+    void releasePersistentPluginGraphResources()
+    {
+        for (auto& slot : persistentGraphSlots)
+        {
+            if (slot.plugin == nullptr)
+                continue;
+            slot.plugin->suspendProcessing(true);
+            slot.plugin->releaseResources();
+        }
+    }
+
+    bool configurePersistentPluginGraph(const juce::var& tracksVar,
+                                        juce::Array<juce::var>& trackErrors,
+                                        juce::String& error)
+    {
+        auto* tracksArray = tracksVar.getArray();
+        if (tracksArray == nullptr || tracksArray->isEmpty())
+        {
+            error = "configure_plugin_graph requires at least one track";
+            return false;
+        }
+
+        if (persistentGraphSlots.size() > static_cast<size_t>(tracksArray->size()))
+        {
+            if (graphEditorSlotIndex >= tracksArray->size())
+                closeGraphEditorWindow();
+            for (size_t index = static_cast<size_t>(tracksArray->size()); index < persistentGraphSlots.size(); ++index)
+                releasePersistentGraphSlot(persistentGraphSlots[index]);
+            persistentGraphSlots.resize(static_cast<size_t>(tracksArray->size()));
+        }
+        else if (persistentGraphSlots.size() < static_cast<size_t>(tracksArray->size()))
+        {
+            persistentGraphSlots.resize(static_cast<size_t>(tracksArray->size()));
+        }
+
+        int loadedCount = 0;
+        for (int index = 0; index < tracksArray->size(); ++index)
+        {
+            auto* trackObject = tracksArray->getReference(index).getDynamicObject();
+            auto& slot = persistentGraphSlots[static_cast<size_t>(index)];
+            if (trackObject == nullptr)
+            {
+                releasePersistentGraphSlot(slot);
+                auto* errorObject = new juce::DynamicObject();
+                errorObject->setProperty("track_index", index);
+                errorObject->setProperty("message", "Track payload must be an object");
+                trackErrors.add(juce::var(errorObject));
+                continue;
+            }
+
+            const auto pluginPath = normaliseVst3PathForSettings(trackObject->getProperty("plugin_path").toString().trim());
+            const auto statePath = trackObject->getProperty("state_path").toString().trim();
+            const auto parameterSignature = parameterPayloadSignature(trackObject->getProperty("parameters"));
+            const auto name = trackObject->hasProperty("name")
+                ? trackObject->getProperty("name").toString().trim()
+                : juce::String();
+            const auto gain = trackObject->hasProperty("gain")
+                ? static_cast<float>(static_cast<double>(trackObject->getProperty("gain")))
+                : 1.0f;
+            const auto pan = trackObject->hasProperty("pan")
+                ? static_cast<float>(static_cast<double>(trackObject->getProperty("pan")))
+                : 0.0f;
+
+            if (pluginPath.isEmpty())
+            {
+                releasePersistentGraphSlot(slot);
+                auto* errorObject = new juce::DynamicObject();
+                errorObject->setProperty("track_index", index);
+                errorObject->setProperty("message", "Missing plugin path");
+                trackErrors.add(juce::var(errorObject));
+                continue;
+            }
+
+            const auto canReuse = slot.plugin != nullptr
+                && slot.pluginPath == pluginPath
+                && slot.statePath == statePath
+                && slot.parameterSignature == parameterSignature;
+            if (canReuse)
+            {
+                slot.name = name.isNotEmpty() ? name : juce::File(pluginPath).getFileNameWithoutExtension();
+                slot.scheduledEvents.clear();
+                slot.gain = gain;
+                slot.pan = pan;
+                ++loadedCount;
+                continue;
+            }
+
+            if (graphEditorSlotIndex == index)
+                closeGraphEditorWindow();
+            releasePersistentGraphSlot(slot);
+
+            const juce::File pluginFile(pluginPath);
+            auto descriptions = describePlugin(pluginFile);
+            if (descriptions.isEmpty())
+            {
+                auto* errorObject = new juce::DynamicObject();
+                errorObject->setProperty("track_index", index);
+                errorObject->setProperty("plugin_path", pluginPath);
+                errorObject->setProperty("message", "No loadable VST3 plugin description found");
+                trackErrors.add(juce::var(errorObject));
+                continue;
+            }
+
+            juce::String createError;
+            auto instance = formatManager.createPluginInstance(*descriptions[0], currentSampleRate, currentBlockSize, createError);
+            if (instance == nullptr)
+            {
+                auto* errorObject = new juce::DynamicObject();
+                errorObject->setProperty("track_index", index);
+                errorObject->setProperty("plugin_path", pluginPath);
+                errorObject->setProperty("message", createError.isNotEmpty() ? createError : "Could not create plugin instance");
+                trackErrors.add(juce::var(errorObject));
+                continue;
+            }
+
+            instance->disableNonMainBuses();
+            instance->setRateAndBufferSizeDetails(currentSampleRate, currentBlockSize);
+            instance->prepareToPlay(currentSampleRate, currentBlockSize);
+            instance->suspendProcessing(false);
+
+            if (statePath.isNotEmpty())
+            {
+                const auto stateFile = juce::File(statePath);
+                if (stateFile.existsAsFile())
+                    loadPluginStateIntoInstance(*instance, stateFile);
+            }
+
+            if (trackObject->hasProperty("parameters"))
+            {
+                juce::String parameterError;
+                int appliedParameterCount = 0;
+                juce::StringArray unmatchedParameters;
+                applyRequestedParameterValuesToPlugin(
+                    *instance,
+                    trackObject->getProperty("parameters"),
+                    parameterError,
+                    appliedParameterCount,
+                    unmatchedParameters
+                );
+            }
+
+            slot.name = name.isNotEmpty() ? name : pluginFile.getFileNameWithoutExtension();
+            slot.pluginPath = pluginPath;
+            slot.statePath = statePath;
+            slot.parameterSignature = parameterSignature;
+            slot.plugin = std::move(instance);
+            slot.scheduledEvents.clear();
+            slot.gain = gain;
+            slot.pan = pan;
+            ++loadedCount;
+        }
+
+        if (loadedCount <= 0)
+        {
+            error = "Could not configure plugin graph";
+            return false;
+        }
         return true;
     }
 
@@ -2325,6 +3126,243 @@ private:
         return response;
     }
 
+    juce::var renderOfflinePluginGraph(const juce::var& tracksVar, int numSamples)
+    {
+        if (!tracksVar.isArray())
+            return makeResponse(false, "render_plugin_graph requires a tracks array");
+
+        auto response = makeResponse(true, "Rendered plugin graph");
+        auto* tracksArray = tracksVar.getArray();
+        if (tracksArray == nullptr || tracksArray->isEmpty())
+            return makeResponse(false, "render_plugin_graph requires at least one track");
+
+        juce::Array<juce::var> trackErrors;
+        juce::String error;
+        if (!configurePersistentPluginGraph(tracksVar, trackErrors, error))
+        {
+            auto failedResponse = makeResponse(false, error.isNotEmpty() ? error : "Could not build plugin graph");
+            if (!trackErrors.isEmpty())
+                setResponseField(failedResponse, "track_errors", juce::var(trackErrors));
+            return failedResponse;
+        }
+
+        std::vector<OfflineGraphTrack> graphTracks;
+        graphTracks.reserve(static_cast<size_t>(tracksArray->size()));
+        for (int trackIndex = 0; trackIndex < tracksArray->size(); ++trackIndex)
+        {
+            auto* trackObject = tracksArray->getReference(trackIndex).getDynamicObject();
+            if (trackObject == nullptr)
+                continue;
+            if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(persistentGraphSlots.size())))
+                continue;
+
+            auto& slot = persistentGraphSlots[static_cast<size_t>(trackIndex)];
+            if (slot.plugin == nullptr)
+                continue;
+
+            OfflineGraphTrack graphTrack;
+            graphTrack.name = slot.name;
+            graphTrack.pluginPath = slot.pluginPath;
+            graphTrack.slot = &slot;
+            graphTrack.plugin = slot.plugin.get();
+            graphTrack.gain = trackObject->hasProperty("gain")
+                ? static_cast<float>(static_cast<double>(trackObject->getProperty("gain")))
+                : slot.gain;
+            graphTrack.pan = trackObject->hasProperty("pan")
+                ? static_cast<float>(static_cast<double>(trackObject->getProperty("pan")))
+                : slot.pan;
+
+            const auto eventsVar = trackObject->getProperty("events");
+            if (auto* eventsArray = eventsVar.getArray())
+            {
+                graphTrack.events.reserve(static_cast<size_t>(eventsArray->size()));
+                for (const auto& eventVar : *eventsArray)
+                {
+                    auto* eventObject = eventVar.getDynamicObject();
+                    if (eventObject == nullptr)
+                        continue;
+
+                    const auto type = eventObject->getProperty("type").toString().trim().toLowerCase();
+                    const auto channel = clampMidiChannel(static_cast<int>(
+                        eventObject->hasProperty("channel") ? eventObject->getProperty("channel") : juce::var(kDefaultMidiChannel)
+                    ));
+                    const auto note = clampMidiNote(static_cast<int>(
+                        eventObject->hasProperty("note") ? eventObject->getProperty("note") : juce::var(60)
+                    ));
+                    const auto velocity = clampMidiVelocity(static_cast<float>(
+                        eventObject->hasProperty("velocity") ? static_cast<double>(eventObject->getProperty("velocity")) : 0.0
+                    ));
+                    const auto sampleOffset = juce::jlimit<int64_t>(
+                        0,
+                        juce::jmax<int64_t>(0, numSamples - 1),
+                        static_cast<int64_t>(eventObject->hasProperty("sample_offset")
+                            ? static_cast<double>(eventObject->getProperty("sample_offset"))
+                            : 0.0)
+                    );
+                    const auto priority = static_cast<int>(
+                        eventObject->hasProperty("priority") ? eventObject->getProperty("priority") : juce::var(0)
+                    );
+
+                    juce::MidiMessage message;
+                    if (type == "note_on")
+                        message = juce::MidiMessage::noteOn(channel, note, velocity);
+                    else if (type == "note_off")
+                        message = juce::MidiMessage::noteOff(channel, note, velocity);
+                    else
+                        continue;
+
+                    graphTrack.events.push_back({ sampleOffset, priority, static_cast<int64_t>(graphTrack.events.size()), 0, message });
+                }
+            }
+
+            std::sort(graphTrack.events.begin(), graphTrack.events.end(), [](const ScheduledMidiEvent& a, const ScheduledMidiEvent& b)
+            {
+                if (a.frame != b.frame)
+                    return a.frame < b.frame;
+                if (a.priority != b.priority)
+                    return a.priority < b.priority;
+                return a.sequence < b.sequence;
+            });
+
+            graphTracks.push_back(std::move(graphTrack));
+        }
+
+        if (graphTracks.empty())
+        {
+            auto failedResponse = makeResponse(false, "Could not build plugin graph");
+            if (!trackErrors.isEmpty())
+                setResponseField(failedResponse, "track_errors", juce::var(trackErrors));
+            return failedResponse;
+        }
+
+        juce::AudioBuffer<float> mixBuffer(2, juce::jmax(1, numSamples));
+        mixBuffer.clear();
+        const auto blockSize = juce::jmax(64, juce::jmin(juce::jmax(64, currentBlockSize > 0 ? currentBlockSize : 512), juce::jmax(1, numSamples)));
+
+        juce::ScopedLock lock(pluginLock);
+        for (int blockStart = 0; blockStart < numSamples; blockStart += blockSize)
+        {
+            const auto blockSamples = juce::jmin(blockSize, numSamples - blockStart);
+            for (auto& graphTrack : graphTracks)
+            {
+                auto* plugin = graphTrack.plugin;
+                if (plugin == nullptr)
+                    continue;
+
+                const auto trackChannelCount = juce::jmax(
+                    2,
+                    juce::jmax(plugin->getTotalNumInputChannels(), plugin->getTotalNumOutputChannels())
+                );
+                juce::AudioBuffer<float> processBuffer(trackChannelCount, blockSamples);
+                processBuffer.clear();
+
+                juce::MidiBuffer midi;
+                for (const auto& event : graphTrack.events)
+                {
+                    if (event.frame < blockStart || event.frame >= blockStart + blockSamples)
+                        continue;
+                    midi.addEvent(event.message, static_cast<int>(event.frame - blockStart));
+                }
+
+                plugin->processBlock(processBuffer, midi);
+
+                juce::AudioBuffer<float> stereoBuffer(2, blockSamples);
+                stereoBuffer.clear();
+                if (plugin->getBusCount(false) > 0)
+                {
+                    auto busBuffer = plugin->getBusBuffer(processBuffer, false, 0);
+                    if (busBuffer.getNumChannels() > 0)
+                    {
+                        const auto leftChannel = 0;
+                        const auto rightChannel = busBuffer.getNumChannels() > 1 ? 1 : 0;
+                        for (int sample = 0; sample < blockSamples; ++sample)
+                        {
+                            stereoBuffer.setSample(0, sample, busBuffer.getSample(leftChannel, sample));
+                            stereoBuffer.setSample(1, sample, busBuffer.getSample(rightChannel, sample));
+                        }
+                    }
+                }
+                else
+                {
+                    const auto rightChannel = processBuffer.getNumChannels() > 1 ? 1 : 0;
+                    for (int sample = 0; sample < blockSamples; ++sample)
+                    {
+                        stereoBuffer.setSample(0, sample, processBuffer.getSample(0, sample));
+                        stereoBuffer.setSample(1, sample, processBuffer.getSample(rightChannel, sample));
+                    }
+                }
+
+                applyOutputMixToBuffer(stereoBuffer, graphTrack.gain, graphTrack.pan);
+                mixBuffer.addFrom(0, blockStart, stereoBuffer, 0, 0, blockSamples);
+                mixBuffer.addFrom(1, blockStart, stereoBuffer, 1, 0, blockSamples);
+            }
+        }
+
+        setResponseField(response, "audio_b64", encodeInterleavedBusAudio(mixBuffer));
+        setResponseField(response, "channels", 2);
+        setResponseField(response, "format", "f32le-interleaved");
+        setResponseField(response, "rendered_track_count", static_cast<int>(graphTracks.size()));
+        if (!trackErrors.isEmpty())
+            setResponseField(response, "track_errors", juce::var(trackErrors));
+        return response;
+    }
+
+    void processPersistentPluginGraphTransport(juce::AudioBuffer<float>& buffer,
+                                               int numSamples,
+                                               int64_t blockStart)
+    {
+        if (persistentGraphSlots.empty())
+            return;
+
+        for (auto& slot : persistentGraphSlots)
+        {
+            auto* plugin = slot.plugin.get();
+            if (plugin == nullptr)
+                continue;
+
+            const auto trackChannelCount = juce::jmax(
+                2,
+                juce::jmax(plugin->getTotalNumInputChannels(), plugin->getTotalNumOutputChannels())
+            );
+            juce::AudioBuffer<float> processBuffer(trackChannelCount, numSamples);
+            processBuffer.clear();
+
+            juce::MidiBuffer midi;
+            appendPersistentGraphScheduledMidiMessages(slot, midi, blockStart, numSamples);
+            plugin->processBlock(processBuffer, midi);
+
+            juce::AudioBuffer<float> stereoBuffer(2, numSamples);
+            stereoBuffer.clear();
+            if (plugin->getBusCount(false) > 0)
+            {
+                auto busBuffer = plugin->getBusBuffer(processBuffer, false, 0);
+                if (busBuffer.getNumChannels() > 0)
+                {
+                    const auto leftChannel = 0;
+                    const auto rightChannel = busBuffer.getNumChannels() > 1 ? 1 : 0;
+                    for (int sample = 0; sample < numSamples; ++sample)
+                    {
+                        stereoBuffer.setSample(0, sample, busBuffer.getSample(leftChannel, sample));
+                        stereoBuffer.setSample(1, sample, busBuffer.getSample(rightChannel, sample));
+                    }
+                }
+            }
+            else
+            {
+                const auto rightChannel = processBuffer.getNumChannels() > 1 ? 1 : 0;
+                for (int sample = 0; sample < numSamples; ++sample)
+                {
+                    stereoBuffer.setSample(0, sample, processBuffer.getSample(0, sample));
+                    stereoBuffer.setSample(1, sample, processBuffer.getSample(rightChannel, sample));
+                }
+            }
+
+            applyOutputMixToBuffer(stereoBuffer, slot.gain, slot.pan);
+            buffer.addFrom(0, 0, stereoBuffer, 0, 0, numSamples);
+            buffer.addFrom(1, 0, stereoBuffer, 1, 0, numSamples);
+        }
+    }
+
     void openEditorWindow()
     {
         if (pluginInstance == nullptr)
@@ -2367,10 +3405,65 @@ private:
         }
     }
 
+    void openGraphEditorWindow(int slotIndex)
+    {
+        if (!juce::isPositiveAndBelow(slotIndex, static_cast<int>(persistentGraphSlots.size())))
+            return;
+
+        auto& slot = persistentGraphSlots[static_cast<size_t>(slotIndex)];
+        if (slot.plugin == nullptr)
+            return;
+
+        if (graphEditorWindow != nullptr && graphEditorSlotIndex == slotIndex)
+        {
+            graphEditorWindow->forceTopmostFront();
+            return;
+        }
+
+        closeGraphEditorWindow();
+
+        auto key = normaliseVst3PathForSettings(slot.pluginPath);
+        if (key.isEmpty())
+            key = "graph_slot_" + juce::String(slotIndex + 1);
+
+        graphEditorWindow = std::make_unique<PluginEditorWindow>(*slot.plugin, "graph_editor_" + key + "_" + juce::String(slotIndex + 1), appSettings);
+        graphEditorSlotIndex = slotIndex;
+        graphEditorWindow->onWindowClosed = [this]
+        {
+            graphEditorWindow.reset();
+            graphEditorSlotIndex = -1;
+            updateButtons();
+        };
+        if (bridgeMode)
+        {
+            graphEditorWindow->showBridgeEditorWindow();
+        }
+        else
+        {
+            graphEditorWindow->forceTopmostFront();
+            graphEditorWindow->beginTopmostWarmup();
+            juce::MessageManager::callAsync([this]
+            {
+                if (graphEditorWindow != nullptr)
+                {
+                    graphEditorWindow->forceTopmostFront();
+                    graphEditorWindow->beginTopmostWarmup();
+                }
+            });
+        }
+    }
+
     void closeEditorWindow()
     {
         if (editorWindow != nullptr)
             editorWindow.reset();
+    }
+
+    void closeGraphEditorWindow()
+    {
+        if (graphEditorWindow != nullptr)
+            graphEditorWindow.reset();
+        graphEditorSlotIndex = -1;
     }
 
     juce::OwnedArray<juce::PluginDescription> describePlugin(const juce::File& pluginFile)
@@ -2403,6 +3496,7 @@ private:
     std::atomic<bool> audioStreamEnabled { false };
     std::atomic<float> pluginOutputGain { 1.0f };
     std::atomic<float> pluginOutputPan { 0.0f };
+    std::atomic<bool> graphTransportEnabled { false };
     std::atomic<int64_t> renderedSampleFrames { 0 };
     std::atomic<int64_t> scheduledMidiSequence { 0 };
 
@@ -2423,6 +3517,9 @@ private:
     juce::PluginDescription pluginDescription;
     std::unique_ptr<juce::AudioPluginInstance> pluginInstance;
     std::unique_ptr<PluginEditorWindow> editorWindow;
+    std::vector<PersistentGraphSlot> persistentGraphSlots;
+    std::unique_ptr<PluginEditorWindow> graphEditorWindow;
+    int graphEditorSlotIndex = -1;
     std::unique_ptr<juce::FileChooser> fileChooser;
     std::unique_ptr<HostCommandServer> commandServer;
     bool bridgeMode = false;
@@ -2581,13 +3678,15 @@ public:
     HostWindow(juce::PropertiesFile& settings,
                const juce::String& startupPluginPath,
                const juce::String& startupStatePath,
+               bool restoreLastPluginOnStartup,
                bool shouldOpenEditorOnStartup,
                int requestedCommandPort,
                bool bridgeModeEnabled,
                bool startHidden,
                double startupSampleRate,
                int startupBufferSize,
-               const juce::String& startupAudioDeviceType)
+               const juce::String& startupAudioDeviceType,
+               const juce::String& startupAudioOutputDeviceName)
         : juce::DocumentWindow("AI Music Studio VST Host",
                                juce::Colour::fromRGB(20, 24, 31),
                                juce::DocumentWindow::allButtons),
@@ -2601,12 +3700,14 @@ public:
         setContentOwned(new HostComponent(settings,
                                           startupPluginPath,
                                           startupStatePath,
+                                          restoreLastPluginOnStartup,
                                           shouldOpenEditorOnStartup,
                                           requestedCommandPort,
                                           bridgeMode,
                                           startupSampleRate,
                                           startupBufferSize,
-                                          startupAudioDeviceType),
+                                          startupAudioDeviceType,
+                                          startupAudioOutputDeviceName),
                         true);
         restoreBounds();
         if (!hiddenOnStartup)
@@ -2700,10 +3801,12 @@ namespace
     {
     public:
         LibraryHostInstance(const juce::String& pluginPath,
+                            bool restoreLastPluginOnStartup,
                             bool shouldOpenEditorOnStartup,
                             double startupSampleRate,
                             int startupBufferSize,
-                            const juce::String& startupAudioDeviceType)
+                            const juce::String& startupAudioDeviceType,
+                            const juce::String& startupAudioOutputDeviceName)
             : guiInitializer(std::make_unique<juce::ScopedJuceInitialiser_GUI>())
         {
             appProperties = std::make_unique<juce::ApplicationProperties>();
@@ -2711,12 +3814,14 @@ namespace
             component = std::make_unique<HostComponent>(*appProperties->getUserSettings(),
                                                         pluginPath,
                                                         juce::String(),
+                                                        restoreLastPluginOnStartup,
                                                         shouldOpenEditorOnStartup,
                                                         0,
                                                         true,
                                                         startupSampleRate,
                                                         startupBufferSize,
-                                                        startupAudioDeviceType);
+                                                        startupAudioDeviceType,
+                                                        startupAudioOutputDeviceName);
         }
 
         juce::String command(const juce::String& requestLine)
@@ -2733,19 +3838,24 @@ namespace
 }
 
 AIMS_VST_HOST_API void* aims_vst_host_create(const char* pluginPath,
+                                             int restoreLastPluginOnStartup,
                                              int openEditor,
                                              double sampleRate,
                                              int bufferSize,
+                                             const char* audioDeviceType,
+                                             const char* audioOutputDeviceName,
                                              char* errorBuffer,
                                              int errorBufferBytes)
 {
     try
     {
         auto instance = std::make_unique<LibraryHostInstance>(juce::String::fromUTF8(pluginPath != nullptr ? pluginPath : ""),
+                                                              restoreLastPluginOnStartup != 0,
                                                               openEditor != 0,
                                                               sampleRate,
                                                               bufferSize,
-                                                              juce::String());
+                                                              juce::String::fromUTF8(audioDeviceType != nullptr ? audioDeviceType : ""),
+                                                              juce::String::fromUTF8(audioOutputDeviceName != nullptr ? audioOutputDeviceName : ""));
         copyUtf8ToBuffer("", errorBuffer, errorBufferBytes);
         return instance.release();
     }
@@ -2819,13 +3929,15 @@ public:
         mainWindow = std::make_unique<HostWindow>(*appProperties->getUserSettings(),
                                                   parseStartupPluginPath(),
                                                   parseStartupStatePath(),
+                                                  shouldRestoreLastPluginOnStartup(),
                                                   shouldOpenEditorOnStartup(),
                                                   parseCommandPort(),
                                                   isBridgeModeEnabled(),
                                                   shouldStartHidden(),
                                                   parseStartupSampleRate(),
                                                   parseStartupBufferSize(),
-                                                  parseStartupAudioDeviceType());
+                                                  parseStartupAudioDeviceType(),
+                                                  parseStartupAudioOutputDeviceName());
     }
 
     void shutdown() override
@@ -2914,6 +4026,23 @@ private:
         }
 
         return {};
+    }
+
+    juce::String parseStartupAudioOutputDeviceName() const
+    {
+        const auto args = getCommandLineParameterArray();
+        for (int i = 0; i < args.size(); ++i)
+        {
+            if (args[i] == "--audio-output-device" && i + 1 < args.size())
+                return args[i + 1].unquoted();
+        }
+
+        return {};
+    }
+
+    bool shouldRestoreLastPluginOnStartup() const
+    {
+        return ! getCommandLineParameterArray().contains("--no-restore-last-plugin");
     }
 
     bool isBridgeModeEnabled() const
