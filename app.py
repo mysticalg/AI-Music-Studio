@@ -11083,24 +11083,24 @@ class MainWindow(QtWidgets.QMainWindow):
             self._pending_playback_start_tick = None
             self._refresh_transport_controls()
             return
-        graph_tracks = []
-        if not bool(getattr(self, 'prefer_prerendered_vst_playback', False)):
-            graph_tracks = self._graph_native_transport_candidates()
-        if graph_tracks:
-            signature = self._native_output_bridge_target_signature(None)
-            if not self._native_output_bridge_matches_signature(signature):
-                if self._begin_async_native_output_bridge_warm():
-                    self.statusBar().showMessage('Starting JUCE graph transport...')
-                    self._refresh_transport_controls()
-                    return
         direct_plugin = None
-        if not graph_tracks and not bool(getattr(self, 'prefer_prerendered_vst_playback', False)):
+        if not bool(getattr(self, 'prefer_prerendered_vst_playback', False)):
             direct_plugin = self._direct_native_transport_candidate()
         if direct_plugin is not None:
             signature = self._native_output_bridge_target_signature(direct_plugin)
             if not self._native_output_bridge_matches_signature(signature):
                 if self._begin_async_native_output_bridge_warm(direct_plugin=direct_plugin):
                     self.statusBar().showMessage(f'Loading {direct_plugin[2].name}...')
+                    self._refresh_transport_controls()
+                    return
+        graph_tracks = []
+        if direct_plugin is None and not bool(getattr(self, 'prefer_prerendered_vst_playback', False)):
+            graph_tracks = self._graph_native_transport_candidates()
+        if graph_tracks:
+            signature = self._native_output_bridge_target_signature(None)
+            if not self._native_output_bridge_matches_signature(signature):
+                if self._begin_async_native_output_bridge_warm():
+                    self.statusBar().showMessage('Starting JUCE graph transport...')
                     self._refresh_transport_controls()
                     return
         self._pending_playback_start_tick = None
@@ -11540,7 +11540,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Send note list and start in-process transport for sample-accurate
         # MIDI scheduling inside the C++ audio callback (no IPC drift).
-        self._send_transport_notes_to_bridge(bridge, track)
+        ipt_ok = self._send_transport_notes_to_bridge(bridge, track)
+        _APP_LOGGER.info(
+            "In-process transport: sent %d notes to bridge ok=%s start_tick=%d loop=%s [%d..%d]",
+            len(track.notes), ipt_ok, start_tick,
+            self.project.loop_enabled,
+            *((self._loop_tick_bounds()) if self.project.loop_enabled else (0, 0)),
+        )
         self._use_inprocess_transport = True
 
         rendered_frames = int(self._native_output_rendered_sample_frames(status))
@@ -11703,6 +11709,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._use_prerendered_transport_mix = False
         self._auto_forced_prerender_vst_transport = False
         if not bool(getattr(self, 'prefer_prerendered_vst_playback', False)):
+            # Prefer direct transport (in-process, sample-accurate) for single
+            # VSTi tracks before falling back to the graph transport path.
+            direct_plugin = self._direct_native_transport_candidate()
+            if direct_plugin is not None:
+                try:
+                    if self._prepare_direct_native_transport_playback(int(start_tick), direct_plugin):
+                        return True
+                except Exception:
+                    _APP_LOGGER.exception("Failed starting direct JUCE transport, falling back to graph/PCM playback")
+                    self._stop_native_output_bridge()
+                    self._clear_direct_native_transport_state()
             graph_tracks = self._graph_native_transport_candidates()
             if graph_tracks:
                 try:
@@ -11722,16 +11739,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 _APP_LOGGER.exception("Failed building prerendered transport mix")
             if self._use_prerendered_transport_mix:
                 self._apply_audio_buffer_preference()
-        else:
-            direct_plugin = self._direct_native_transport_candidate()
-            if direct_plugin is not None:
-                try:
-                    if self._prepare_direct_native_transport_playback(int(start_tick), direct_plugin):
-                        return True
-                except Exception:
-                    _APP_LOGGER.exception("Failed starting direct JUCE transport, falling back to PCM playback")
-                    self._stop_native_output_bridge()
-                    self._clear_direct_native_transport_state()
         if self._native_output_bridge_supported():
             try:
                 if self._prepare_native_output_playback():
@@ -12917,8 +12924,17 @@ class MainWindow(QtWidgets.QMainWindow):
             # ── In-process transport: C++ handles MIDI scheduling directly ──
             # Only update UI playhead from the host's authoritative position.
             if getattr(self, '_use_inprocess_transport', False):
+                ipt_running = bool(status.get('inprocess_transport_running', False))
                 ipt_frame = int(status.get('inprocess_transport_position_frame', 0) or 0)
                 self._inprocess_transport_position_frame = ipt_frame
+                if not hasattr(self, '_ipt_log_counter'):
+                    self._ipt_log_counter = 0
+                self._ipt_log_counter += 1
+                if self._ipt_log_counter <= 3 or self._ipt_log_counter % 50 == 0:
+                    _APP_LOGGER.info(
+                        "IPT pump #%d: running=%s pos_frame=%d level=%.3f",
+                        self._ipt_log_counter, ipt_running, ipt_frame, direct_level,
+                    )
                 return
 
             current_frame = self._native_output_rendered_sample_frames(status)
