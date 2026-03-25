@@ -12925,13 +12925,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Send note list and start in-process transport for sample-accurate
         # MIDI scheduling inside the C++ audio callback (no IPC drift).
-        ipt_ok = self._send_transport_notes_to_bridge(bridge, track)
-        _APP_LOGGER.info(
-            "In-process transport: sent %d notes to bridge ok=%s start_tick=%d loop=%s [%d..%d]",
-            len(track.notes), ipt_ok, start_tick,
-            self.project.loop_enabled,
-            *((self._loop_tick_bounds()) if self.project.loop_enabled else (0, 0)),
-        )
+        self._send_transport_notes_to_bridge(bridge, track)
         self._use_inprocess_transport = True
 
         rendered_frames = int(self._native_output_rendered_sample_frames(status))
@@ -14478,17 +14472,8 @@ class MainWindow(QtWidgets.QMainWindow):
             # ── In-process transport: C++ handles MIDI scheduling directly ──
             # Only update UI playhead from the host's authoritative position.
             if getattr(self, '_use_inprocess_transport', False):
-                ipt_running = bool(status.get('inprocess_transport_running', False))
                 ipt_frame = int(status.get('inprocess_transport_position_frame', 0) or 0)
                 self._inprocess_transport_position_frame = ipt_frame
-                if not hasattr(self, '_ipt_log_counter'):
-                    self._ipt_log_counter = 0
-                self._ipt_log_counter += 1
-                if self._ipt_log_counter <= 3 or self._ipt_log_counter % 50 == 0:
-                    _APP_LOGGER.info(
-                        "IPT pump #%d: running=%s pos_frame=%d level=%.3f",
-                        self._ipt_log_counter, ipt_running, ipt_frame, direct_level,
-                    )
                 return
 
             current_frame = self._native_output_rendered_sample_frames(status)
@@ -16623,6 +16608,38 @@ class MainWindow(QtWidgets.QMainWindow):
                     track.rack_vsti,
                 )
 
+        if self._native_audio_engine_active():
+            engine_track_rows = list(getattr(self, '_native_audio_engine_track_rows', []) or [])
+            if track_index in engine_track_rows:
+                engine_track_index = engine_track_rows.index(track_index)
+                engine_payload = self._sanitize_native_vst_bridge_parameter_values(
+                    payload_values if payload_values is not None else values
+                )
+                if engine_payload:
+                    engine_bridge = getattr(self, '_native_output_bridge', None)
+                    if engine_bridge is not None:
+                        rack_name = str(getattr(bridge, '_aims_rack_name', '') or '') if bridge is not None else ''
+                        if rack_name:
+                            parameter_names = [str(name) for name in self.vsti_parameter_names_for_rack(rack_name)]
+                            parameter_index_by_name = {name: idx for idx, name in enumerate(parameter_names, start=1)}
+                            for key, value in list(engine_payload.items()):
+                                parameter_index = parameter_index_by_name.get(str(key))
+                                if parameter_index is not None:
+                                    engine_payload.setdefault(f'Param {parameter_index}', float(value))
+                        try:
+                            engine_bridge.command(
+                                'set_audio_engine_track_parameters',
+                                track_index=int(engine_track_index),
+                                parameters=dict(engine_payload),
+                            )
+                        except Exception:
+                            _APP_LOGGER.exception(
+                                "Failed syncing audio engine track parameters row=%s engine_track=%s rack=%s",
+                                track_index,
+                                engine_track_index,
+                                track.rack_vsti,
+                            )
+
     def _native_vst_parameter_change_is_live_safe(self, track: TrackState) -> bool:
         if not bool(getattr(self, '_playback_active', False)):
             return False
@@ -16653,6 +16670,10 @@ class MainWindow(QtWidgets.QMainWindow):
             graph_bridge = self._active_native_vst_graph_bridge()
             graph_slot_index = self._native_vst_graph_bridge_slot_index(track_index, entry, bridge=graph_bridge)
             if graph_bridge is not None and graph_slot_index >= 0:
+                return True
+
+        if self._native_audio_engine_active():
+            if track_index in getattr(self, '_native_audio_engine_track_rows', []):
                 return True
 
         return False

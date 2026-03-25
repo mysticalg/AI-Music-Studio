@@ -456,6 +456,7 @@ public:
                 || command == "queue_audio" || command == "clear_audio_queue"
                 || command == "start_audio_stream"
                 || command == "set_audio_engine_transport"
+                || command == "set_audio_engine_track_parameters"
                 || command == "seek_audio_engine"
                 || command == "set_transport_notes"
                 || command == "start_inprocess_transport"
@@ -1581,6 +1582,34 @@ private:
 
             auto response = makeResponse(true, "Audio engine transport updated");
             appendStatusFields(response);
+            return response;
+        }
+
+        if (command == "set_audio_engine_track_parameters")
+        {
+            const auto trackIndex = static_cast<int>(object->hasProperty("track_index")
+                ? object->getProperty("track_index") : juce::var(-1));
+
+            juce::ScopedLock lock(pluginLock);
+            if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(audioEngine.tracks.size())))
+                return makeResponse(false, "Invalid audio engine track index");
+
+            auto& track = audioEngine.tracks[static_cast<size_t>(trackIndex)];
+            if (track.plugin == nullptr)
+                return makeResponse(false, "Audio engine track has no plugin loaded");
+
+            juce::String error;
+            int appliedCount = 0;
+            juce::StringArray unmatchedParameters;
+            if (!applyRequestedParameterValuesToPlugin(
+                    *track.plugin,
+                    object->getProperty("parameters"),
+                    error, appliedCount, unmatchedParameters))
+                return makeResponse(false, error.isNotEmpty() ? error : "Could not update track parameters");
+
+            auto response = makeResponse(true, "Audio engine track parameters updated");
+            appendStatusFields(response);
+            setResponseField(response, "applied_parameter_count", appliedCount);
             return response;
         }
 
