@@ -1613,6 +1613,7 @@ private:
             return response;
         }
 
+
         if (command == "seek_audio_engine")
         {
             const auto startTick = object->hasProperty("start_tick")

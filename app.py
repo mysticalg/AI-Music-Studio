@@ -12925,7 +12925,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Send note list and start in-process transport for sample-accurate
         # MIDI scheduling inside the C++ audio callback (no IPC drift).
-        self._send_transport_notes_to_bridge(bridge, track)
+        ipt_ok = self._send_transport_notes_to_bridge(bridge, track)
+        _APP_LOGGER.info(
+            "In-process transport: sent %d notes to bridge ok=%s start_tick=%d loop=%s [%d..%d]",
+            len(track.notes), ipt_ok, start_tick,
+            self.project.loop_enabled,
+            *((self._loop_tick_bounds()) if self.project.loop_enabled else (0, 0)),
+        )
         self._use_inprocess_transport = True
 
         rendered_frames = int(self._native_output_rendered_sample_frames(status))
@@ -14472,8 +14478,17 @@ class MainWindow(QtWidgets.QMainWindow):
             # ── In-process transport: C++ handles MIDI scheduling directly ──
             # Only update UI playhead from the host's authoritative position.
             if getattr(self, '_use_inprocess_transport', False):
+                ipt_running = bool(status.get('inprocess_transport_running', False))
                 ipt_frame = int(status.get('inprocess_transport_position_frame', 0) or 0)
                 self._inprocess_transport_position_frame = ipt_frame
+                if not hasattr(self, '_ipt_log_counter'):
+                    self._ipt_log_counter = 0
+                self._ipt_log_counter += 1
+                if self._ipt_log_counter <= 3 or self._ipt_log_counter % 50 == 0:
+                    _APP_LOGGER.info(
+                        "IPT pump #%d: running=%s pos_frame=%d level=%.3f",
+                        self._ipt_log_counter, ipt_running, ipt_frame, direct_level,
+                    )
                 return
 
             current_frame = self._native_output_rendered_sample_frames(status)
