@@ -29,18 +29,28 @@ def _exercise_window(iteration: int) -> int:
 
     qt_app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     window = app.MainWindow()
+    window.hide()
 
     def pump(seconds: float) -> None:
         deadline = time.perf_counter() + max(0.0, float(seconds))
         while time.perf_counter() < deadline:
-            QtWidgets.QApplication.processEvents()
-            QtCore.QThread.msleep(10)
+            qt_app.processEvents(QtCore.QEventLoop.ProcessEventsFlag.AllEvents, 50)
+            time.sleep(0.01)
+
+    def wait_for_clean_engine(timeout: float = 4.0) -> bool:
+        deadline = time.perf_counter() + max(0.0, float(timeout))
+        while time.perf_counter() < deadline:
+            qt_app.processEvents(QtCore.QEventLoop.ProcessEventsFlag.AllEvents, 50)
+            if bool(getattr(window, "_playback_active", False)) and window._native_audio_engine_active():
+                return True
+            time.sleep(0.01)
+        qt_app.processEvents(QtCore.QEventLoop.ProcessEventsFlag.AllEvents, 50)
+        return bool(getattr(window, "_playback_active", False)) and window._native_audio_engine_active()
 
     try:
         window.new_project()
-        while len(window.project.tracks) < 4:
-            window.add_track(preferred_type="instrument", ask=False)
-
+        window.set_prefer_prerendered_vst_playback(False)
+        pump(0.1)
         available = [
             name for name in [
                 "AI Bass Synth",
@@ -53,6 +63,32 @@ def _exercise_window(iteration: int) -> int:
         ]
         if len(available) < 3:
             raise RuntimeError(f"Not enough bundled VSTs available for stress test: {available}")
+
+        cold_track = window.project.tracks[0]
+        cold_track.notes = [
+            app.MidiNote(
+                start_tick=0,
+                duration_tick=app.TICKS_PER_BEAT,
+                pitch=48,
+                velocity=100,
+            )
+        ]
+        if not window._assign_rack_vsti_to_track(0, available[0]):
+            raise RuntimeError(f"Failed cold-start assignment for {available[0]}")
+        window.on_notes_changed()
+        pump(0.1)
+        window.start_playback()
+        if not wait_for_clean_engine(4.0):
+            raise RuntimeError("Clean audio engine did not become active for fresh-project single-VST cold start")
+        pump(0.18)
+        window.stop_playback()
+        pump(0.08)
+
+        window.new_project()
+        window.set_prefer_prerendered_vst_playback(False)
+        pump(0.1)
+        while len(window.project.tracks) < 4:
+            window.add_track(preferred_type="instrument", ask=False)
 
         bpm = 120
         window.project.bpm = bpm
@@ -99,6 +135,8 @@ def _exercise_window(iteration: int) -> int:
 
         for cycle in range(12):
             window.start_playback()
+            if not wait_for_clean_engine(4.0):
+                raise RuntimeError(f"Clean audio engine did not become active on cycle {cycle + 1}")
             pump(0.35 if cycle < 6 else 0.25)
             window.stop_playback()
             pump(0.08)
@@ -121,11 +159,15 @@ def _exercise_window(iteration: int) -> int:
                 raise RuntimeError(f"Failed swap assignment row={row} vst={vst_name}")
             pump(0.06)
             window.start_playback()
+            if not wait_for_clean_engine(4.0):
+                raise RuntimeError(f"Clean audio engine inactive after swap row={row} vst={vst_name}")
             pump(0.22)
             window.stop_playback()
             pump(0.06)
 
         window.start_playback()
+        if not wait_for_clean_engine(4.0):
+            raise RuntimeError("Clean audio engine inactive before live swaps")
         pump(0.18)
         live_swaps = ["AI String Synth", "AI Lead Synth", "AI Pad Synth", "AI Bass Synth"]
         for offset, vst_name in enumerate(live_swaps):
@@ -135,6 +177,8 @@ def _exercise_window(iteration: int) -> int:
             ok = window._assign_rack_vsti_to_track(row, vst_name)
             if not ok:
                 raise RuntimeError(f"Failed live assignment row={row} vst={vst_name}")
+            if not wait_for_clean_engine(4.0):
+                raise RuntimeError(f"Clean audio engine inactive during live swap row={row} vst={vst_name}")
             pump(0.14)
         window.stop_playback()
         pump(0.08)
@@ -144,6 +188,7 @@ def _exercise_window(iteration: int) -> int:
                 "iteration": iteration,
                 "tracks": len(window.project.tracks),
                 "vsts": [track.rack_vsti for track in window.project.tracks[:4]],
+                "audio_engine_rows": list(getattr(window, "_native_audio_engine_track_rows", [])),
                 "status": "ok",
             }
         )
