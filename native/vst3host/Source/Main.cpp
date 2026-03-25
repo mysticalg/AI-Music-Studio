@@ -1897,6 +1897,7 @@ private:
             updateDeviceLabel();
         }
         keyboardState.reset();
+        ensureScratchBufferSize(currentBlockSize);
         preparePluginForPlayback();
         preparePersistentPluginGraphForPlayback();
     }
@@ -1916,6 +1917,7 @@ private:
     {
         juce::AudioBuffer<float> buffer(outputChannelData, numOutputChannels, numSamples);
         buffer.clear();
+        ensureScratchBufferSize(numSamples);
 
         {
             juce::ScopedLock lock(pluginLock);
@@ -1970,14 +1972,7 @@ private:
 
     static float peakLevelForBuffer(const juce::AudioBuffer<float>& buffer)
     {
-        float peak = 0.0f;
-        for (int channel = 0; channel < buffer.getNumChannels(); ++channel)
-        {
-            const auto* data = buffer.getReadPointer(channel);
-            for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
-                peak = juce::jmax(peak, std::abs(data[sample]));
-        }
-        return juce::jlimit(0.0f, 1.0f, peak);
+        return juce::jlimit(0.0f, 1.0f, buffer.getMagnitude(0, buffer.getNumSamples()));
     }
 
     static void copyStereoBufferToPluginInput(
@@ -2117,30 +2112,37 @@ private:
     {
         const auto blockStart = renderedSampleFrames.load();
         const auto blockEnd = blockStart + juce::jmax(1, numSamples);
-        juce::Array<ScheduledMidiEvent> keep;
-        juce::Array<ScheduledMidiEvent> ready;
 
         juce::ScopedLock lock(scheduledMidiLock);
-        for (const auto& event : scheduledMidiEvents)
+        if (scheduledMidiEvents.isEmpty())
+            return;
+
+        // Partition in-place: move future events to the front, collect ready ones
+        int keepCount = 0;
+        scheduledMidiReady.clearQuick();
+        for (int i = 0; i < scheduledMidiEvents.size(); ++i)
         {
-            if (event.frame < blockStart)
+            auto& event = scheduledMidiEvents.getReference(i);
+            if (event.frame >= blockEnd)
             {
-                auto lateEvent = event;
-                lateEvent.frame = blockStart;
-                ready.add(lateEvent);
-            }
-            else if (event.frame < blockEnd)
-            {
-                ready.add(event);
+                if (keepCount != i)
+                    scheduledMidiEvents.getReference(keepCount) = std::move(event);
+                ++keepCount;
             }
             else
             {
-                keep.add(event);
+                if (event.frame < blockStart)
+                    event.frame = blockStart;
+                scheduledMidiReady.add(std::move(event));
             }
         }
-        scheduledMidiEvents.swapWith(keep);
+        scheduledMidiEvents.removeRange(keepCount, scheduledMidiEvents.size() - keepCount);
 
-        std::sort(ready.begin(), ready.end(), [](const ScheduledMidiEvent& a, const ScheduledMidiEvent& b)
+        if (scheduledMidiReady.isEmpty())
+            return;
+
+        std::sort(scheduledMidiReady.begin(), scheduledMidiReady.end(),
+            [](const ScheduledMidiEvent& a, const ScheduledMidiEvent& b)
         {
             if (a.frame != b.frame)
                 return a.frame < b.frame;
@@ -2149,7 +2151,7 @@ private:
             return a.sequence < b.sequence;
         });
 
-        for (const auto& event : ready)
+        for (const auto& event : scheduledMidiReady)
         {
             const auto samplePosition = static_cast<int>(
                 juce::jlimit<int64_t>(0, juce::jmax(0, numSamples - 1), event.frame - blockStart)
@@ -2585,12 +2587,36 @@ private:
         auto* source = reinterpret_cast<const float*>(
             static_cast<const char*>(stream.data.getData()) + stream.readOffset
         );
-        for (int sample = 0; sample < copiedFrames; ++sample)
+
+        if (stream.channelCount == 2 && numChannels >= 2)
         {
-            for (int channel = 0; channel < numChannels; ++channel)
+            // Fast path: stereo-to-stereo bulk de-interleave + add
+            for (int sample = 0; sample < copiedFrames; ++sample)
             {
-                const auto sourceChannel = stream.channelCount == 1 ? 0 : juce::jmin(channel, stream.channelCount - 1);
-                buffer.addSample(channel, sample, source[(sample * stream.channelCount) + sourceChannel]);
+                deinterleaveLeft[sample] = source[sample * 2];
+                deinterleaveRight[sample] = source[sample * 2 + 1];
+            }
+            juce::FloatVectorOperations::add(buffer.getWritePointer(0), deinterleaveLeft.data(), copiedFrames);
+            juce::FloatVectorOperations::add(buffer.getWritePointer(1), deinterleaveRight.data(), copiedFrames);
+            for (int channel = 2; channel < numChannels; ++channel)
+                juce::FloatVectorOperations::add(buffer.getWritePointer(channel), deinterleaveRight.data(), copiedFrames);
+        }
+        else if (stream.channelCount == 1)
+        {
+            // Mono source: bulk add the same data to all output channels
+            for (int channel = 0; channel < numChannels; ++channel)
+                juce::FloatVectorOperations::add(buffer.getWritePointer(channel), source, copiedFrames);
+        }
+        else
+        {
+            // Generic fallback for unusual channel counts
+            for (int sample = 0; sample < copiedFrames; ++sample)
+            {
+                for (int channel = 0; channel < numChannels; ++channel)
+                {
+                    const auto sourceChannel = juce::jmin(channel, stream.channelCount - 1);
+                    buffer.addSample(channel, sample, source[(sample * stream.channelCount) + sourceChannel]);
+                }
             }
         }
 
@@ -2976,30 +3002,37 @@ private:
                                                     int64_t blockStart,
                                                     int numSamples)
     {
-        const auto blockEnd = blockStart + juce::jmax(1, numSamples);
-        juce::Array<ScheduledMidiEvent> keep;
-        juce::Array<ScheduledMidiEvent> ready;
+        if (slot.scheduledEvents.isEmpty())
+            return;
 
-        for (const auto& event : slot.scheduledEvents)
+        const auto blockEnd = blockStart + juce::jmax(1, numSamples);
+
+        // Partition in-place: compact future events to the front
+        int keepCount = 0;
+        graphMidiReady.clearQuick();
+        for (int i = 0; i < slot.scheduledEvents.size(); ++i)
         {
-            if (event.frame < blockStart)
+            auto& event = slot.scheduledEvents.getReference(i);
+            if (event.frame >= blockEnd)
             {
-                auto lateEvent = event;
-                lateEvent.frame = blockStart;
-                ready.add(lateEvent);
-            }
-            else if (event.frame < blockEnd)
-            {
-                ready.add(event);
+                if (keepCount != i)
+                    slot.scheduledEvents.getReference(keepCount) = std::move(event);
+                ++keepCount;
             }
             else
             {
-                keep.add(event);
+                if (event.frame < blockStart)
+                    event.frame = blockStart;
+                graphMidiReady.add(std::move(event));
             }
         }
-        slot.scheduledEvents.swapWith(keep);
+        slot.scheduledEvents.removeRange(keepCount, slot.scheduledEvents.size() - keepCount);
 
-        std::sort(ready.begin(), ready.end(), [](const ScheduledMidiEvent& a, const ScheduledMidiEvent& b)
+        if (graphMidiReady.isEmpty())
+            return;
+
+        std::sort(graphMidiReady.begin(), graphMidiReady.end(),
+            [](const ScheduledMidiEvent& a, const ScheduledMidiEvent& b)
         {
             if (a.frame != b.frame)
                 return a.frame < b.frame;
@@ -3008,7 +3041,7 @@ private:
             return a.sequence < b.sequence;
         });
 
-        for (const auto& event : ready)
+        for (const auto& event : graphMidiReady)
         {
             const auto samplePosition = static_cast<int>(
                 juce::jlimit<int64_t>(0, juce::jmax(0, numSamples - 1), event.frame - blockStart)
@@ -3806,6 +3839,9 @@ private:
         if (persistentGraphSlots.empty())
             return;
 
+        // Reuse pre-allocated stereo scratch buffer
+        graphStereoBuffer.setSize(2, numSamples, false, false, true);
+
         for (auto& slot : persistentGraphSlots)
         {
             auto* plugin = slot.plugin.get();
@@ -3816,20 +3852,21 @@ private:
                 2,
                 juce::jmax(plugin->getTotalNumInputChannels(), plugin->getTotalNumOutputChannels())
             );
-            juce::AudioBuffer<float> processBuffer(trackChannelCount, numSamples);
-            processBuffer.clear();
+            // Reuse pre-allocated process buffer, resizing only when channel count grows
+            graphProcessBuffer.setSize(trackChannelCount, numSamples, false, false, true);
+            graphProcessBuffer.clear();
 
             juce::MidiBuffer midi;
             appendPersistentGraphScheduledMidiMessages(slot, midi, blockStart, numSamples);
-            plugin->processBlock(processBuffer, midi);
+            plugin->processBlock(graphProcessBuffer, midi);
 
-            juce::AudioBuffer<float> stereoBuffer(2, numSamples);
-            extractPluginOutputToStereo(*plugin, processBuffer, stereoBuffer);
-            processPersistentGraphEffectChain(slot, stereoBuffer);
-            applyOutputMixToBuffer(stereoBuffer, slot.gain, slot.pan);
-            slot.peakLevel = peakLevelForBuffer(stereoBuffer);
-            buffer.addFrom(0, 0, stereoBuffer, 0, 0, numSamples);
-            buffer.addFrom(1, 0, stereoBuffer, 1, 0, numSamples);
+            graphStereoBuffer.clear();
+            extractPluginOutputToStereo(*plugin, graphProcessBuffer, graphStereoBuffer);
+            processPersistentGraphEffectChain(slot, graphStereoBuffer);
+            applyOutputMixToBuffer(graphStereoBuffer, slot.gain, slot.pan);
+            slot.peakLevel = peakLevelForBuffer(graphStereoBuffer);
+            buffer.addFrom(0, 0, graphStereoBuffer, 0, 0, numSamples);
+            buffer.addFrom(1, 0, graphStereoBuffer, 1, 0, numSamples);
         }
     }
 
@@ -3959,6 +3996,8 @@ private:
     juce::MidiBuffer pendingMidiMessages;
     juce::CriticalSection scheduledMidiLock;
     juce::Array<ScheduledMidiEvent> scheduledMidiEvents;
+    juce::Array<ScheduledMidiEvent> scheduledMidiReady;   // scratch buffer, avoids per-callback alloc
+    juce::Array<ScheduledMidiEvent> graphMidiReady;      // scratch buffer for graph MIDI dispatch
     mutable juce::CriticalSection streamAudioLock;
     BufferedOutputStream mainOutputStream;
     BufferedOutputStream previewOutputStream;
@@ -3999,6 +4038,24 @@ private:
     double currentSampleRate = 44100.0;
     int currentBlockSize = 512;
     float pluginOutputPeakLevel = 0.0f;
+
+    // Pre-allocated scratch buffers for realtime audio callback (avoid heap allocs)
+    std::vector<float> deinterleaveLeft;
+    std::vector<float> deinterleaveRight;
+    juce::AudioBuffer<float> graphProcessBuffer;
+    juce::AudioBuffer<float> graphStereoBuffer;
+
+    void ensureScratchBufferSize(int numSamples)
+    {
+        const auto needed = static_cast<size_t>(juce::jmax(64, numSamples));
+        if (deinterleaveLeft.size() < needed)
+        {
+            deinterleaveLeft.resize(needed, 0.0f);
+            deinterleaveRight.resize(needed, 0.0f);
+        }
+        if (graphStereoBuffer.getNumSamples() < numSamples)
+            graphStereoBuffer.setSize(2, numSamples, false, false, true);
+    }
 };
 
 HostCommandServer::HostCommandServer(HostComponent& ownerIn, int requestedPortIn)
