@@ -575,12 +575,15 @@ def clamp(value: float, low: float, high: float) -> float:
 
 
 def tick_to_sample_frame(tick: int, sample_rate: int, bpm: int) -> int:
+    # Floor division: notes land exactly on or just after the beat boundary,
+    # never ahead of it.  This eliminates perceptible "early note" jitter that
+    # round-to-nearest caused at non-integer tick/sample ratios.
     tick_value = max(0, int(tick))
     rate = max(1, int(sample_rate))
     tempo = max(1, int(bpm))
     numerator = tick_value * rate * 60
     denominator = tempo * TICKS_PER_BEAT
-    return (numerator + (denominator // 2)) // denominator
+    return numerator // denominator
 
 
 def tick_to_seconds(tick: int, bpm: int) -> float:
@@ -606,12 +609,16 @@ def seconds_to_sample_frame(sec: float, sample_rate: int) -> int:
 
 
 def sample_frame_to_tick(frame: int, sample_rate: int, bpm: int) -> int:
+    # Ceiling division: when converting from frames back to ticks, round up so
+    # that a frame that sits between two tick boundaries maps to the later tick.
+    # This pairs with tick_to_sample_frame's floor to keep round-trip conversions
+    # stable and avoid the playhead drifting backwards.
     frame_value = max(0, int(frame))
     rate = max(1, int(sample_rate))
     tempo = max(1, int(bpm))
     numerator = frame_value * tempo * TICKS_PER_BEAT
     denominator = rate * 60
-    return (numerator + (denominator // 2)) // denominator
+    return (numerator + denominator - 1) // denominator
 
 
 def midi_to_hz(note: int) -> float:
@@ -7328,17 +7335,20 @@ class MainWindow(QtWidgets.QMainWindow):
         # from the main output.
         output_latency_ms = self._buffer_frames_latency_ms(self._desired_audio_buffer_frames())
         auto_frames = int(round((float(self._native_vst_host_target_sample_rate()) * float(output_latency_ms)) / 1000.0))
-        return int(clamp(max(512, auto_frames), 512, self._maximum_native_vst_host_buffer_size()))
+        # Match the JUCE host buffer to the user's chosen latency target instead
+        # of clamping to a 512-sample floor.  The previous 512 floor forced
+        # unnecessary latency even when the user explicitly chose a low buffer.
+        return int(clamp(max(64, auto_frames), 64, self._maximum_native_vst_host_buffer_size()))
 
     def _buffer_frames_latency_ms(self, frame_count: int) -> float:
         return self._buffer_frames_duration_ms(frame_count, self._playback_sample_rate)
 
     def _recommended_audio_pump_interval_ms(self, frame_count: int) -> int:
         latency_ms = self._buffer_frames_latency_ms(frame_count)
-        # Wake often enough to keep the buffer fed but not so often that the
-        # pump competes with UI events for the main thread.  Allow up to 16ms
-        # between wakeups so high-latency buffers don't force 100 Hz polling.
-        return int(clamp(int(math.floor((latency_ms * 0.4) + 0.5)), 2, 16))
+        # Wake at roughly 1/3 of the buffer period so there is always time to
+        # refill before the device drains.  Cap at 10ms (not 16ms) to avoid
+        # underruns with medium-sized buffers (~256-512 samples at 44.1kHz).
+        return int(clamp(int(math.floor((latency_ms * 0.33) + 0.5)), 2, 10))
 
     def _preferred_playback_chunk_frames(self) -> int:
         driver_block = max(64, int(self._actual_output_buffer_frames()))
@@ -7352,16 +7362,20 @@ class MainWindow(QtWidgets.QMainWindow):
         # Size queued PCM work from the actual JUCE device block instead of the
         # requested UI buffer so Windows-shared devices that clamp to larger
         # blocks do not force dozens of tiny Python-side renders per second.
+        # Keep chunks small enough for tight scheduling but large enough to
+        # avoid excessive Python-side overhead.
         active_vsti = max(0, int(getattr(self, '_realtime_transport_vsti_count', 0) or 0))
         if active_vsti >= 2:
+            # Scale more gently: cap the multiplier at 3x instead of 6x so
+            # multi-instrument sessions still schedule at a fine granularity.
             driver_block = max(
                 driver_block,
-                int(driver_block * min(6, active_vsti * 2)),
-                int(max(1024, requested_queue // 4)),
+                int(driver_block * min(3, 1 + active_vsti)),
+                int(max(512, requested_queue // 4)),
             )
         elif requested_queue > driver_block:
-            driver_block = max(driver_block, int(min(4096, max(512, requested_queue // 4))))
-        return int(clamp(driver_block, 128, 8192))
+            driver_block = max(driver_block, int(min(2048, max(256, requested_queue // 4))))
+        return int(clamp(driver_block, 128, 4096))
 
     def _preferred_live_midi_chunk_frames(self) -> int:
         desired = max(
@@ -7385,11 +7399,13 @@ class MainWindow(QtWidgets.QMainWindow):
             target = max(device_block * 3, chunk_frames * 2, requested_queue)
         active_vsti = max(0, int(getattr(self, '_realtime_transport_vsti_count', 0) or 0))
         if active_vsti >= 2 and not bool(getattr(self, '_use_prerendered_transport_mix', False)):
+            # Keep the queue deep enough to absorb scheduling jitter but not so
+            # deep that it adds audible latency.  Cap per-VSTi overhead at 150ms.
             target = max(
                 target,
                 requested_queue,
-                chunk_frames * (active_vsti + 2),
-                int(self._playback_sample_rate * min(0.35, 0.1 + (0.1 * active_vsti))),
+                chunk_frames * min(active_vsti + 2, 6),
+                int(self._playback_sample_rate * min(0.15, 0.05 + (0.05 * active_vsti))),
             )
         return int(target)
 
@@ -11778,7 +11794,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @staticmethod
     def _realtime_vst_timing_block_frames() -> int:
-        return 1024
+        # Smaller blocks give finer MIDI timing granularity within each render
+        # chunk.  256 frames at 44.1kHz ≈ 5.8ms — tight enough that note
+        # placement jitter stays below the ~10ms perceptual threshold.
+        return 256
 
     @staticmethod
     def _preferred_vst_buffer_size(frame_count: int) -> int:
