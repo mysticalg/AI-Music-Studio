@@ -4,6 +4,54 @@
 namespace
 {
 constexpr float twoPi = juce::MathConstants<float>::twoPi;
+constexpr int pluginStateVersion = 2;
+constexpr std::array<const char*, 15> drumVoiceLevelParamIds {
+    "DRUMLEVEL_KICK",
+    "DRUMLEVEL_SNARE",
+    "DRUMLEVEL_RIM",
+    "DRUMLEVEL_CLAP",
+    "DRUMLEVEL_CLOSED_HAT",
+    "DRUMLEVEL_OPEN_HAT",
+    "DRUMLEVEL_LOW_TOM",
+    "DRUMLEVEL_MID_TOM",
+    "DRUMLEVEL_HIGH_TOM",
+    "DRUMLEVEL_CRASH",
+    "DRUMLEVEL_RIDE",
+    "DRUMLEVEL_COWBELL",
+    "DRUMLEVEL_CLAVE",
+    "DRUMLEVEL_MARACA",
+    "DRUMLEVEL_PERC"
+};
+
+constexpr std::array<const char*, 15> drumVoiceLevelNames {
+    "Bass Drum Level",
+    "Snare Level",
+    "Rim Shot Level",
+    "Clap Level",
+    "Closed Hat Level",
+    "Open Hat Level",
+    "Low Tom Level",
+    "Mid Tom Level",
+    "High Tom Level",
+    "Crash Level",
+    "Ride Level",
+    "Cowbell Level",
+    "Clave Level",
+    "Maraca Level",
+    "Perc Level"
+};
+
+constexpr std::array<float, 15> drumMachineVoiceLevelDefaults {
+    1.0f, 0.96f, 0.72f, 0.9f, 0.84f,
+    0.88f, 0.84f, 0.82f, 0.8f, 0.78f,
+    0.76f, 0.68f, 0.66f, 0.62f, 0.72f
+};
+
+constexpr std::array<float, 15> drum808VoiceLevelDefaults {
+    1.08f, 0.94f, 0.7f, 0.8f, 0.72f,
+    0.8f, 0.88f, 0.84f, 0.8f, 0.72f,
+    0.74f, 0.68f, 0.64f, 0.66f, 0.72f
+};
 
 float paramValue (const juce::AudioProcessorValueTreeState& apvts, const char* paramId)
 {
@@ -114,6 +162,39 @@ bool isHatKind (DrumVoiceKind kind) noexcept
 {
     return kind == DrumVoiceKind::closedHat || kind == DrumVoiceKind::openHat;
 }
+
+constexpr size_t drumVoiceIndex (DrumVoiceKind kind) noexcept
+{
+    return static_cast<size_t> (kind);
+}
+
+bool migrateLegacyDrumFilterChoice (juce::ValueTree state)
+{
+    if (! state.isValid())
+        return false;
+
+    if (state.hasProperty ("id") && state["id"].toString() == "FILTERTYPE")
+    {
+        const auto currentValue = static_cast<float> (state.getProperty ("value", 0.0f));
+        state.setProperty ("value", juce::jlimit (1.0f, 4.0f, currentValue + 1.0f), nullptr);
+        return true;
+    }
+
+    if (state.hasProperty ("FILTERTYPE"))
+    {
+        const auto currentValue = static_cast<float> (state.getProperty ("FILTERTYPE", 0.0f));
+        state.setProperty ("FILTERTYPE", juce::jlimit (1.0f, 4.0f, currentValue + 1.0f), nullptr);
+        return true;
+    }
+
+    for (int index = 0; index < state.getNumChildren(); ++index)
+    {
+        if (migrateLegacyDrumFilterChoice (state.getChild (index)))
+            return true;
+    }
+
+    return false;
+}
 } // namespace
 
 AdvancedVSTiAudioProcessor::AdvancedVSTiAudioProcessor()
@@ -130,6 +211,18 @@ AdvancedVSTiAudioProcessor::~AdvancedVSTiAudioProcessor()
 {
     cancelPendingUpdate();
     apvts.removeParameterListener ("PRESET", this);
+}
+
+void AdvancedVSTiAudioProcessor::previewDrumPad (int midiNote, float velocity)
+{
+    if constexpr (! isDrumFlavor())
+        return;
+
+    const juce::SpinLock::ScopedLockType lock (pendingPreviewMidiLock);
+    pendingPreviewMidi.addEvent (juce::MidiMessage::noteOn (1,
+                                                            juce::jlimit (0, 127, midiNote),
+                                                            juce::jlimit (0.0f, 1.0f, velocity)),
+                                 0);
 }
 
 void AdvancedVSTiAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
@@ -472,7 +565,8 @@ void AdvancedVSTiAudioProcessor::handleMidiMessage (const juce::MidiMessage& msg
         voice.ampEnv.noteOn();
         voice.filterEnv.noteOn();
 
-        heldNotes.addIfNotAlreadyThere (voice.midiNote);
+        if constexpr (! isDrumFlavor())
+            heldNotes.addIfNotAlreadyThere (voice.midiNote);
         return;
     }
 
@@ -850,7 +944,7 @@ float AdvancedVSTiAudioProcessor::renderDrumVoiceSample (VoiceState& voice)
     if (voice.noteAge >= duration)
         voice.active = false;
 
-    return output * voice.velocity;
+    return output * voice.velocity * renderParams.drumVoiceLevels[drumVoiceIndex (kind)];
 }
 
 float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice)
@@ -1008,7 +1102,10 @@ void AdvancedVSTiAudioProcessor::updateRenderParameters()
     renderParams.lfo1Shape = paramIndex (apvts, "LFO1SHAPE");
     renderParams.lfo2Shape = paramIndex (apvts, "LFO2SHAPE");
     renderParams.arpMode = paramIndex (apvts, "ARPMODE");
-    renderParams.filterType = juce::jlimit (0, 2, paramIndex (apvts, "FILTERTYPE"));
+    if constexpr (isDrumFlavor())
+        renderParams.filterType = juce::jlimit (0, 4, paramIndex (apvts, "FILTERTYPE"));
+    else
+        renderParams.filterType = juce::jlimit (0, 3, paramIndex (apvts, "FILTERTYPE"));
 
     renderParams.detune = paramValue (apvts, "DETUNE");
     renderParams.fmAmount = paramValue (apvts, "FMAMOUNT");
@@ -1031,6 +1128,16 @@ void AdvancedVSTiAudioProcessor::updateRenderParameters()
     renderParams.rhythmGateRate = paramValue (apvts, "RHYTHMGATE_RATE");
     renderParams.rhythmGateDepth = paramValue (apvts, "RHYTHMGATE_DEPTH");
 
+    if constexpr (isDrumFlavor())
+    {
+        for (size_t index = 0; index < drumVoiceLevelParamIds.size(); ++index)
+            renderParams.drumVoiceLevels[index] = paramValue (apvts, drumVoiceLevelParamIds[index]);
+    }
+    else
+    {
+        renderParams.drumVoiceLevels.fill (1.0f);
+    }
+
     renderParams.ampEnv.attack = paramValue (apvts, "AMPATTACK");
     renderParams.ampEnv.decay = paramValue (apvts, "AMPDECAY");
     renderParams.ampEnv.sustain = paramValue (apvts, "AMPSUSTAIN");
@@ -1052,11 +1159,31 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     updateRenderParameters();
     applyEnvelopeSettings();
 
+    {
+        const juce::SpinLock::ScopedLockType lock (pendingPreviewMidiLock);
+        midiMessages.addEvents (pendingPreviewMidi, 0, -1, 0);
+        pendingPreviewMidi.clear();
+    }
+
     leftFilter.setResonance (renderParams.resonance);
     rightFilter.setResonance (renderParams.resonance);
 
-    leftFilter.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (renderParams.filterType));
-    rightFilter.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (renderParams.filterType));
+    bool bypassFilter = false;
+    if constexpr (isDrumFlavor())
+    {
+        bypassFilter = renderParams.filterType == 0;
+        if (! bypassFilter)
+        {
+            const auto filterMode = juce::jlimit (0, 3, renderParams.filterType - 1);
+            leftFilter.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (filterMode));
+            rightFilter.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (filterMode));
+        }
+    }
+    else
+    {
+        leftFilter.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (renderParams.filterType));
+        rightFilter.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (renderParams.filterType));
+    }
 
     int arpCounter = 0;
     const auto arpIntervalSamples = juce::jmax (1, static_cast<int> (currentSampleRate / juce::jmax (0.25f, renderParams.arpRate)));
@@ -1095,8 +1222,8 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         for (auto& voice : voices)
             sum += renderVoiceSample (voice);
 
-        auto filteredL = leftFilter.processSample (0, sum);
-        auto filteredR = rightFilter.processSample (0, sum);
+        const auto filteredL = bypassFilter ? sum : leftFilter.processSample (0, sum);
+        const auto filteredR = bypassFilter ? sum : rightFilter.processSample (0, sum);
 
         buffer.setSample (0, sample, filteredL);
         buffer.setSample (1, sample, filteredR);
@@ -1129,6 +1256,7 @@ juce::AudioProcessorEditor* AdvancedVSTiAudioProcessor::createEditor()
 void AdvancedVSTiAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     auto state = apvts.copyState();
+    state.setProperty ("STATE_VERSION", pluginStateVersion, nullptr);
     std::unique_ptr<juce::XmlElement> xml (state.createXml());
     copyXmlToBinary (*xml, destData);
 }
@@ -1138,8 +1266,16 @@ void AdvancedVSTiAudioProcessor::setStateInformation (const void* data, int size
     std::unique_ptr<juce::XmlElement> xmlState (getXmlFromBinary (data, sizeInBytes));
     if (xmlState != nullptr && xmlState->hasTagName (apvts.state.getType()))
     {
+        auto restoredState = juce::ValueTree::fromXml (*xmlState);
+        if constexpr (isDrumFlavor())
+        {
+            const auto savedStateVersion = static_cast<int> (restoredState.getProperty ("STATE_VERSION", 1));
+            if (savedStateVersion < pluginStateVersion)
+                migrateLegacyDrumFilterChoice (restoredState);
+        }
+
         const juce::ScopedValueSetter<bool> suppress (suppressPresetCallback, true);
-        apvts.replaceState (juce::ValueTree::fromXml (*xmlState));
+        apvts.replaceState (restoredState);
     }
     pendingPresetIndex.store (-1);
     currentProgramIndex = juce::jlimit (0, juce::jmax (0, getNumPrograms() - 1), paramIndex (apvts, "PRESET"));
@@ -1191,10 +1327,16 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
     float arpRateDefault = 4.0f;
     float rhythmRateDefault = 8.0f;
     float rhythmDepthDefault = 0.0f;
+    std::array<float, 15> drumVoiceLevelDefaults {
+        1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+        1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+        1.0f, 1.0f, 1.0f, 1.0f, 1.0f
+    };
 
     if constexpr (buildFlavor() == InstrumentFlavor::drumMachine)
     {
         oscDefault = 3;
+        filterTypeDefault = 1;
         gateDefault = 0.42f;
         ampAttackDefault = 0.001f;
         ampDecayDefault = 0.18f;
@@ -1211,10 +1353,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
         filterEnvAmountDefault = 0.12f;
         rhythmRateDefault = 16.0f;
         rhythmDepthDefault = 0.0f;
+        drumVoiceLevelDefaults = drumMachineVoiceLevelDefaults;
     }
     else if constexpr (buildFlavor() == InstrumentFlavor::drum808)
     {
         oscDefault = 0;
+        filterTypeDefault = 1;
         gateDefault = 0.95f;
         ampAttackDefault = 0.001f;
         ampDecayDefault = 0.34f;
@@ -1231,6 +1375,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
         filterEnvAmountDefault = 0.05f;
         rhythmRateDefault = 16.0f;
         rhythmDepthDefault = 0.0f;
+        drumVoiceLevelDefaults = drum808VoiceLevelDefaults;
     }
     else if constexpr (buildFlavor() == InstrumentFlavor::bassSynth)
     {
@@ -1424,7 +1569,10 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("FILTRELEASE", "Filter Release", 0.001f, 10.0f, filtReleaseDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("ENVCURVE", "Envelope Curve", -1.0f, 1.0f, envCurveDefault));
 
-    params.push_back (std::make_unique<juce::AudioParameterChoice> ("FILTERTYPE", "Filter Type", juce::StringArray { "LP", "BP", "HP", "Notch" }, filterTypeDefault));
+    if constexpr (isDrumFlavor())
+        params.push_back (std::make_unique<juce::AudioParameterChoice> ("FILTERTYPE", "Filter Type", juce::StringArray { "Off", "LP", "BP", "HP", "Notch" }, filterTypeDefault));
+    else
+        params.push_back (std::make_unique<juce::AudioParameterChoice> ("FILTERTYPE", "Filter Type", juce::StringArray { "LP", "BP", "HP", "Notch" }, filterTypeDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("CUTOFF", "Cutoff", 20.0f, 20000.0f, cutoffDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("RESONANCE", "Resonance", 0.1f, 1.2f, resonanceDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("FILTERENVAMOUNT", "Filter Env Amount", 0.0f, 1.0f, filterEnvAmountDefault));
@@ -1442,6 +1590,17 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
 
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("RHYTHMGATE_RATE", "Rhythm Gate Rate", 0.25f, 32.0f, rhythmRateDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("RHYTHMGATE_DEPTH", "Rhythm Gate Depth", 0.0f, 1.0f, rhythmDepthDefault));
+
+    if constexpr (isDrumFlavor())
+    {
+        for (size_t index = 0; index < drumVoiceLevelParamIds.size(); ++index)
+        {
+            params.push_back (std::make_unique<juce::AudioParameterFloat> (drumVoiceLevelParamIds[index],
+                                                                            drumVoiceLevelNames[index],
+                                                                            0.0f, 1.5f,
+                                                                            drumVoiceLevelDefaults[index]));
+        }
+    }
 
     return { params.begin(), params.end() };
 }
@@ -1722,6 +1881,9 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
     }
     else if constexpr (buildFlavor() == InstrumentFlavor::drumMachine)
     {
+        for (size_t index = 0; index < drumVoiceLevelParamIds.size(); ++index)
+            setParameterActual (drumVoiceLevelParamIds[index], drumMachineVoiceLevelDefaults[index]);
+
         switch (presetIndex)
         {
             case 1:
@@ -1746,6 +1908,9 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
     }
     else if constexpr (buildFlavor() == InstrumentFlavor::drum808)
     {
+        for (size_t index = 0; index < drumVoiceLevelParamIds.size(); ++index)
+            setParameterActual (drumVoiceLevelParamIds[index], drum808VoiceLevelDefaults[index]);
+
         switch (presetIndex)
         {
             case 1:

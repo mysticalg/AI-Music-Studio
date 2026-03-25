@@ -119,6 +119,7 @@ public:
     {
         setUsingNativeTitleBar(true);
         setResizable(true, true);
+        setAlwaysOnTop(true);
 
         if (auto* editor = processor.createEditorIfNeeded())
         {
@@ -147,7 +148,7 @@ public:
 
     void forceTopmostFront()
     {
-        setAlwaysOnTop(false);
+        setAlwaysOnTop(true);
         setMinimised(false);
         setVisible(true);
         toFront(true);
@@ -156,7 +157,7 @@ public:
 
     void showBridgeEditorWindow()
     {
-        setAlwaysOnTop(false);
+        setAlwaysOnTop(true);
         setMinimised(false);
         setVisible(true);
         toFront(true);

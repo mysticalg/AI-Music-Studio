@@ -23,6 +23,8 @@ if (-not $OutputDir) {
     $OutputDir = Join-Path $RepoRoot "vsti"
 }
 
+$distOutputDir = Join-Path $RepoRoot "dist\\AI Music Studio\\vsti"
+
 if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
     throw "cmake is required to build the bundled VST3 instruments."
 }
@@ -58,6 +60,13 @@ New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
 foreach ($bundle in $pluginBundles) {
     Copy-Item $bundle.FullName -Destination (Join-Path $OutputDir $bundle.Name) -Recurse -Force
+}
+
+if (Test-Path (Split-Path $distOutputDir -Parent)) {
+    New-Item -ItemType Directory -Path $distOutputDir -Force | Out-Null
+    foreach ($bundle in $pluginBundles) {
+        Copy-Item $bundle.FullName -Destination (Join-Path $distOutputDir $bundle.Name) -Recurse -Force
+    }
 }
 
 Write-Output $OutputDir

@@ -14,6 +14,8 @@ AdvancedVSTiAudioProcessorEditor::AccentLookAndFeel::AccentLookAndFeel (Theme th
     setColour (juce::Slider::thumbColourId, theme.accent);
     setColour (juce::Slider::rotarySliderOutlineColourId, theme.panelEdge);
     setColour (juce::Slider::rotarySliderFillColourId, theme.accent);
+    setColour (juce::Slider::trackColourId, theme.accent);
+    setColour (juce::Slider::backgroundColourId, theme.panelEdge.withAlpha (0.85f));
     setColour (juce::ComboBox::backgroundColourId, theme.panel);
     setColour (juce::ComboBox::outlineColourId, theme.panelEdge);
     setColour (juce::ComboBox::textColourId, theme.text);
@@ -218,6 +220,72 @@ void AdvancedVSTiAudioProcessorEditor::ChoiceCard::resized()
     combo.setBounds (area.removeFromTop (32));
 }
 
+AdvancedVSTiAudioProcessorEditor::DrumPad::DrumPad (
+    AccentLookAndFeel& lf,
+    const juce::String& titleText,
+    const juce::String& noteText)
+    : lookAndFeel (lf)
+{
+    titleLabel.setText (titleText, juce::dontSendNotification);
+    titleLabel.setJustificationType (juce::Justification::centred);
+    titleLabel.setFont (juce::Font (juce::FontOptions { 13.0f, juce::Font::bold }));
+    titleLabel.setColour (juce::Label::textColourId, lf.theme.text);
+    titleLabel.setMinimumHorizontalScale (0.7f);
+    titleLabel.setInterceptsMouseClicks (false, false);
+    addAndMakeVisible (titleLabel);
+
+    noteLabel.setText (noteText, juce::dontSendNotification);
+    noteLabel.setJustificationType (juce::Justification::centred);
+    noteLabel.setFont (juce::Font (juce::FontOptions { 10.5f, juce::Font::plain }));
+    noteLabel.setColour (juce::Label::textColourId, lf.theme.hint);
+    noteLabel.setInterceptsMouseClicks (false, false);
+    addAndMakeVisible (noteLabel);
+
+    slider.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
+    slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 58, 20);
+    slider.setLookAndFeel (&lookAndFeel);
+    slider.setColour (juce::Slider::textBoxTextColourId, lf.theme.text);
+    slider.setColour (juce::Slider::textBoxBackgroundColourId, lf.theme.panel.brighter (0.08f));
+    slider.setColour (juce::Slider::textBoxOutlineColourId, lf.theme.panelEdge);
+    slider.setColour (juce::Slider::textBoxHighlightColourId, lf.theme.accent.withAlpha (0.16f));
+    slider.setMouseDragSensitivity (160);
+    addAndMakeVisible (slider);
+}
+
+void AdvancedVSTiAudioProcessorEditor::DrumPad::mouseDown (const juce::MouseEvent& event)
+{
+    if (event.mods.isLeftButtonDown() && onPreviewRequested != nullptr)
+        onPreviewRequested();
+}
+
+void AdvancedVSTiAudioProcessorEditor::DrumPad::paint (juce::Graphics& g)
+{
+    auto area = getLocalBounds().toFloat().reduced (1.0f);
+
+    juce::ColourGradient padFill (lookAndFeel.theme.panel.brighter (0.18f), area.getTopLeft(),
+                                  lookAndFeel.theme.panel.darker (0.16f), area.getBottomRight(), false);
+    g.setGradientFill (padFill);
+    g.fillRoundedRectangle (area, 20.0f);
+
+    g.setColour (lookAndFeel.theme.accentGlow.withAlpha (0.18f));
+    g.fillRoundedRectangle (area.reduced (10.0f, 8.0f).removeFromTop (40.0f), 12.0f);
+
+    g.setColour (lookAndFeel.theme.panelEdge);
+    g.drawRoundedRectangle (area, 20.0f, 1.2f);
+
+    g.setColour (lookAndFeel.theme.accent.withAlpha (0.6f));
+    g.fillRoundedRectangle (area.reduced (14.0f).removeFromBottom (4.0f), 2.0f);
+}
+
+void AdvancedVSTiAudioProcessorEditor::DrumPad::resized()
+{
+    auto area = getLocalBounds().reduced (12);
+    titleLabel.setBounds (area.removeFromTop (20));
+    noteLabel.setBounds (area.removeFromTop (16));
+    area.removeFromTop (2);
+    slider.setBounds (area.reduced (6, 0));
+}
+
 AdvancedVSTiAudioProcessorEditor::AdvancedVSTiAudioProcessorEditor (AdvancedVSTiAudioProcessor& p)
     : AudioProcessorEditor (&p),
       audioProcessor (p),
@@ -225,7 +293,36 @@ AdvancedVSTiAudioProcessorEditor::AdvancedVSTiAudioProcessorEditor (AdvancedVSTi
       lookAndFeel (theme)
 {
     buildEditor();
-    setSize (isTribute303() ? 1020 : 1040, isTribute303() ? 430 : 640);
+
+    int defaultWidth = 1040;
+    int defaultHeight = 640;
+    int minWidth = 820;
+    int minHeight = 520;
+    int maxWidth = 2200;
+    int maxHeight = 1600;
+
+    if (isTribute303())
+    {
+        defaultWidth = 1020;
+        defaultHeight = 430;
+        minWidth = 860;
+        minHeight = 380;
+        maxWidth = 1800;
+        maxHeight = 980;
+    }
+    else if (usesDrumPadLayout())
+    {
+        defaultWidth = 1180;
+        defaultHeight = 860;
+        minWidth = 960;
+        minHeight = 700;
+        maxWidth = 2400;
+        maxHeight = 1800;
+    }
+
+    setResizable (true, false);
+    setResizeLimits (minWidth, minHeight, maxWidth, maxHeight);
+    setSize (defaultWidth, defaultHeight);
 }
 
 void AdvancedVSTiAudioProcessorEditor::buildEditor()
@@ -263,11 +360,32 @@ void AdvancedVSTiAudioProcessorEditor::buildEditor()
         sliderAttachments.push_back (std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (audioProcessor.apvts, spec.paramId, card->slider));
         addAndMakeVisible (card);
     }
+
+    if (usesDrumPadLayout())
+    {
+        for (const auto& spec : buildDrumPadSpecs())
+        {
+            auto* pad = drumPads.add (new DrumPad (lookAndFeel, spec.title, spec.note));
+            pad->onPreviewRequested = [this, midiNote = spec.midiNote]
+            {
+                audioProcessor.previewDrumPad (midiNote);
+            };
+            pad->slider.onPreviewRequested = pad->onPreviewRequested;
+            sliderAttachments.push_back (std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (audioProcessor.apvts, spec.paramId, pad->slider));
+            addAndMakeVisible (pad);
+        }
+    }
 }
 
 bool AdvancedVSTiAudioProcessorEditor::isTribute303() const noexcept
 {
     return theme.tribute303;
+}
+
+bool AdvancedVSTiAudioProcessorEditor::usesDrumPadLayout() const noexcept
+{
+    const auto name = normalizedPluginName (audioProcessor);
+    return name.contains ("drum") || name.contains ("808");
 }
 
 AdvancedVSTiAudioProcessorEditor::Theme AdvancedVSTiAudioProcessorEditor::buildTheme() const
@@ -371,7 +489,7 @@ std::vector<AdvancedVSTiAudioProcessorEditor::ChoiceSpec> AdvancedVSTiAudioProce
 
     if (name.contains ("drum") || name.contains ("808"))
     {
-        specs.push_back ({ "FILTERTYPE", "Tone Filter", "Top-end response", { "LP", "BP", "HP", "Notch" } });
+        specs.push_back ({ "FILTERTYPE", "Tone Filter", "Top-end response", { "Off", "LP", "BP", "HP", "Notch" } });
         return specs;
     }
 
@@ -455,6 +573,27 @@ std::vector<AdvancedVSTiAudioProcessorEditor::KnobSpec> AdvancedVSTiAudioProcess
         { "FILTERENVAMOUNT", "Env Mod", "Envelope filter amount" },
         { "LFO1RATE", "LFO 1", "Primary movement speed" },
         { "LFO2RATE", "LFO 2", "Secondary movement speed" },
+    };
+}
+
+std::vector<AdvancedVSTiAudioProcessorEditor::DrumPadSpec> AdvancedVSTiAudioProcessorEditor::buildDrumPadSpecs() const
+{
+    return {
+        { "DRUMLEVEL_KICK", "Bass Drum", "C1", 36 },
+        { "DRUMLEVEL_RIM", "Rim Shot", "C#1", 37 },
+        { "DRUMLEVEL_SNARE", "Snare", "D1", 38 },
+        { "DRUMLEVEL_CLAP", "Clap", "D#1", 39 },
+        { "DRUMLEVEL_CLOSED_HAT", "Closed Hat", "E1", 40 },
+        { "DRUMLEVEL_OPEN_HAT", "Open Hat", "F1", 41 },
+        { "DRUMLEVEL_LOW_TOM", "Low Tom", "F#1", 42 },
+        { "DRUMLEVEL_MID_TOM", "Mid Tom", "G1", 43 },
+        { "DRUMLEVEL_HIGH_TOM", "High Tom", "G#1", 44 },
+        { "DRUMLEVEL_CRASH", "Crash", "A1", 45 },
+        { "DRUMLEVEL_RIDE", "Ride", "A#1", 46 },
+        { "DRUMLEVEL_COWBELL", "Cowbell", "B1", 47 },
+        { "DRUMLEVEL_CLAVE", "Clave", "C2", 48 },
+        { "DRUMLEVEL_MARACA", "Maraca", "C#2", 49 },
+        { "DRUMLEVEL_PERC", "Perc", "D2", 50 },
     };
 }
 
@@ -557,6 +696,72 @@ void AdvancedVSTiAudioProcessorEditor::resized()
         {
             card->setBounds (x, area.getY(), cardWidth, cardHeight);
             x += cardWidth + spacing;
+        }
+        return;
+    }
+
+    if (usesDrumPadLayout())
+    {
+        auto area = getLocalBounds().reduced (22);
+        auto hero = area.removeFromTop (96);
+        badgeLabel.setBounds (hero.removeFromTop (18));
+        titleLabel.setBounds (hero.removeFromTop (36));
+        subtitleLabel.setBounds (hero.removeFromTop (36));
+        area.removeFromTop (10);
+
+        auto controlBand = area.removeFromTop (204);
+        if (! choiceCards.isEmpty())
+        {
+            auto choiceArea = controlBand.removeFromLeft (juce::jmin (300, juce::jmax (250, getWidth() / 4)));
+            const int spacing = 12;
+            const int cardHeight = (choiceArea.getHeight() - (spacing * (choiceCards.size() - 1))) / juce::jmax (1, choiceCards.size());
+            for (int index = 0; index < choiceCards.size(); ++index)
+            {
+                choiceCards[index]->setBounds (choiceArea.removeFromTop (cardHeight));
+                if (index + 1 < choiceCards.size())
+                    choiceArea.removeFromTop (spacing);
+            }
+            controlBand.removeFromLeft (18);
+        }
+
+        if (! knobCards.isEmpty())
+        {
+            const int spacing = 14;
+            const int cardWidth = (controlBand.getWidth() - (spacing * (knobCards.size() - 1))) / juce::jmax (1, knobCards.size());
+            for (int index = 0; index < knobCards.size(); ++index)
+            {
+                knobCards[index]->setBounds (controlBand.removeFromLeft (cardWidth));
+                if (index + 1 < knobCards.size())
+                    controlBand.removeFromLeft (spacing);
+            }
+        }
+
+        area.removeFromTop (18);
+
+        auto padArea = area;
+        const int spacing = 14;
+        const int columns = 4;
+        const int rows = 4;
+        const int padWidth = (padArea.getWidth() - ((columns - 1) * spacing)) / columns;
+        const int padHeight = (padArea.getHeight() - ((rows - 1) * spacing)) / rows;
+
+        int x = padArea.getX();
+        int y = padArea.getY();
+        int column = 0;
+        for (auto* pad : drumPads)
+        {
+            pad->setBounds (x, y, padWidth, padHeight);
+            ++column;
+            if (column >= columns)
+            {
+                column = 0;
+                x = padArea.getX();
+                y += padHeight + spacing;
+            }
+            else
+            {
+                x += padWidth + spacing;
+            }
         }
         return;
     }

@@ -1648,6 +1648,7 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         self._right_locator_tag: QtWidgets.QGraphicsSimpleTextItem | None = None
         self._playhead_item: QtWidgets.QGraphicsLineItem | None = None
         self._note_items: dict[int, QtWidgets.QGraphicsRectItem] = {}
+        self._keyboard_focus_note_id: int | None = None
         self._hover_pitch: int | None = None
         self._note_clipboard: list[tuple[int, int, int, int]] = []
         self.refresh()
@@ -1956,6 +1957,7 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         return None, None
 
     def _begin_note_drag(self, clicked: MidiNote) -> None:
+        self._set_keyboard_focus_note(clicked)
         if not clicked.selected:
             self._set_single_selected_note(clicked)
         self._drag_anchor_tick = clicked.start_tick
@@ -1965,6 +1967,7 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         ]
 
     def _begin_note_resize(self, clicked: MidiNote, edge: str = 'right') -> None:
+        self._set_keyboard_focus_note(clicked)
         if not clicked.selected:
             self._set_single_selected_note(clicked)
         self._resize_note = clicked
@@ -2066,9 +2069,24 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         self._apply_note_item_style(item, note)
 
     def _remove_note_item(self, note: MidiNote) -> None:
+        if self._keyboard_focus_note_id == id(note):
+            self._keyboard_focus_note_id = None
         item = self._note_items.pop(id(note), None)
         if item is not None:
             self.scene_obj.removeItem(item)
+
+    def _set_keyboard_focus_note(self, note: MidiNote | None) -> None:
+        self._keyboard_focus_note_id = None if note is None else id(note)
+
+    def _keyboard_focus_note(self) -> MidiNote | None:
+        focus_id = self._keyboard_focus_note_id
+        if focus_id is None:
+            return None
+        for note in self.current_track().notes:
+            if id(note) == focus_id:
+                return note
+        self._keyboard_focus_note_id = None
+        return None
 
     def _set_single_selected_note(self, clicked: MidiNote) -> None:
         changed = False
@@ -2078,6 +2096,7 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
                 note.selected = selected
                 self._update_note_item(note)
                 changed = True
+        self._set_keyboard_focus_note(clicked)
         if changed:
             self.selectionChanged.emit()
 
@@ -2088,6 +2107,7 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
                 note.selected = False
                 self._update_note_item(note)
                 changed = True
+        self._set_keyboard_focus_note(None)
         if changed:
             self.selectionChanged.emit()
 
@@ -2325,6 +2345,14 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         note, _hit = self._find_note_hit(scene_pos)
         return note
 
+    def _preview_pitch_lane_note_at(self, scene_pos: QtCore.QPointF, velocity: int = 100) -> None:
+        _beat, pitch = self._pos_to_beat_pitch(scene_pos)
+        self.notePreviewRequested.emit(
+            int(pitch),
+            max(1, min(127, int(velocity))),
+            self._length_ticks(),
+        )
+
     def _insert_note_at(self, scene_pos: QtCore.QPointF, commit: bool = True) -> MidiNote:
         _beat, pitch = self._pos_to_beat_pitch(scene_pos)
         start_tick = self._scene_x_to_grid_start_tick(scene_pos.x())
@@ -2416,6 +2444,8 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
             return
 
         if self._is_in_pitch_lane(viewport_x):
+            if event.button() == QtCore.Qt.MouseButton.LeftButton and viewport_y > self._locator_ruler_height:
+                self._preview_pitch_lane_note_at(scene_pos)
             event.accept()
             return
 
@@ -2625,6 +2655,111 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         self.sync_selection()
         return [note for note in self.current_track().notes if note.selected]
 
+    def _resolve_keyboard_anchor_note(self) -> MidiNote | None:
+        selected = self._selected_notes()
+        if not selected:
+            self._set_keyboard_focus_note(None)
+            return None
+
+        focused = self._keyboard_focus_note()
+        if focused is not None and any(note is focused for note in selected):
+            return focused
+
+        anchor = min(
+            selected,
+            key=lambda note: (int(note.start_tick), abs(int(note.pitch) - 60), int(note.duration_tick)),
+        )
+        self._set_keyboard_focus_note(anchor)
+        return anchor
+
+    def _select_note_via_keyboard(self, note: MidiNote) -> bool:
+        self._set_single_selected_note(note)
+        item = self._note_items.get(id(note))
+        if item is not None:
+            self.ensureVisible(item, 24, 24)
+        return True
+
+    def _navigate_note_selection(self, direction: str) -> bool:
+        notes = self.current_track().notes
+        if not notes:
+            return False
+
+        direction = str(direction).strip().lower()
+        anchor = self._resolve_keyboard_anchor_note()
+        if anchor is None:
+            if direction == 'left':
+                target = max(notes, key=lambda note: (int(note.start_tick), int(note.pitch), int(note.duration_tick)))
+            elif direction == 'right':
+                target = min(notes, key=lambda note: (int(note.start_tick), int(note.pitch), int(note.duration_tick)))
+            elif direction == 'up':
+                target = max(notes, key=lambda note: (int(note.pitch), -int(note.start_tick), -int(note.duration_tick)))
+            elif direction == 'down':
+                target = min(notes, key=lambda note: (int(note.pitch), int(note.start_tick), int(note.duration_tick)))
+            else:
+                return False
+            return self._select_note_via_keyboard(target)
+
+        if direction == 'left':
+            candidates = [note for note in notes if int(note.start_tick) < int(anchor.start_tick)]
+            if not candidates:
+                return False
+            target = min(
+                candidates,
+                key=lambda note: (
+                    int(anchor.start_tick) - int(note.start_tick),
+                    abs(int(note.pitch) - int(anchor.pitch)),
+                    abs(int(note.duration_tick) - int(anchor.duration_tick)),
+                    -int(note.start_tick),
+                    int(note.pitch),
+                ),
+            )
+        elif direction == 'right':
+            candidates = [note for note in notes if int(note.start_tick) > int(anchor.start_tick)]
+            if not candidates:
+                return False
+            target = min(
+                candidates,
+                key=lambda note: (
+                    int(note.start_tick) - int(anchor.start_tick),
+                    abs(int(note.pitch) - int(anchor.pitch)),
+                    abs(int(note.duration_tick) - int(anchor.duration_tick)),
+                    int(note.start_tick),
+                    int(note.pitch),
+                ),
+            )
+        elif direction == 'up':
+            candidates = [note for note in notes if int(note.pitch) > int(anchor.pitch)]
+            if not candidates:
+                return False
+            target = min(
+                candidates,
+                key=lambda note: (
+                    int(note.pitch) - int(anchor.pitch),
+                    abs(int(note.start_tick) - int(anchor.start_tick)),
+                    abs(int(note.duration_tick) - int(anchor.duration_tick)),
+                    int(note.start_tick),
+                    int(note.pitch),
+                ),
+            )
+        elif direction == 'down':
+            candidates = [note for note in notes if int(note.pitch) < int(anchor.pitch)]
+            if not candidates:
+                return False
+            target = min(
+                candidates,
+                key=lambda note: (
+                    int(anchor.pitch) - int(note.pitch),
+                    abs(int(note.start_tick) - int(anchor.start_tick)),
+                    abs(int(note.duration_tick) - int(anchor.duration_tick)),
+                    int(note.start_tick),
+                    -int(note.pitch),
+                ),
+            )
+        else:
+            return False
+
+        return self._select_note_via_keyboard(target)
+
     def copy_selected(self) -> bool:
         selected = sorted(self._selected_notes(), key=lambda note: (int(note.start_tick), int(note.pitch), int(note.duration_tick)))
         if not selected:
@@ -2697,14 +2832,18 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         self.noteChanged.emit()
         return True
 
-    def delete_selected(self) -> None:
+    def delete_selected(self) -> bool:
         self.sync_selection()
         track = self.current_track()
         removed = [n for n in track.notes if n.selected]
+        if not removed:
+            return False
         track.notes = [n for n in track.notes if not n.selected]
         for note in removed:
             self._remove_note_item(note)
+        self.selectionChanged.emit()
         self.noteChanged.emit()
+        return True
 
     def quantize_selected(self) -> None:
         if not getattr(self.project, 'quantize_enabled', True):
@@ -2748,16 +2887,45 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
             if self.paste_copied():
                 event.accept()
                 return
+        if event.key() in (QtCore.Qt.Key.Key_Delete, QtCore.Qt.Key.Key_Backspace):
+            if self.delete_selected():
+                event.accept()
+                return
         step_tick = self._grid_tick()
         handled = False
-        if event.key() == QtCore.Qt.Key.Key_Left:
-            handled = self._nudge_selected(delta_tick=-step_tick)
-        elif event.key() == QtCore.Qt.Key.Key_Right:
-            handled = self._nudge_selected(delta_tick=step_tick)
-        elif event.key() == QtCore.Qt.Key.Key_Up:
-            handled = self._nudge_selected(delta_pitch=1)
-        elif event.key() == QtCore.Qt.Key.Key_Down:
-            handled = self._nudge_selected(delta_pitch=-1)
+        modifiers = event.modifiers()
+        shift_pressed = bool(modifiers & QtCore.Qt.KeyboardModifier.ShiftModifier)
+        other_modifier_mask = (
+            QtCore.Qt.KeyboardModifier.ControlModifier
+            | QtCore.Qt.KeyboardModifier.AltModifier
+            | QtCore.Qt.KeyboardModifier.MetaModifier
+        )
+        has_other_modifiers = bool(modifiers & other_modifier_mask)
+        if not has_other_modifiers:
+            if event.key() == QtCore.Qt.Key.Key_Left:
+                handled = (
+                    self._nudge_selected(delta_tick=-step_tick)
+                    if shift_pressed
+                    else self._navigate_note_selection('left')
+                )
+            elif event.key() == QtCore.Qt.Key.Key_Right:
+                handled = (
+                    self._nudge_selected(delta_tick=step_tick)
+                    if shift_pressed
+                    else self._navigate_note_selection('right')
+                )
+            elif event.key() == QtCore.Qt.Key.Key_Up:
+                handled = (
+                    self._nudge_selected(delta_pitch=1)
+                    if shift_pressed
+                    else self._navigate_note_selection('up')
+                )
+            elif event.key() == QtCore.Qt.Key.Key_Down:
+                handled = (
+                    self._nudge_selected(delta_pitch=-1)
+                    if shift_pressed
+                    else self._navigate_note_selection('down')
+                )
 
         if handled:
             event.accept()
@@ -7866,8 +8034,11 @@ class MainWindow(QtWidgets.QMainWindow):
             driver_block = max(0, int(source.get('buffer_size') or 0))
         if driver_block <= 0:
             driver_block = max(0, int(getattr(target, 'buffer_size', 0) or 0))
-        fallback = max(64, int(round(self._playback_sample_rate * 0.005)))
-        return int(max(64, min(self._playback_chunk_frames, max(driver_block, fallback))))
+        if driver_block <= 0:
+            driver_block = max(0, int(self._actual_output_buffer_frames(source)))
+        # Keep native MIDI scheduling aligned to the JUCE device cadence.
+        # Avoid adding extra software-side lead beyond the actual host block.
+        return int(max(64, driver_block))
 
     def _native_transport_startup_padding_frames(
         self,
@@ -7875,9 +8046,11 @@ class MainWindow(QtWidgets.QMainWindow):
         *,
         lead_frames: int,
     ) -> int:
-        device_block = max(64, int(self._actual_output_buffer_frames(status)))
-        queue_target = max(device_block * 2, int(self._shared_native_output_queue_target_frames(status)))
-        return max(0, int(queue_target) - max(0, int(lead_frames)))
+        _ = status
+        _ = lead_frames
+        # Native VST transport is MIDI-driven inside the JUCE host, so do not
+        # add extra startup padding on top of the host's own device buffer.
+        return 0
 
     @staticmethod
     def _native_output_stream_entry(status: dict[str, object] | None, stream_id: str) -> dict[str, object] | None:
@@ -9152,10 +9325,7 @@ class MainWindow(QtWidgets.QMainWindow):
             int(getattr(self, '_graph_native_transport_schedule_padding_frames', 0) or 0),
         )
         base_target_ahead_frames = int(
-            max(
-                self._playback_chunk_frames * 4,
-                self._shared_native_output_queue_target_frames(source_status),
-            )
+            max(1, int(self._actual_output_buffer_frames(source_status)))
         )
         target_ahead_frames = int(
             self._native_transport_target_ahead_frames(
@@ -11991,8 +12161,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 int(getattr(self, '_direct_native_transport_schedule_padding_frames', 0) or 0),
             )
             base_target_ahead_frames = int(max(
-                self._playback_chunk_frames * 4,
-                self._desired_audio_buffer_frames() * 2,
+                1,
+                int(self._actual_output_buffer_frames(status)),
             ))
             target_ahead_frames = self._native_transport_target_ahead_frames(
                 base_target_ahead_frames,

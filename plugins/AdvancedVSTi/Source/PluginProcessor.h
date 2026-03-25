@@ -39,6 +39,7 @@ public:
 
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
     [[nodiscard]] juce::StringArray presetNames() const;
+    void previewDrumPad (int midiNote, float velocity = 0.9f);
 
     juce::AudioProcessorValueTreeState apvts;
 
@@ -56,6 +57,8 @@ private:
         drum808,
         acid303
     };
+
+    static constexpr int drumVoiceLevelCount = 15;
 
     enum class OscType
     {
@@ -111,6 +114,11 @@ private:
         int sampleBank = 0;
         float sampleStart = 0.0f;
         float sampleEnd = 1.0f;
+        std::array<float, drumVoiceLevelCount> drumVoiceLevels {
+            1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+            1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
+            1.0f, 1.0f, 1.0f, 1.0f, 1.0f
+        };
 
         juce::ADSR::Parameters ampEnv;
         juce::ADSR::Parameters filterEnv;
@@ -135,6 +143,8 @@ private:
     std::atomic<int> pendingPresetIndex { -1 };
     int currentProgramIndex = 0;
     bool suppressPresetCallback = false;
+    juce::SpinLock pendingPreviewMidiLock;
+    juce::MidiBuffer pendingPreviewMidi;
 
     [[nodiscard]] static constexpr InstrumentFlavor buildFlavor() noexcept
     {
