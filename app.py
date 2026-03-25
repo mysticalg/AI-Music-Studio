@@ -11461,6 +11461,53 @@ class MainWindow(QtWidgets.QMainWindow):
         response = bridge.queue_audio(payload, channels=2, stream_id=str(stream_id))
         return bool(response.get('ok', True))
 
+    def _send_transport_notes_to_bridge(self, bridge: object, track: TrackState) -> bool:
+        """Send the track's note list to the C++ host for in-process scheduling."""
+        notes_payload = []
+        midi_channel = int(clamp(track.midi_channel, 0, 15)) + 1
+        for note in track.notes:
+            notes_payload.append({
+                'start_tick': int(note.start_tick),
+                'end_tick': int(self._playback_note_end_tick(note)),
+                'pitch': int(clamp(note.pitch, 0, 127)),
+                'velocity': int(clamp(note.velocity, 1, 127)),
+                'channel': midi_channel,
+            })
+        loop_start_tick, loop_end_tick = self._loop_tick_bounds() if self.project.loop_enabled else (0, 0)
+        try:
+            bridge.command(
+                'set_transport_notes',
+                notes=notes_payload,
+                bpm=float(max(1, self.project.bpm)),
+                ticks_per_beat=TICKS_PER_BEAT,
+                loop_enabled=bool(self.project.loop_enabled),
+                loop_start_tick=int(loop_start_tick),
+                loop_end_tick=int(loop_end_tick),
+            )
+            return True
+        except Exception:
+            _APP_LOGGER.exception("Failed to send transport notes to bridge")
+            return False
+
+    def _start_inprocess_transport(self, bridge: object, start_tick: int) -> bool:
+        """Start the C++ in-process transport at the given tick."""
+        try:
+            bridge.command('start_inprocess_transport', start_tick=int(start_tick))
+            return True
+        except Exception:
+            _APP_LOGGER.exception("Failed to start in-process transport")
+            return False
+
+    def _stop_inprocess_transport(self, bridge: object | None = None) -> None:
+        """Stop the C++ in-process transport."""
+        target = bridge or getattr(self, '_native_output_bridge', None)
+        if target is None:
+            return
+        try:
+            target.command('stop_inprocess_transport')
+        except Exception:
+            _APP_LOGGER.debug("stop_inprocess_transport failed (bridge may be closed)")
+
     def _prepare_direct_native_transport_playback(
         self,
         start_tick: int,
@@ -11491,6 +11538,11 @@ class MainWindow(QtWidgets.QMainWindow):
         bridge.clear_audio_queue(reset_counters=True, stream_id='live_midi')
         bridge.command('panic')
 
+        # Send note list and start in-process transport for sample-accurate
+        # MIDI scheduling inside the C++ audio callback (no IPC drift).
+        self._send_transport_notes_to_bridge(bridge, track)
+        self._use_inprocess_transport = True
+
         rendered_frames = int(self._native_output_rendered_sample_frames(status))
         self._direct_native_transport_row = int(row)
         self._direct_native_transport_origin_frame = int(start_frame)
@@ -11518,7 +11570,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._transport_uses_native_output_bridge = True
         self._playback_active = True
-        self._pump_direct_native_transport()
+
+        # Start in-process transport — the C++ host generates MIDI directly
+        self._start_inprocess_transport(bridge, int(start_tick))
+
         if not bool(getattr(self, '_playback_active', False)):
             return False
         if self._shared_native_output_has_pcm_transport_audio():
@@ -12382,6 +12437,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if not getattr(self, '_playback_active', False):
             return int(self.project.playhead_tick)
         if self._direct_native_transport_active():
+            # When in-process transport is active, the C++ host tracks the
+            # authoritative musical position — use it directly.
+            if getattr(self, '_use_inprocess_transport', False):
+                ipt_frame = int(getattr(self, '_inprocess_transport_position_frame', 0) or 0)
+                return sample_frame_to_tick(ipt_frame, self._playback_sample_rate, self.project.bpm)
             direct_frames = max(
                 0,
                 self._native_output_rendered_sample_frames()
@@ -12854,6 +12914,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self._set_native_track_meter_levels({int(row): direct_level})
             self._update_track_meter_levels(self._native_track_meter_levels)
 
+            # ── In-process transport: C++ handles MIDI scheduling directly ──
+            # Only update UI playhead from the host's authoritative position.
+            if getattr(self, '_use_inprocess_transport', False):
+                ipt_frame = int(status.get('inprocess_transport_position_frame', 0) or 0)
+                self._inprocess_transport_position_frame = ipt_frame
+                return
+
             current_frame = self._native_output_rendered_sample_frames(status)
             if current_frame > int(self._direct_native_transport_output_cursor_frame):
                 advanced_frames = int(current_frame - int(self._direct_native_transport_output_cursor_frame))
@@ -13020,6 +13087,9 @@ class MainWindow(QtWidgets.QMainWindow):
         direct_row = self._direct_native_transport_row
         live_direct_row = self._live_midi_direct_output_row
         graph_transport_active = self._graph_native_transport_active()
+        if getattr(self, '_use_inprocess_transport', False):
+            self._stop_inprocess_transport()
+            self._use_inprocess_transport = False
         if hasattr(self, 'playback_timer'):
             self.playback_timer.stop()
         self._stop_realtime_audio_sink(cleanup_bridge=False)
