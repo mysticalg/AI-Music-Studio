@@ -16623,6 +16623,38 @@ class MainWindow(QtWidgets.QMainWindow):
                     track.rack_vsti,
                 )
 
+        if self._native_audio_engine_active():
+            engine_track_rows = list(getattr(self, '_native_audio_engine_track_rows', []) or [])
+            if track_index in engine_track_rows:
+                engine_track_index = engine_track_rows.index(track_index)
+                engine_payload = self._sanitize_native_vst_bridge_parameter_values(
+                    payload_values if payload_values is not None else values
+                )
+                if engine_payload:
+                    engine_bridge = getattr(self, '_native_output_bridge', None)
+                    if engine_bridge is not None:
+                        rack_name = str(getattr(bridge, '_aims_rack_name', '') or '') if bridge is not None else ''
+                        if rack_name:
+                            parameter_names = [str(name) for name in self.vsti_parameter_names_for_rack(rack_name)]
+                            parameter_index_by_name = {name: idx for idx, name in enumerate(parameter_names, start=1)}
+                            for key, value in list(engine_payload.items()):
+                                parameter_index = parameter_index_by_name.get(str(key))
+                                if parameter_index is not None:
+                                    engine_payload.setdefault(f'Param {parameter_index}', float(value))
+                        try:
+                            engine_bridge.command(
+                                'set_audio_engine_track_parameters',
+                                track_index=int(engine_track_index),
+                                parameters=dict(engine_payload),
+                            )
+                        except Exception:
+                            _APP_LOGGER.exception(
+                                "Failed syncing audio engine track parameters row=%s engine_track=%s rack=%s",
+                                track_index,
+                                engine_track_index,
+                                track.rack_vsti,
+                            )
+
     def _native_vst_parameter_change_is_live_safe(self, track: TrackState) -> bool:
         if not bool(getattr(self, '_playback_active', False)):
             return False
@@ -16653,6 +16685,10 @@ class MainWindow(QtWidgets.QMainWindow):
             graph_bridge = self._active_native_vst_graph_bridge()
             graph_slot_index = self._native_vst_graph_bridge_slot_index(track_index, entry, bridge=graph_bridge)
             if graph_bridge is not None and graph_slot_index >= 0:
+                return True
+
+        if self._native_audio_engine_active():
+            if track_index in getattr(self, '_native_audio_engine_track_rows', []):
                 return True
 
         return False
