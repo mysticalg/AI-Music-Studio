@@ -61,6 +61,7 @@ target_compile_definitions(AIMusicStudioVSTHost
 target_link_libraries(AIMusicStudioVSTHost
     PRIVATE
         juce::juce_audio_devices
+        juce::juce_audio_formats
         juce::juce_audio_processors
         juce::juce_audio_utils
         juce::juce_gui_extra
@@ -98,6 +99,7 @@ target_compile_definitions(AIMusicStudioVSTHostLib
 target_link_libraries(AIMusicStudioVSTHostLib
     PRIVATE
         juce::juce_audio_devices
+        juce::juce_audio_formats
         juce::juce_audio_processors
         juce::juce_audio_utils
         juce::juce_gui_extra

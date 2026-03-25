@@ -51,6 +51,11 @@ except Exception:
     NATIVE_VST_HOST_AVAILABLE = False
     NATIVE_VST_HOST_IMPORT_ERROR = str(sys.exc_info()[1])
 
+try:
+    from scripts.native_audio_engine import NativeAudioEngineClient
+except Exception:
+    NativeAudioEngineClient = None
+
 TICKS_PER_BEAT = 480
 TICKS_PER_BAR = TICKS_PER_BEAT * 4
 DEFAULT_BPM = 120
@@ -67,7 +72,7 @@ PCM_SAMPLE_FORMAT_FLOAT = "float32"
 APP_NAME = "AI Music Studio"
 PROJECT_FILE_EXTENSION = ".aims"
 PROJECT_FILE_FILTER = "AI Music Studio Project (*.aims);;JSON files (*.json);;All files (*)"
-PROJECT_FILE_VERSION = 1
+PROJECT_FILE_VERSION = 2
 TRACK_COLOR_PALETTE = [
     "#4AB4FF",
     "#FF8A65",
@@ -94,6 +99,36 @@ DIVISION_TEXT_OPTIONS = [
     "1/64T",
 ]
 QUANTIZE_TEXT_OPTIONS = ["Off", *DIVISION_TEXT_OPTIONS]
+AUTOMATION_TARGET_VOLUME = "volume"
+AUTOMATION_TARGET_PAN = "pan"
+AUTOMATION_TARGET_VST_OUTPUT_GAIN_DB = "vsti_output_gain_db"
+AUTOMATION_TARGET_VST_PARAMETER_PREFIX = "vsti_parameter:"
+AUTOMATION_BUILTIN_TARGET_ORDER = (
+    AUTOMATION_TARGET_VOLUME,
+    AUTOMATION_TARGET_PAN,
+    AUTOMATION_TARGET_VST_OUTPUT_GAIN_DB,
+)
+AUTOMATION_BUILTIN_TARGET_LABELS = {
+    AUTOMATION_TARGET_VOLUME: "Track Volume",
+    AUTOMATION_TARGET_PAN: "Track Pan",
+    AUTOMATION_TARGET_VST_OUTPUT_GAIN_DB: "VST Output Gain",
+}
+AUTOMATION_CANVAS_MIN_HEIGHT = 220
+
+
+def automation_target_for_vst_parameter(name: str) -> str:
+    return f"{AUTOMATION_TARGET_VST_PARAMETER_PREFIX}{str(name or '').strip()}"
+
+
+def automation_target_is_vst_parameter(target: object) -> bool:
+    return str(target or "").startswith(AUTOMATION_TARGET_VST_PARAMETER_PREFIX)
+
+
+def automation_target_parameter_name(target: object) -> str:
+    raw = str(target or "")
+    if not raw.startswith(AUTOMATION_TARGET_VST_PARAMETER_PREFIX):
+        return ""
+    return raw[len(AUTOMATION_TARGET_VST_PARAMETER_PREFIX) :].strip()
 
 
 def division_choice_text(div: int, triplet: bool = False) -> str:
@@ -491,6 +526,21 @@ def _archive_previous_unclean_session() -> Path | None:
         return None
 
 
+class SafeRotatingFileHandler(RotatingFileHandler):
+    """Skip shared-log rollover when another process has the file locked."""
+
+    def doRollover(self) -> None:
+        try:
+            super().doRollover()
+        except PermissionError:
+            if self.stream:
+                try:
+                    self.stream.close()
+                except Exception:
+                    pass
+            self.stream = self._open()
+
+
 def configure_app_logging() -> logging.Logger:
     global _APP_LOGGING_CONFIGURED, _FAULT_LOG_STREAM, _SESSION_LOG_HANDLER, _SESSION_FAULT_LOG_STREAM
     global _CURRENT_SESSION_ID, _CURRENT_SESSION_LOG_PATH, _CURRENT_SESSION_FAULT_PATH, _LAST_CRASH_REPORT_PATH
@@ -505,7 +555,7 @@ def configure_app_logging() -> logging.Logger:
     _APP_LOGGER.setLevel(logging.DEBUG)
     _APP_LOGGER.propagate = False
     if not _APP_LOGGER.handlers:
-        file_handler = RotatingFileHandler(
+        file_handler = SafeRotatingFileHandler(
             APP_LOG_PATH,
             maxBytes=2 * 1024 * 1024,
             backupCount=4,
@@ -736,14 +786,41 @@ def write_wav_samples(path: Path, samples: object, sample_rate: int = 44100) -> 
 def encode_wav_samples(samples: object, sample_rate: int = 44100) -> bytes:
     buffer = io.BytesIO()
     with wave.open(buffer, "wb") as wf:
-        wf.setnchannels(1)
         wf.setsampwidth(2)
         wf.setframerate(sample_rate)
         if np is not None and isinstance(samples, np.ndarray):
-            clipped = np.clip(samples, -1.0, 1.0)
-            frames = (clipped * 32767.0).astype("<i2", copy=False).tobytes()
+            audio = np.asarray(samples, dtype=np.float32)
+            if audio.ndim == 2 and (audio.shape[0] == 2 or audio.shape[1] == 2):
+                if audio.shape[0] == 2:
+                    left = audio[0]
+                    right = audio[1]
+                else:
+                    left = audio[:, 0]
+                    right = audio[:, 1]
+                frame_count = min(int(left.shape[0]), int(right.shape[0]))
+                interleaved = np.empty((frame_count, 2), dtype=np.float32)
+                interleaved[:, 0] = np.clip(left[:frame_count], -1.0, 1.0)
+                interleaved[:, 1] = np.clip(right[:frame_count], -1.0, 1.0)
+                wf.setnchannels(2)
+                frames = (interleaved * 32767.0).astype("<i2", copy=False).tobytes()
+            else:
+                wf.setnchannels(1)
+                clipped = np.clip(audio.reshape(-1), -1.0, 1.0)
+                frames = (clipped * 32767.0).astype("<i2", copy=False).tobytes()
             wf.writeframes(frames)
             return buffer.getvalue()
+        if isinstance(samples, (list, tuple)) and samples and isinstance(samples[0], (list, tuple)):
+            left = [clamp(float(value), -1.0, 1.0) for value in samples[0]]
+            right = [clamp(float(value), -1.0, 1.0) for value in (samples[1] if len(samples) > 1 else samples[0])]
+            frame_count = min(len(left), len(right))
+            wf.setnchannels(2)
+            frames = bytearray()
+            for index in range(frame_count):
+                frames.extend(struct.pack("<h", int(left[index] * 32767)))
+                frames.extend(struct.pack("<h", int(right[index] * 32767)))
+            wf.writeframes(frames)
+            return buffer.getvalue()
+        wf.setnchannels(1)
         frames = bytearray()
         for value in samples:
             clipped = int(clamp(value, -1.0, 1.0) * 32767)
@@ -864,6 +941,19 @@ class MidiNote:
 
 
 @dataclasses.dataclass
+class AutomationPoint:
+    tick: int
+    value: float
+
+
+@dataclasses.dataclass
+class AutomationLane:
+    target: str
+    enabled: bool = True
+    points: list[AutomationPoint] = dataclasses.field(default_factory=list)
+
+
+@dataclasses.dataclass
 class TrackState:
     name: str
     track_type: str = "instrument"
@@ -889,6 +979,7 @@ class TrackState:
     solo: bool = False
     live_armed: bool = False
     color_hex: str = ""
+    automation_lanes: list[AutomationLane] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -4488,6 +4579,683 @@ class InstrumentFxWidget(QtWidgets.QWidget):
             self._update_track_fx_summary(track)
 
 
+class AutomationCurveEditorWidget(QtWidgets.QWidget):
+    def __init__(self, lane_changed_callable=None) -> None:
+        super().__init__()
+        self._on_lane_changed = lane_changed_callable
+        self._track: TrackState | None = None
+        self._lane: AutomationLane | None = None
+        self._minimum = 0.0
+        self._maximum = 1.0
+        self._default_value = 0.0
+        self._lane_label = "Automation"
+        self._value_formatter = lambda value: f"{float(value):.2f}"
+        self._max_tick = TICKS_PER_BAR
+        self._playhead_tick = 0
+        self._loop_start_tick = 0
+        self._loop_end_tick = TICKS_PER_BAR
+        self._selected_point_index = -1
+        self._dragging_point = False
+        self._point_radius = 6
+        self._hover_point_index = -1
+        self.setMinimumHeight(AUTOMATION_CANVAS_MIN_HEIGHT)
+        self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
+        self.setMouseTracking(True)
+
+    def set_lane(
+        self,
+        track: TrackState | None,
+        lane: AutomationLane | None,
+        *,
+        lane_label: str,
+        minimum: float,
+        maximum: float,
+        default_value: float,
+        max_tick: int,
+        playhead_tick: int,
+        loop_start_tick: int,
+        loop_end_tick: int,
+        value_formatter=None,
+    ) -> None:
+        self._track = track
+        self._lane = lane
+        self._minimum = float(minimum)
+        self._maximum = float(maximum) if float(maximum) > float(minimum) else float(minimum) + 1.0
+        self._default_value = float(clamp(float(default_value), self._minimum, self._maximum))
+        self._lane_label = str(lane_label or "Automation")
+        if callable(value_formatter):
+            self._value_formatter = value_formatter
+        else:
+            self._value_formatter = lambda value: f"{float(value):.2f}"
+        self._max_tick = max(TICKS_PER_BAR, int(max_tick))
+        self._playhead_tick = max(0, int(playhead_tick))
+        self._loop_start_tick = max(0, int(loop_start_tick))
+        self._loop_end_tick = max(self._loop_start_tick + 1, int(loop_end_tick))
+        point_count = len(self._sorted_points())
+        if point_count == 0:
+            self._selected_point_index = -1
+        elif self._selected_point_index >= point_count:
+            self._selected_point_index = point_count - 1
+        self.update()
+
+    def _sorted_points(self) -> list[AutomationPoint]:
+        lane = self._lane
+        if lane is None:
+            return []
+        return sorted(
+            [
+                AutomationPoint(tick=max(0, int(point.tick)), value=float(point.value))
+                for point in lane.points
+            ],
+            key=lambda point: (int(point.tick), float(point.value)),
+        )
+
+    def _content_rect(self) -> QtCore.QRectF:
+        rect = QtCore.QRectF(self.rect())
+        return rect.adjusted(56.0, 20.0, -18.0, -28.0)
+
+    def _tick_to_x(self, tick: int) -> float:
+        rect = self._content_rect()
+        if rect.width() <= 1.0:
+            return rect.left()
+        normalized = max(0.0, min(1.0, float(tick) / float(max(1, self._max_tick))))
+        return rect.left() + (rect.width() * normalized)
+
+    def _x_to_tick(self, x: float) -> int:
+        rect = self._content_rect()
+        if rect.width() <= 1.0:
+            return 0
+        normalized = max(0.0, min(1.0, (float(x) - rect.left()) / rect.width()))
+        return max(0, min(int(round(normalized * max(1, self._max_tick))), int(self._max_tick)))
+
+    def _value_to_y(self, value: float) -> float:
+        rect = self._content_rect()
+        span = max(1e-9, self._maximum - self._minimum)
+        normalized = (clamp(float(value), self._minimum, self._maximum) - self._minimum) / span
+        return rect.bottom() - (normalized * rect.height())
+
+    def _y_to_value(self, y: float) -> float:
+        rect = self._content_rect()
+        if rect.height() <= 1.0:
+            return self._default_value
+        normalized = max(0.0, min(1.0, (rect.bottom() - float(y)) / rect.height()))
+        return clamp(self._minimum + (normalized * (self._maximum - self._minimum)), self._minimum, self._maximum)
+
+    def _point_at_pos(self, pos: QtCore.QPointF) -> int:
+        points = self._sorted_points()
+        if not points:
+            return -1
+        threshold = float(self._point_radius + 5)
+        for index, point in enumerate(points):
+            point_pos = QtCore.QPointF(self._tick_to_x(point.tick), self._value_to_y(point.value))
+            if QtCore.QLineF(pos, point_pos).length() <= threshold:
+                return index
+        return -1
+
+    def _normalize_lane_points(self) -> None:
+        lane = self._lane
+        if lane is None:
+            return
+        points_by_tick: dict[int, AutomationPoint] = {}
+        for point in lane.points:
+            tick = max(0, min(int(point.tick), int(self._max_tick)))
+            value = clamp(float(point.value), self._minimum, self._maximum)
+            points_by_tick[tick] = AutomationPoint(tick=tick, value=value)
+        lane.points = [points_by_tick[tick] for tick in sorted(points_by_tick)]
+        if self._selected_point_index >= len(lane.points):
+            self._selected_point_index = len(lane.points) - 1
+
+    def _notify_lane_changed(self) -> None:
+        self._normalize_lane_points()
+        if callable(self._on_lane_changed):
+            self._on_lane_changed()
+        self.update()
+
+    def _remove_selected_point(self) -> bool:
+        lane = self._lane
+        if lane is None:
+            return False
+        points = self._sorted_points()
+        index = int(self._selected_point_index)
+        if index < 0 or index >= len(points):
+            return False
+        del points[index]
+        lane.points = points
+        self._selected_point_index = min(index, len(points) - 1)
+        self._notify_lane_changed()
+        return True
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self.setFocus(QtCore.Qt.FocusReason.MouseFocusReason)
+            point_index = self._point_at_pos(event.position())
+            self._selected_point_index = int(point_index)
+            self._dragging_point = point_index >= 0
+            self.update()
+            event.accept()
+            return
+        if event.button() == QtCore.Qt.MouseButton.RightButton:
+            point_index = self._point_at_pos(event.position())
+            if point_index >= 0:
+                self._selected_point_index = int(point_index)
+                self._remove_selected_point()
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        point_index = self._point_at_pos(event.position())
+        if point_index != self._hover_point_index:
+            self._hover_point_index = point_index
+            self.update()
+        if not self._dragging_point:
+            super().mouseMoveEvent(event)
+            return
+        lane = self._lane
+        if lane is None:
+            return
+        points = self._sorted_points()
+        index = int(self._selected_point_index)
+        if index < 0 or index >= len(points):
+            return
+        points[index] = AutomationPoint(
+            tick=self._x_to_tick(event.position().x()),
+            value=self._y_to_value(event.position().y()),
+        )
+        lane.points = points
+        self._notify_lane_changed()
+        event.accept()
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == QtCore.Qt.MouseButton.LeftButton and self._dragging_point:
+            self._dragging_point = False
+            self._notify_lane_changed()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() != QtCore.Qt.MouseButton.LeftButton:
+            super().mouseDoubleClickEvent(event)
+            return
+        lane = self._lane
+        if lane is None:
+            return
+        points = self._sorted_points()
+        new_point = AutomationPoint(
+            tick=self._x_to_tick(event.position().x()),
+            value=self._y_to_value(event.position().y()),
+        )
+        points.append(new_point)
+        points.sort(key=lambda point: (int(point.tick), float(point.value)))
+        lane.points = points
+        self._selected_point_index = next(
+            (index for index, point in enumerate(points) if int(point.tick) == int(new_point.tick)),
+            len(points) - 1,
+        )
+        self._notify_lane_changed()
+        event.accept()
+
+    def leaveEvent(self, event: QtCore.QEvent) -> None:
+        self._hover_point_index = -1
+        self.update()
+        super().leaveEvent(event)
+
+    def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        if event.key() in {QtCore.Qt.Key.Key_Delete, QtCore.Qt.Key.Key_Backspace}:
+            if self._remove_selected_point():
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        del event
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        painter.fillRect(self.rect(), QtGui.QColor('#131821'))
+
+        rect = self._content_rect()
+        if rect.width() <= 1.0 or rect.height() <= 1.0:
+            painter.end()
+            return
+
+        painter.setPen(QtGui.QPen(QtGui.QColor('#263444'), 1))
+        painter.setBrush(QtGui.QBrush(QtGui.QColor('#18212d')))
+        painter.drawRoundedRect(rect, 8, 8)
+
+        loop_left = self._tick_to_x(self._loop_start_tick)
+        loop_right = self._tick_to_x(self._loop_end_tick)
+        if loop_right > loop_left:
+            loop_rect = QtCore.QRectF(loop_left, rect.top(), loop_right - loop_left, rect.height())
+            painter.fillRect(loop_rect, QtGui.QColor(62, 122, 186, 30))
+
+        bar_pen = QtGui.QPen(QtGui.QColor('#2f4053'), 1)
+        beat_pen = QtGui.QPen(QtGui.QColor('#22303f'), 1)
+        tick = 0
+        while tick <= self._max_tick:
+            x = self._tick_to_x(tick)
+            painter.setPen(bar_pen if tick % TICKS_PER_BAR == 0 else beat_pen)
+            painter.drawLine(QtCore.QPointF(x, rect.top()), QtCore.QPointF(x, rect.bottom()))
+            tick += TICKS_PER_BEAT
+
+        value_steps = 4
+        for step in range(value_steps + 1):
+            progress = step / float(value_steps)
+            y = rect.top() + (rect.height() * progress)
+            painter.setPen(QtGui.QPen(QtGui.QColor('#22303f'), 1))
+            painter.drawLine(QtCore.QPointF(rect.left(), y), QtCore.QPointF(rect.right(), y))
+            value = self._maximum - (progress * (self._maximum - self._minimum))
+            painter.setPen(QtGui.QColor('#97a8bb'))
+            painter.drawText(
+                QtCore.QRectF(6.0, y - 10.0, 44.0, 20.0),
+                QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter,
+                self._value_formatter(value),
+            )
+
+        default_y = self._value_to_y(self._default_value)
+        default_pen = QtGui.QPen(QtGui.QColor('#64748b'), 1)
+        default_pen.setStyle(QtCore.Qt.PenStyle.DashLine)
+        painter.setPen(default_pen)
+        painter.drawLine(QtCore.QPointF(rect.left(), default_y), QtCore.QPointF(rect.right(), default_y))
+
+        points = self._sorted_points()
+        line_pen = QtGui.QPen(QtGui.QColor('#67c1ff'), 2)
+        painter.setPen(line_pen)
+        if points:
+            segments: list[QtCore.QPointF] = []
+            first_point = points[0]
+            if int(first_point.tick) > 0:
+                segments.append(QtCore.QPointF(rect.left(), self._value_to_y(self._default_value)))
+                segments.append(QtCore.QPointF(self._tick_to_x(first_point.tick), self._value_to_y(self._default_value)))
+            for point in points:
+                segments.append(QtCore.QPointF(self._tick_to_x(point.tick), self._value_to_y(point.value)))
+            last_point = points[-1]
+            segments.append(QtCore.QPointF(rect.right(), self._value_to_y(last_point.value)))
+            for index in range(len(segments) - 1):
+                painter.drawLine(segments[index], segments[index + 1])
+        else:
+            painter.drawLine(QtCore.QPointF(rect.left(), default_y), QtCore.QPointF(rect.right(), default_y))
+
+        for index, point in enumerate(points):
+            point_pos = QtCore.QPointF(self._tick_to_x(point.tick), self._value_to_y(point.value))
+            if index == self._selected_point_index:
+                brush = QtGui.QColor('#ffffff')
+                pen = QtGui.QPen(QtGui.QColor('#67c1ff'), 2)
+            elif index == self._hover_point_index:
+                brush = QtGui.QColor('#a8dbff')
+                pen = QtGui.QPen(QtGui.QColor('#d8f0ff'), 1.5)
+            else:
+                brush = QtGui.QColor('#67c1ff')
+                pen = QtGui.QPen(QtGui.QColor('#0e1721'), 1.2)
+            painter.setPen(pen)
+            painter.setBrush(brush)
+            painter.drawEllipse(point_pos, float(self._point_radius), float(self._point_radius))
+
+        if self._playhead_tick >= 0:
+            playhead_x = self._tick_to_x(self._playhead_tick)
+            painter.setPen(QtGui.QPen(QtGui.QColor('#f4d35e'), 1.5))
+            painter.drawLine(QtCore.QPointF(playhead_x, rect.top()), QtCore.QPointF(playhead_x, rect.bottom()))
+
+        painter.setPen(QtGui.QColor('#d7e1ef'))
+        painter.drawText(
+            QtCore.QRectF(rect.left(), 2.0, rect.width(), 18.0),
+            QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter,
+            self._lane_label,
+        )
+
+        if self._selected_point_index >= 0 and self._selected_point_index < len(points):
+            selected = points[self._selected_point_index]
+            detail = f"Tick {int(selected.tick)}   Value {self._value_formatter(selected.value)}"
+        else:
+            detail = "Double-click to add a point. Drag to move. Right-click or Delete to remove."
+        painter.setPen(QtGui.QColor('#9bb0c5'))
+        painter.drawText(
+            QtCore.QRectF(rect.left(), rect.bottom() + 6.0, rect.width(), 18.0),
+            QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter,
+            detail,
+        )
+        painter.end()
+
+
+class AutomationEditorWidget(QtWidgets.QWidget):
+    def __init__(
+        self,
+        project: ProjectState,
+        current_track_callable,
+        current_track_index_callable,
+        available_targets_callable,
+        target_label_callable,
+        target_bounds_callable,
+        target_default_callable,
+        on_track_updated_callable=None,
+    ) -> None:
+        super().__init__()
+        self.project = project
+        self.current_track_callable = current_track_callable
+        self.current_track_index_callable = current_track_index_callable
+        self.available_targets_callable = available_targets_callable
+        self.target_label_callable = target_label_callable
+        self.target_bounds_callable = target_bounds_callable
+        self.target_default_callable = target_default_callable
+        self.on_track_updated = on_track_updated_callable
+        self._updating_ui = False
+        self._selected_target_by_track: dict[int, str] = {}
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
+
+        header = QtWidgets.QLabel('Automation')
+        header.setStyleSheet('font-size: 16px; font-weight: 700; color: #E9EEF5;')
+        root.addWidget(header)
+
+        subheader = QtWidgets.QLabel('Build per-track automation lanes for volume, pan, output gain, and VST parameters.')
+        subheader.setWordWrap(True)
+        subheader.setStyleSheet('font-size: 11px; color: #94A4B7;')
+        root.addWidget(subheader)
+
+        control_row = QtWidgets.QHBoxLayout()
+        control_row.setContentsMargins(0, 0, 0, 0)
+        control_row.setSpacing(8)
+        self.add_lane_combo = QtWidgets.QComboBox()
+        self.add_lane_combo.setMinimumWidth(220)
+        self.add_lane_btn = QtWidgets.QPushButton('Add Lane')
+        self.remove_lane_btn = QtWidgets.QPushButton('Remove Lane')
+        self.enable_lane_btn = QtWidgets.QCheckBox('Read Enabled')
+        self.reset_lane_btn = QtWidgets.QPushButton('Reset Lane')
+        control_row.addWidget(QtWidgets.QLabel('Target'))
+        control_row.addWidget(self.add_lane_combo, 1)
+        control_row.addWidget(self.add_lane_btn)
+        control_row.addWidget(self.remove_lane_btn)
+        control_row.addWidget(self.enable_lane_btn)
+        control_row.addWidget(self.reset_lane_btn)
+        root.addLayout(control_row)
+
+        split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        split.setChildrenCollapsible(False)
+
+        lane_panel = QtWidgets.QWidget()
+        lane_panel.setMinimumWidth(220)
+        lane_layout = QtWidgets.QVBoxLayout(lane_panel)
+        lane_layout.setContentsMargins(0, 0, 0, 0)
+        lane_layout.setSpacing(6)
+        self.track_summary = QtWidgets.QLabel()
+        self.track_summary.setWordWrap(True)
+        self.track_summary.setStyleSheet('font-size: 12px; color: #D7E1EC; font-weight: 600;')
+        lane_layout.addWidget(self.track_summary)
+        self.lane_list = QtWidgets.QListWidget()
+        self.lane_list.setStyleSheet(
+            'QListWidget { background: #18212d; border: 1px solid #2e3d50; border-radius: 8px; color: #dbe6f4; }'
+            'QListWidget::item { padding: 6px 8px; }'
+            'QListWidget::item:selected { background: #295278; color: #ffffff; }'
+        )
+        lane_layout.addWidget(self.lane_list, 1)
+        split.addWidget(lane_panel)
+
+        editor_panel = QtWidgets.QWidget()
+        editor_layout = QtWidgets.QVBoxLayout(editor_panel)
+        editor_layout.setContentsMargins(0, 0, 0, 0)
+        editor_layout.setSpacing(6)
+        self.lane_summary = QtWidgets.QLabel('Choose a lane to edit.')
+        self.lane_summary.setWordWrap(True)
+        self.lane_summary.setStyleSheet('font-size: 12px; color: #B8C7D6;')
+        editor_layout.addWidget(self.lane_summary)
+        self.canvas = AutomationCurveEditorWidget(self._handle_lane_points_changed)
+        editor_layout.addWidget(self.canvas, 1)
+        split.addWidget(editor_panel)
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        root.addWidget(split, 1)
+
+        self.add_lane_btn.clicked.connect(self._add_selected_lane)
+        self.remove_lane_btn.clicked.connect(self._remove_selected_lane)
+        self.enable_lane_btn.toggled.connect(self._toggle_selected_lane_enabled)
+        self.reset_lane_btn.clicked.connect(self._reset_selected_lane)
+        self.lane_list.currentRowChanged.connect(self._on_lane_selection_changed)
+
+    def _current_row(self) -> int:
+        try:
+            return int(self.current_track_index_callable())
+        except Exception:
+            return -1
+
+    def _current_track(self) -> TrackState | None:
+        try:
+            return self.current_track_callable()
+        except Exception:
+            return None
+
+    def _current_lane(self) -> AutomationLane | None:
+        track = self._current_track()
+        row = self._current_row()
+        if track is None or row < 0:
+            return None
+        target = str(self._selected_target_by_track.get(row, '') or '')
+        if not target:
+            item = self.lane_list.currentItem()
+            if item is not None:
+                target = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or '')
+        if not target:
+            return None
+        for lane in getattr(track, 'automation_lanes', []) or []:
+            if str(lane.target).casefold() == target.casefold():
+                return lane
+        return None
+
+    def _lane_item_text(self, track: TrackState, lane: AutomationLane) -> str:
+        label = self.target_label_callable(track, lane.target) if callable(self.target_label_callable) else str(lane.target)
+        point_count = len(lane.points)
+        status = 'Read' if lane.enabled else 'Bypassed'
+        return f'{label}   [{status}]   {point_count} pt{"s" if point_count != 1 else ""}'
+
+    def _value_formatter(self, track: TrackState, target: str):
+        def formatter(value: float) -> str:
+            numeric = float(value)
+            if target == AUTOMATION_TARGET_VOLUME:
+                return f'{numeric * 100.0:.0f}%'
+            if target == AUTOMATION_TARGET_PAN:
+                return f'{numeric:+.2f}'
+            if target == AUTOMATION_TARGET_VST_OUTPUT_GAIN_DB:
+                return f'{numeric:+.1f} dB'
+            if automation_target_is_vst_parameter(target):
+                return f'{numeric:.1f}'
+            return f'{numeric:.2f}'
+        return formatter
+
+    def _refresh_available_targets(self, track: TrackState | None) -> None:
+        self.add_lane_combo.blockSignals(True)
+        self.add_lane_combo.clear()
+        if track is not None:
+            existing = {str(lane.target).casefold() for lane in getattr(track, 'automation_lanes', []) or []}
+            for target in self.available_targets_callable(track):
+                if str(target).casefold() in existing:
+                    continue
+                label = self.target_label_callable(track, target) if callable(self.target_label_callable) else str(target)
+                self.add_lane_combo.addItem(label, target)
+        self.add_lane_combo.blockSignals(False)
+
+    def _sync_canvas(self) -> None:
+        track = self._current_track()
+        lane = self._current_lane()
+        if track is None or lane is None:
+            self.canvas.set_lane(
+                None,
+                None,
+                lane_label='Automation',
+                minimum=0.0,
+                maximum=1.0,
+                default_value=0.0,
+                max_tick=max(TICKS_PER_BAR, int(getattr(self.project, 'right_locator_tick', TICKS_PER_BAR))),
+                playhead_tick=int(getattr(self.project, 'playhead_tick', 0)),
+                loop_start_tick=int(getattr(self.project, 'left_locator_tick', 0)),
+                loop_end_tick=max(1, int(getattr(self.project, 'right_locator_tick', TICKS_PER_BAR))),
+            )
+            return
+        max_tick = max(
+            int(getattr(self.project, 'right_locator_tick', TICKS_PER_BAR)),
+            max((int(point.tick) for point in lane.points), default=0) + TICKS_PER_BAR,
+            max((int(note.start_tick + note.duration_tick) for note in getattr(track, 'notes', [])), default=0) + TICKS_PER_BAR,
+        )
+        minimum, maximum = self.target_bounds_callable(track, lane.target)
+        default_value = self.target_default_callable(track, lane.target)
+        label = self.target_label_callable(track, lane.target)
+        self.canvas.set_lane(
+            track,
+            lane,
+            lane_label=label,
+            minimum=float(minimum),
+            maximum=float(maximum),
+            default_value=float(default_value),
+            max_tick=int(max_tick),
+            playhead_tick=int(getattr(self.project, 'playhead_tick', 0)),
+            loop_start_tick=int(getattr(self.project, 'left_locator_tick', 0)),
+            loop_end_tick=max(1, int(getattr(self.project, 'right_locator_tick', TICKS_PER_BAR))),
+            value_formatter=self._value_formatter(track, lane.target),
+        )
+
+    def load_track(self) -> None:
+        self._updating_ui = True
+        try:
+            row = self._current_row()
+            track = self._current_track()
+            self.lane_list.clear()
+            self._refresh_available_targets(track)
+            if track is None or row < 0:
+                self.track_summary.setText('No track selected.')
+                self.lane_summary.setText('Choose a track to create or edit automation.')
+                self.enable_lane_btn.setChecked(False)
+                self.enable_lane_btn.setEnabled(False)
+                self.remove_lane_btn.setEnabled(False)
+                self.reset_lane_btn.setEnabled(False)
+                self.add_lane_btn.setEnabled(False)
+                self._sync_canvas()
+                return
+
+            self.track_summary.setText(f'{track.name}  |  {track.track_type.title()} track')
+            lanes = list(getattr(track, 'automation_lanes', []) or [])
+            for lane in lanes:
+                item = QtWidgets.QListWidgetItem(self._lane_item_text(track, lane))
+                item.setData(QtCore.Qt.ItemDataRole.UserRole, str(lane.target))
+                self.lane_list.addItem(item)
+
+            selected_target = str(self._selected_target_by_track.get(row, '') or '')
+            if selected_target:
+                for index in range(self.lane_list.count()):
+                    item = self.lane_list.item(index)
+                    if str(item.data(QtCore.Qt.ItemDataRole.UserRole) or '').casefold() == selected_target.casefold():
+                        self.lane_list.setCurrentRow(index)
+                        break
+            if self.lane_list.currentRow() < 0 and self.lane_list.count() > 0:
+                self.lane_list.setCurrentRow(0)
+            if self.lane_list.currentRow() < 0:
+                self._selected_target_by_track.pop(row, None)
+
+            selected_lane = self._current_lane()
+            has_selection = selected_lane is not None
+            self.add_lane_btn.setEnabled(self.add_lane_combo.count() > 0)
+            self.remove_lane_btn.setEnabled(has_selection)
+            self.reset_lane_btn.setEnabled(has_selection)
+            self.enable_lane_btn.setEnabled(has_selection)
+            self.enable_lane_btn.blockSignals(True)
+            self.enable_lane_btn.setChecked(bool(selected_lane.enabled) if selected_lane is not None else False)
+            self.enable_lane_btn.blockSignals(False)
+            if selected_lane is not None:
+                label = self.target_label_callable(track, selected_lane.target)
+                self.lane_summary.setText(
+                    f'{label} automation. Double-click to add points, drag to reshape, and use Read Enabled to bypass a lane without deleting it.'
+                )
+            else:
+                self.lane_summary.setText('Add a lane to begin automating this track.')
+            self._sync_canvas()
+        finally:
+            self._updating_ui = False
+
+    def refresh_view_state(self) -> None:
+        self._sync_canvas()
+
+    def _emit_track_updated(self, changed_targets: set[str] | None = None) -> None:
+        if callable(self.on_track_updated):
+            self.on_track_updated(self._current_row(), changed_targets or set())
+
+    def _add_selected_lane(self) -> None:
+        track = self._current_track()
+        row = self._current_row()
+        if track is None or row < 0:
+            return
+        target = str(self.add_lane_combo.currentData() or '').strip()
+        if not target:
+            return
+        existing_targets = {str(lane.target).casefold() for lane in getattr(track, 'automation_lanes', []) or []}
+        if target.casefold() in existing_targets:
+            self.load_track()
+            return
+        default_value = float(self.target_default_callable(track, target))
+        new_tick = max(0, int(getattr(self.project, 'playhead_tick', 0)))
+        track.automation_lanes.append(
+            AutomationLane(
+                target=target,
+                enabled=True,
+                points=[AutomationPoint(tick=int(new_tick), value=default_value)],
+            )
+        )
+        self._selected_target_by_track[row] = target
+        self.load_track()
+        self._emit_track_updated({target})
+
+    def _remove_selected_lane(self) -> None:
+        track = self._current_track()
+        row = self._current_row()
+        lane = self._current_lane()
+        if track is None or row < 0 or lane is None:
+            return
+        target = str(lane.target)
+        track.automation_lanes = [
+            existing
+            for existing in getattr(track, 'automation_lanes', []) or []
+            if str(existing.target).casefold() != target.casefold()
+        ]
+        self._selected_target_by_track.pop(row, None)
+        self.load_track()
+        self._emit_track_updated({target})
+
+    def _toggle_selected_lane_enabled(self, checked: bool) -> None:
+        if self._updating_ui:
+            return
+        lane = self._current_lane()
+        if lane is None:
+            return
+        lane.enabled = bool(checked)
+        self.load_track()
+        self._emit_track_updated({str(lane.target)})
+
+    def _reset_selected_lane(self) -> None:
+        lane = self._current_lane()
+        track = self._current_track()
+        if lane is None or track is None:
+            return
+        default_value = float(self.target_default_callable(track, lane.target))
+        lane.points = [AutomationPoint(tick=0, value=default_value)]
+        self.load_track()
+        self._emit_track_updated({str(lane.target)})
+
+    def _on_lane_selection_changed(self, row: int) -> None:
+        del row
+        if self._updating_ui:
+            return
+        track = self._current_track()
+        current_row = self._current_row()
+        item = self.lane_list.currentItem()
+        if track is not None and current_row >= 0 and item is not None:
+            self._selected_target_by_track[current_row] = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or '')
+        self.load_track()
+
+    def _handle_lane_points_changed(self) -> None:
+        lane = self._current_lane()
+        if lane is None:
+            return
+        self._emit_track_updated({str(lane.target)})
+
+
 class SampleLibraryWidget(QtWidgets.QListWidget):
     def __init__(self) -> None:
         super().__init__()
@@ -5458,6 +6226,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._graph_native_transport_loop_start_frame = 0
         self._graph_native_transport_loop_end_frame = 0
         self._graph_native_transport_lead_frames = 0
+        self._native_audio_engine_track_rows: list[int] = []
+        self._native_audio_engine_running = False
+        self._native_audio_engine_position_frame = 0
         self._last_track_preview_notes: dict[int, tuple[int, int, int]] = {}
         self._pending_parameter_audition_row: int | None = None
         self._native_vst_host_audio_status_cache: dict[str, dict[str, object]] = {}
@@ -5594,6 +6365,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._native_output_async_warm_poll_timer = QtCore.QTimer(self)
         self._native_output_async_warm_poll_timer.setInterval(40)
         self._native_output_async_warm_poll_timer.timeout.connect(self._poll_async_native_output_bridge_warm)
+        self._pending_playback_start_retry_timer = QtCore.QTimer(self)
+        self._pending_playback_start_retry_timer.setSingleShot(True)
+        self._pending_playback_start_retry_timer.setInterval(40)
+        self._pending_playback_start_retry_timer.timeout.connect(self._flush_pending_playback_start_retry)
         if self._native_output_bridge_supported():
             self._begin_async_native_output_bridge_warm()
         self._deferred_playback_stop_cleanup: dict[str, object] | None = None
@@ -5658,6 +6433,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self.vsti_parameter_names_for_rack,
             self.available_fx_plugin_names,
             self.open_current_track_vst_fx_dialog,
+        )
+        self.automation_editor = AutomationEditorWidget(
+            self.project,
+            self.current_track,
+            self.current_track_index,
+            self._available_track_automation_targets,
+            self._automation_target_label,
+            self._automation_target_bounds,
+            self._automation_target_default_value,
+            self.on_track_automation_changed,
         )
         self.sample_timeline = SampleTimelineWidget(self.project, self.sample_track_indices, self.place_sample_asset_on_track, self.set_playhead_position)
         self.arrangement_overview = ArrangementOverviewWidget(self.project, self.set_playhead_position, self.set_left_locator_position, self.set_right_locator_position, self.apply_arrangement_section_move, lambda: self.project.bpm)
@@ -5727,6 +6512,7 @@ class MainWindow(QtWidgets.QMainWindow):
         right_tabs.addTab(self.arrangement_overview, "Arrangement Overview")
         right_tabs.addTab(self.sample_timeline, "Sample Timeline")
         right_tabs.addTab(self.instruments, "Instruments / FX")
+        right_tabs.addTab(self.automation_editor, "Automation")
         self.right_tabs = right_tabs
         self.tools_window = FloatingPanelWindow('Panels', self)
         self.tools_window.setCentralWidget(self.right_tabs)
@@ -6179,6 +6965,254 @@ class MainWindow(QtWidgets.QMainWindow):
             result = min(maximum, result)
         return result
 
+    def _automation_target_default_value(self, track: TrackState, target: str) -> float:
+        if target == AUTOMATION_TARGET_VOLUME:
+            return float(track.volume)
+        if target == AUTOMATION_TARGET_PAN:
+            return float(track.pan)
+        if target == AUTOMATION_TARGET_VST_OUTPUT_GAIN_DB:
+            return float(track.vsti_output_gain_db)
+        if automation_target_is_vst_parameter(target):
+            parameter_name = automation_target_parameter_name(target)
+            return float(track.vsti_parameters.get(parameter_name, 0.0))
+        return 0.0
+
+    def _automation_target_bounds(self, track: TrackState, target: str) -> tuple[float, float]:
+        _ = track
+        if target == AUTOMATION_TARGET_VOLUME:
+            return 0.0, 1.5
+        if target == AUTOMATION_TARGET_PAN:
+            return -1.0, 1.0
+        if target == AUTOMATION_TARGET_VST_OUTPUT_GAIN_DB:
+            return -48.0, 24.0
+        if automation_target_is_vst_parameter(target):
+            return 0.0, 100.0
+        return 0.0, 1.0
+
+    def _automation_target_label(self, track: TrackState, target: str) -> str:
+        if target in AUTOMATION_BUILTIN_TARGET_LABELS:
+            if target == AUTOMATION_TARGET_VST_OUTPUT_GAIN_DB and track.instrument_mode != 'VSTI Rack':
+                return 'Output Gain'
+            return AUTOMATION_BUILTIN_TARGET_LABELS[target]
+        if automation_target_is_vst_parameter(target):
+            parameter_name = automation_target_parameter_name(target)
+            return f'VST Parameter: {parameter_name or "Unnamed"}'
+        return str(target or 'Automation')
+
+    def _available_track_automation_targets(self, track: TrackState) -> list[str]:
+        targets = [AUTOMATION_TARGET_VOLUME, AUTOMATION_TARGET_PAN]
+        if track.track_type == 'instrument' and track.instrument_mode == 'VSTI Rack':
+            targets.append(AUTOMATION_TARGET_VST_OUTPUT_GAIN_DB)
+            parameter_names = list(track.vsti_parameters.keys())
+            if track.rack_vsti:
+                parameter_names.extend(self.vsti_parameter_names_for_rack(track.rack_vsti))
+            seen_parameter_names: set[str] = set()
+            for raw_name in parameter_names:
+                parameter_name = str(raw_name or '').strip()
+                if not parameter_name:
+                    continue
+                folded = parameter_name.casefold()
+                if folded in seen_parameter_names:
+                    continue
+                seen_parameter_names.add(folded)
+                targets.append(automation_target_for_vst_parameter(parameter_name))
+        return targets
+
+    def _sanitize_track_automation_lanes(self, track: TrackState) -> list[AutomationLane]:
+        sanitized: list[AutomationLane] = []
+        seen_targets: set[str] = set()
+        available_targets = set(self._available_track_automation_targets(track))
+        raw_lanes = getattr(track, 'automation_lanes', []) or []
+        for raw_lane in raw_lanes:
+            if dataclasses.is_dataclass(raw_lane) and isinstance(raw_lane, AutomationLane):
+                target = str(raw_lane.target or '').strip()
+                enabled = bool(raw_lane.enabled)
+                raw_points = list(raw_lane.points)
+            elif isinstance(raw_lane, dict):
+                target = str(raw_lane.get('target') or '').strip()
+                enabled = bool(raw_lane.get('enabled', True))
+                raw_points = list(raw_lane.get('points', []))
+            else:
+                continue
+            if not target:
+                continue
+            if available_targets and target not in available_targets and not automation_target_is_vst_parameter(target):
+                continue
+            target_key = target.casefold()
+            if target_key in seen_targets:
+                continue
+            seen_targets.add(target_key)
+            minimum, maximum = self._automation_target_bounds(track, target)
+            points_by_tick: dict[int, AutomationPoint] = {}
+            for raw_point in raw_points:
+                if dataclasses.is_dataclass(raw_point) and isinstance(raw_point, AutomationPoint):
+                    tick = self._coerce_int(getattr(raw_point, 'tick', 0), 0, 0)
+                    value = self._coerce_float(getattr(raw_point, 'value', 0.0), 0.0, minimum, maximum)
+                elif isinstance(raw_point, dict):
+                    tick = self._coerce_int(raw_point.get('tick'), 0, 0)
+                    value = self._coerce_float(raw_point.get('value'), 0.0, minimum, maximum)
+                else:
+                    continue
+                points_by_tick[tick] = AutomationPoint(tick=tick, value=value)
+            points = [points_by_tick[tick] for tick in sorted(points_by_tick)]
+            sanitized.append(AutomationLane(target=target, enabled=enabled, points=points))
+        return sanitized
+
+    def _normalize_track_automation_lanes(self, track: TrackState) -> list[AutomationLane]:
+        lanes = self._sanitize_track_automation_lanes(track)
+        track.automation_lanes = lanes
+        return lanes
+
+    def _track_automation_lane(self, track: TrackState, target: str, *, create: bool = False) -> AutomationLane | None:
+        normalized_target = str(target or '').strip()
+        if not normalized_target:
+            return None
+        lanes = self._normalize_track_automation_lanes(track)
+        for lane in lanes:
+            if str(lane.target).casefold() == normalized_target.casefold():
+                return lane
+        if not create:
+            return None
+        if normalized_target not in self._available_track_automation_targets(track) and not automation_target_is_vst_parameter(normalized_target):
+            return None
+        default_value = self._automation_target_default_value(track, normalized_target)
+        lane = AutomationLane(
+            target=normalized_target,
+            enabled=True,
+            points=[AutomationPoint(tick=0, value=float(default_value))],
+        )
+        lanes.append(lane)
+        track.automation_lanes = lanes
+        return lane
+
+    def _track_has_enabled_automation(
+        self,
+        track: TrackState,
+        targets: tuple[str, ...] | list[str] | set[str] | None = None,
+    ) -> bool:
+        target_set = None if targets is None else {str(target) for target in targets}
+        for lane in self._normalize_track_automation_lanes(track):
+            if not lane.enabled or not lane.points:
+                continue
+            if target_set is None or str(lane.target) in target_set:
+                return True
+        return False
+
+    def _track_automation_parameter_values_at_tick(self, track: TrackState, tick: int) -> dict[str, float]:
+        values = {str(key): float(value) for key, value in track.vsti_parameters.items()}
+        for lane in self._normalize_track_automation_lanes(track):
+            if not lane.enabled or not lane.points or not automation_target_is_vst_parameter(lane.target):
+                continue
+            parameter_name = automation_target_parameter_name(lane.target)
+            if not parameter_name:
+                continue
+            values[parameter_name] = float(
+                self._automation_value_at_tick(
+                    track,
+                    lane.target,
+                    tick,
+                    default_value=float(values.get(parameter_name, 0.0)),
+                )
+            )
+        return values
+
+    def _automation_points_signature(self, track: TrackState) -> tuple[tuple[object, ...], ...]:
+        signature: list[tuple[object, ...]] = []
+        for lane in self._normalize_track_automation_lanes(track):
+            signature.append(
+                (
+                    str(lane.target),
+                    bool(lane.enabled),
+                    tuple(
+                        (int(point.tick), round(float(point.value), 6))
+                        for point in lane.points
+                    ),
+                )
+            )
+        return tuple(signature)
+
+    def _automation_value_at_tick(
+        self,
+        track: TrackState,
+        target: str,
+        tick: int,
+        *,
+        default_value: float | None = None,
+    ) -> float:
+        lane = self._track_automation_lane(track, target)
+        if lane is None or not lane.enabled or not lane.points:
+            return float(
+                self._automation_target_default_value(track, target)
+                if default_value is None
+                else default_value
+            )
+        points = lane.points
+        clamped_tick = max(0, int(tick))
+        base_value = float(
+            self._automation_target_default_value(track, target)
+            if default_value is None
+            else default_value
+        )
+        if len(points) == 1:
+            point = points[0]
+            return float(point.value if clamped_tick >= int(point.tick) else base_value)
+        previous_tick = 0
+        previous_value = base_value
+        for point in points:
+            point_tick = int(point.tick)
+            point_value = float(point.value)
+            if point_tick <= 0:
+                previous_tick = point_tick
+                previous_value = point_value
+                if clamped_tick <= 0:
+                    return point_value
+                continue
+            if clamped_tick < point_tick:
+                if previous_tick <= 0:
+                    return previous_value
+                span = max(1, point_tick - previous_tick)
+                progress = max(0.0, min(1.0, (clamped_tick - previous_tick) / float(span)))
+                return previous_value + ((point_value - previous_value) * progress)
+            previous_tick = point_tick
+            previous_value = point_value
+        return previous_value
+
+    def _automation_frame_values(
+        self,
+        track: TrackState,
+        target: str,
+        start_frame: int,
+        frame_count: int,
+        sample_rate: int,
+        *,
+        default_value: float | None = None,
+    ) -> object:
+        count = max(1, int(frame_count))
+        base_value = float(
+            self._automation_target_default_value(track, target)
+            if default_value is None
+            else default_value
+        )
+        lane = self._track_automation_lane(track, target)
+        if lane is None or not lane.enabled or not lane.points:
+            if np is not None:
+                return np.full(count, base_value, dtype=np.float32)
+            return [base_value] * count
+        values = [
+            float(
+                self._automation_value_at_tick(
+                    track,
+                    target,
+                    sample_frame_to_tick(int(start_frame) + offset, int(sample_rate), self.project.bpm),
+                    default_value=base_value,
+                )
+            )
+            for offset in range(count)
+        ]
+        if np is not None:
+            return np.asarray(values, dtype=np.float32)
+        return values
+
     def _project_quantize_text(self) -> str:
         if not getattr(self.project, 'quantize_enabled', True):
             return 'Off'
@@ -6444,6 +7478,8 @@ class MainWindow(QtWidgets.QMainWindow):
             track.solo = bool(raw_track.get('solo', False))
             track.live_armed = bool(raw_track.get('live_armed', False))
             track.color_hex = str(raw_track.get('color_hex') or '')
+            track.automation_lanes = list(raw_track.get('automation_lanes', [])) if isinstance(raw_track.get('automation_lanes'), list) else []
+            track.automation_lanes = self._sanitize_track_automation_lanes(track)
             tracks.append(track)
             blob = self._decode_project_blob(raw_track.get('vsti_state_b64'))
             if blob:
@@ -6545,6 +7581,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _set_project_references(self, project: ProjectState) -> None:
         self.project = project
+        for track in self.project.tracks:
+            track.automation_lanes = self._sanitize_track_automation_lanes(track)
         self.timeline.project = project
         self.piano_roll.project = project
         self.velocity_editor.project = project
@@ -6552,6 +7590,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.arrangement_overview.project = project
         self.mixer.project = project
         self.instruments.project = project
+        self.automation_editor.project = project
         self._track_meter_levels = {}
         self._native_track_meter_levels = {}
 
@@ -6656,6 +7695,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.arrangement_overview.refresh()
         self.piano_roll.refresh()
         self.velocity_editor.refresh()
+        self.automation_editor.load_track()
         self.refresh_vsti_rack_ui()
 
         selected_track = self._coerce_int((ui_state or {}).get('selected_track_index'), 0, 0, max(0, len(self.project.tracks) - 1))
@@ -6838,6 +7878,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.arrangement_overview.update_overlay_items()
         self.piano_roll.update_overlay_items()
         self.velocity_editor.update_overlay_items()
+        self.automation_editor.refresh_view_state()
         self.timeline.update_locator_header()
 
     def _invalidate_playback_caches(self, clear_track_audio: bool = True, *, reset_realtime: bool = True) -> None:
@@ -7496,8 +8537,160 @@ class MainWindow(QtWidgets.QMainWindow):
             slot_tracks.append((int(slot_index), int(row), track, entry))
         return slot_tracks
 
+    def _clear_native_audio_engine_state(self) -> None:
+        for row in list(getattr(self, '_native_audio_engine_track_rows', []) or []):
+            self._native_track_meter_levels.pop(int(row), None)
+        self._native_audio_engine_track_rows = []
+        self._native_audio_engine_running = False
+        self._native_audio_engine_position_frame = 0
+
+    def _native_audio_engine_active(self) -> bool:
+        return (
+            bool(getattr(self, '_native_audio_engine_running', False))
+            and self._native_output_bridge_alive()
+        )
+
+    @staticmethod
+    def _native_audio_engine_client(bridge: object | None) -> object | None:
+        if bridge is None or NativeAudioEngineClient is None:
+            return None
+        client = getattr(bridge, '_aims_native_audio_engine_client', None)
+        if client is None or getattr(client, 'bridge', None) is not bridge:
+            client = NativeAudioEngineClient(bridge)
+            setattr(bridge, '_aims_native_audio_engine_client', client)
+        return client
+
+    def _track_can_use_native_audio_engine(self, track: TrackState, entry: VSTInstrument | None) -> bool:
+        if track.track_type != 'instrument' or not track.notes:
+            return False
+        if entry is None or not entry.is_instrument or not entry.host_supported:
+            return False
+        if not self._can_use_native_vst_host(entry):
+            return False
+        if abs(float(track.vsti_wet_mix) - 100.0) > 0.001:
+            return False
+        if any(bool(route.get('enabled', False)) for route in self._sanitize_vsti_input_bus_routes(track.vsti_input_bus_routes)):
+            return False
+        if any(bool(route.get('enabled', False)) for route in self._sanitize_vsti_output_bus_routes(track.vsti_output_bus_routes)):
+            return False
+        return True
+
+    def _native_audio_engine_render_cache_dir(self) -> Path:
+        cache_dir = RENDER_DIR / '_native_audio_engine_tracks'
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir
+
+    def _native_audio_engine_render_cache_key(
+        self,
+        idx: int,
+        track: TrackState,
+        sample_rate: int,
+    ) -> str:
+        return self._cache_payload_hash(
+            {
+                'idx': int(idx),
+                'sample_rate': int(sample_rate),
+                'audio': self._track_audio_cache_key(track, idx),
+                'automation': self._automation_points_signature(track),
+            }
+        )
+
+    def _ensure_native_audio_engine_rendered_track_path(
+        self,
+        idx: int,
+        track: TrackState,
+        sample_rate: int,
+    ) -> Path:
+        cache_key = self._native_audio_engine_render_cache_key(idx, track, sample_rate)
+        output_path = self._native_audio_engine_render_cache_dir() / f'{cache_key}.wav'
+        if output_path.exists():
+            return output_path
+        data, rendered_sample_rate = self._render_track_audio(track, target_sample_rate=int(sample_rate))
+        if int(rendered_sample_rate) != int(sample_rate):
+            data = resample_samples(data, rendered_sample_rate, sample_rate)
+            rendered_sample_rate = sample_rate
+        write_wav_samples(output_path, data, int(rendered_sample_rate))
+        return output_path
+
+    def _native_audio_engine_clip_source_path(self, path: str) -> str:
+        clip_path = Path(path)
+        if clip_path.suffix.lower() != '.mp3':
+            return str(clip_path.resolve()) if clip_path.exists() else str(path)
+        converted = RENDER_DIR / f'{clip_path.stem}_native_engine.wav'
+        if not converted.exists() or self._path_mtime_ns(converted) < self._path_mtime_ns(clip_path):
+            convert_audio(clip_path, converted)
+        return str(converted.resolve()) if converted.exists() else str(converted)
+
+    def _native_audio_engine_sample_track_clips(
+        self,
+        idx: int,
+        sample_rate: int,
+    ) -> list[dict[str, object]]:
+        clips: list[dict[str, object]] = []
+        for clip in getattr(self.project, 'sample_clips', []):
+            if int(clip.track_index) != int(idx):
+                continue
+            clips.append(
+                {
+                    'path': self._native_audio_engine_clip_source_path(str(clip.path)),
+                    'start_frame': int(round(float(clip.start_sec) * float(sample_rate))),
+                }
+            )
+        clips.sort(key=lambda current: (int(current.get('start_frame', 0) or 0), str(current.get('path', ''))))
+        return clips
+
+    def _native_audio_engine_candidates(self) -> list[tuple[int, TrackState, VSTInstrument | None]]:
+        if not self._native_output_bridge_supported():
+            return []
+
+        solo_tracks = self._active_solo_track_indices()
+        sample_track_rows = {
+            int(clip.track_index)
+            for clip in getattr(self.project, 'sample_clips', [])
+            if 0 <= int(clip.track_index) < len(self.project.tracks)
+        }
+        candidates: list[tuple[int, TrackState, VSTInstrument | None]] = []
+        for idx, track in enumerate(self.project.tracks):
+            if not self._track_is_audible(idx, solo_tracks):
+                continue
+            if track.track_type == 'sample':
+                if idx in sample_track_rows:
+                    candidates.append((idx, track, None))
+                continue
+            if track.track_type != 'instrument' or not track.notes:
+                continue
+            entry = self._native_instrument_entry_for_track(track)
+            if entry is not None and self._track_can_use_native_audio_engine(track, entry):
+                candidates.append((idx, track, entry))
+                continue
+            candidates.append((idx, track, None))
+        return candidates
+
+    def _should_use_native_audio_engine_transport(self) -> bool:
+        if not self._native_output_bridge_supported():
+            return False
+        return bool(self.project.metronome_enabled) or bool(self._native_audio_engine_candidates())
+
+    def _native_bridge_transport_owned_rows(self) -> set[int]:
+        rows: set[int] = set()
+        if self._graph_native_transport_active():
+            rows.update(self._graph_native_transport_row_set())
+        if self._direct_native_transport_active():
+            direct_row = int(getattr(self, '_direct_native_transport_row', -1) or -1)
+            if direct_row >= 0:
+                rows.add(direct_row)
+        if self._native_audio_engine_active():
+            rows.update(
+                int(row)
+                for row in getattr(self, '_native_audio_engine_track_rows', [])
+                if int(row) >= 0
+            )
+        return rows
+
     def _track_can_use_direct_native_transport(self, track: TrackState, entry: VSTInstrument | None) -> bool:
         if entry is None or not entry.is_instrument or not entry.host_supported or not self._can_use_native_vst_host(entry):
+            return False
+        if self._track_has_enabled_automation(track):
             return False
         if bool(track.vst_fx_chain):
             return False
@@ -7898,7 +9091,12 @@ class MainWindow(QtWidgets.QMainWindow):
         ):
             self._native_output_async_warm_poll_timer.stop()
 
+        if self._native_output_bridge_alive() and self._pending_playback_start_tick is not None:
+            self._flush_queued_playback_start(int(self._pending_playback_start_tick))
+
     def _resume_pending_playback_start(self, tick: int) -> None:
+        if hasattr(self, '_pending_playback_start_retry_timer'):
+            self._pending_playback_start_retry_timer.stop()
         if bool(getattr(self, '_shutdown_complete', False)) or bool(getattr(self, '_playback_active', False)):
             return
         start_tick = int(tick)
@@ -7917,6 +9115,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(
                 f'Playback started at {self.project.bpm} BPM (multi-VST prerender fallback)'
             )
+        elif self._native_audio_engine_active():
+            self.statusBar().showMessage(f'Playback started at {self.project.bpm} BPM (unified native audio engine)')
         elif self._graph_native_transport_active():
             self.statusBar().showMessage(f'Playback started at {self.project.bpm} BPM (native graph transport)')
         else:
@@ -7943,6 +9143,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._transport_uses_native_output_bridge = False
         self._clear_direct_native_transport_state()
         self._clear_graph_native_transport_state()
+        self._clear_native_audio_engine_state()
         if bridge is None:
             return
         try:
@@ -8670,6 +9871,7 @@ class MainWindow(QtWidgets.QMainWindow):
         frame_count: int,
         *,
         return_mono: bool,
+        apply_track_gain: bool = True,
     ) -> object:
         route_by_bus = {
             int(route.get('bus_index', 0)): route
@@ -8710,7 +9912,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     stereo_mix[0][pos] += float(stereo[0][pos]) * gain_linear * left_gain
                     stereo_mix[1][pos] += float(stereo[1][pos]) * gain_linear * right_gain
 
-        overall_gain = max(0.0, float(track.volume)) * (10.0 ** (float(track.vsti_output_gain_db) / 20.0))
+        overall_gain = (
+            max(0.0, float(track.volume)) * (10.0 ** (float(track.vsti_output_gain_db) / 20.0))
+            if apply_track_gain
+            else 1.0
+        )
         if np is not None and isinstance(stereo_mix, np.ndarray):
             stereo_mix = np.asarray(stereo_mix, dtype=np.float32) * overall_gain
             return self._as_mono_audio(stereo_mix) if return_mono else stereo_mix
@@ -8990,7 +10196,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if info is None:
             return False
         if hasattr(self, 'playback_timer') and self.playback_timer.isActive():
-            self.statusBar().showMessage('Live MIDI monitoring uses the shared JUCE engine when transport is stopped.')
             return False
         idx, track, entry = info
         msg_type = str(getattr(msg, 'type', '') or '').lower()
@@ -9276,6 +10481,21 @@ class MainWindow(QtWidgets.QMainWindow):
         ):
             self._warm_native_vst_host_for_track(row, delay_ms=delay_ms)
             self._schedule_native_output_bridge_warm(delay_ms=delay_ms)
+
+    def _suspend_track_native_vst_hosts_for_transport(self) -> None:
+        for timer in list(getattr(self, '_native_vst_host_warm_timers', {}).values()):
+            try:
+                timer.stop()
+            except Exception:
+                pass
+        self._release_live_midi_host()
+        open_rows = (
+            {int(row) for row in getattr(self, '_track_vsti_windows', {}).keys()}
+            | {int(row) for row in getattr(self, '_track_native_vst_host_bridges', {}).keys()}
+        )
+        for row in sorted(open_rows, reverse=True):
+            self._close_track_vsti_window(int(row), teardown_host=True, suppress_finished_reload=True)
+            self._stop_native_vst_host_bridge(int(row), capture_state=False)
 
     def _preview_note_with_native_vst_host(
         self,
@@ -10126,6 +11346,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         if self._graph_native_transport_active():
             return row_set.issubset(self._graph_native_transport_row_set())
+        if self._native_audio_engine_active():
+            return False
         if self._direct_native_transport_active():
             direct_row = int(getattr(self, '_direct_native_transport_row', -1) or -1)
             return bool(row_set) and row_set == {direct_row}
@@ -10732,6 +11954,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def set_metronome_enabled(self, enabled: bool) -> None:
         self.project.metronome_enabled = bool(enabled)
         self._clear_realtime_mix_cache()
+        if hasattr(self, 'playback_timer') and self.playback_timer.isActive():
+            if self._native_audio_engine_active():
+                if not self._update_active_native_audio_engine_transport_state():
+                    self._schedule_transport_reprepare(reason='metronome change', delay_ms=0)
+            else:
+                self._schedule_transport_reprepare(reason='metronome change', delay_ms=0)
         self._refresh_transport_controls()
         self.statusBar().showMessage('Metronome enabled' if self.project.metronome_enabled else 'Metronome disabled')
 
@@ -10746,6 +11974,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self._playback_committed_total_bytes = 0
         self._playback_pending_bytes.clear()
         self._native_output_queued_frames = 0
+        if self._seek_active_native_audio_engine(target_tick):
+            self._loop_declick_pending_frames = 0
+            self._realtime_reset_pending = True
+            self._clear_realtime_mix_cache()
+            return
+        if self._native_audio_engine_active():
+            self._schedule_transport_reprepare(reason='transport seek', delay_ms=0)
+            self._loop_declick_pending_frames = 0
+            self._realtime_reset_pending = True
+            self._clear_realtime_mix_cache()
+            return
         if bool(getattr(self, '_transport_uses_native_output_bridge', False)) and not self._direct_native_transport_active():
             bridge = getattr(self, '_native_output_bridge', None)
             if bridge is not None:
@@ -10845,6 +12084,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.arrangement_overview.update_overlay_items()
             self.piano_roll.update_overlay_items()
             self.velocity_editor.update_overlay_items()
+        self.automation_editor.refresh_view_state()
 
     def set_playhead_position(self, sec: float, playback_tick: bool = False) -> None:
         self._set_playhead_tick_position(self._transport_seconds_to_tick(sec), playback_tick=playback_tick)
@@ -10857,9 +12097,13 @@ class MainWindow(QtWidgets.QMainWindow):
         direct_row = self._direct_native_transport_row
         live_direct_row = self._live_midi_direct_output_row
         graph_transport_active = self._graph_native_transport_active()
+        native_audio_engine_active = self._native_audio_engine_active()
+        if native_audio_engine_active:
+            self._stop_native_audio_engine()
         self._stop_realtime_audio_sink(cleanup_bridge=False)
         stop_generation = int(self._realtime_pump_generation)
         self._clear_direct_native_transport_state()
+        self._clear_native_audio_engine_state()
         self._realtime_reset_pending = True
         self._schedule_deferred_playback_stop_cleanup(
             direct_row=direct_row,
@@ -10939,32 +12183,14 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         try:
             current_tick = int(self._current_audible_playback_tick())
-            graph_tracks = []
-            if not bool(getattr(self, 'prefer_prerendered_vst_playback', False)):
-                graph_tracks = self._graph_native_transport_candidates()
-            if graph_tracks:
-                graph_signature = self._native_output_bridge_target_signature(None)
-                if not self._native_output_bridge_matches_signature(graph_signature):
-                    self.stop_playback()
-                    self._set_playhead_tick_position(current_tick)
-                    self._queue_pending_playback_start(current_tick)
-                    if self._begin_async_native_output_bridge_warm():
-                        self.statusBar().showMessage('Starting JUCE graph transport...')
-                        return
-                    self._pending_playback_start_tick = None
-            direct_plugin = None
-            if not graph_tracks and not bool(getattr(self, 'prefer_prerendered_vst_playback', False)):
-                direct_plugin = self._direct_native_transport_candidate()
-            if direct_plugin is not None:
-                signature = self._native_output_bridge_target_signature(direct_plugin)
-                if not self._native_output_bridge_matches_signature(signature):
-                    self.stop_playback()
-                    self._set_playhead_tick_position(current_tick)
-                    self._queue_pending_playback_start(current_tick)
-                    if self._begin_async_native_output_bridge_warm(direct_plugin=direct_plugin):
-                        self.statusBar().showMessage(f'Loading {direct_plugin[2].name}...')
-                        return
-                    self._pending_playback_start_tick = None
+            if self._should_use_native_audio_engine_transport() and not self._native_output_bridge_alive():
+                self.stop_playback()
+                self._set_playhead_tick_position(current_tick)
+                self._queue_pending_playback_start(current_tick)
+                if self._begin_async_native_output_bridge_warm():
+                    self.statusBar().showMessage('Starting unified JUCE audio engine...')
+                    return
+                self._pending_playback_start_tick = None
             self._restart_playback_preserving_tick()
         except Exception:
             _APP_LOGGER.exception(
@@ -11069,50 +12295,81 @@ class MainWindow(QtWidgets.QMainWindow):
             0,
             lambda tick=requested_tick: self._flush_queued_playback_start(tick),
         )
+        if hasattr(self, '_pending_playback_start_retry_timer'):
+            self._pending_playback_start_retry_timer.start()
+
+    def _flush_pending_playback_start_retry(self) -> None:
+        pending_tick = self._pending_playback_start_tick
+        if pending_tick is None:
+            return
+        if bool(getattr(self, '_playback_active', False)) or bool(hasattr(self, 'playback_timer') and self.playback_timer.isActive()):
+            return
+        if not self._native_output_bridge_alive():
+            # Drain any completed warm result before retrying. Without this,
+            # the retry timer can race the async warm poller and invalidate a
+            # healthy bridge by starting a fresh warm just before the queued
+            # "ready" result is attached.
+            self._poll_async_native_output_bridge_warm()
+            pending_tick = self._pending_playback_start_tick
+            if pending_tick is None:
+                return
+            if bool(getattr(self, '_playback_active', False)) or bool(hasattr(self, 'playback_timer') and self.playback_timer.isActive()):
+                return
+            current_thread = getattr(self, '_native_output_async_warm_thread', None)
+            if current_thread is not None and current_thread.is_alive():
+                if hasattr(self, '_pending_playback_start_retry_timer'):
+                    self._pending_playback_start_retry_timer.start()
+                return
+        self._flush_queued_playback_start(int(pending_tick))
+        if (
+            self._pending_playback_start_tick is not None
+            and not bool(getattr(self, '_playback_active', False))
+            and hasattr(self, '_pending_playback_start_retry_timer')
+        ):
+            self._pending_playback_start_retry_timer.start()
 
     def _flush_queued_playback_start(self, start_tick: int) -> None:
         requested_tick = int(start_tick)
         pending_tick = self._pending_playback_start_tick
         if pending_tick is None or int(pending_tick) != requested_tick:
+            if pending_tick is None and hasattr(self, '_pending_playback_start_retry_timer'):
+                self._pending_playback_start_retry_timer.stop()
             return
         if bool(getattr(self, '_shutdown_complete', False)):
             self._pending_playback_start_tick = None
+            if hasattr(self, '_pending_playback_start_retry_timer'):
+                self._pending_playback_start_retry_timer.stop()
             self._refresh_transport_controls()
             return
         if bool(getattr(self, '_playback_active', False)) or bool(hasattr(self, 'playback_timer') and self.playback_timer.isActive()):
             self._pending_playback_start_tick = None
+            if hasattr(self, '_pending_playback_start_retry_timer'):
+                self._pending_playback_start_retry_timer.stop()
             self._refresh_transport_controls()
             return
-        direct_plugin = None
-        if not bool(getattr(self, 'prefer_prerendered_vst_playback', False)):
-            direct_plugin = self._direct_native_transport_candidate()
-        if direct_plugin is not None:
-            signature = self._native_output_bridge_target_signature(direct_plugin)
-            if not self._native_output_bridge_matches_signature(signature):
-                if self._begin_async_native_output_bridge_warm(direct_plugin=direct_plugin):
-                    self.statusBar().showMessage(f'Loading {direct_plugin[2].name}...')
-                    self._refresh_transport_controls()
-                    return
-        graph_tracks = []
-        if direct_plugin is None and not bool(getattr(self, 'prefer_prerendered_vst_playback', False)):
-            graph_tracks = self._graph_native_transport_candidates()
-        if graph_tracks:
-            signature = self._native_output_bridge_target_signature(None)
-            if not self._native_output_bridge_matches_signature(signature):
-                if self._begin_async_native_output_bridge_warm():
-                    self.statusBar().showMessage('Starting JUCE graph transport...')
-                    self._refresh_transport_controls()
-                    return
+        if self._should_use_native_audio_engine_transport() and not self._native_output_bridge_alive():
+            if self._begin_async_native_output_bridge_warm():
+                self.statusBar().showMessage('Starting unified JUCE audio engine...')
+                self._refresh_transport_controls()
+                return
         self._pending_playback_start_tick = None
+        if hasattr(self, '_pending_playback_start_retry_timer'):
+            self._pending_playback_start_retry_timer.stop()
         self._resume_pending_playback_start(requested_tick)
 
     def _reload_playback_mix_if_running(self) -> None:
         if not hasattr(self, 'playback_timer') or not self.playback_timer.isActive():
             return
+        if self._native_audio_engine_active() or self._should_use_native_audio_engine_transport():
+            self._schedule_transport_reprepare(reason='transport edit', delay_ms=90)
+            return
         if self._graph_native_transport_active() or self._direct_native_transport_active():
             if self._try_live_safe_active_native_transport_refresh():
                 return
             self._schedule_transport_reprepare(reason='transport edit', delay_ms=90)
+            return
+        if not bool(getattr(self, 'prefer_prerendered_vst_playback', False)) and self._native_audio_engine_candidates():
+            self._schedule_transport_reprepare(reason='transport mode change', delay_ms=90)
             return
         if not bool(getattr(self, 'prefer_prerendered_vst_playback', False)):
             if self._graph_native_transport_candidates() or self._direct_native_transport_candidate() is not None:
@@ -11291,16 +12548,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self._schedule_deferred_note_refresh(reload_mix=True)
 
     def _has_realtime_playable_audio(self) -> bool:
+        if bool(getattr(self.project, 'metronome_enabled', False)):
+            return True
         if any(track.track_type == 'instrument' and track.notes for track in self.project.tracks):
             return True
         return any(0 <= clip.track_index < len(self.project.tracks) for clip in self.project.sample_clips)
 
     def _shared_native_output_has_pcm_transport_audio(self) -> bool:
+        if self._native_audio_engine_active():
+            return False
         if bool(getattr(self.project, 'metronome_enabled', False)):
             return True
         solo_tracks = self._active_solo_track_indices()
-        graph_rows = self._graph_native_transport_row_set() if self._graph_native_transport_active() else set()
-        direct_row = int(getattr(self, '_direct_native_transport_row', -1) or -1) if self._direct_native_transport_active() else -1
+        native_owned_rows = self._native_bridge_transport_owned_rows()
         sample_track_rows = {
             int(clip.track_index)
             for clip in getattr(self.project, 'sample_clips', [])
@@ -11309,7 +12569,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for idx, track in enumerate(self.project.tracks):
             if not self._track_is_audible(idx, solo_tracks):
                 continue
-            if idx in graph_rows or idx == direct_row:
+            if idx in native_owned_rows:
                 continue
             if track.track_type == 'instrument' and track.notes:
                 return True
@@ -11460,6 +12720,131 @@ class MainWindow(QtWidgets.QMainWindow):
             bridge.clear_audio_queue(reset_counters=False, stream_id=str(stream_id))
         response = bridge.queue_audio(payload, channels=2, stream_id=str(stream_id))
         return bool(response.get('ok', True))
+
+    def _stop_native_audio_engine(self, bridge: object | None = None) -> None:
+        target = bridge or getattr(self, '_native_output_bridge', None)
+        client = self._native_audio_engine_client(target)
+        if client is None:
+            return
+        try:
+            client.stop()
+            self._native_audio_engine_running = False
+        except Exception:
+            _APP_LOGGER.debug("stop_audio_engine failed (bridge may be closed)")
+
+    def _update_active_native_audio_engine_transport_state(self) -> bool:
+        if not self._native_audio_engine_active():
+            return False
+        bridge = getattr(self, '_native_output_bridge', None)
+        client = self._native_audio_engine_client(bridge)
+        if client is None:
+            return False
+        loop_start_tick, loop_end_tick = self._loop_tick_bounds() if self.project.loop_enabled else (0, 0)
+        try:
+            status = client.update_transport(
+                bpm=float(max(1, self.project.bpm)),
+                ticks_per_beat=TICKS_PER_BEAT,
+                loop_enabled=bool(self.project.loop_enabled),
+                loop_start_tick=int(loop_start_tick),
+                loop_end_tick=int(loop_end_tick),
+                metronome_enabled=bool(getattr(self.project, 'metronome_enabled', False)),
+            )
+        except Exception:
+            _APP_LOGGER.exception("Failed updating active native audio engine transport")
+            return False
+        self._cache_native_output_status(bridge, status)
+        self._native_audio_engine_running = bool(status.get('audio_engine_running', self._native_audio_engine_running))
+        self._native_audio_engine_position_frame = int(status.get('audio_engine_position_frame', self._native_audio_engine_position_frame) or 0)
+        return True
+
+    def _seek_active_native_audio_engine(self, start_tick: int) -> bool:
+        if not self._native_audio_engine_active():
+            return False
+        bridge = getattr(self, '_native_output_bridge', None)
+        client = self._native_audio_engine_client(bridge)
+        if client is None:
+            return False
+        try:
+            if not self._update_active_native_audio_engine_transport_state():
+                return False
+            status = client.seek(int(start_tick))
+        except Exception:
+            _APP_LOGGER.exception("Failed seeking active native audio engine transport")
+            return False
+        self._cache_native_output_status(bridge, status)
+        self._native_audio_engine_running = bool(status.get('audio_engine_running', self._native_audio_engine_running))
+        self._native_audio_engine_position_frame = int(status.get('audio_engine_position_frame', 0) or 0)
+        self._playback_frame_position = int(self._native_audio_engine_position_frame)
+        self._playback_logical_origin_frame = int(self._native_audio_engine_position_frame)
+        self._cancel_pending_transport_reprepare()
+        return True
+
+    def _prepare_native_audio_engine_playback(
+        self,
+        start_tick: int,
+        candidate_tracks: list[tuple[int, TrackState, VSTInstrument | None]],
+    ) -> bool:
+        bridge = self._ensure_native_output_bridge()
+        if bridge is None:
+            return False
+        client = self._native_audio_engine_client(bridge)
+        if client is None:
+            return False
+
+        payload_tracks = self._build_native_audio_engine_payload_tracks(candidate_tracks)
+        loop_start_tick, loop_end_tick = self._loop_tick_bounds() if self.project.loop_enabled else (0, 0)
+
+        try:
+            bridge.clear_audio_queue(reset_counters=True, stream_id='main')
+            bridge.clear_audio_queue(reset_counters=True, stream_id='preview')
+            bridge.clear_audio_queue(reset_counters=True, stream_id='live_midi')
+            self._stop_inprocess_transport(bridge)
+            try:
+                bridge.command('stop_graph_transport', panic=True)
+            except Exception:
+                _APP_LOGGER.debug("stop_graph_transport failed before audio engine start")
+            client.set_tracks(
+                payload_tracks,
+                bpm=float(max(1, self.project.bpm)),
+                ticks_per_beat=TICKS_PER_BEAT,
+                loop_enabled=bool(self.project.loop_enabled),
+                loop_start_tick=int(loop_start_tick),
+                loop_end_tick=int(loop_end_tick),
+                metronome_enabled=bool(getattr(self.project, 'metronome_enabled', False)),
+            )
+            status = client.play(int(start_tick))
+        except Exception:
+            _APP_LOGGER.exception("Failed starting native audio engine transport")
+            return False
+        if not bool(status.get('audio_engine_running', False)):
+            _APP_LOGGER.error("Native audio engine start returned non-running status: %s", status)
+            return False
+
+        start_frame = int(
+            status.get(
+                'audio_engine_position_frame',
+                tick_to_sample_frame(int(start_tick), self._playback_sample_rate, self.project.bpm),
+            )
+            or 0
+        )
+        self._clear_direct_native_transport_state()
+        self._clear_graph_native_transport_state()
+        self._clear_native_audio_engine_state()
+        self._native_audio_engine_track_rows = [int(row) for row, _track, _entry in candidate_tracks]
+        self._native_audio_engine_running = bool(status.get('audio_engine_running', False))
+        self._native_audio_engine_position_frame = int(start_frame)
+        self._playback_logical_origin_frame = int(start_frame)
+        self._playback_frame_position = int(start_frame)
+        self._transport_uses_native_output_bridge = True
+        self._playback_active = True
+        self._use_inprocess_transport = False
+        self._cache_native_output_status(bridge, status)
+        self._set_native_track_meter_levels(self._native_audio_engine_track_peak_levels(status))
+        self._update_track_meter_levels(self._native_track_meter_levels)
+        self._audio_pump_timer.start()
+        generation = self._realtime_pump_generation
+        QtCore.QTimer.singleShot(0, lambda g=generation: self._pump_realtime_audio(g))
+        return True
 
     def _send_transport_notes_to_bridge(self, bridge: object, track: TrackState) -> bool:
         """Send the track's note list to the C++ host for in-process scheduling."""
@@ -11708,43 +13093,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._transport_uses_native_output_bridge = False
         self._use_prerendered_transport_mix = False
         self._auto_forced_prerender_vst_transport = False
-        if not bool(getattr(self, 'prefer_prerendered_vst_playback', False)):
-            # Prefer direct transport (in-process, sample-accurate) for single
-            # VSTi tracks before falling back to the graph transport path.
-            direct_plugin = self._direct_native_transport_candidate()
-            if direct_plugin is not None:
-                try:
-                    if self._prepare_direct_native_transport_playback(int(start_tick), direct_plugin):
-                        return True
-                except Exception:
-                    _APP_LOGGER.exception("Failed starting direct JUCE transport, falling back to graph/PCM playback")
-                    self._stop_native_output_bridge()
-                    self._clear_direct_native_transport_state()
-            graph_tracks = self._graph_native_transport_candidates()
-            if graph_tracks:
-                try:
-                    if self._prepare_graph_native_transport_playback(int(start_tick), graph_tracks):
-                        return True
-                except Exception:
-                    _APP_LOGGER.exception("Failed starting native graph transport, falling back to existing transport modes")
-                    self._stop_native_output_bridge()
-        force_prerender = self._should_force_prerendered_transport_playback()
-        if bool(getattr(self, 'prefer_prerendered_vst_playback', False)) or force_prerender:
+        if self._should_use_native_audio_engine_transport():
+            clean_engine_tracks = self._native_audio_engine_candidates()
             try:
-                self._use_prerendered_transport_mix = self._build_playback_mix()
-                self._auto_forced_prerender_vst_transport = bool(force_prerender and self._use_prerendered_transport_mix)
-            except Exception:
-                self._use_prerendered_transport_mix = False
-                self._auto_forced_prerender_vst_transport = False
-                _APP_LOGGER.exception("Failed building prerendered transport mix")
-            if self._use_prerendered_transport_mix:
-                self._apply_audio_buffer_preference()
-        if self._native_output_bridge_supported():
-            try:
-                if self._prepare_native_output_playback():
+                if self._prepare_native_audio_engine_playback(int(start_tick), clean_engine_tracks):
                     return True
             except Exception:
-                _APP_LOGGER.exception("Failed starting shared JUCE output transport")
+                _APP_LOGGER.exception("Failed starting unified native audio engine transport")
                 self._stop_native_output_bridge()
         self._playback_pending_bytes.clear()
         return False
@@ -11956,6 +13311,115 @@ class MainWindow(QtWidgets.QMainWindow):
         right = [float(sample) * right_gain for sample in data]
         return [left, right]
 
+    def _track_static_gain_linear(self, track: TrackState) -> float:
+        base_gain = max(0.0, float(track.volume))
+        if track.track_type == 'instrument':
+            base_gain *= 10.0 ** (float(track.vsti_output_gain_db) / 20.0)
+        return float(base_gain)
+
+    def _track_render_source_state(self, track: TrackState) -> TrackState:
+        gain_automation_targets = {AUTOMATION_TARGET_VOLUME, AUTOMATION_TARGET_VST_OUTPUT_GAIN_DB}
+        if not self._track_has_enabled_automation(track, gain_automation_targets):
+            return track
+        return dataclasses.replace(
+            track,
+            volume=1.0,
+            vsti_output_gain_db=0.0 if track.track_type == 'instrument' else float(track.vsti_output_gain_db),
+        )
+
+    def _apply_stereo_gain_envelope(self, stereo: object, gain_values: object) -> object:
+        if np is not None and isinstance(stereo, np.ndarray):
+            output = np.asarray(stereo, dtype=np.float32).copy()
+            gains = np.asarray(gain_values, dtype=np.float32)
+            output[0] *= gains
+            output[1] *= gains
+            return output
+        left = [float(value) * float(gain_values[index]) for index, value in enumerate(stereo[0])]
+        right = [float(value) * float(gain_values[index]) for index, value in enumerate(stereo[1])]
+        return [left, right]
+
+    def _apply_pan_envelope_to_stereo(self, stereo: object, pan_values: object) -> object:
+        sample_count = int(stereo.shape[-1]) if np is not None and isinstance(stereo, np.ndarray) else len(stereo[0]) if isinstance(stereo, (list, tuple)) and stereo else 0
+        if sample_count <= 0:
+            return stereo
+        if np is not None and isinstance(stereo, np.ndarray):
+            output = np.asarray(stereo, dtype=np.float32).copy()
+            pans = np.asarray(pan_values, dtype=np.float32)
+            angles = (np.clip(pans, -1.0, 1.0) + 1.0) * (math.pi * 0.25)
+            output[0] *= np.cos(angles).astype(np.float32, copy=False)
+            output[1] *= np.sin(angles).astype(np.float32, copy=False)
+            return output.astype(np.float32, copy=False)
+        left: list[float] = []
+        right: list[float] = []
+        for index in range(sample_count):
+            left_gain, right_gain = self._pan_gains(float(pan_values[index]))
+            left.append(float(stereo[0][index]) * left_gain)
+            right.append(float(stereo[1][index]) * right_gain)
+        return [left, right]
+
+    def _apply_track_mix_automation_to_audio(
+        self,
+        audio: object,
+        track: TrackState,
+        start_frame: int,
+        sample_rate: int,
+        *,
+        gain_already_applied: bool = False,
+        pan_already_applied: bool = False,
+    ) -> object:
+        frame_count = int(audio.shape[-1]) if np is not None and isinstance(audio, np.ndarray) else len(audio[0]) if isinstance(audio, (list, tuple)) and audio and isinstance(audio[0], (list, tuple)) else len(audio) if isinstance(audio, (list, tuple)) else 1
+        stereo = self._ensure_stereo_sample_count(audio, max(1, frame_count))
+        volume_values = self._automation_frame_values(
+            track,
+            AUTOMATION_TARGET_VOLUME,
+            start_frame,
+            max(1, frame_count),
+            sample_rate,
+            default_value=float(track.volume),
+        )
+        if track.track_type == 'instrument':
+            gain_db_values = self._automation_frame_values(
+                track,
+                AUTOMATION_TARGET_VST_OUTPUT_GAIN_DB,
+                start_frame,
+                max(1, frame_count),
+                sample_rate,
+                default_value=float(track.vsti_output_gain_db),
+            )
+            if np is not None:
+                gain_values = np.asarray(volume_values, dtype=np.float32) * np.power(
+                    np.float32(10.0),
+                    np.asarray(gain_db_values, dtype=np.float32) / np.float32(20.0),
+                )
+            else:
+                gain_values = [
+                    float(volume_values[index]) * (10.0 ** (float(gain_db_values[index]) / 20.0))
+                    for index in range(max(1, frame_count))
+                ]
+        else:
+            gain_values = volume_values
+
+        if gain_already_applied:
+            base_gain = self._track_static_gain_linear(track)
+            if base_gain > 1e-9:
+                if np is not None:
+                    gain_values = np.asarray(gain_values, dtype=np.float32) / np.float32(base_gain)
+                else:
+                    gain_values = [float(value) / float(base_gain) for value in gain_values]
+        stereo = self._apply_stereo_gain_envelope(stereo, gain_values)
+
+        pan_values = self._automation_frame_values(
+            track,
+            AUTOMATION_TARGET_PAN,
+            start_frame,
+            max(1, frame_count),
+            sample_rate,
+            default_value=float(track.pan),
+        )
+        if pan_already_applied:
+            return stereo
+        return self._apply_pan_envelope_to_stereo(stereo, pan_values)
+
     def _audio_peak_level(self, data: object) -> float:
         if np is not None:
             try:
@@ -12021,6 +13485,33 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 level = 0.0
             levels[int(rows[slot_index])] = level
+        return levels
+
+    def _native_audio_engine_track_peak_levels(
+        self,
+        status: dict[str, object] | None,
+    ) -> dict[int, float]:
+        if not isinstance(status, dict):
+            return {}
+        rows = [int(row) for row in (getattr(self, '_native_audio_engine_track_rows', []) or [])]
+        raw_tracks = status.get('audio_engine_tracks')
+        if not isinstance(raw_tracks, list) or not rows:
+            return {}
+        levels: dict[int, float] = {}
+        for raw_track in raw_tracks:
+            if not isinstance(raw_track, dict):
+                continue
+            try:
+                track_index = int(raw_track.get('track_index', -1))
+            except Exception:
+                continue
+            if track_index < 0 or track_index >= len(rows):
+                continue
+            try:
+                level = max(0.0, min(1.0, float(raw_track.get('peak_level', 0.0) or 0.0)))
+            except Exception:
+                level = 0.0
+            levels[int(rows[track_index])] = level
         return levels
 
     def _update_track_meter_levels(self, meter_levels: object | None = None) -> None:
@@ -12135,6 +13626,12 @@ class MainWindow(QtWidgets.QMainWindow):
             output_offset_frames=0,
         ):
             return self._empty_stereo_playback_samples(requested_count)
+        if self._track_has_enabled_automation(track, {lane.target for lane in self._normalize_track_automation_lanes(track) if automation_target_is_vst_parameter(lane.target)}):
+            parameter_values = self._track_automation_parameter_values_at_tick(
+                track,
+                sample_frame_to_tick(requested_start, sample_rate, self.project.bpm),
+            )
+            self._apply_native_vst_bridge_parameter_values(bridge, parameter_values)
         input_buses = self._native_vst_input_bus_payload(
             track,
             entry,
@@ -12257,14 +13754,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
 
             if np is not None and isinstance(data, np.ndarray) and isinstance(clip_data, np.ndarray):
-                data[dst_start:dst_start + count] += clip_data[src_start:src_start + count] * 0.7 * float(track.volume)
+                data[dst_start:dst_start + count] += clip_data[src_start:src_start + count] * 0.7
             else:
                 source = list(clip_data)
                 for offset in range(count):
-                    data[dst_start + offset] += source[src_start + offset] * 0.7 * float(track.volume)
+                    data[dst_start + offset] += source[src_start + offset] * 0.7
 
         state = self._realtime_track_state(idx, track)
         processed = self._apply_realtime_vst_fx_chain(idx, track, data, self._playback_sample_rate, state)
+        processed = self._apply_track_mix_automation_to_audio(
+            processed,
+            track,
+            start_frame,
+            self._playback_sample_rate,
+            gain_already_applied=False,
+            pan_already_applied=False,
+        )
         state.instrument_reset_pending = False
         state.fx_reset_pending = False
         return processed, self._playback_sample_rate
@@ -12272,6 +13777,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _render_instrument_track_chunk(self, idx: int, track: TrackState, start_frame: int, frame_count: int) -> tuple[object, int]:
         state = self._realtime_track_state(idx, track)
         entry = self._native_instrument_entry_for_track(track)
+        render_track = self._track_render_source_state(track)
+        gain_applied_in_source = render_track is track
         sample_rate = self._playback_sample_rate
         start_sec = sample_frame_to_seconds(start_frame, sample_rate)
         duration_sec = max(frame_count, 1) / float(sample_rate)
@@ -12282,7 +13789,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     if self._should_use_cached_realtime_vst_playback():
                         rendered = self._render_native_vst_realtime_window(
                             idx,
-                            track,
+                            render_track,
                             entry,
                             state,
                             start_frame,
@@ -12301,7 +13808,7 @@ class MainWindow(QtWidgets.QMainWindow):
                             return [0.0] * max(1, int(frame_count)), sample_rate
                         if not self._schedule_native_vst_track_chunk(
                             idx,
-                            track,
+                            render_track,
                             entry,
                             start_frame,
                             frame_count,
@@ -12309,8 +13816,21 @@ class MainWindow(QtWidgets.QMainWindow):
                             output_offset_frames=0,
                         ):
                             raise RuntimeError('Could not schedule native VST MIDI block')
-                        input_buses = self._native_vst_input_bus_payload(
+                        if self._track_has_enabled_automation(
                             track,
+                            {
+                                lane.target
+                                for lane in self._normalize_track_automation_lanes(track)
+                                if automation_target_is_vst_parameter(lane.target)
+                            },
+                        ):
+                            parameter_values = self._track_automation_parameter_values_at_tick(
+                                track,
+                                sample_frame_to_tick(start_frame, sample_rate, self.project.bpm),
+                            )
+                            self._apply_native_vst_bridge_parameter_values(bridge, parameter_values)
+                        input_buses = self._native_vst_input_bus_payload(
+                            render_track,
                             entry,
                             start_frame,
                             frame_count,
@@ -12319,13 +13839,21 @@ class MainWindow(QtWidgets.QMainWindow):
                         )
                         response = bridge.command('render_audio', frames=max(1, int(frame_count)), input_buses=input_buses)
                         rendered = self._mix_native_vst_render_response(
-                            track,
+                            render_track,
                             entry,
                             response,
                             max(1, int(frame_count)),
                             return_mono=False,
                         )
-                    rendered = self._apply_realtime_vst_fx_chain(idx, track, rendered, sample_rate, state)
+                    rendered = self._apply_realtime_vst_fx_chain(idx, render_track, rendered, sample_rate, state)
+                    rendered = self._apply_track_mix_automation_to_audio(
+                        rendered,
+                        track,
+                        start_frame,
+                        sample_rate,
+                        gain_already_applied=gain_applied_in_source,
+                        pan_already_applied=False,
+                    )
                     state.last_error = ""
                     state.instrument_reset_pending = False
                     state.fx_reset_pending = False
@@ -12336,11 +13864,19 @@ class MainWindow(QtWidgets.QMainWindow):
                     _APP_LOGGER.exception("Realtime native VST render failed track_index=%s rack=%s", idx, track.rack_vsti)
                     self._stop_native_vst_host_bridge(idx)
                     if np is not None:
-                        return np.zeros(max(1, int(frame_count)), dtype=np.float32), sample_rate
+                            return np.zeros(max(1, int(frame_count)), dtype=np.float32), sample_rate
                     return [0.0] * max(1, int(frame_count)), sample_rate
 
-        data, sample_rate = self._legacy_renderer().render_track_chunk(track, self.project.bpm, start_sec, duration_sec)
-        data = self._apply_realtime_vst_fx_chain(idx, track, data, sample_rate, state)
+        data, sample_rate = self._legacy_renderer().render_track_chunk(render_track, self.project.bpm, start_sec, duration_sec)
+        data = self._apply_realtime_vst_fx_chain(idx, render_track, data, sample_rate, state)
+        data = self._apply_track_mix_automation_to_audio(
+            data,
+            track,
+            start_frame,
+            sample_rate,
+            gain_already_applied=gain_applied_in_source,
+            pan_already_applied=False,
+        )
         state.last_error = ""
         state.instrument_reset_pending = False
         state.fx_reset_pending = False
@@ -12352,15 +13888,7 @@ class MainWindow(QtWidgets.QMainWindow):
             data, _sample_rate = self._render_sample_track_chunk(idx, track, start_frame, expected_samples)
         else:
             data, _sample_rate = self._render_instrument_track_chunk(idx, track, start_frame, expected_samples)
-        if np is not None and isinstance(data, np.ndarray) and data.ndim == 2:
-            stereo = self._ensure_stereo_sample_count(data, expected_samples)
-            return self._apply_track_pan_stereo(stereo, track.pan)
-        if isinstance(data, (list, tuple)) and data and isinstance(data[0], (list, tuple)):
-            stereo = self._ensure_stereo_sample_count(data, expected_samples)
-            return self._apply_track_pan_stereo(stereo, track.pan)
-        mono = self._ensure_mono_sample_count(data, expected_samples)
-        stereo = self._apply_track_pan(mono, track.pan)
-        return self._ensure_stereo_sample_count(stereo, expected_samples)
+        return self._ensure_stereo_sample_count(data, expected_samples)
 
     def _active_realtime_vsti_track_count(self) -> int:
         solo_tracks = self._active_solo_track_indices()
@@ -12470,6 +13998,9 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 logical_frame = int(self._direct_native_transport_origin_frame) + direct_frames
             return sample_frame_to_tick(logical_frame, self._playback_sample_rate, self.project.bpm)
+        if self._native_audio_engine_active():
+            engine_frame = int(getattr(self, '_native_audio_engine_position_frame', 0) or 0)
+            return sample_frame_to_tick(engine_frame, self._playback_sample_rate, self.project.bpm)
         if bool(getattr(self, '_transport_uses_native_output_bridge', False)) and self._native_output_bridge_alive():
             logical_frame = self._shared_native_output_logical_frame(include_queued=False)
             return sample_frame_to_tick(logical_frame, self._playback_sample_rate, self.project.bpm)
@@ -12630,11 +14161,11 @@ class MainWindow(QtWidgets.QMainWindow):
                         mix[channel][pos] += metronome[channel][pos]
 
         solo_tracks = self._active_solo_track_indices()
-        graph_rows = self._graph_native_transport_row_set() if self._graph_native_transport_active() else set()
+        native_owned_rows = self._native_bridge_transport_owned_rows()
         for idx, track in enumerate(self.project.tracks):
             if not self._track_is_audible(idx, solo_tracks):
                 continue
-            if idx in graph_rows:
+            if idx in native_owned_rows:
                 continue
             if track.track_type == 'instrument' and not track.notes:
                 continue
@@ -12897,6 +14428,29 @@ class MainWindow(QtWidgets.QMainWindow):
         finally:
             self._audio_pump_in_progress = False
 
+    def _pump_native_audio_engine(self, *, status: dict[str, object] | None = None) -> None:
+        bridge = getattr(self, '_native_output_bridge', None)
+        if bridge is None:
+            return
+        self._audio_pump_in_progress = True
+        try:
+            status = status if isinstance(status, dict) else self._native_output_status(bridge)
+            if status is None:
+                raise RuntimeError('Native audio engine bridge is unavailable')
+            had_native_audio_engine_running = bool(getattr(self, '_native_audio_engine_running', False))
+            self._native_audio_engine_running = bool(status.get('audio_engine_running', False))
+            if had_native_audio_engine_running and not self._native_audio_engine_running:
+                raise RuntimeError('Native audio engine stopped unexpectedly')
+            self._native_audio_engine_position_frame = int(status.get('audio_engine_position_frame', 0) or 0)
+            self._set_native_track_meter_levels(self._native_audio_engine_track_peak_levels(status))
+            self._update_track_meter_levels(self._native_track_meter_levels)
+        except Exception as exc:
+            _APP_LOGGER.exception("Native audio engine pump failed")
+            self.stop_playback()
+            self.statusBar().showMessage(f'Audio engine playback stopped: {exc}')
+        finally:
+            self._audio_pump_in_progress = False
+
     def _pump_direct_native_transport(self) -> None:
         row = self._direct_native_transport_row
         bridge = getattr(self, '_native_output_bridge', None)
@@ -13043,15 +14597,28 @@ class MainWindow(QtWidgets.QMainWindow):
                 raise RuntimeError('Native output bridge is unavailable')
             if self._graph_native_transport_active():
                 self._pump_graph_native_transport(status=status)
+            had_native_audio_engine_running = bool(getattr(self, '_native_audio_engine_running', False))
+            self._native_audio_engine_running = bool(status.get('audio_engine_running', False))
+            if had_native_audio_engine_running and not self._native_audio_engine_running:
+                raise RuntimeError('Native audio engine stopped unexpectedly')
+            if self._native_audio_engine_active():
+                self._native_audio_engine_position_frame = int(status.get('audio_engine_position_frame', 0) or 0)
+                self._set_native_track_meter_levels(self._native_audio_engine_track_peak_levels(status))
+                self._update_track_meter_levels(self._native_track_meter_levels)
             queued_frames = int(status.get('queued_audio_frames') or 0)
             self._native_output_queued_frames = queued_frames
             self._native_output_underruns = int(status.get('audio_queue_underruns') or 0)
             if (
-                (self._graph_native_transport_active() or self._direct_native_transport_active())
+                (
+                    self._graph_native_transport_active()
+                    or self._direct_native_transport_active()
+                    or self._native_audio_engine_active()
+                )
                 and not self._shared_native_output_has_pcm_transport_audio()
             ):
-                # Graph/direct-native transport can render directly in the host.
-                # If the shared PCM path only has silence, keep that queue idle.
+                # Graph/direct-native/audio-engine transport can render directly
+                # in the host. If the shared PCM path only has silence, keep
+                # that queue idle.
                 if queued_frames > 0 or bool(status.get('audio_stream_enabled', False)):
                     bridge.clear_audio_queue(reset_counters=False, stream_id='main')
                     self._native_output_queued_frames = 0
@@ -13080,6 +14647,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._cancel_deferred_playback_stop_cleanup()
         self._cancel_scheduled_transport_reprepare()
+        self._suspend_track_native_vst_hosts_for_transport()
         self._sync_playback_loop_state()
         start_tick = int(self.project.playhead_tick)
         if self.project.loop_enabled:
@@ -13097,20 +14665,26 @@ class MainWindow(QtWidgets.QMainWindow):
     def stop_playback(self) -> None:
         self._cancel_scheduled_transport_reprepare()
         self._cancel_deferred_playback_stop_cleanup()
+        if hasattr(self, '_pending_playback_start_retry_timer'):
+            self._pending_playback_start_retry_timer.stop()
         pending_start = self._pending_playback_start_tick is not None
         self._pending_playback_start_tick = None
         should_reset = hasattr(self, 'playback_timer') and (not self.playback_timer.isActive())
         direct_row = self._direct_native_transport_row
         live_direct_row = self._live_midi_direct_output_row
         graph_transport_active = self._graph_native_transport_active()
+        native_audio_engine_active = self._native_audio_engine_active()
         if getattr(self, '_use_inprocess_transport', False):
             self._stop_inprocess_transport()
             self._use_inprocess_transport = False
+        if native_audio_engine_active:
+            self._stop_native_audio_engine()
         if hasattr(self, 'playback_timer'):
             self.playback_timer.stop()
         self._stop_realtime_audio_sink(cleanup_bridge=False)
         stop_generation = int(self._realtime_pump_generation)
         self._clear_direct_native_transport_state()
+        self._clear_native_audio_engine_state()
         self._realtime_reset_pending = True
         self._schedule_deferred_playback_stop_cleanup(
             direct_row=direct_row,
@@ -16048,13 +17622,19 @@ class MainWindow(QtWidgets.QMainWindow):
             silent = [0.0]
         if track.track_type != 'instrument' or not track.notes:
             return silent, sample_rate
+        render_track = self._track_render_source_state(track)
 
         entry = self._native_instrument_entry_for_track(track)
         if track.instrument_mode == 'VSTI Rack' and entry is not None and not entry.host_supported:
             self.statusBar().showMessage(f'Unsupported rack VST for {track.name}: {entry.name}. Falling back to the built-in synth.')
         if entry is not None and entry.is_instrument:
             try:
-                rendered = self._render_track_audio_native_vst_host(track, entry, target_sample_rate=sample_rate)
+                rendered = self._render_track_audio_native_vst_host(
+                    render_track,
+                    entry,
+                    target_sample_rate=sample_rate,
+                    source_track=track,
+                )
                 if rendered is not None:
                     return rendered
             except Exception as exc:
@@ -16065,9 +17645,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
                 self.statusBar().showMessage(f'Internal VST render fallback to synth for {track.name}: {exc}')
 
-        data, sr = self._legacy_renderer().render_track_audio(track, self.project.bpm)
+        data, sr = self._legacy_renderer().render_track_audio(render_track, self.project.bpm)
 
-        data = self._apply_vst_fx_chain(track, data, sr)
+        data = self._apply_vst_fx_chain(render_track, data, sr)
         return data, sr
 
     @staticmethod
@@ -16139,6 +17719,7 @@ class MainWindow(QtWidgets.QMainWindow):
             'vst_fx_chain': list(track.vst_fx_chain),
             'vst_fx_paths': [self._rack_vsti_path(name) for name in track.vst_fx_chain],
             'notes': [(note.start_tick, note.duration_tick, note.pitch, note.velocity) for note in track.notes],
+            'automation': self._automation_points_signature(track),
         }
         return self._cache_payload_hash(payload)
 
@@ -16186,6 +17767,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ),
             tuple(str(name) for name in track.vst_fx_chain),
             tuple(self._rack_vsti_path(name) for name in track.vst_fx_chain),
+            self._automation_points_signature(track),
         )
 
     def _track_uses_rack_vsti(self, rack_name: str, *, exclude_row: int | None = None) -> bool:
@@ -16376,10 +17958,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 return False
         return True
 
-    def _render_track_audio_native_vst_host(self, track: TrackState, entry: VSTInstrument, *, target_sample_rate: int | None = None) -> tuple[object, int] | None:
+    def _render_track_audio_native_vst_host(
+        self,
+        track: TrackState,
+        entry: VSTInstrument,
+        *,
+        target_sample_rate: int | None = None,
+        source_track: TrackState | None = None,
+    ) -> tuple[object, int] | None:
         if np is None or not self._can_use_native_vst_host(entry):
             return None
-        track_index = self._track_index_for_object(track)
+        lookup_track = source_track if source_track is not None else track
+        track_index = self._track_index_for_object(lookup_track)
         if track_index < 0:
             return None
         if not self._open_native_vst_host_for_track(track_index, entry, open_editor=False):
@@ -16434,6 +18024,12 @@ class MainWindow(QtWidgets.QMainWindow):
         render_cursor = 0
         while remaining > 0:
             current_frames = min(chunk_frames, remaining)
+            parameter_values = self._track_automation_parameter_values_at_tick(
+                source_track if source_track is not None else track,
+                sample_frame_to_tick(render_cursor, sample_rate, self.project.bpm),
+            )
+            if parameter_values:
+                self._apply_native_vst_bridge_parameter_values(bridge, parameter_values)
             input_buses = self._native_vst_input_bus_payload(
                 track,
                 entry,
@@ -16771,6 +18367,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         if entry is None or not entry.is_instrument or not entry.host_supported:
             return False
+        if self._track_has_enabled_automation(track):
+            return False
         if not self._can_use_native_vst_host(entry):
             return False
         if abs(float(track.vsti_wet_mix) - 100.0) > 0.001:
@@ -16790,6 +18388,25 @@ class MainWindow(QtWidgets.QMainWindow):
                     'plugin_path': str(effect_entry.path),
                     'state_path': '',
                     'parameters': {},
+                }
+            )
+        return payload
+
+    def _build_track_automation_payload(self, track: TrackState) -> list[dict[str, object]]:
+        payload: list[dict[str, object]] = []
+        for lane in self._sanitize_track_automation_lanes(track):
+            if not lane.enabled or not lane.points:
+                continue
+            payload.append(
+                {
+                    'target': str(lane.target),
+                    'points': [
+                        {
+                            'tick': int(point.tick),
+                            'value': float(point.value),
+                        }
+                        for point in lane.points
+                    ],
                 }
             )
         return payload
@@ -16847,6 +18464,73 @@ class MainWindow(QtWidgets.QMainWindow):
             graph_track_rows.append(int(idx))
             graph_track_paths.append(self._normalized_vsti_path(str(entry.path)))
         return payload_tracks, graph_track_rows, graph_track_paths
+
+    def _build_native_audio_engine_payload_tracks(
+        self,
+        tracks: list[tuple[int, TrackState, VSTInstrument | None]],
+    ) -> list[dict[str, object]]:
+        payload_tracks: list[dict[str, object]] = []
+        sample_rate = max(1, int(self._playback_sample_rate))
+        for idx, track, entry in tracks:
+            payload_track: dict[str, object] = {
+                'name': str(track.name or (entry.name if entry is not None else f'Track {idx + 1}')),
+                'volume': float(track.volume),
+                'output_gain_db': float(track.vsti_output_gain_db),
+                'pan': float(clamp(float(track.pan), -1.0, 1.0)),
+            }
+            if entry is not None and self._track_can_use_native_audio_engine(track, entry):
+                state_path = self._effective_vsti_state_path(track, entry)
+                gain = max(0.0, float(track.volume) * (10.0 ** (float(track.vsti_output_gain_db) / 20.0)))
+                midi_channel = int(clamp(track.midi_channel, 0, 15)) + 1
+                payload_track.update(
+                    {
+                        'track_type': 'instrument',
+                        'plugin_path': str(entry.path),
+                        'state_path': str(state_path) if state_path is not None and state_path.exists() else '',
+                        'parameters': dict(track.vsti_parameters),
+                        'gain': float(gain),
+                        'notes': [
+                            {
+                                'start_tick': int(note.start_tick),
+                                'end_tick': int(self._playback_note_end_tick(note)),
+                                'pitch': int(clamp(note.pitch, 0, 127)),
+                                'velocity': int(clamp(note.velocity, 1, 127)),
+                                'channel': midi_channel,
+                            }
+                            for note in sorted(
+                                track.notes,
+                                key=lambda current: (int(current.start_tick), int(current.duration_tick), int(current.pitch)),
+                            )
+                        ],
+                    }
+                )
+            else:
+                clips = self._native_audio_engine_sample_track_clips(int(idx), sample_rate)
+                if track.track_type == 'instrument':
+                    rendered_path = self._ensure_native_audio_engine_rendered_track_path(int(idx), track, sample_rate)
+                    clips = [
+                        {
+                            'path': str(rendered_path),
+                            'start_frame': 0,
+                        }
+                    ]
+                payload_track.update(
+                    {
+                        'track_type': 'audio',
+                        'plugin_path': '',
+                        'state_path': '',
+                        'parameters': {},
+                        'clips': clips,
+                    }
+                )
+            fx_chain = self._build_native_vst_graph_fx_payload(track)
+            if fx_chain:
+                payload_track['fx_chain'] = fx_chain
+            automation = self._build_track_automation_payload(track)
+            if automation:
+                payload_track['automation'] = automation
+            payload_tracks.append(payload_track)
+        return payload_tracks
 
     def _native_vst_graph_config_signature(
         self,
@@ -16963,7 +18647,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 {
                     'idx': idx,
                     'audio': self._track_audio_cache_key(track, idx),
-                    'pan': round(float(track.pan), 6),
+                    'automation': self._automation_points_signature(track),
                 }
             )
 
@@ -16986,6 +18670,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     'track_solo': bool(track.solo) if track else False,
                     'track_fx': list(track.vst_fx_chain) if track else [],
                     'track_fx_paths': [self._rack_vsti_path(name) for name in track.vst_fx_chain] if track else [],
+                    'track_automation': self._automation_points_signature(track) if track else (),
                 }
             )
 
@@ -17051,6 +18736,7 @@ class MainWindow(QtWidgets.QMainWindow):
         prerender_track_audio: dict[int, tuple[object, int]] = {}
         audible_instrument_tracks: list[tuple[int, TrackState]] = []
         graph_rendered_track_indices: set[int] = set()
+        native_owned_rows = self._native_bridge_transport_owned_rows()
 
         if bool(getattr(self.project, 'metronome_enabled', False)):
             click = self._render_metronome_segment(window_start, requested_frames)
@@ -17070,6 +18756,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if solo_tracks and idx not in solo_tracks:
                 continue
             if track.mute:
+                continue
+            if idx in native_owned_rows:
                 continue
             audible_instrument_tracks.append((idx, track))
 
@@ -17137,13 +18825,21 @@ class MainWindow(QtWidgets.QMainWindow):
 
             if np is not None and isinstance(data, np.ndarray) and data.ndim == 2:
                 track_audio = self._slice_stereo_audio(data, window_start, requested_frames)
-                track_audio = self._apply_track_pan_stereo(track_audio, track.pan)
             elif isinstance(data, (list, tuple)) and data and isinstance(data[0], (list, tuple)):
                 track_audio = self._slice_stereo_audio(data, window_start, requested_frames)
-                track_audio = self._apply_track_pan_stereo(track_audio, track.pan)
             else:
                 track_audio = self._slice_mono_audio(data, window_start, requested_frames)
-                track_audio = self._apply_track_pan(track_audio, track.pan)
+            track_audio = self._apply_track_mix_automation_to_audio(
+                track_audio,
+                track,
+                window_start,
+                sample_rate,
+                gain_already_applied=not self._track_has_enabled_automation(
+                    track,
+                    {AUTOMATION_TARGET_VOLUME, AUTOMATION_TARGET_VST_OUTPUT_GAIN_DB},
+                ),
+                pan_already_applied=False,
+            )
             track_audio = self._ensure_stereo_sample_count(
                 track_audio,
                 requested_frames,
@@ -17157,6 +18853,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         for clip in self.project.sample_clips:
             if clip.track_index < 0 or clip.track_index >= len(self.project.tracks):
+                continue
+            if int(clip.track_index) in native_owned_rows:
                 continue
             clip_track = self.project.tracks[clip.track_index]
             if solo_tracks and clip.track_index not in solo_tracks:
@@ -17197,23 +18895,37 @@ class MainWindow(QtWidgets.QMainWindow):
             if np is not None and isinstance(mix, np.ndarray) and isinstance(data, np.ndarray):
                 if data.ndim == 2 and (data.shape[0] == 2 or data.shape[1] == 2):
                     stereo_data = self._slice_stereo_audio(data, src_start, overlap_frames)
-                    stereo_data = self._apply_track_pan_stereo(stereo_data, clip_track.pan)
                 else:
                     mono_data = self._slice_mono_audio(data, src_start, overlap_frames)
-                    stereo_data = self._apply_track_pan(mono_data, clip_track.pan)
+                    stereo_data = mono_data
+                stereo_data = self._apply_track_mix_automation_to_audio(
+                    stereo_data,
+                    clip_track,
+                    overlap_start,
+                    sample_rate,
+                    gain_already_applied=False,
+                    pan_already_applied=False,
+                )
                 stereo_data = self._ensure_stereo_sample_count(stereo_data, overlap_frames)
-                mix[:, dst_start : dst_start + overlap_frames] += stereo_data[:, :overlap_frames] * 0.7 * float(clip_track.volume)
+                mix[:, dst_start : dst_start + overlap_frames] += stereo_data[:, :overlap_frames] * 0.7
             else:
                 if isinstance(data, (list, tuple)) and data and isinstance(data[0], (list, tuple)):
                     stereo_data = self._slice_stereo_audio(data, src_start, overlap_frames)
-                    stereo_data = self._apply_track_pan_stereo(stereo_data, clip_track.pan)
                 else:
                     mono_data = self._slice_mono_audio(data, src_start, overlap_frames)
-                    stereo_data = self._apply_track_pan(mono_data, clip_track.pan)
+                    stereo_data = mono_data
+                stereo_data = self._apply_track_mix_automation_to_audio(
+                    stereo_data,
+                    clip_track,
+                    overlap_start,
+                    sample_rate,
+                    gain_already_applied=False,
+                    pan_already_applied=False,
+                )
                 stereo_data = self._ensure_stereo_sample_count(stereo_data, overlap_frames)
                 for channel in range(2):
                     for i in range(overlap_frames):
-                        mix[channel][dst_start + i] += stereo_data[channel][i] * 0.7 * float(clip_track.volume)
+                        mix[channel][dst_start + i] += stereo_data[channel][i] * 0.7
 
         if not has_sources:
             self._playback_mix_cache_key = ''
@@ -18272,6 +19984,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if current_idx >= 0:
             current_track = self.project.tracks[current_idx]
             self._normalize_track_native_instrument(current_track)
+            current_track.automation_lanes = self._sanitize_track_automation_lanes(current_track)
             previous_name = str(previous_rack_vsti or '')
             current_entry = self._native_instrument_entry_for_track(current_track)
             current_native_name = str(current_entry.name) if current_entry is not None else ''
@@ -18301,10 +20014,39 @@ class MainWindow(QtWidgets.QMainWindow):
         self._invalidate_playback_caches()
         self._reload_playback_mix_if_running()
 
+    def on_track_automation_changed(
+        self,
+        row: int | None = None,
+        changed_targets: set[str] | list[str] | tuple[str, ...] | None = None,
+    ) -> None:
+        track_row = self.current_track_index() if row is None else int(row)
+        if track_row < 0 or track_row >= len(self.project.tracks):
+            return
+        track = self.project.tracks[track_row]
+        track.automation_lanes = self._sanitize_track_automation_lanes(track)
+        self._update_track_list_item(track_row)
+        if track_row == self.current_track_index():
+            self._schedule_selected_track_panel_refresh(track_row)
+        self._invalidate_playback_caches(clear_track_audio=False, reset_realtime=True)
+        target_names = {str(target) for target in (changed_targets or set()) if str(target)}
+        if hasattr(self, 'playback_timer') and self.playback_timer.isActive():
+            if self._native_audio_engine_active() or self._graph_native_transport_active() or self._direct_native_transport_active():
+                self._schedule_transport_reprepare(reason='automation edit', delay_ms=0)
+            elif bool(getattr(self, '_use_prerendered_transport_mix', False)):
+                self._schedule_prerendered_playback_mix_refresh(reason='automation edit')
+            else:
+                self._clear_realtime_mix_cache()
+        else:
+            self._reload_playback_mix_if_running()
+        if track_row == self.current_track_index() and target_names:
+            readable = ', '.join(sorted(target_names))
+            self.statusBar().showMessage(f'Updated automation for {track.name}: {readable}')
+
     def _apply_track_sound_assignment(self, row: int, *, force_host_reset: bool = False, host_reset_rack_name: str | None = None) -> None:
         if row < 0 or row >= len(self.project.tracks):
             return
         track = self.project.tracks[row]
+        track.automation_lanes = self._sanitize_track_automation_lanes(track)
         if force_host_reset:
             reset_name = str(host_reset_rack_name or '')
             if not reset_name:
@@ -20131,11 +21873,15 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.mixer.load_track()
         self.instruments.load_track()
+        self.automation_editor.load_track()
 
     def _restart_native_transport_for_audibility_change(self, changed_rows: set[int] | None = None) -> None:
         if not hasattr(self, 'playback_timer') or not self.playback_timer.isActive():
             return
         changed_row_set = {int(row) for row in (changed_rows or set()) if int(row) >= 0}
+        if self._native_audio_engine_active():
+            self._schedule_transport_reprepare(reason='audibility change', delay_ms=0)
+            return
         if self._graph_native_transport_active():
             graph_rows = self._graph_native_transport_row_set()
             requires_full_restart = False
@@ -20279,6 +22025,20 @@ class MainWindow(QtWidgets.QMainWindow):
             solo=bool(source.solo),
             live_armed=False,
             color_hex=str(source.color_hex),
+            automation_lanes=[
+                AutomationLane(
+                    target=str(lane.target),
+                    enabled=bool(lane.enabled),
+                    points=[
+                        AutomationPoint(
+                            tick=int(point.tick),
+                            value=float(point.value),
+                        )
+                        for point in lane.points
+                    ],
+                )
+                for lane in source.automation_lanes
+            ],
         )
         return clone
 
@@ -20469,87 +22229,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(f'Loaded project: {project_path.name}')
 
     def _render_sequence_mix(self, left_sec: float, right_sec: float) -> tuple[object, int]:
-        sample_rate = 44100
-        mix_length = max(1, int(max(0.0, right_sec - left_sec) * sample_rate))
+        sample_rate = max(1, int(self._playback_sample_rate))
+        start_frame = max(0, int(left_sec * sample_rate))
+        frame_count = max(1, int(max(0.0, right_sec - left_sec) * sample_rate))
+        if self._build_playback_mix(start_frame=start_frame, frame_count=frame_count):
+            mix = self._playback_mix_samples
+            if mix is not None:
+                return mix, sample_rate
         if np is not None:
-            mix: object = np.zeros(mix_length, dtype=np.float32)
-        else:
-            mix = [0.0] * mix_length
-
-        solo_tracks = {idx for idx, track in enumerate(self.project.tracks) if track.solo}
-
-        for idx, track in enumerate(self.project.tracks):
-            if track.track_type != 'instrument':
-                continue
-            if solo_tracks and idx not in solo_tracks:
-                continue
-            if track.mute:
-                continue
-
-            data, sr = self._get_track_playback_audio(idx, track)
-            if sr != sample_rate:
-                data = resample_samples(data, sr, sample_rate)
-            source_start = max(0, int(left_sec * sample_rate))
-            source_end = min(source_start + mix_length, data.shape[0] if np is not None and isinstance(data, np.ndarray) else len(data))
-            if source_end <= source_start:
-                continue
-
-            if np is not None and isinstance(mix, np.ndarray) and isinstance(data, np.ndarray):
-                count = min(mix.shape[0], source_end - source_start)
-                if count > 0:
-                    mix[:count] += data[source_start:source_start + count]
-            else:
-                source = list(data)[source_start:source_end]
-                count = min(len(mix), len(source))
-                for i in range(count):
-                    mix[i] += source[i]
-
-        for clip in self.project.sample_clips:
-            if clip.track_index < 0 or clip.track_index >= len(self.project.tracks):
-                continue
-            clip_track = self.project.tracks[clip.track_index]
-            if solo_tracks and clip.track_index not in solo_tracks:
-                continue
-            if clip_track.mute:
-                continue
-
-            wav_path = Path(clip.path)
-            if wav_path.suffix.lower() == '.mp3':
-                converted = RENDER_DIR / f'{wav_path.stem}_sequence_export.wav'
-                convert_audio(wav_path, converted)
-                wav_path = converted
-            data, sr = load_wav_samples(wav_path)
-            if sr != sample_rate:
-                data = resample_samples(data, sr, sample_rate)
-                sr = sample_rate
-            data = self._apply_vst_fx_chain(clip_track, data, sr)
-
-            clip_start = float(clip.start_sec)
-            clip_end = clip_start + ((data.shape[0] if np is not None and isinstance(data, np.ndarray) else len(data)) / sample_rate)
-            if clip_end <= left_sec or clip_start >= right_sec:
-                continue
-
-            overlap_start = max(left_sec, clip_start)
-            overlap_end = min(right_sec, clip_end)
-            src_start = int((overlap_start - clip_start) * sample_rate)
-            dst_start = int((overlap_start - left_sec) * sample_rate)
-            count = int((overlap_end - overlap_start) * sample_rate)
-            if count <= 0:
-                continue
-
-            if np is not None and isinstance(mix, np.ndarray) and isinstance(data, np.ndarray):
-                mix[dst_start:dst_start + count] += data[src_start:src_start + count] * 0.7 * float(clip_track.volume)
-            else:
-                source = list(data)[src_start:src_start + count]
-                for i, sample in enumerate(source):
-                    target = dst_start + i
-                    if target >= len(mix):
-                        break
-                    mix[target] += sample * 0.7 * float(clip_track.volume)
-
-        if np is not None and isinstance(mix, np.ndarray):
-            return np.clip(mix, -1.0, 1.0).astype(np.float32, copy=False), sample_rate
-        return [clamp(value, -1.0, 1.0) for value in mix], sample_rate
+            return np.zeros((2, frame_count), dtype=np.float32), sample_rate
+        return [[0.0] * frame_count, [0.0] * frame_count], sample_rate
 
     def export_sequence_wav(self) -> None:
         path, _ = QtWidgets.QFileDialog.getSaveFileName(

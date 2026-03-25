@@ -1,4 +1,5 @@
 #include <juce_audio_devices/juce_audio_devices.h>
+#include <juce_audio_formats/juce_audio_formats.h>
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_audio_utils/juce_audio_utils.h>
 #include <juce_gui_extra/juce_gui_extra.h>
@@ -9,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -257,6 +259,7 @@ public:
           keyboardComponent(keyboardState, juce::MidiKeyboardComponent::horizontalKeyboard)
     {
         formatManager.addFormat(std::make_unique<juce::VST3PluginFormat>());
+        audioFormatManager.registerBasicFormats();
 
         addAndMakeVisible(pathLabel);
         pathLabel.setText("Plugin path", juce::dontSendNotification);
@@ -357,6 +360,7 @@ public:
         }
         closeGraphEditorWindow();
         clearPersistentPluginGraph();
+        clearAudioEngine();
         closeEditorWindow();
         unloadPlugin();
     }
@@ -451,6 +455,8 @@ public:
                 || command == "load_graph_slot_state"
                 || command == "queue_audio" || command == "clear_audio_queue"
                 || command == "start_audio_stream"
+                || command == "set_audio_engine_transport"
+                || command == "seek_audio_engine"
                 || command == "set_transport_notes"
                 || command == "start_inprocess_transport"
                 || command == "stop_inprocess_transport")
@@ -655,6 +661,123 @@ private:
         std::vector<ScheduledMidiEvent> events;
     };
 
+    struct AudioEngineTrackNote
+    {
+        int startTick = 0;
+        int endTick = 0;
+        int pitch = 60;
+        int velocity = 100;
+        int channel = 1;
+    };
+
+    enum class AudioEngineTrackKind
+    {
+        instrument,
+        audio
+    };
+
+    struct AudioEngineAudioClip
+    {
+        juce::String path;
+        int64_t startFrame = 0;
+        juce::AudioBuffer<float> audioData;
+    };
+
+    enum class AudioEngineAutomationTargetType
+    {
+        volume,
+        pan,
+        outputGainDb,
+        vstParameter
+    };
+
+    struct AudioEngineAutomationPoint
+    {
+        int tick = 0;
+        float value = 0.0f;
+    };
+
+    struct AudioEngineAutomationLane
+    {
+        AudioEngineAutomationTargetType type = AudioEngineAutomationTargetType::volume;
+        juce::String target;
+        juce::String parameterName;
+        int parameterIndex = -1;
+        float defaultValue = 0.0f;
+        float lastAppliedValue = std::numeric_limits<float>::quiet_NaN();
+        std::vector<AudioEngineAutomationPoint> points;
+    };
+
+    struct AudioEngineTrack
+    {
+        struct EffectSlot
+        {
+            juce::String name;
+            juce::String pluginPath;
+            juce::String statePath;
+            juce::String parameterSignature;
+            std::unique_ptr<juce::AudioPluginInstance> plugin;
+        };
+
+        AudioEngineTrackKind kind = AudioEngineTrackKind::instrument;
+        juce::String name;
+        juce::String pluginPath;
+        juce::String statePath;
+        juce::String parameterSignature;
+        juce::String fxChainSignature;
+        std::unique_ptr<juce::AudioPluginInstance> plugin;
+        std::vector<EffectSlot> fxChain;
+        std::vector<AudioEngineTrackNote> notes;
+        std::vector<AudioEngineAudioClip> audioClips;
+        std::vector<AudioEngineAutomationLane> automationLanes;
+        float baseVolume = 1.0f;
+        float basePan = 0.0f;
+        float baseOutputGainDb = 0.0f;
+        float peakLevel = 0.0f;
+        juce::AudioBuffer<float> processBuffer;
+        juce::AudioBuffer<float> stereoBuffer;
+    };
+
+    struct AudioEngineState
+    {
+        std::vector<AudioEngineTrack> tracks;
+        double bpm = 120.0;
+        int ticksPerBeat = 480;
+        int64_t positionFrame = 0;
+        int64_t loopStartTick = 0;
+        int64_t loopEndTick = 0;
+        bool loopEnabled = false;
+        bool running = false;
+        bool bootstrapPending = false;
+        bool metronomeEnabled = false;
+        juce::AudioBuffer<float> metronomeClickBuffer;
+        juce::AudioBuffer<float> metronomeAccentBuffer;
+
+        int64_t tickToFrame(int64_t tick, double sampleRate) const
+        {
+            return static_cast<int64_t>(
+                (static_cast<double>(tick) * sampleRate * 60.0)
+                / (bpm * static_cast<double>(ticksPerBeat))
+            );
+        }
+
+        int64_t frameToTick(int64_t frame, double sampleRate) const
+        {
+            return static_cast<int64_t>(
+                (static_cast<double>(frame) * bpm * static_cast<double>(ticksPerBeat))
+                / (sampleRate * 60.0)
+            );
+        }
+
+        double frameToTickDouble(int64_t frame, double sampleRate) const
+        {
+            return (
+                (static_cast<double>(frame) * bpm * static_cast<double>(ticksPerBeat))
+                / (sampleRate * 60.0)
+            );
+        }
+    };
+
     juce::var handleRemoteCommand(const juce::var& request)
     {
         auto* object = request.getDynamicObject();
@@ -811,6 +934,8 @@ private:
         {
             {
                 juce::ScopedLock lock(pluginLock);
+                audioEngine.running = false;
+                audioEngine.bootstrapPending = false;
                 for (auto& slot : persistentGraphSlots)
                     resetPersistentGraphSlotProcessingState(slot);
             }
@@ -1335,6 +1460,8 @@ private:
                 inProcessTransport.positionFrame = inProcessTransport.tickToFrame(
                     startTick, currentSampleRate);
                 inProcessTransport.running = true;
+                audioEngine.running = false;
+                audioEngine.bootstrapPending = false;
                 // Clear any leftover scheduled events from the old IPC-based path
                 clearScheduledMidiEvents();
                 renderedSampleFrames.store(0);
@@ -1356,6 +1483,188 @@ private:
             }
 
             auto response = makeResponse(true, "In-process transport stopped");
+            appendStatusFields(response);
+            return response;
+        }
+
+        if (command == "set_audio_engine_state")
+        {
+            const auto bpm = object->hasProperty("bpm")
+                ? static_cast<double>(object->getProperty("bpm")) : 120.0;
+            const auto ticksPerBeat = object->hasProperty("ticks_per_beat")
+                ? static_cast<int>(object->getProperty("ticks_per_beat")) : 480;
+            const auto loopEnabled = object->hasProperty("loop_enabled")
+                ? static_cast<bool>(object->getProperty("loop_enabled")) : false;
+            const auto loopStartTick = object->hasProperty("loop_start_tick")
+                ? static_cast<int64_t>(static_cast<double>(object->getProperty("loop_start_tick"))) : int64_t(0);
+            const auto loopEndTick = object->hasProperty("loop_end_tick")
+                ? static_cast<int64_t>(static_cast<double>(object->getProperty("loop_end_tick"))) : int64_t(0);
+            const auto metronomeEnabled = object->hasProperty("metronome_enabled")
+                ? static_cast<bool>(object->getProperty("metronome_enabled")) : false;
+
+            juce::Array<juce::var> trackErrors;
+            juce::String error;
+            {
+                juce::ScopedLock lock(pluginLock);
+                if (!configureAudioEngine(
+                        object->getProperty("tracks"),
+                        bpm,
+                        ticksPerBeat,
+                        loopEnabled,
+                        loopStartTick,
+                        loopEndTick,
+                        metronomeEnabled,
+                        trackErrors,
+                        error))
+                {
+                    auto failedResponse = makeResponse(false, error.isNotEmpty() ? error : "Could not configure audio engine");
+                    if (!trackErrors.isEmpty())
+                        setResponseField(failedResponse, "track_errors", juce::var(trackErrors));
+                    return failedResponse;
+                }
+            }
+
+            auto response = makeResponse(true, "Audio engine state updated");
+            appendStatusFields(response);
+            setResponseField(response, "track_count", static_cast<int>(audioEngine.tracks.size()));
+            if (!trackErrors.isEmpty())
+                setResponseField(response, "track_errors", juce::var(trackErrors));
+            return response;
+        }
+
+        if (command == "set_audio_engine_transport")
+        {
+            const auto bpm = object->hasProperty("bpm")
+                ? static_cast<double>(object->getProperty("bpm")) : audioEngine.bpm;
+            const auto ticksPerBeat = object->hasProperty("ticks_per_beat")
+                ? static_cast<int>(object->getProperty("ticks_per_beat")) : audioEngine.ticksPerBeat;
+            const auto loopEnabled = object->hasProperty("loop_enabled")
+                ? static_cast<bool>(object->getProperty("loop_enabled")) : audioEngine.loopEnabled;
+            const auto loopStartTick = object->hasProperty("loop_start_tick")
+                ? static_cast<int64_t>(static_cast<double>(object->getProperty("loop_start_tick"))) : audioEngine.loopStartTick;
+            const auto loopEndTick = object->hasProperty("loop_end_tick")
+                ? static_cast<int64_t>(static_cast<double>(object->getProperty("loop_end_tick"))) : audioEngine.loopEndTick;
+            const auto metronomeEnabled = object->hasProperty("metronome_enabled")
+                ? static_cast<bool>(object->getProperty("metronome_enabled")) : audioEngine.metronomeEnabled;
+
+            {
+                juce::ScopedLock lock(pluginLock);
+                const auto sampleRate = juce::jmax(1.0, currentSampleRate);
+                const auto preservedTick = audioEngine.frameToTickDouble(audioEngine.positionFrame, sampleRate);
+
+                audioEngine.bpm = juce::jmax(1.0, bpm);
+                audioEngine.ticksPerBeat = juce::jmax(1, ticksPerBeat);
+                audioEngine.loopEnabled = loopEnabled;
+                audioEngine.loopStartTick = loopStartTick;
+                audioEngine.loopEndTick = loopEndTick;
+                audioEngine.metronomeEnabled = metronomeEnabled;
+
+                if (currentSampleRate > 0.0 && currentBlockSize > 0)
+                    prepareAudioEngineMetronome();
+
+                auto targetFrame = audioEngine.tickToFrame(static_cast<int64_t>(std::llround(preservedTick)), sampleRate);
+                const auto loopStartFrame = audioEngine.tickToFrame(audioEngine.loopStartTick, sampleRate);
+                const auto loopEndFrame = audioEngine.tickToFrame(audioEngine.loopEndTick, sampleRate);
+                if (audioEngine.loopEnabled && loopEndFrame > loopStartFrame
+                    && (targetFrame < loopStartFrame || targetFrame >= loopEndFrame))
+                {
+                    targetFrame = loopStartFrame;
+                }
+
+                audioEngine.positionFrame = juce::jmax<int64_t>(0, targetFrame);
+                if (audioEngine.running)
+                {
+                    resetAudioEngineProcessingState();
+                    audioEngine.bootstrapPending = true;
+                }
+            }
+
+            auto response = makeResponse(true, "Audio engine transport updated");
+            appendStatusFields(response);
+            return response;
+        }
+
+        if (command == "seek_audio_engine")
+        {
+            const auto startTick = object->hasProperty("start_tick")
+                ? static_cast<int64_t>(static_cast<double>(object->getProperty("start_tick")))
+                : int64_t(0);
+
+            {
+                juce::ScopedLock lock(pluginLock);
+                if (currentSampleRate <= 0.0 || currentBlockSize <= 0)
+                    return makeResponse(false, "Audio device is not ready");
+
+                auto targetFrame = audioEngine.tickToFrame(startTick, currentSampleRate);
+                const auto loopStartFrame = audioEngine.tickToFrame(audioEngine.loopStartTick, currentSampleRate);
+                const auto loopEndFrame = audioEngine.tickToFrame(audioEngine.loopEndTick, currentSampleRate);
+                if (audioEngine.loopEnabled && loopEndFrame > loopStartFrame
+                    && (targetFrame < loopStartFrame || targetFrame >= loopEndFrame))
+                {
+                    targetFrame = loopStartFrame;
+                }
+
+                audioEngine.positionFrame = juce::jmax<int64_t>(0, targetFrame);
+                resetAudioEngineProcessingState();
+                audioEngine.bootstrapPending = audioEngine.running;
+            }
+
+            auto response = makeResponse(true, "Audio engine seek updated");
+            appendStatusFields(response);
+            setResponseField(response, "start_tick", static_cast<double>(startTick));
+            setResponseField(response, "position_frame", static_cast<double>(audioEngine.positionFrame));
+            return response;
+        }
+
+        if (command == "start_audio_engine")
+        {
+            const auto startTick = object->hasProperty("start_tick")
+                ? static_cast<int64_t>(static_cast<double>(object->getProperty("start_tick")))
+                : int64_t(0);
+
+            {
+                juce::ScopedLock lock(pluginLock);
+                if (audioEngine.tracks.empty() && !audioEngine.metronomeEnabled)
+                    return makeResponse(false, "Audio engine has no tracks");
+                if (currentSampleRate <= 0.0 || currentBlockSize <= 0)
+                    return makeResponse(false, "Audio device is not ready");
+
+                const auto loopStartFrame = audioEngine.tickToFrame(audioEngine.loopStartTick, currentSampleRate);
+                const auto loopEndFrame = audioEngine.tickToFrame(audioEngine.loopEndTick, currentSampleRate);
+                auto targetFrame = audioEngine.tickToFrame(startTick, currentSampleRate);
+                if (audioEngine.loopEnabled && loopEndFrame > loopStartFrame
+                    && (targetFrame < loopStartFrame || targetFrame >= loopEndFrame))
+                {
+                    targetFrame = loopStartFrame;
+                }
+
+                graphTransportEnabled.store(false);
+                inProcessTransport.running = false;
+                clearScheduledMidiEvents();
+                resetAudioEngineProcessingState();
+                audioEngine.positionFrame = juce::jmax<int64_t>(0, targetFrame);
+                audioEngine.running = true;
+                audioEngine.bootstrapPending = true;
+                renderedSampleFrames.store(0);
+            }
+
+            auto response = makeResponse(true, "Audio engine started");
+            appendStatusFields(response);
+            setResponseField(response, "start_tick", static_cast<double>(startTick));
+            setResponseField(response, "position_frame", static_cast<double>(audioEngine.positionFrame));
+            return response;
+        }
+
+        if (command == "stop_audio_engine")
+        {
+            {
+                juce::ScopedLock lock(pluginLock);
+                audioEngine.running = false;
+                audioEngine.bootstrapPending = false;
+                resetAudioEngineProcessingState();
+            }
+
+            auto response = makeResponse(true, "Audio engine stopped");
             appendStatusFields(response);
             return response;
         }
@@ -1639,6 +1948,26 @@ private:
         setResponseField(response, "inprocess_transport_running", inProcessTransport.running);
         setResponseField(response, "inprocess_transport_position_frame",
                          static_cast<double>(inProcessTransport.positionFrame));
+        juce::Array<juce::var> audioEngineTracks;
+        for (int trackIndex = 0; trackIndex < static_cast<int>(audioEngine.tracks.size()); ++trackIndex)
+        {
+            const auto& track = audioEngine.tracks[static_cast<size_t>(trackIndex)];
+            auto* trackObject = new juce::DynamicObject();
+            trackObject->setProperty("track_index", trackIndex);
+            trackObject->setProperty("name", track.name);
+            trackObject->setProperty("track_type",
+                track.kind == AudioEngineTrackKind::audio ? "audio" : "instrument");
+            trackObject->setProperty("plugin_path", track.pluginPath);
+            trackObject->setProperty("note_count", static_cast<int>(track.notes.size()));
+            trackObject->setProperty("clip_count", static_cast<int>(track.audioClips.size()));
+            trackObject->setProperty("peak_level", track.peakLevel);
+            audioEngineTracks.add(juce::var(trackObject));
+        }
+        setResponseField(response, "audio_engine_track_count", static_cast<int>(audioEngine.tracks.size()));
+        setResponseField(response, "audio_engine_running", audioEngine.running);
+        setResponseField(response, "audio_engine_position_frame", static_cast<double>(audioEngine.positionFrame));
+        setResponseField(response, "audio_engine_metronome_enabled", audioEngine.metronomeEnabled);
+        setResponseField(response, "audio_engine_tracks", juce::var(audioEngineTracks));
         setResponseField(response, "graph_scheduled_event_count", totalPersistentGraphScheduledEventCount());
         setResponseField(response, "input_buses", describeBuses(true));
         setResponseField(response, "output_buses", describeBuses(false));
@@ -2091,12 +2420,14 @@ private:
         ensureScratchBufferSize(currentBlockSize);
         preparePluginForPlayback();
         preparePersistentPluginGraphForPlayback();
+        prepareAudioEngineForPlayback();
     }
 
     void audioDeviceStopped() override
     {
         releasePluginResources();
         releasePersistentPluginGraphResources();
+        releaseAudioEngineResources();
     }
 
     void audioDeviceIOCallbackWithContext(const float* const* /*inputChannelData*/,
@@ -2132,6 +2463,8 @@ private:
             }
             if (graphTransportEnabled.load())
                 processPersistentPluginGraphTransport(buffer, numSamples, renderedSampleFrames.load());
+            if (audioEngine.running)
+                processAudioEngine(buffer, numSamples);
         }
 
         mixQueuedAudioStreamsIntoBuffer(buffer);
@@ -2218,6 +2551,217 @@ private:
         const auto rightChannel = processBuffer.getNumChannels() > 1 ? 1 : 0;
         stereoBuffer.copyFrom(0, 0, processBuffer, 0, 0, stereoBuffer.getNumSamples());
         stereoBuffer.copyFrom(1, 0, processBuffer, rightChannel, 0, stereoBuffer.getNumSamples());
+    }
+
+    static juce::AudioBuffer<float> ensureStereoAudioEngineBuffer(const juce::AudioBuffer<float>& input)
+    {
+        juce::AudioBuffer<float> stereo(2, juce::jmax(0, input.getNumSamples()));
+        stereo.clear();
+        if (input.getNumChannels() <= 0 || input.getNumSamples() <= 0)
+            return stereo;
+
+        const auto rightChannel = input.getNumChannels() > 1 ? 1 : 0;
+        stereo.copyFrom(0, 0, input, 0, 0, input.getNumSamples());
+        stereo.copyFrom(1, 0, input, rightChannel, 0, input.getNumSamples());
+        return stereo;
+    }
+
+    static juce::AudioBuffer<float> resampleAudioEngineBuffer(const juce::AudioBuffer<float>& input,
+                                                              double sourceSampleRate,
+                                                              double targetSampleRate)
+    {
+        if (input.getNumSamples() <= 0 || input.getNumChannels() <= 0)
+            return ensureStereoAudioEngineBuffer(input);
+        if (sourceSampleRate <= 0.0 || targetSampleRate <= 0.0
+            || std::abs(sourceSampleRate - targetSampleRate) < 0.01)
+        {
+            return ensureStereoAudioEngineBuffer(input);
+        }
+
+        const auto ratio = targetSampleRate / sourceSampleRate;
+        const auto targetSamples = juce::jmax(1, static_cast<int>(std::llround(input.getNumSamples() * ratio)));
+        juce::AudioBuffer<float> output(input.getNumChannels(), targetSamples);
+        output.clear();
+
+        for (int channel = 0; channel < input.getNumChannels(); ++channel)
+        {
+            const auto* source = input.getReadPointer(channel);
+            auto* destination = output.getWritePointer(channel);
+            for (int sample = 0; sample < targetSamples; ++sample)
+            {
+                const auto sourcePosition = (static_cast<double>(sample) * sourceSampleRate) / targetSampleRate;
+                const auto lowerIndex = juce::jlimit(0, juce::jmax(0, input.getNumSamples() - 1), static_cast<int>(std::floor(sourcePosition)));
+                const auto upperIndex = juce::jlimit(0, juce::jmax(0, input.getNumSamples() - 1), lowerIndex + 1);
+                const auto fraction = static_cast<float>(sourcePosition - static_cast<double>(lowerIndex));
+                destination[sample] = source[lowerIndex] + ((source[upperIndex] - source[lowerIndex]) * fraction);
+            }
+        }
+
+        return ensureStereoAudioEngineBuffer(output);
+    }
+
+    bool loadAudioEngineClipBuffer(const juce::String& path,
+                                   juce::AudioBuffer<float>& destination,
+                                   juce::String& error)
+    {
+        if (currentSampleRate <= 0.0)
+        {
+            error = "Audio device is not ready for audio clips";
+            return false;
+        }
+
+        const juce::File audioFile(path);
+        if (!audioFile.existsAsFile())
+        {
+            error = "Audio clip file not found";
+            return false;
+        }
+
+        auto reader = std::unique_ptr<juce::AudioFormatReader>(audioFormatManager.createReaderFor(audioFile));
+        if (reader == nullptr)
+        {
+            error = "Could not open audio clip";
+            return false;
+        }
+
+        const auto sourceSamples = juce::jmax<int>(1, static_cast<int>(reader->lengthInSamples));
+        const auto sourceChannels = juce::jmax(1, static_cast<int>(reader->numChannels));
+        juce::AudioBuffer<float> source(sourceChannels, sourceSamples);
+        source.clear();
+        if (!reader->read(&source, 0, sourceSamples, 0, true, true))
+        {
+            error = "Could not read audio clip";
+            return false;
+        }
+
+        auto resampled = resampleAudioEngineBuffer(source, reader->sampleRate, currentSampleRate);
+        destination.makeCopyOf(resampled);
+        return true;
+    }
+
+    static void prepareAudioEngineMetronomeBuffer(juce::AudioBuffer<float>& buffer,
+                                                  double sampleRate,
+                                                  bool accented)
+    {
+        const auto clickFrames = juce::jmax(8, static_cast<int>(sampleRate * (accented ? 0.032 : 0.022)));
+        buffer.setSize(2, clickFrames, false, false, true);
+        buffer.clear();
+
+        const auto frequency = accented ? 1760.0f : 1320.0f;
+        const auto gain = accented ? 0.22f : 0.14f;
+        const auto decayRate = accented ? 78.0f : 96.0f;
+        const auto harmonic = accented ? 0.28f : 0.18f;
+        auto* left = buffer.getWritePointer(0);
+        auto* right = buffer.getWritePointer(1);
+        for (int sample = 0; sample < clickFrames; ++sample)
+        {
+            const auto t = static_cast<float>(sample / sampleRate);
+            const auto envelope = std::exp(-t * decayRate);
+            const auto value = (std::sin(2.0f * juce::MathConstants<float>::pi * frequency * t)
+                + (harmonic * std::sin(2.0f * juce::MathConstants<float>::pi * frequency * 2.0f * t)))
+                * envelope * gain;
+            left[sample] = value;
+            right[sample] = value;
+        }
+    }
+
+    void prepareAudioEngineMetronome()
+    {
+        if (!audioEngine.metronomeEnabled || currentSampleRate <= 0.0)
+        {
+            audioEngine.metronomeClickBuffer.setSize(0, 0);
+            audioEngine.metronomeAccentBuffer.setSize(0, 0);
+            return;
+        }
+
+        prepareAudioEngineMetronomeBuffer(audioEngine.metronomeClickBuffer, currentSampleRate, false);
+        prepareAudioEngineMetronomeBuffer(audioEngine.metronomeAccentBuffer, currentSampleRate, true);
+    }
+
+    static void renderAudioEngineTrackClips(AudioEngineTrack& track,
+                                            int64_t chunkStartFrame,
+                                            int chunkSamples)
+    {
+        track.stereoBuffer.clear();
+        if (track.audioClips.empty() || chunkSamples <= 0)
+            return;
+
+        const auto chunkEndFrame = chunkStartFrame + static_cast<int64_t>(chunkSamples);
+        for (const auto& clip : track.audioClips)
+        {
+            const auto clipSamples = clip.audioData.getNumSamples();
+            if (clipSamples <= 0)
+                continue;
+
+            const auto clipStartFrame = clip.startFrame;
+            const auto clipEndFrame = clipStartFrame + static_cast<int64_t>(clipSamples);
+            const auto overlapStart = juce::jmax(chunkStartFrame, clipStartFrame);
+            const auto overlapEnd = juce::jmin(chunkEndFrame, clipEndFrame);
+            if (overlapEnd <= overlapStart)
+                continue;
+
+            const auto sourceOffset = static_cast<int>(overlapStart - clipStartFrame);
+            const auto destinationOffset = static_cast<int>(overlapStart - chunkStartFrame);
+            const auto overlapSamples = static_cast<int>(overlapEnd - overlapStart);
+            track.stereoBuffer.addFrom(0, destinationOffset, clip.audioData, 0, sourceOffset, overlapSamples);
+            track.stereoBuffer.addFrom(1, destinationOffset, clip.audioData, 1, sourceOffset, overlapSamples);
+        }
+    }
+
+    void mixAudioEngineMetronomeChunk(juce::AudioBuffer<float>& destination,
+                                      int sampleOffset,
+                                      int64_t chunkStartFrame,
+                                      int chunkSamples,
+                                      double sampleRate)
+    {
+        if (!audioEngine.metronomeEnabled || chunkSamples <= 0 || audioEngine.ticksPerBeat <= 0)
+            return;
+
+        const auto chunkEndFrame = chunkStartFrame + static_cast<int64_t>(chunkSamples);
+        int64_t beatIndex = juce::jmax<int64_t>(
+            0,
+            (audioEngine.frameToTick(chunkStartFrame, sampleRate) / audioEngine.ticksPerBeat) - 1
+        );
+
+        while (audioEngine.tickToFrame((beatIndex + 1) * static_cast<int64_t>(audioEngine.ticksPerBeat), sampleRate) <= chunkStartFrame)
+            ++beatIndex;
+        while (beatIndex > 0
+            && audioEngine.tickToFrame(beatIndex * static_cast<int64_t>(audioEngine.ticksPerBeat), sampleRate) > chunkStartFrame)
+        {
+            --beatIndex;
+        }
+
+        while (true)
+        {
+            const auto beatFrame = audioEngine.tickToFrame(
+                beatIndex * static_cast<int64_t>(audioEngine.ticksPerBeat),
+                sampleRate
+            );
+            const auto& clickBuffer = (beatIndex % 4) == 0
+                ? audioEngine.metronomeAccentBuffer
+                : audioEngine.metronomeClickBuffer;
+            const auto clickSamples = clickBuffer.getNumSamples();
+            if (clickSamples <= 0 && beatFrame >= chunkEndFrame)
+                break;
+            if (clickSamples > 0)
+            {
+                const auto clickEndFrame = beatFrame + static_cast<int64_t>(clickSamples);
+                const auto overlapStart = juce::jmax(chunkStartFrame, beatFrame);
+                const auto overlapEnd = juce::jmin(chunkEndFrame, clickEndFrame);
+                if (overlapEnd > overlapStart)
+                {
+                    const auto sourceOffset = static_cast<int>(overlapStart - beatFrame);
+                    const auto destinationOffset = sampleOffset + static_cast<int>(overlapStart - chunkStartFrame);
+                    const auto overlapSamples = static_cast<int>(overlapEnd - overlapStart);
+                    destination.addFrom(0, destinationOffset, clickBuffer, 0, sourceOffset, overlapSamples);
+                    destination.addFrom(1, destinationOffset, clickBuffer, 1, sourceOffset, overlapSamples);
+                }
+            }
+
+            if (beatFrame >= chunkEndFrame)
+                break;
+            ++beatIndex;
+        }
     }
 
     void enqueueMidiMessage(const juce::MidiMessage& message)
@@ -2887,6 +3431,41 @@ private:
         return stateFile.replaceWithData(rawState.getData(), rawState.getSize());
     }
 
+    static int resolvePluginParameterIndex(juce::AudioPluginInstance& plugin, const juce::String& rawName)
+    {
+        auto parameters = plugin.getParameters();
+        const auto requestedName = rawName.trim();
+        if (requestedName.isEmpty())
+            return -1;
+
+        if (requestedName.startsWithIgnoreCase("Param "))
+        {
+            const auto legacyNumber = requestedName.fromFirstOccurrenceOf(" ", false, false).trim().getIntValue();
+            const auto legacyIndex = legacyNumber - 1;
+            if (juce::isPositiveAndBelow(legacyIndex, parameters.size()))
+                return legacyIndex;
+        }
+
+        for (int index = 0; index < parameters.size(); ++index)
+        {
+            auto* parameter = parameters[index];
+            if (parameter == nullptr)
+                continue;
+
+            auto parameterName = parameter->getName(256).trim();
+            if (parameterName.isEmpty())
+                parameterName = "Param " + juce::String(index + 1);
+
+            if (parameterName.equalsIgnoreCase(requestedName)
+                || ("Param " + juce::String(index + 1)).equalsIgnoreCase(requestedName))
+            {
+                return index;
+            }
+        }
+
+        return -1;
+    }
+
     bool applyRequestedParameterValues(const juce::var& parametersVar,
                                        juce::String& error,
                                        int& appliedCount,
@@ -2929,44 +3508,11 @@ private:
         }
 
         auto parameters = plugin.getParameters();
-        auto resolveParameterIndex = [&parameters](const juce::String& rawName) -> int
-        {
-            const auto requestedName = rawName.trim();
-            if (requestedName.isEmpty())
-                return -1;
-
-            if (requestedName.startsWithIgnoreCase("Param "))
-            {
-                const auto legacyNumber = requestedName.fromFirstOccurrenceOf(" ", false, false).trim().getIntValue();
-                const auto legacyIndex = legacyNumber - 1;
-                if (juce::isPositiveAndBelow(legacyIndex, parameters.size()))
-                    return legacyIndex;
-            }
-
-            for (int index = 0; index < parameters.size(); ++index)
-            {
-                auto* parameter = parameters[index];
-                if (parameter == nullptr)
-                    continue;
-
-                auto parameterName = parameter->getName(256).trim();
-                if (parameterName.isEmpty())
-                    parameterName = "Param " + juce::String(index + 1);
-
-                if (parameterName.equalsIgnoreCase(requestedName)
-                    || ("Param " + juce::String(index + 1)).equalsIgnoreCase(requestedName))
-                {
-                    return index;
-                }
-            }
-
-            return -1;
-        };
 
         for (const auto& property : parameterObject->getProperties())
         {
             const auto parameterName = property.name.toString();
-            const auto parameterIndex = resolveParameterIndex(parameterName);
+            const auto parameterIndex = resolvePluginParameterIndex(plugin, parameterName);
             if (!juce::isPositiveAndBelow(parameterIndex, parameters.size()))
             {
                 unmatchedParameters.addIfNotAlreadyThere(parameterName);
@@ -4059,6 +4605,892 @@ private:
         }
     }
 
+    void releaseAudioEngineEffectSlot(AudioEngineTrack::EffectSlot& slot)
+    {
+        if (slot.plugin != nullptr)
+        {
+            slot.plugin->suspendProcessing(true);
+            slot.plugin->releaseResources();
+        }
+        slot.plugin.reset();
+    }
+
+    void releaseAudioEngineTrack(AudioEngineTrack& track)
+    {
+        if (track.plugin != nullptr)
+        {
+            track.plugin->suspendProcessing(true);
+            track.plugin->releaseResources();
+        }
+        track.kind = AudioEngineTrackKind::instrument;
+        track.plugin.reset();
+        for (auto& effectSlot : track.fxChain)
+            releaseAudioEngineEffectSlot(effectSlot);
+        track.fxChain.clear();
+        track.notes.clear();
+        track.audioClips.clear();
+        track.automationLanes.clear();
+        track.baseVolume = 1.0f;
+        track.basePan = 0.0f;
+        track.baseOutputGainDb = 0.0f;
+        track.processBuffer.setSize(0, 0);
+        track.stereoBuffer.setSize(0, 0);
+        track.peakLevel = 0.0f;
+    }
+
+    void clearAudioEngine()
+    {
+        audioEngine.running = false;
+        audioEngine.bootstrapPending = false;
+        for (auto& track : audioEngine.tracks)
+            releaseAudioEngineTrack(track);
+        audioEngine.tracks.clear();
+        audioEngine.positionFrame = 0;
+        audioEngine.metronomeEnabled = false;
+        audioEngine.metronomeClickBuffer.setSize(0, 0);
+        audioEngine.metronomeAccentBuffer.setSize(0, 0);
+    }
+
+    void resetAudioEngineTrackProcessingState(AudioEngineTrack& track)
+    {
+        if (track.plugin != nullptr)
+            track.plugin->reset();
+        for (auto& effectSlot : track.fxChain)
+        {
+            if (effectSlot.plugin != nullptr)
+                effectSlot.plugin->reset();
+        }
+        for (auto& lane : track.automationLanes)
+            lane.lastAppliedValue = std::numeric_limits<float>::quiet_NaN();
+        track.peakLevel = 0.0f;
+    }
+
+    void resetAudioEngineProcessingState()
+    {
+        for (auto& track : audioEngine.tracks)
+            resetAudioEngineTrackProcessingState(track);
+    }
+
+    static float evaluateAudioEngineAutomationLane(const AudioEngineAutomationLane& lane, double tick)
+    {
+        if (lane.points.empty())
+            return lane.defaultValue;
+
+        if (lane.points.size() == 1)
+        {
+            const auto& point = lane.points.front();
+            return tick >= static_cast<double>(point.tick) ? point.value : lane.defaultValue;
+        }
+
+        auto previousTick = 0.0;
+        auto previousValue = static_cast<double>(lane.defaultValue);
+        for (const auto& point : lane.points)
+        {
+            const auto pointTick = static_cast<double>(point.tick);
+            const auto pointValue = static_cast<double>(point.value);
+            if (pointTick <= 0.0)
+            {
+                previousTick = pointTick;
+                previousValue = pointValue;
+                if (tick <= 0.0)
+                    return point.value;
+                continue;
+            }
+
+            if (tick < pointTick)
+            {
+                if (previousTick <= 0.0)
+                    return static_cast<float>(previousValue);
+
+                const auto span = juce::jmax(1.0, pointTick - previousTick);
+                const auto progress = juce::jlimit(0.0, 1.0, (tick - previousTick) / span);
+                return static_cast<float>(previousValue + ((pointValue - previousValue) * progress));
+            }
+
+            previousTick = pointTick;
+            previousValue = pointValue;
+        }
+
+        return static_cast<float>(previousValue);
+    }
+
+    static bool audioEngineTrackHasParameterAutomation(const AudioEngineTrack& track)
+    {
+        return std::any_of(track.automationLanes.begin(), track.automationLanes.end(), [](const AudioEngineAutomationLane& lane)
+        {
+            return lane.type == AudioEngineAutomationTargetType::vstParameter
+                && lane.parameterIndex >= 0
+                && !lane.points.empty();
+        });
+    }
+
+    static void applyAudioEngineTrackParameterAutomation(AudioEngineTrack& track, double tick)
+    {
+        auto* plugin = track.plugin.get();
+        if (plugin == nullptr)
+            return;
+
+        auto parameters = plugin->getParameters();
+        for (auto& lane : track.automationLanes)
+        {
+            if (lane.type != AudioEngineAutomationTargetType::vstParameter
+                || !juce::isPositiveAndBelow(lane.parameterIndex, parameters.size()))
+            {
+                continue;
+            }
+
+            auto* parameter = parameters[lane.parameterIndex];
+            if (parameter == nullptr)
+                continue;
+
+            const auto value = juce::jlimit(0.0f, 100.0f, evaluateAudioEngineAutomationLane(lane, tick));
+            if (std::isfinite(lane.lastAppliedValue)
+                && std::abs(lane.lastAppliedValue - value) < 0.001f)
+            {
+                continue;
+            }
+
+            parameter->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, value / 100.0f));
+            lane.lastAppliedValue = value;
+        }
+    }
+
+    static void applyAudioEngineTrackMixAutomation(const AudioEngineState& engineState,
+                                                   AudioEngineTrack& track,
+                                                   juce::AudioBuffer<float>& stereoBuffer,
+                                                   int64_t chunkStartFrame,
+                                                   double sampleRate)
+    {
+        if (stereoBuffer.getNumSamples() <= 0)
+            return;
+
+        const AudioEngineAutomationLane* volumeLane = nullptr;
+        const AudioEngineAutomationLane* panLane = nullptr;
+        const AudioEngineAutomationLane* outputGainLane = nullptr;
+        for (const auto& lane : track.automationLanes)
+        {
+            if (lane.points.empty())
+                continue;
+            if (lane.type == AudioEngineAutomationTargetType::volume)
+                volumeLane = &lane;
+            else if (lane.type == AudioEngineAutomationTargetType::pan)
+                panLane = &lane;
+            else if (lane.type == AudioEngineAutomationTargetType::outputGainDb)
+                outputGainLane = &lane;
+        }
+
+        if (volumeLane == nullptr && panLane == nullptr && outputGainLane == nullptr)
+        {
+            const auto gain = juce::jmax(0.0f, track.baseVolume * std::pow(10.0f, track.baseOutputGainDb / 20.0f));
+            applyOutputMixToBuffer(stereoBuffer, gain, track.basePan);
+            return;
+        }
+
+        auto* left = stereoBuffer.getWritePointer(0);
+        auto* right = stereoBuffer.getWritePointer(1);
+        for (int sample = 0; sample < stereoBuffer.getNumSamples(); ++sample)
+        {
+            const auto tick = engineState.frameToTickDouble(chunkStartFrame + static_cast<int64_t>(sample), sampleRate);
+            const auto volume = volumeLane != nullptr
+                ? evaluateAudioEngineAutomationLane(*volumeLane, tick)
+                : track.baseVolume;
+            const auto pan = panLane != nullptr
+                ? evaluateAudioEngineAutomationLane(*panLane, tick)
+                : track.basePan;
+            const auto outputGainDb = outputGainLane != nullptr
+                ? evaluateAudioEngineAutomationLane(*outputGainLane, tick)
+                : track.baseOutputGainDb;
+            const auto gain = juce::jmax(0.0f, volume * std::pow(10.0f, outputGainDb / 20.0f));
+            const auto clampedPan = juce::jlimit(-1.0f, 1.0f, pan);
+            const auto angle = (clampedPan + 1.0f) * juce::MathConstants<float>::pi * 0.25f;
+            left[sample] *= gain * std::cos(angle);
+            right[sample] *= gain * std::sin(angle);
+        }
+    }
+
+    void processAudioEngineEffectChain(AudioEngineTrack& track, juce::AudioBuffer<float>& stereoBuffer)
+    {
+        if (track.fxChain.empty() || stereoBuffer.getNumSamples() <= 0)
+            return;
+
+        for (auto& effectSlot : track.fxChain)
+        {
+            auto* plugin = effectSlot.plugin.get();
+            if (plugin == nullptr)
+                continue;
+
+            const auto channelCount = juce::jmax(
+                2,
+                juce::jmax(plugin->getTotalNumInputChannels(), plugin->getTotalNumOutputChannels())
+            );
+            juce::AudioBuffer<float> processBuffer(channelCount, stereoBuffer.getNumSamples());
+            processBuffer.clear();
+            copyStereoBufferToPluginInput(*plugin, processBuffer, stereoBuffer);
+
+            juce::MidiBuffer midi;
+            plugin->processBlock(processBuffer, midi);
+            extractPluginOutputToStereo(*plugin, processBuffer, stereoBuffer);
+        }
+    }
+
+    void prepareAudioEngineForPlayback()
+    {
+        prepareAudioEngineMetronome();
+        for (auto& track : audioEngine.tracks)
+        {
+            if (track.plugin == nullptr)
+            {
+                track.processBuffer.setSize(0, 0);
+            }
+            else
+            {
+                track.plugin->setRateAndBufferSizeDetails(currentSampleRate, currentBlockSize);
+                track.plugin->prepareToPlay(currentSampleRate, currentBlockSize);
+                track.plugin->suspendProcessing(false);
+            }
+            for (auto& effectSlot : track.fxChain)
+            {
+                if (effectSlot.plugin == nullptr)
+                    continue;
+                effectSlot.plugin->setRateAndBufferSizeDetails(currentSampleRate, currentBlockSize);
+                effectSlot.plugin->prepareToPlay(currentSampleRate, currentBlockSize);
+                effectSlot.plugin->suspendProcessing(false);
+            }
+            resetAudioEngineTrackProcessingState(track);
+        }
+    }
+
+    void releaseAudioEngineResources()
+    {
+        for (auto& track : audioEngine.tracks)
+        {
+            if (track.plugin != nullptr)
+            {
+                track.plugin->suspendProcessing(true);
+                track.plugin->releaseResources();
+            }
+            for (auto& effectSlot : track.fxChain)
+            {
+                if (effectSlot.plugin != nullptr)
+                {
+                    effectSlot.plugin->suspendProcessing(true);
+                    effectSlot.plugin->releaseResources();
+                }
+            }
+        }
+        audioEngine.metronomeClickBuffer.setSize(0, 0);
+        audioEngine.metronomeAccentBuffer.setSize(0, 0);
+    }
+
+    bool configureAudioEngineTrackEffectChain(AudioEngineTrack& track,
+                                              const juce::var& fxChainVar,
+                                              int trackIndex,
+                                              juce::Array<juce::var>& trackErrors)
+    {
+        for (auto& effectSlot : track.fxChain)
+            releaseAudioEngineEffectSlot(effectSlot);
+        track.fxChain.clear();
+
+        auto* fxArray = fxChainVar.getArray();
+        if (fxArray == nullptr || fxArray->isEmpty())
+            return true;
+
+        track.fxChain.reserve(static_cast<size_t>(fxArray->size()));
+        for (int fxIndex = 0; fxIndex < fxArray->size(); ++fxIndex)
+        {
+            auto* fxObject = fxArray->getReference(fxIndex).getDynamicObject();
+            if (fxObject == nullptr)
+            {
+                auto* errorObject = new juce::DynamicObject();
+                errorObject->setProperty("track_index", trackIndex);
+                errorObject->setProperty("fx_index", fxIndex);
+                errorObject->setProperty("message", "FX payload must be an object");
+                trackErrors.add(juce::var(errorObject));
+                continue;
+            }
+
+            const auto pluginPath = normaliseVst3PathForSettings(
+                fxObject->getProperty("plugin_path").toString().trim()
+            );
+            const auto statePath = fxObject->getProperty("state_path").toString().trim();
+            const auto parameterSignature = parameterPayloadSignature(fxObject->getProperty("parameters"));
+            const auto name = fxObject->hasProperty("name")
+                ? fxObject->getProperty("name").toString().trim()
+                : juce::String();
+
+            if (pluginPath.isEmpty())
+            {
+                auto* errorObject = new juce::DynamicObject();
+                errorObject->setProperty("track_index", trackIndex);
+                errorObject->setProperty("fx_index", fxIndex);
+                errorObject->setProperty("message", "Missing FX plugin path");
+                trackErrors.add(juce::var(errorObject));
+                continue;
+            }
+
+            juce::String createError;
+            auto instance = createPreparedGraphPluginInstance(
+                pluginPath,
+                statePath,
+                fxObject->getProperty("parameters"),
+                createError
+            );
+            if (instance == nullptr)
+            {
+                auto* errorObject = new juce::DynamicObject();
+                errorObject->setProperty("track_index", trackIndex);
+                errorObject->setProperty("fx_index", fxIndex);
+                errorObject->setProperty("plugin_path", pluginPath);
+                errorObject->setProperty("message", createError.isNotEmpty() ? createError : "Could not create FX instance");
+                trackErrors.add(juce::var(errorObject));
+                continue;
+            }
+
+            AudioEngineTrack::EffectSlot effectSlot;
+            effectSlot.name = name.isNotEmpty() ? name : juce::File(pluginPath).getFileNameWithoutExtension();
+            effectSlot.pluginPath = pluginPath;
+            effectSlot.statePath = statePath;
+            effectSlot.parameterSignature = parameterSignature;
+            effectSlot.plugin = std::move(instance);
+            track.fxChain.push_back(std::move(effectSlot));
+        }
+
+        return true;
+    }
+
+    bool configureAudioEngine(const juce::var& tracksVar,
+                              double bpm,
+                              int ticksPerBeat,
+                              bool loopEnabled,
+                              int64_t loopStartTick,
+                              int64_t loopEndTick,
+                              bool metronomeEnabled,
+                              juce::Array<juce::var>& trackErrors,
+                              juce::String& error)
+    {
+        auto* tracksArray = tracksVar.getArray();
+        const auto requestedTrackCount = tracksArray != nullptr ? tracksArray->size() : 0;
+        if (requestedTrackCount <= 0 && !metronomeEnabled)
+        {
+            error = "set_audio_engine_state requires track or metronome state";
+            return false;
+        }
+
+        const auto shouldPrepare = currentSampleRate > 0.0 && currentBlockSize > 0;
+        if (shouldPrepare)
+            releaseAudioEngineResources();
+
+        if (audioEngine.tracks.size() > static_cast<size_t>(requestedTrackCount))
+        {
+            for (size_t index = static_cast<size_t>(requestedTrackCount); index < audioEngine.tracks.size(); ++index)
+                releaseAudioEngineTrack(audioEngine.tracks[index]);
+            audioEngine.tracks.resize(static_cast<size_t>(requestedTrackCount));
+        }
+        else if (audioEngine.tracks.size() < static_cast<size_t>(requestedTrackCount))
+        {
+            audioEngine.tracks.resize(static_cast<size_t>(requestedTrackCount));
+        }
+
+        int loadedCount = 0;
+        for (int trackIndex = 0; trackIndex < requestedTrackCount; ++trackIndex)
+        {
+            auto* trackObject = tracksArray->getReference(trackIndex).getDynamicObject();
+            auto& track = audioEngine.tracks[static_cast<size_t>(trackIndex)];
+            if (trackObject == nullptr)
+            {
+                releaseAudioEngineTrack(track);
+                auto* errorObject = new juce::DynamicObject();
+                errorObject->setProperty("track_index", trackIndex);
+                errorObject->setProperty("message", "Track payload must be an object");
+                trackErrors.add(juce::var(errorObject));
+                continue;
+            }
+
+            const auto trackType = trackObject->hasProperty("track_type")
+                ? trackObject->getProperty("track_type").toString().trim().toLowerCase()
+                : juce::String("instrument");
+            const auto requestedKind = trackType == "audio"
+                ? AudioEngineTrackKind::audio
+                : AudioEngineTrackKind::instrument;
+            const auto pluginPath = normaliseVst3PathForSettings(trackObject->getProperty("plugin_path").toString().trim());
+            const auto statePath = trackObject->getProperty("state_path").toString().trim();
+            const auto parameterSignature = parameterPayloadSignature(trackObject->getProperty("parameters"));
+            const auto fxChainSignature = graphEffectChainPayloadSignature(trackObject->getProperty("fx_chain"));
+            const auto name = trackObject->hasProperty("name")
+                ? trackObject->getProperty("name").toString().trim()
+                : juce::String();
+            const auto baseVolume = trackObject->hasProperty("volume")
+                ? static_cast<float>(static_cast<double>(trackObject->getProperty("volume")))
+                : (trackObject->hasProperty("gain")
+                    ? static_cast<float>(static_cast<double>(trackObject->getProperty("gain")))
+                    : 1.0f);
+            const auto pan = trackObject->hasProperty("pan")
+                ? static_cast<float>(static_cast<double>(trackObject->getProperty("pan")))
+                : 0.0f;
+            const auto outputGainDb = trackObject->hasProperty("output_gain_db")
+                ? static_cast<float>(static_cast<double>(trackObject->getProperty("output_gain_db")))
+                : 0.0f;
+
+            std::vector<AudioEngineTrackNote> notes;
+            if (auto* notesArray = trackObject->getProperty("notes").getArray())
+            {
+                notes.reserve(static_cast<size_t>(notesArray->size()));
+                for (const auto& noteVar : *notesArray)
+                {
+                    auto* noteObject = noteVar.getDynamicObject();
+                    if (noteObject == nullptr)
+                        continue;
+
+                    AudioEngineTrackNote note;
+                    note.startTick = static_cast<int>(noteObject->hasProperty("start_tick")
+                        ? noteObject->getProperty("start_tick")
+                        : juce::var(0));
+                    note.endTick = static_cast<int>(noteObject->hasProperty("end_tick")
+                        ? noteObject->getProperty("end_tick")
+                        : juce::var(note.startTick + 1));
+                    note.pitch = clampMidiNote(static_cast<int>(noteObject->hasProperty("pitch")
+                        ? noteObject->getProperty("pitch")
+                        : juce::var(60)));
+                    note.velocity = juce::jlimit(1, 127, static_cast<int>(noteObject->hasProperty("velocity")
+                        ? noteObject->getProperty("velocity")
+                        : juce::var(100)));
+                    note.channel = clampMidiChannel(static_cast<int>(noteObject->hasProperty("channel")
+                        ? noteObject->getProperty("channel")
+                        : juce::var(kDefaultMidiChannel)));
+                    note.endTick = juce::jmax(note.startTick + 1, note.endTick);
+                    notes.push_back(note);
+                }
+            }
+            std::sort(notes.begin(), notes.end(), [](const AudioEngineTrackNote& a, const AudioEngineTrackNote& b)
+            {
+                if (a.startTick != b.startTick)
+                    return a.startTick < b.startTick;
+                if (a.endTick != b.endTick)
+                    return a.endTick < b.endTick;
+                if (a.channel != b.channel)
+                    return a.channel < b.channel;
+                return a.pitch < b.pitch;
+            });
+
+            std::vector<AudioEngineAudioClip> audioClips;
+            if (requestedKind == AudioEngineTrackKind::audio)
+            {
+                if (auto* clipsArray = trackObject->getProperty("clips").getArray())
+                {
+                    audioClips.reserve(static_cast<size_t>(clipsArray->size()));
+                    for (int clipIndex = 0; clipIndex < clipsArray->size(); ++clipIndex)
+                    {
+                        auto* clipObject = clipsArray->getReference(clipIndex).getDynamicObject();
+                        if (clipObject == nullptr)
+                            continue;
+
+                        const auto clipPath = clipObject->getProperty("path").toString().trim();
+                        const auto startFrame = clipObject->hasProperty("start_frame")
+                            ? static_cast<int64_t>(static_cast<double>(clipObject->getProperty("start_frame")))
+                            : int64_t(0);
+                        if (clipPath.isEmpty())
+                        {
+                            auto* errorObject = new juce::DynamicObject();
+                            errorObject->setProperty("track_index", trackIndex);
+                            errorObject->setProperty("clip_index", clipIndex);
+                            errorObject->setProperty("message", "Missing audio clip path");
+                            trackErrors.add(juce::var(errorObject));
+                            continue;
+                        }
+
+                        AudioEngineAudioClip clip;
+                        clip.path = clipPath;
+                        clip.startFrame = juce::jmax<int64_t>(0, startFrame);
+                        juce::String clipError;
+                        if (!loadAudioEngineClipBuffer(clipPath, clip.audioData, clipError))
+                        {
+                            auto* errorObject = new juce::DynamicObject();
+                            errorObject->setProperty("track_index", trackIndex);
+                            errorObject->setProperty("clip_index", clipIndex);
+                            errorObject->setProperty("path", clipPath);
+                            errorObject->setProperty("message", clipError.isNotEmpty() ? clipError : "Could not load audio clip");
+                            trackErrors.add(juce::var(errorObject));
+                            continue;
+                        }
+
+                        audioClips.push_back(std::move(clip));
+                    }
+                }
+
+                std::sort(audioClips.begin(), audioClips.end(), [](const AudioEngineAudioClip& a, const AudioEngineAudioClip& b)
+                {
+                    if (a.startFrame != b.startFrame)
+                        return a.startFrame < b.startFrame;
+                    return a.path.compareNatural(b.path) < 0;
+                });
+            }
+
+            if (requestedKind == AudioEngineTrackKind::instrument && pluginPath.isEmpty())
+            {
+                releaseAudioEngineTrack(track);
+                auto* errorObject = new juce::DynamicObject();
+                errorObject->setProperty("track_index", trackIndex);
+                errorObject->setProperty("message", "Missing plugin path");
+                trackErrors.add(juce::var(errorObject));
+                continue;
+            }
+
+            const auto canReuse = track.kind == requestedKind
+                && track.statePath == statePath
+                && track.parameterSignature == parameterSignature
+                && track.fxChainSignature == fxChainSignature
+                && (
+                    (requestedKind == AudioEngineTrackKind::instrument
+                        && track.plugin != nullptr
+                        && track.pluginPath == pluginPath)
+                    || (requestedKind == AudioEngineTrackKind::audio
+                        && track.plugin == nullptr)
+                );
+
+            if (!canReuse)
+            {
+                releaseAudioEngineTrack(track);
+                track.kind = requestedKind;
+
+                if (requestedKind == AudioEngineTrackKind::instrument)
+                {
+                    juce::String createError;
+                    auto instance = createPreparedGraphPluginInstance(
+                        pluginPath,
+                        statePath,
+                        trackObject->getProperty("parameters"),
+                        createError
+                    );
+                    if (instance == nullptr)
+                    {
+                        auto* errorObject = new juce::DynamicObject();
+                        errorObject->setProperty("track_index", trackIndex);
+                        errorObject->setProperty("plugin_path", pluginPath);
+                        errorObject->setProperty("message", createError.isNotEmpty() ? createError : "Could not create plugin instance");
+                        trackErrors.add(juce::var(errorObject));
+                        continue;
+                    }
+
+                    track.pluginPath = pluginPath;
+                    track.statePath = statePath;
+                    track.parameterSignature = parameterSignature;
+                    track.fxChainSignature = fxChainSignature;
+                    track.plugin = std::move(instance);
+                }
+                else
+                {
+                    track.pluginPath = {};
+                    track.statePath = statePath;
+                    track.parameterSignature = parameterSignature;
+                    track.fxChainSignature = fxChainSignature;
+                }
+
+                configureAudioEngineTrackEffectChain(track, trackObject->getProperty("fx_chain"), trackIndex, trackErrors);
+            }
+
+            std::vector<AudioEngineAutomationLane> automationLanes;
+            if (auto* automationArray = trackObject->getProperty("automation").getArray())
+            {
+                automationLanes.reserve(static_cast<size_t>(automationArray->size()));
+                for (const auto& laneVar : *automationArray)
+                {
+                    auto* laneObject = laneVar.getDynamicObject();
+                    if (laneObject == nullptr)
+                        continue;
+
+                    const auto target = laneObject->getProperty("target").toString().trim();
+                    if (target.isEmpty())
+                        continue;
+
+                    AudioEngineAutomationLane lane;
+                    lane.target = target;
+                    if (target.equalsIgnoreCase("volume"))
+                    {
+                        lane.type = AudioEngineAutomationTargetType::volume;
+                        lane.defaultValue = baseVolume;
+                    }
+                    else if (target.equalsIgnoreCase("pan"))
+                    {
+                        lane.type = AudioEngineAutomationTargetType::pan;
+                        lane.defaultValue = pan;
+                    }
+                    else if (target.equalsIgnoreCase("vsti_output_gain_db"))
+                    {
+                        lane.type = AudioEngineAutomationTargetType::outputGainDb;
+                        lane.defaultValue = outputGainDb;
+                    }
+                    else if (target.startsWithIgnoreCase("vsti_parameter:"))
+                    {
+                        if (requestedKind != AudioEngineTrackKind::instrument || track.plugin == nullptr)
+                            continue;
+                        lane.type = AudioEngineAutomationTargetType::vstParameter;
+                        lane.parameterName = target.fromFirstOccurrenceOf(":", false, false).trim();
+                        lane.parameterIndex = track.plugin != nullptr
+                            ? resolvePluginParameterIndex(*track.plugin, lane.parameterName)
+                            : -1;
+                        if (lane.parameterName.isEmpty() || lane.parameterIndex < 0)
+                        {
+                            auto* errorObject = new juce::DynamicObject();
+                            errorObject->setProperty("track_index", trackIndex);
+                            errorObject->setProperty("target", target);
+                            errorObject->setProperty("message", "Unknown automation parameter");
+                            trackErrors.add(juce::var(errorObject));
+                            continue;
+                        }
+                        auto parameters = track.plugin->getParameters();
+                        if (juce::isPositiveAndBelow(lane.parameterIndex, parameters.size())
+                            && parameters[lane.parameterIndex] != nullptr)
+                        {
+                            lane.defaultValue = parameters[lane.parameterIndex]->getValue() * 100.0f;
+                        }
+                    }
+                    else
+                    {
+                        continue;
+                    }
+
+                    std::vector<AudioEngineAutomationPoint> rawPoints;
+                    if (auto* pointsArray = laneObject->getProperty("points").getArray())
+                    {
+                        for (const auto& pointVar : *pointsArray)
+                        {
+                            auto* pointObject = pointVar.getDynamicObject();
+                            if (pointObject == nullptr)
+                                continue;
+
+                            AudioEngineAutomationPoint point;
+                            point.tick = juce::jmax(0, static_cast<int>(pointObject->hasProperty("tick")
+                                ? pointObject->getProperty("tick")
+                                : juce::var(0)));
+                            point.value = static_cast<float>(static_cast<double>(pointObject->hasProperty("value")
+                                ? pointObject->getProperty("value")
+                                : juce::var(lane.defaultValue)));
+                            rawPoints.push_back(point);
+                        }
+                    }
+
+                    std::sort(rawPoints.begin(), rawPoints.end(), [](const AudioEngineAutomationPoint& a, const AudioEngineAutomationPoint& b)
+                    {
+                        return a.tick < b.tick;
+                    });
+                    for (const auto& point : rawPoints)
+                    {
+                        if (!lane.points.empty() && lane.points.back().tick == point.tick)
+                            lane.points.back().value = point.value;
+                        else
+                            lane.points.push_back(point);
+                    }
+
+                    if (!lane.points.empty())
+                        automationLanes.push_back(std::move(lane));
+                }
+            }
+
+            track.kind = requestedKind;
+            track.name = name.isNotEmpty()
+                ? name
+                : (requestedKind == AudioEngineTrackKind::instrument
+                    ? juce::File(pluginPath).getFileNameWithoutExtension()
+                    : "Audio Track " + juce::String(trackIndex + 1));
+            track.notes = requestedKind == AudioEngineTrackKind::instrument
+                ? std::move(notes)
+                : std::vector<AudioEngineTrackNote>{};
+            track.audioClips = requestedKind == AudioEngineTrackKind::audio
+                ? std::move(audioClips)
+                : std::vector<AudioEngineAudioClip>{};
+            track.automationLanes = std::move(automationLanes);
+            track.baseVolume = baseVolume;
+            track.basePan = pan;
+            track.baseOutputGainDb = outputGainDb;
+            track.peakLevel = 0.0f;
+            if (requestedKind == AudioEngineTrackKind::instrument)
+            {
+                if (track.plugin != nullptr)
+                    ++loadedCount;
+            }
+            else if (!track.audioClips.empty())
+            {
+                ++loadedCount;
+            }
+        }
+
+        if (loadedCount <= 0 && !metronomeEnabled)
+        {
+            error = "Could not configure audio engine";
+            clearAudioEngine();
+            return false;
+        }
+
+        audioEngine.bpm = juce::jmax(1.0, bpm);
+        audioEngine.ticksPerBeat = juce::jmax(1, ticksPerBeat);
+        audioEngine.loopEnabled = loopEnabled;
+        audioEngine.loopStartTick = loopStartTick;
+        audioEngine.loopEndTick = loopEndTick;
+        audioEngine.metronomeEnabled = metronomeEnabled;
+        audioEngine.running = false;
+        audioEngine.bootstrapPending = false;
+        audioEngine.positionFrame = 0;
+
+        if (shouldPrepare)
+            prepareAudioEngineForPlayback();
+
+        return true;
+    }
+
+    void appendAudioEngineNoteEvents(AudioEngineTrack& track,
+                                     juce::MidiBuffer& midi,
+                                     int64_t chunkStartFrame,
+                                     int chunkSamples,
+                                     double sampleRate,
+                                     bool bootstrapActive,
+                                     bool wrapAfterChunk,
+                                     int64_t loopEndFrame)
+    {
+        if (track.notes.empty())
+            return;
+
+        const auto chunkEndFrame = chunkStartFrame + chunkSamples;
+        const auto noteOffAdvance = juce::jmax<int64_t>(1, static_cast<int64_t>(sampleRate) / 1000);
+        const auto looping = audioEngine.loopEnabled && loopEndFrame > audioEngine.tickToFrame(audioEngine.loopStartTick, sampleRate);
+
+        for (const auto& note : track.notes)
+        {
+            const auto noteStartFrame = audioEngine.tickToFrame(note.startTick, sampleRate);
+            auto noteEndFrame = juce::jmax<int64_t>(
+                noteStartFrame + 1,
+                audioEngine.tickToFrame(note.endTick, sampleRate)
+            );
+            if (looping && noteStartFrame < loopEndFrame && noteEndFrame > loopEndFrame)
+                noteEndFrame = loopEndFrame;
+
+            const auto noteOffFrame = juce::jmax<int64_t>(noteStartFrame, noteEndFrame - noteOffAdvance);
+            if (bootstrapActive && noteStartFrame < chunkStartFrame && noteOffFrame > chunkStartFrame)
+            {
+                midi.addEvent(
+                    juce::MidiMessage::noteOn(note.channel, note.pitch, static_cast<float>(note.velocity) / 127.0f),
+                    0
+                );
+            }
+            else if (noteStartFrame >= chunkStartFrame && noteStartFrame < chunkEndFrame)
+            {
+                midi.addEvent(
+                    juce::MidiMessage::noteOn(note.channel, note.pitch, static_cast<float>(note.velocity) / 127.0f),
+                    static_cast<int>(noteStartFrame - chunkStartFrame)
+                );
+            }
+
+            if (noteOffFrame >= chunkStartFrame && noteOffFrame < chunkEndFrame)
+            {
+                midi.addEvent(
+                    juce::MidiMessage::noteOff(note.channel, note.pitch, 0.0f),
+                    static_cast<int>(noteOffFrame - chunkStartFrame)
+                );
+            }
+        }
+
+        if (wrapAfterChunk)
+        {
+            for (const auto& note : track.notes)
+            {
+                midi.addEvent(
+                    juce::MidiMessage::noteOff(note.channel, note.pitch, 0.0f),
+                    juce::jmax(0, chunkSamples - 1)
+                );
+            }
+        }
+    }
+
+    void processAudioEngine(juce::AudioBuffer<float>& buffer, int numSamples)
+    {
+        if (!audioEngine.running || numSamples <= 0)
+            return;
+
+        const auto sampleRate = juce::jmax(1.0, currentSampleRate);
+        const auto loopStartFrame = audioEngine.tickToFrame(audioEngine.loopStartTick, sampleRate);
+        const auto loopEndFrame = audioEngine.tickToFrame(audioEngine.loopEndTick, sampleRate);
+        const auto looping = audioEngine.loopEnabled && loopEndFrame > loopStartFrame;
+
+        int samplesRemaining = numSamples;
+        int sampleOffset = 0;
+
+        while (samplesRemaining > 0)
+        {
+            int chunkSamples = samplesRemaining;
+            if (looping)
+            {
+                const auto framesUntilLoopEnd = loopEndFrame - audioEngine.positionFrame;
+                if (framesUntilLoopEnd > 0 && framesUntilLoopEnd < chunkSamples)
+                    chunkSamples = static_cast<int>(framesUntilLoopEnd);
+            }
+
+            const auto chunkStartFrame = audioEngine.positionFrame;
+            const auto wrapAfterChunk = looping && (chunkStartFrame + chunkSamples) >= loopEndFrame;
+            const auto bootstrapActive = audioEngine.bootstrapPending;
+
+            for (auto& track : audioEngine.tracks)
+            {
+                track.stereoBuffer.setSize(2, chunkSamples, false, false, true);
+                track.stereoBuffer.clear();
+                if (track.kind == AudioEngineTrackKind::instrument)
+                {
+                    auto* plugin = track.plugin.get();
+                    if (plugin == nullptr)
+                        continue;
+
+                    const auto trackChannelCount = juce::jmax(
+                        2,
+                        juce::jmax(plugin->getTotalNumInputChannels(), plugin->getTotalNumOutputChannels())
+                    );
+                    track.processBuffer.setSize(trackChannelCount, chunkSamples, false, false, true);
+                    track.processBuffer.clear();
+
+                    juce::MidiBuffer midi;
+                    appendAudioEngineNoteEvents(
+                        track,
+                        midi,
+                        chunkStartFrame,
+                        chunkSamples,
+                        sampleRate,
+                        bootstrapActive,
+                        wrapAfterChunk,
+                        loopEndFrame
+                    );
+
+                    applyAudioEngineTrackParameterAutomation(
+                        track,
+                        audioEngine.frameToTickDouble(chunkStartFrame, sampleRate)
+                    );
+                    plugin->processBlock(track.processBuffer, midi);
+                    extractPluginOutputToStereo(*plugin, track.processBuffer, track.stereoBuffer);
+                }
+                else
+                {
+                    renderAudioEngineTrackClips(track, chunkStartFrame, chunkSamples);
+                }
+
+                processAudioEngineEffectChain(track, track.stereoBuffer);
+                applyAudioEngineTrackMixAutomation(audioEngine, track, track.stereoBuffer, chunkStartFrame, sampleRate);
+                track.peakLevel = peakLevelForBuffer(track.stereoBuffer);
+                buffer.addFrom(0, sampleOffset, track.stereoBuffer, 0, 0, chunkSamples);
+                buffer.addFrom(1, sampleOffset, track.stereoBuffer, 1, 0, chunkSamples);
+            }
+
+            if (audioEngine.metronomeEnabled)
+                mixAudioEngineMetronomeChunk(buffer, sampleOffset, chunkStartFrame, chunkSamples, sampleRate);
+
+            audioEngine.positionFrame += chunkSamples;
+            audioEngine.bootstrapPending = false;
+            sampleOffset += chunkSamples;
+            samplesRemaining -= chunkSamples;
+
+            if (wrapAfterChunk)
+            {
+                audioEngine.positionFrame = loopStartFrame;
+                audioEngine.bootstrapPending = true;
+            }
+        }
+    }
+
     void openEditorWindow()
     {
         if (pluginInstance == nullptr)
@@ -4178,6 +5610,7 @@ private:
 
     juce::PropertiesFile& appSettings;
     juce::AudioPluginFormatManager formatManager;
+    juce::AudioFormatManager audioFormatManager;
     juce::AudioDeviceManager deviceManager;
     juce::MidiKeyboardState keyboardState;
     juce::CriticalSection pluginLock;
@@ -4198,6 +5631,7 @@ private:
     std::atomic<int64_t> renderedSampleFrames { 0 };
     std::atomic<int64_t> scheduledMidiSequence { 0 };
     InProcessTransport inProcessTransport;
+    AudioEngineState audioEngine;
 
     juce::Label pathLabel;
     juce::TextEditor pathEditor;

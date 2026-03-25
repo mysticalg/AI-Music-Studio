@@ -23,6 +23,11 @@ def build_parser() -> argparse.ArgumentParser:
                             "panic",
                             "schedule_midi",
                             "render_audio",
+                            "set_audio_engine_state",
+                            "set_audio_engine_transport",
+                            "start_audio_engine",
+                            "seek_audio_engine",
+                            "stop_audio_engine",
                             "configure_buses",
                             "quit",
                         ])
