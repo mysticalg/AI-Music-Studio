@@ -530,83 +530,82 @@ private:
             );
         }
 
-        // Generate MIDI events for a block [blockStartFrame, blockStartFrame + numSamples)
+        // Generate MIDI events for a block of numSamples starting at positionFrame.
+        // When looping, splits the block at the loop boundary so each sub-block
+        // maps cleanly onto the note range with no iteration math drift.
         void generateMidi(juce::MidiBuffer& midi, int numSamples, double sampleRate)
         {
             if (!running || notes.empty())
                 return;
 
-            const auto blockStart = positionFrame;
-            const auto blockEnd = positionFrame + numSamples;
+            // Compute loop frame boundaries once, consistently from tick values
+            const auto lsFrame = tickToFrame(loopStartTick, sampleRate);
+            const auto leFrame = tickToFrame(loopEndTick, sampleRate);
+            const bool looping = loopEnabled && leFrame > lsFrame;
 
-            // Convert block boundaries to ticks for note matching
-            const auto loopLenTick = (loopEnabled && loopEndTick > loopStartTick)
-                ? (loopEndTick - loopStartTick) : int64_t(0);
-            const auto loopLenFrame = loopLenTick > 0
-                ? tickToFrame(loopLenTick, sampleRate) : int64_t(0);
+            int samplesRemaining = numSamples;
+            int sampleOffset = 0;  // offset into the output MidiBuffer
 
-            for (const auto& note : notes)
+            while (samplesRemaining > 0)
             {
-                const auto noteStartFrame = tickToFrame(note.startTick, sampleRate);
-                auto noteEndFrame = tickToFrame(note.endTick, sampleRate);
-                // Small note-off advance to avoid collision with next note-on
-                const auto noteOffAdvance = juce::jmax<int64_t>(1, static_cast<int64_t>(sampleRate) / 1000);
-                noteEndFrame = juce::jmax(noteStartFrame + 1, noteEndFrame - noteOffAdvance);
-
-                // Clamp note end at loop boundary
-                int64_t loopEndFrame = loopLenFrame > 0 ? tickToFrame(loopEndTick, sampleRate) : int64_t(0);
-                if (loopLenFrame > 0 && noteStartFrame < loopEndFrame && noteEndFrame > loopEndFrame)
-                    noteEndFrame = loopEndFrame;
-
-                // Check if this note falls within the current block,
-                // accounting for the logical position within the loop
-                auto checkNote = [&](int64_t logicalOffset)
+                // How many samples until the loop boundary (or end of block)?
+                int chunkSamples = samplesRemaining;
+                if (looping)
                 {
-                    const auto adjStart = noteStartFrame + logicalOffset;
-                    const auto adjEnd = noteEndFrame + logicalOffset;
+                    const auto framesUntilLoopEnd = leFrame - positionFrame;
+                    if (framesUntilLoopEnd > 0 && framesUntilLoopEnd < chunkSamples)
+                        chunkSamples = static_cast<int>(framesUntilLoopEnd);
+                }
 
-                    if (adjStart >= blockStart && adjStart < blockEnd)
+                const auto chunkStart = positionFrame;
+                const auto chunkEnd = positionFrame + chunkSamples;
+
+                // Emit MIDI events for notes that fall within [chunkStart, chunkEnd)
+                const auto noteOffAdvance = juce::jmax<int64_t>(1, static_cast<int64_t>(sampleRate) / 1000);
+                for (const auto& note : notes)
+                {
+                    const auto nsFrame = tickToFrame(note.startTick, sampleRate);
+                    auto neFrame = tickToFrame(note.endTick, sampleRate);
+                    neFrame = juce::jmax(nsFrame + 1, neFrame - noteOffAdvance);
+                    // Clamp note end just before the loop boundary so the
+                    // note-off fires inside the pre-wrap chunk (not on the
+                    // exact boundary frame which equals chunkEnd and would
+                    // be skipped by the < chunkEnd check).
+                    if (looping && nsFrame < leFrame && neFrame >= leFrame)
+                        neFrame = juce::jmax(nsFrame + 1, leFrame - 1);
+
+                    if (nsFrame >= chunkStart && nsFrame < chunkEnd)
                     {
-                        const auto samplePos = static_cast<int>(adjStart - blockStart);
                         midi.addEvent(
                             juce::MidiMessage::noteOn(note.channel, note.pitch,
                                 static_cast<float>(note.velocity) / 127.0f),
-                            samplePos);
+                            sampleOffset + static_cast<int>(nsFrame - chunkStart));
                     }
-                    if (adjEnd >= blockStart && adjEnd < blockEnd)
+                    if (neFrame >= chunkStart && neFrame < chunkEnd)
                     {
-                        const auto samplePos = static_cast<int>(adjEnd - blockStart);
                         midi.addEvent(
                             juce::MidiMessage::noteOff(note.channel, note.pitch, 0.0f),
-                            samplePos);
+                            sampleOffset + static_cast<int>(neFrame - chunkStart));
                     }
-                };
-
-                if (loopLenFrame > 0)
-                {
-                    // Find which loop iterations overlap this block
-                    const auto loopStartFrame = tickToFrame(loopStartTick, sampleRate);
-                    const auto firstIter = juce::jmax<int64_t>(0, (blockStart - loopEndFrame + loopLenFrame) / loopLenFrame);
-                    const auto lastIter = juce::jmax<int64_t>(0, (blockEnd - loopStartFrame) / loopLenFrame) + 1;
-                    for (auto iter = firstIter; iter <= lastIter; ++iter)
-                        checkNote(iter * loopLenFrame);
                 }
-                else
+
+                positionFrame += chunkSamples;
+                sampleOffset += chunkSamples;
+                samplesRemaining -= chunkSamples;
+
+                // Wrap at loop boundary — send explicit noteOff for every note
+                // to avoid overlap. CC 123 (allNotesOff) is unreliable across
+                // VST plugins, so we send per-note noteOff messages instead.
+                if (looping && positionFrame >= leFrame)
                 {
-                    checkNote(0);
+                    for (const auto& n : notes)
+                    {
+                        midi.addEvent(
+                            juce::MidiMessage::noteOff(n.channel, n.pitch, 0.0f),
+                            juce::jmax(0, sampleOffset - 1));
+                    }
+                    positionFrame = lsFrame;
                 }
-            }
-
-            positionFrame += numSamples;
-
-            // Wrap position for looping
-            if (loopLenFrame > 0)
-            {
-                const auto loopStartFrame = tickToFrame(loopStartTick, sampleRate);
-                while (positionFrame >= tickToFrame(loopEndTick, sampleRate))
-                    positionFrame -= loopLenFrame;
-                if (positionFrame < loopStartFrame)
-                    positionFrame = loopStartFrame;
             }
         }
     };
