@@ -9166,7 +9166,7 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         )
         target_output_frame = current_frame + target_ahead_frames + startup_padding_frames
-        max_writes = max(4, int(math.ceil(target_ahead_frames / max(1, self._playback_chunk_frames))) + 2)
+        max_writes = self._native_transport_max_writes(target_ahead_frames)
         writes = 0
 
         while writes < max_writes and self._graph_native_transport_output_cursor_frame < target_output_frame:
@@ -9215,7 +9215,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     state.native_host_epoch_flush_pending = False
                     state.native_host_scheduled_until_frame = -1
                     state.native_host_loop_epoch += 1
-                writes += 1
+            writes += 1
         if startup_padding_frames > 0 and writes > 0:
             self._graph_native_transport_schedule_padding_frames = 0
 
@@ -10469,6 +10469,28 @@ class MainWindow(QtWidgets.QMainWindow):
             return True
         return any(0 <= clip.track_index < len(self.project.tracks) for clip in self.project.sample_clips)
 
+    def _shared_native_output_has_pcm_transport_audio(self) -> bool:
+        if bool(getattr(self.project, 'metronome_enabled', False)):
+            return True
+        solo_tracks = self._active_solo_track_indices()
+        graph_rows = self._graph_native_transport_row_set() if self._graph_native_transport_active() else set()
+        direct_row = int(getattr(self, '_direct_native_transport_row', -1) or -1) if self._direct_native_transport_active() else -1
+        sample_track_rows = {
+            int(clip.track_index)
+            for clip in getattr(self.project, 'sample_clips', [])
+            if 0 <= int(clip.track_index) < len(self.project.tracks)
+        }
+        for idx, track in enumerate(self.project.tracks):
+            if not self._track_is_audible(idx, solo_tracks):
+                continue
+            if idx in graph_rows or idx == direct_row:
+                continue
+            if track.track_type == 'instrument' and track.notes:
+                return True
+            if track.track_type == 'sample' and idx in sample_track_rows:
+                return True
+        return False
+
     def _active_solo_track_indices(self) -> set[int]:
         return {idx for idx, track in enumerate(self.project.tracks) if track.solo}
 
@@ -10674,7 +10696,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pump_direct_native_transport()
         if not bool(getattr(self, '_playback_active', False)):
             return False
-        bridge.start_audio_stream(stream_id='main')
+        if self._shared_native_output_has_pcm_transport_audio():
+            bridge.start_audio_stream(stream_id='main')
         self._audio_pump_timer.start()
         generation = self._realtime_pump_generation
         QtCore.QTimer.singleShot(0, lambda g=generation: self._pump_realtime_audio(g))
@@ -10752,7 +10775,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if not bool(getattr(self, '_playback_active', False)):
             return False
         bridge.command('start_graph_transport')
-        bridge.start_audio_stream(stream_id='main')
+        if self._shared_native_output_has_pcm_transport_audio():
+            bridge.start_audio_stream(stream_id='main')
         self._audio_pump_timer.start()
         generation = self._realtime_pump_generation
         QtCore.QTimer.singleShot(0, lambda g=generation: self._pump_realtime_audio(g))
@@ -11455,6 +11479,15 @@ class MainWindow(QtWidgets.QMainWindow):
             min(max_guard_frames, frames_until_wrap + int(post_wrap_frames)),
         )
 
+    def _native_transport_max_writes(self, target_ahead_frames: int) -> int:
+        chunk_frames = max(1, int(self._playback_chunk_frames))
+        base_writes = max(4, int(math.ceil(max(1, int(target_ahead_frames)) / chunk_frames)) + 2)
+        if self.project.loop_enabled:
+            # Loop boundaries can split one target window into many smaller
+            # scheduling chunks, so leave extra room before we stop refilling.
+            return max(8, base_writes * 2)
+        return base_writes
+
     def _current_audible_playback_tick(self) -> int:
         if not getattr(self, '_playback_active', False):
             return int(self.project.playhead_tick)
@@ -11971,7 +12004,7 @@ class MainWindow(QtWidgets.QMainWindow):
             state = self._realtime_track_state(row, track)
             if self._realtime_reset_pending:
                 self._realtime_reset_pending = False
-            max_writes = max(4, int(math.ceil(target_ahead_frames / max(1, self._playback_chunk_frames))) + 2)
+            max_writes = self._native_transport_max_writes(target_ahead_frames)
             writes = 0
 
             while writes < max_writes and self._direct_native_transport_output_cursor_frame < target_output_frame:
@@ -12041,13 +12074,25 @@ class MainWindow(QtWidgets.QMainWindow):
                 raise RuntimeError('Native output bridge is unavailable')
             if self._graph_native_transport_active():
                 self._pump_graph_native_transport(status=status)
+            queued_frames = int(status.get('queued_audio_frames') or 0)
+            self._native_output_queued_frames = queued_frames
+            self._native_output_underruns = int(status.get('audio_queue_underruns') or 0)
+            if (
+                (self._graph_native_transport_active() or self._direct_native_transport_active())
+                and not self._shared_native_output_has_pcm_transport_audio()
+            ):
+                # Graph/direct-native transport can render directly in the host.
+                # If the shared PCM path only has silence, keep that queue idle.
+                if queued_frames > 0 or bool(status.get('audio_stream_enabled', False)):
+                    bridge.clear_audio_queue(reset_counters=False, stream_id='main')
+                    self._native_output_queued_frames = 0
+                return
+            if not bool(status.get('audio_stream_enabled', False)):
+                bridge.start_audio_stream(stream_id='main')
             buffer_frames = int(max(self._playback_chunk_frames, self._actual_output_buffer_frames(status)))
             target_frames = int(max(buffer_frames, self._shared_native_output_queue_target_frames(status)))
             max_writes = max(4, int(math.ceil(target_frames / max(1, self._playback_chunk_frames))) + 2)
             writes = 0
-            queued_frames = int(status.get('queued_audio_frames') or 0)
-            self._native_output_queued_frames = queued_frames
-            self._native_output_underruns = int(status.get('audio_queue_underruns') or 0)
             while writes < max_writes and queued_frames < target_frames:
                 free_frames = max(1, target_frames - queued_frames)
                 chunk_frames = max(1, min(self._playback_chunk_frames, free_frames))
