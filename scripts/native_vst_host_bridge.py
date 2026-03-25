@@ -12,11 +12,24 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-HOST_EXE = REPO_ROOT / "build" / "native-vst3host" / "AIMusicStudioVSTHost_artefacts" / "Release" / "AI Music Studio VST Host.exe"
+HOST_EXE_CANDIDATES = [
+    REPO_ROOT / "build" / "native-vst3host-hotfix" / "AIMusicStudioVSTHost_artefacts" / "Release" / "AI Music Studio VST Host.exe",
+    REPO_ROOT / "build" / "native-vst3host" / "AIMusicStudioVSTHost_artefacts" / "Release" / "AI Music Studio VST Host.exe",
+]
+_existing_host_exes = [candidate for candidate in HOST_EXE_CANDIDATES if candidate.exists()]
+HOST_EXE = (
+    max(_existing_host_exes, key=lambda candidate: candidate.stat().st_mtime_ns)
+    if _existing_host_exes
+    else HOST_EXE_CANDIDATES[0]
+)
 HOST_DLL_CANDIDATES = [
+    REPO_ROOT / "build" / "native-vst3host-hotfix" / "Release" / "AIMusicStudioVSTHostLib.dll",
     REPO_ROOT / "build" / "native-vst3host" / "Release" / "AIMusicStudioVSTHostLib.dll",
+    REPO_ROOT / "build" / "native-vst3host-hotfix" / "Debug" / "AIMusicStudioVSTHostLib.dll",
     REPO_ROOT / "build" / "native-vst3host" / "Debug" / "AIMusicStudioVSTHostLib.dll",
+    REPO_ROOT / "build" / "native-vst3host-hotfix" / "RelWithDebInfo" / "AIMusicStudioVSTHostLib.dll",
     REPO_ROOT / "build" / "native-vst3host" / "RelWithDebInfo" / "AIMusicStudioVSTHostLib.dll",
+    REPO_ROOT / "build" / "native-vst3host-hotfix" / "MinSizeRel" / "AIMusicStudioVSTHostLib.dll",
     REPO_ROOT / "build" / "native-vst3host" / "MinSizeRel" / "AIMusicStudioVSTHostLib.dll",
 ]
 _existing_host_dlls = [candidate for candidate in HOST_DLL_CANDIDATES if candidate.exists()]

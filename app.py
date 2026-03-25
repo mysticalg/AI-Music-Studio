@@ -3028,6 +3028,34 @@ class VelocityEditorWidget(QtWidgets.QGraphicsView):
         pen.setCosmetic(True)
         return pen
 
+    def _find_note_at_velocity_pos(self, scene_pos: QtCore.QPointF) -> MidiNote | None:
+        height = 120.0
+        x_pos = float(scene_pos.x())
+        y_pos = float(scene_pos.y())
+        hit_tolerance_x = 8.0
+        hit_tolerance_y = 6.0
+        best_key: tuple[float, float, float] | None = None
+        best_note: MidiNote | None = None
+
+        for note in self.current_track().notes:
+            note_x = self._tick_to_x(note.start_tick)
+            dx = abs(note_x - x_pos)
+            if dx > hit_tolerance_x:
+                continue
+
+            top_y = height - self._velocity_line_height(note, height)
+            if y_pos < top_y - hit_tolerance_y or y_pos > height + hit_tolerance_y:
+                continue
+
+            selected_bias = 0.0 if note.selected else 1.0
+            top_distance = abs(y_pos - top_y)
+            key = (selected_bias, dx, top_distance)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_note = note
+
+        return best_note
+
     def update_overlay_items(self) -> None:
         height = 120
         if self._left_locator_item is not None:
@@ -3115,14 +3143,14 @@ class VelocityEditorWidget(QtWidgets.QGraphicsView):
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
         if event.button() == QtCore.Qt.MouseButton.LeftButton:
-            item = self.itemAt(event.position().toPoint())
-            if item is not None:
-                note = item.data(0)
-                if isinstance(note, MidiNote):
-                    self._drag_note = note
-                    self._drag_dirty = False
-                    self._apply_velocity_from_pos(self.mapToScene(event.position().toPoint()), commit=False)
-                    return
+            scene_pos = self.mapToScene(event.position().toPoint())
+            note = self._find_note_at_velocity_pos(scene_pos)
+            if note is not None:
+                self._drag_note = note
+                self._drag_dirty = False
+                self._apply_velocity_from_pos(scene_pos, commit=False)
+                event.accept()
+                return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
@@ -3171,28 +3199,65 @@ class TimelineWidget(QtWidgets.QTableWidget):
     def update_locator_header(self) -> None:
         self._set_headers()
 
+    def _row_palette(self, row: int) -> tuple[QtGui.QColor, QtGui.QColor]:
+        track = self.project.tracks[row]
+        row_color = track_display_color(track, row)
+        row_background = row_color.darker(240)
+        text_color = track_text_color(row_background)
+        return row_background, text_color
+
+    @staticmethod
+    def _row_values(track: TrackState) -> list[str]:
+        return [
+            track.name,
+            track.track_type.title(),
+            track.instrument,
+            track.instrument_mode,
+            track.synth_profile,
+            'Yes' if track.mute else 'No',
+            'Yes' if track.solo else 'No',
+            str(len(track.notes)),
+        ]
+
+    def refresh_row(self, row: int) -> None:
+        if row < 0 or row >= len(self.project.tracks):
+            return
+        track = self.project.tracks[row]
+        row_background, text_color = self._row_palette(row)
+        for col, value in enumerate(self._row_values(track)):
+            item = self.item(row, col)
+            if item is None:
+                item = QtWidgets.QTableWidgetItem()
+                self.setItem(row, col, item)
+            if item.text() != value:
+                item.setText(value)
+            item.setBackground(QtGui.QBrush(row_background))
+            item.setForeground(QtGui.QBrush(text_color))
+
+    def refresh_rows(self, rows: set[int] | list[int] | tuple[int, ...]) -> None:
+        if self.rowCount() != len(self.project.tracks):
+            self.refresh()
+            return
+        valid_rows = sorted({int(row) for row in rows if 0 <= int(row) < len(self.project.tracks)})
+        if not valid_rows:
+            return
+        self.setUpdatesEnabled(False)
+        try:
+            for row in valid_rows:
+                self.refresh_row(row)
+        finally:
+            self.setUpdatesEnabled(True)
+
     def refresh(self) -> None:
         self._set_headers()
-        self.setRowCount(len(self.project.tracks))
-        for i, track in enumerate(self.project.tracks):
-            row_color = track_display_color(track, i)
-            row_background = row_color.darker(240)
-            text_color = track_text_color(row_background)
-            values = [
-                track.name,
-                track.track_type.title(),
-                track.instrument,
-                track.instrument_mode,
-                track.synth_profile,
-                'Yes' if track.mute else 'No',
-                'Yes' if track.solo else 'No',
-                str(len(track.notes)),
-            ]
-            for col, value in enumerate(values):
-                item = QtWidgets.QTableWidgetItem(value)
-                item.setBackground(QtGui.QBrush(row_background))
-                item.setForeground(QtGui.QBrush(text_color))
-                self.setItem(i, col, item)
+        row_count = len(self.project.tracks)
+        self.setUpdatesEnabled(False)
+        try:
+            self.setRowCount(row_count)
+            for row in range(row_count):
+                self.refresh_row(row)
+        finally:
+            self.setUpdatesEnabled(True)
 
 
 class SampleTimelineWidget(QtWidgets.QGraphicsView):
@@ -3384,6 +3449,7 @@ class ArrangementOverviewWidget(QtWidgets.QGraphicsView):
         self._left_locator_item: QtWidgets.QGraphicsLineItem | None = None
         self._right_locator_item: QtWidgets.QGraphicsLineItem | None = None
         self._playhead_item: QtWidgets.QGraphicsLineItem | None = None
+        self._section_scene_items_by_row: dict[int, list[QtWidgets.QGraphicsItem]] = {}
         self.refresh()
 
     def _duration_seconds(self) -> float:
@@ -3420,11 +3486,81 @@ class ArrangementOverviewWidget(QtWidgets.QGraphicsView):
             return
         self._playhead_item.setLine(x, 0, x, height)
 
+    def _clear_section_items(self, rows: set[int] | None = None) -> None:
+        if rows is None:
+            target_rows = list(self._section_scene_items_by_row.keys())
+        else:
+            target_rows = [int(row) for row in rows]
+        for row in target_rows:
+            for item in self._section_scene_items_by_row.pop(int(row), []):
+                try:
+                    self.scene_obj.removeItem(item)
+                except Exception:
+                    pass
+
+    def _draw_section_items(self, lane_count: int, rows: set[int] | None = None) -> None:
+        target_rows = None if rows is None else {int(row) for row in rows}
+        if target_rows is not None:
+            for row in target_rows:
+                self._section_scene_items_by_row.pop(int(row), None)
+        for idx, section in enumerate(self.project.midi_sections):
+            track_index = int(section.track_index)
+            if track_index >= lane_count:
+                continue
+            if target_rows is not None and track_index not in target_rows:
+                continue
+            x = section.start_sec * self.pixels_per_second
+            w = max(10, section.duration_sec * self.pixels_per_second)
+            y = track_index * self.lane_height + 20
+            h = self.lane_height - 24
+            track = self.project.tracks[track_index]
+            section_color = track_display_color(track, track_index)
+            rect = self.scene_obj.addRect(
+                x,
+                y,
+                w,
+                h,
+                QtGui.QPen(section_color.darker(210)),
+                QtGui.QBrush(section_color),
+            )
+            rect.setData(0, idx)
+            label = self.scene_obj.addText(section.name)
+            label.setDefaultTextColor(track_text_color(section_color))
+            label.setPos(x + 4, y + 2)
+            self._section_scene_items_by_row.setdefault(track_index, []).extend([rect, label])
+
+    def refresh_sections(self, rows: set[int] | list[int] | tuple[int, ...] | None = None) -> None:
+        duration = self._duration_seconds()
+        lane_count = self._lane_count()
+        width = duration * self.pixels_per_second
+        height = lane_count * self.lane_height
+        current_rect = self.sceneRect()
+        geometry_changed = (
+            abs(float(current_rect.width()) - float(width)) > 0.25
+            or abs(float(current_rect.height()) - float(height)) > 0.25
+        )
+        if (
+            rows is None
+            or geometry_changed
+            or self._left_locator_item is None
+            or self._right_locator_item is None
+            or self._playhead_item is None
+        ):
+            self.refresh()
+            return
+        valid_rows = {int(row) for row in rows if 0 <= int(row) < lane_count}
+        if not valid_rows:
+            return
+        self._clear_section_items(valid_rows)
+        self._draw_section_items(lane_count, valid_rows)
+        self.update_overlay_items()
+
     def refresh(self) -> None:
         self.scene_obj.clear()
         self._left_locator_item = None
         self._right_locator_item = None
         self._playhead_item = None
+        self._section_scene_items_by_row.clear()
         duration = self._duration_seconds()
         lane_count = self._lane_count()
         width = duration * self.pixels_per_second
@@ -3453,20 +3589,7 @@ class ArrangementOverviewWidget(QtWidgets.QGraphicsView):
                 label.setPos(x + 2, 0)
             sec += 1
 
-        for idx, section in enumerate(self.project.midi_sections):
-            if section.track_index >= lane_count:
-                continue
-            x = section.start_sec * self.pixels_per_second
-            w = max(10, section.duration_sec * self.pixels_per_second)
-            y = section.track_index * self.lane_height + 20
-            h = self.lane_height - 24
-            track = self.project.tracks[section.track_index]
-            section_color = track_display_color(track, section.track_index)
-            rect = self.scene_obj.addRect(x, y, w, h, QtGui.QPen(section_color.darker(210)), QtGui.QBrush(section_color))
-            rect.setData(0, idx)
-            label = self.scene_obj.addText(section.name)
-            label.setDefaultTextColor(track_text_color(section_color))
-            label.setPos(x + 4, y + 2)
+        self._draw_section_items(lane_count)
 
         self._playhead_item = self.scene_obj.addLine(0, 0, 0, height, QtGui.QPen(QtGui.QColor(255, 80, 80), 2))
         self._playhead_item.setZValue(1001)
@@ -3999,7 +4122,18 @@ class MixerWidget(QtWidgets.QWidget):
 
 
 class InstrumentFxWidget(QtWidgets.QWidget):
-    def __init__(self, project: ProjectState, current_track_callable, refresh_vsti_choices_callable, on_track_updated_callable=None, load_selected_vsti_callable=None, open_vsti_gui_callable=None, vsti_param_names_callable=None) -> None:
+    def __init__(
+        self,
+        project: ProjectState,
+        current_track_callable,
+        refresh_vsti_choices_callable,
+        on_track_updated_callable=None,
+        load_selected_vsti_callable=None,
+        open_vsti_gui_callable=None,
+        vsti_param_names_callable=None,
+        available_fx_names_callable=None,
+        configure_track_fx_callable=None,
+    ) -> None:
         super().__init__()
         self.project = project
         self.current_track_callable = current_track_callable
@@ -4008,6 +4142,8 @@ class InstrumentFxWidget(QtWidgets.QWidget):
         self.load_selected_vsti = load_selected_vsti_callable
         self.open_vsti_gui = open_vsti_gui_callable
         self.vsti_param_names_callable = vsti_param_names_callable
+        self.available_fx_names = available_fx_names_callable or (lambda: [])
+        self.configure_track_fx = configure_track_fx_callable
         self._updating_ui = False
 
         root = QtWidgets.QVBoxLayout(self)
@@ -4029,6 +4165,10 @@ class InstrumentFxWidget(QtWidgets.QWidget):
         self.midi_program.setRange(0, 127)
         form.addRow("MIDI channel", self.midi_channel)
         form.addRow("MIDI program", self.midi_program)
+        self.track_fx_summary = QtWidgets.QLineEdit()
+        self.track_fx_summary.setReadOnly(True)
+        self.track_fx_summary.setPlaceholderText('No track VST FX assigned')
+        form.addRow("Track VST FX", self.track_fx_summary)
 
         self.fx_controls: dict[str, KnobInput] = {}
         fx_row_widget = QtWidgets.QWidget()
@@ -4058,10 +4198,12 @@ class InstrumentFxWidget(QtWidgets.QWidget):
         self.load_vsti_btn = QtWidgets.QPushButton('Refresh VSTI Info')
         self.open_vsti_gui_btn = QtWidgets.QPushButton('Open VSTI GUI')
         self.edit_vsti_params_btn = QtWidgets.QPushButton('Edit VSTI Parameters')
+        self.edit_track_fx_btn = QtWidgets.QPushButton('Track VST FX...')
         btn_row.addWidget(self.assign_rack_btn)
         btn_row.addWidget(self.load_vsti_btn)
         btn_row.addWidget(self.open_vsti_gui_btn)
         btn_row.addWidget(self.edit_vsti_params_btn)
+        btn_row.addWidget(self.edit_track_fx_btn)
         root.addLayout(btn_row)
 
         self.instrument.currentTextChanged.connect(self.apply_changes)
@@ -4073,6 +4215,7 @@ class InstrumentFxWidget(QtWidgets.QWidget):
         self.load_vsti_btn.clicked.connect(self.load_selected_vsti_binary)
         self.open_vsti_gui_btn.clicked.connect(self.open_selected_vsti_gui)
         self.edit_vsti_params_btn.clicked.connect(self.edit_vsti_parameters)
+        self.edit_track_fx_btn.clicked.connect(self.configure_selected_track_fx)
         for knob in self.fx_controls.values():
             knob.valueChanged.connect(self.apply_changes)
         self._update_vsti_controls()
@@ -4094,6 +4237,8 @@ class InstrumentFxWidget(QtWidgets.QWidget):
         self.load_vsti_btn.setEnabled(use_vsti)
         self.open_vsti_gui_btn.setEnabled(use_vsti and bool(active_track.rack_vsti) and (active_entry is None or active_entry.host_supported))
         self.edit_vsti_params_btn.setEnabled(use_vsti and bool(active_track.rack_vsti) and (active_entry is None or active_entry.host_supported))
+        fx_available = bool(self.available_fx_names())
+        self.edit_track_fx_btn.setEnabled(use_vsti and bool(active_track.rack_vsti) and fx_available)
         if not self._instrument_entries():
             self.vsti_selector.setToolTip('Add at least one supported VST3 instrument plugin to the rack.')
         elif not NATIVE_VST_HOST_AVAILABLE:
@@ -4102,6 +4247,18 @@ class InstrumentFxWidget(QtWidgets.QWidget):
             self.vsti_selector.setToolTip(active_entry.host_error or 'This rack plugin is not supported by the current VST backend.')
         else:
             self.vsti_selector.setToolTip('Choose a VST instrument from the rack.')
+        if not fx_available:
+            self.edit_track_fx_btn.setToolTip('Add at least one supported VST3 effect to the rack first.')
+        elif use_vsti and bool(active_track.rack_vsti):
+            self.edit_track_fx_btn.setToolTip('Assign rack VST effects to this track in series.')
+        else:
+            self.edit_track_fx_btn.setToolTip('Track VST FX are available for rack VST instrument tracks.')
+        self._update_track_fx_summary(active_track)
+
+    def _update_track_fx_summary(self, track: TrackState | None = None) -> None:
+        active_track = track or self.current_track_callable()
+        names = [str(name).strip() for name in getattr(active_track, 'vst_fx_chain', []) if str(name).strip()]
+        self.track_fx_summary.setText(' > '.join(names) if names else 'None')
 
     def reload_vsti_choices(self) -> None:
         current = self.vsti_selector.currentText()
@@ -4310,6 +4467,18 @@ class InstrumentFxWidget(QtWidgets.QWidget):
 
     def edit_vsti_parameters(self) -> None:
         self.open_selected_vsti_gui()
+
+    def configure_selected_track_fx(self) -> None:
+        track = self.current_track_callable()
+        if not (track.track_type == 'instrument' and track.instrument_mode == 'VSTI Rack' and track.rack_vsti):
+            QtWidgets.QMessageBox.information(self, 'Track VST FX unavailable', 'Assign a rack VST instrument to this track first.')
+            return
+        if not self.available_fx_names():
+            QtWidgets.QMessageBox.information(self, 'No VST FX available', 'Add at least one supported VST3 effect to the rack first.')
+            return
+        if callable(self.configure_track_fx):
+            self.configure_track_fx()
+            self._update_track_fx_summary(track)
 
 
 class SampleLibraryWidget(QtWidgets.QListWidget):
@@ -4961,7 +5130,7 @@ class AudioSettingsDialog(QtWidgets.QDialog):
         main_window = self._main_window()
         if main_window is None:
             return
-        main_window.set_playback_ui_refresh_ms(int(self.playhead_refresh_combo.currentData() or 16))
+        main_window.set_playback_ui_refresh_ms(int(self.playhead_refresh_combo.currentData() or 33))
 
     def _on_note_length_offset_changed(self, value: int) -> None:
         main_window = self._main_window()
@@ -5230,7 +5399,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.native_vst_host_buffer_size = 0
         self.prefer_prerendered_vst_playback = False
         self.note_length_offset_ticks = 0
-        self.playback_ui_refresh_ms = 16
+        self.playback_ui_refresh_ms = 33
         self.prefer_gpu_rendering = True
         self._main_splitter_sizes = [170, 1330]
         self._note_editor_inner_sizes = [640, 160]
@@ -5324,7 +5493,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._native_output_status_cache: dict[str, object] | None = None
         self._native_output_status_cache_at = 0.0
         self._native_output_status_cache_bridge_id = 0
-        self._pending_native_vst_parameter_updates: dict[int, tuple[object, dict[str, float], int | None]] = {}
+        self._pending_native_vst_parameter_updates: dict[int, tuple[object, dict[str, float], dict[str, float], int | None]] = {}
         self._realtime_mix_cache: object | None = None
         self._realtime_mix_cache_start_frame = 0
         self._realtime_mix_cache_frame_count = 0
@@ -5341,6 +5510,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._native_vst_host_retry_after: dict[int, float] = {}
         self._native_vst_host_warm_timers: dict[int, QtCore.QTimer] = {}
         self._track_meter_levels: dict[int, float] = {}
+        self._native_track_meter_levels: dict[int, float] = {}
         self._sample_audio_cache: dict[str, tuple[object, int, int]] = {}
         self._realtime_reset_pending = False
         self._loop_declick_pending_frames = 0
@@ -5351,22 +5521,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self._playback_loop_ms = 0
         self._deferred_note_refresh_timer = QtCore.QTimer(self)
         self._deferred_note_refresh_timer.setSingleShot(True)
+        self._deferred_note_refresh_timer.setInterval(12)
         self._deferred_note_refresh_timer.timeout.connect(self._flush_deferred_note_refresh)
         self._deferred_refresh_velocity = False
         self._deferred_refresh_timeline = False
+        self._deferred_timeline_rows: set[int] | None = set()
         self._deferred_refresh_sample_timeline = False
         self._deferred_rebuild_sections = False
         self._deferred_refresh_arrangement = False
+        self._deferred_arrangement_rows: set[int] | None = set()
         self._deferred_reload_mix = False
         self._pending_transport_reprepare = False
         self._pending_transport_reprepare_reason = ''
         self._selected_track_panel_refresh_row: int | None = None
         self._selected_track_panel_refresh_timer = QtCore.QTimer(self)
         self._selected_track_panel_refresh_timer.setSingleShot(True)
+        self._selected_track_panel_refresh_timer.setInterval(16)
         self._selected_track_panel_refresh_timer.timeout.connect(self._flush_selected_track_panel_refresh)
         self._pending_track_list_row_refresh: set[int] = set()
         self._track_list_row_refresh_timer = QtCore.QTimer(self)
         self._track_list_row_refresh_timer.setSingleShot(True)
+        self._track_list_row_refresh_timer.setInterval(16)
         self._track_list_row_refresh_timer.timeout.connect(self._flush_scheduled_track_list_row_refresh)
         self._transport_reprepare_timer = QtCore.QTimer(self)
         self._transport_reprepare_timer.setSingleShot(True)
@@ -5429,6 +5604,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._live_midi_poll_timer = QtCore.QTimer(self)
         self._live_midi_poll_timer.setInterval(120)
         self._live_midi_poll_timer.timeout.connect(self._poll_live_midi_plugin_state)
+        self._native_vst_editor_sync_timer = QtCore.QTimer(self)
+        self._native_vst_editor_sync_timer.setInterval(240)
+        self._native_vst_editor_sync_timer.timeout.connect(self._poll_native_vst_editor_state)
         self._realtime_pump_generation = 0
         self.current_project_path: Path | None = None
         self.setWindowTitle(APP_NAME)
@@ -5463,7 +5641,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self.select_track_by_index,
             self.track_meter_levels,
         )
-        self.instruments = InstrumentFxWidget(self.project, self.current_track, self.refresh_vsti_rack_ui, self.on_track_instrument_changed, self.load_vsti_binary_by_name, self.open_vsti_gui_by_name, self.vsti_parameter_names_for_rack)
+        self.instruments = InstrumentFxWidget(
+            self.project,
+            self.current_track,
+            self.refresh_vsti_rack_ui,
+            self.on_track_instrument_changed,
+            self.load_vsti_binary_by_name,
+            self.open_vsti_gui_by_name,
+            self.vsti_parameter_names_for_rack,
+            self.available_fx_plugin_names,
+            self.open_current_track_vst_fx_dialog,
+        )
         self.sample_timeline = SampleTimelineWidget(self.project, self.sample_track_indices, self.place_sample_asset_on_track, self.set_playhead_position)
         self.arrangement_overview = ArrangementOverviewWidget(self.project, self.set_playhead_position, self.set_left_locator_position, self.set_right_locator_position, self.apply_arrangement_section_move, lambda: self.project.bpm)
         self.sample_library = SampleLibraryWidget()
@@ -6358,6 +6546,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mixer.project = project
         self.instruments.project = project
         self._track_meter_levels = {}
+        self._native_track_meter_levels = {}
 
     def _reset_project_runtime_state(self) -> None:
         self._deferred_note_refresh_timer.stop()
@@ -7244,6 +7433,9 @@ class MainWindow(QtWidgets.QMainWindow):
         return int(clamp(int(getattr(self, 'audio_buffer_frames', 1024)), 64, self._maximum_audio_buffer_frames()))
 
     def _clear_direct_native_transport_state(self) -> None:
+        direct_row = getattr(self, '_direct_native_transport_row', None)
+        if direct_row is not None:
+            self._native_track_meter_levels.pop(int(direct_row), None)
         self._direct_native_transport_row = None
         self._direct_native_transport_origin_frame = 0
         self._direct_native_transport_output_cursor_frame = 0
@@ -7258,6 +7450,8 @@ class MainWindow(QtWidgets.QMainWindow):
         return self._direct_native_transport_row is not None and self._native_output_bridge_alive()
 
     def _clear_graph_native_transport_state(self) -> None:
+        for row in list(getattr(self, '_graph_native_transport_rows', []) or []):
+            self._native_track_meter_levels.pop(int(row), None)
         self._graph_native_transport_rows = []
         self._graph_native_transport_origin_frame = 0
         self._graph_native_transport_output_cursor_frame = 0
@@ -7534,6 +7728,27 @@ class MainWindow(QtWidgets.QMainWindow):
             and str(getattr(target, 'requested_audio_output_device_name', getattr(target, 'audio_output_device_name', '')) or '').strip().casefold()
             == audio_output_device_name.casefold()
             and actual_plugin_path == plugin_path
+        )
+
+    def _native_output_bridge_matches_audio_signature(
+        self,
+        signature: tuple[object, ...],
+        bridge: object | None = None,
+    ) -> bool:
+        target = bridge if bridge is not None else getattr(self, '_native_output_bridge', None)
+        if target is None or not self._native_bridge_process_alive(target):
+            return False
+        sample_rate = max(1, int(signature[0]))
+        buffer_size = max(64, int(signature[1]))
+        audio_device_type = str(signature[2] or '').strip()
+        audio_output_device_name = str(signature[3] or '').strip()
+        return (
+            int(getattr(target, 'requested_sample_rate', getattr(target, 'sample_rate', 0)) or 0) == sample_rate
+            and int(getattr(target, 'requested_buffer_size', getattr(target, 'buffer_size', 0)) or 0) == buffer_size
+            and str(getattr(target, 'requested_audio_device_type', getattr(target, 'audio_device_type', '')) or '').strip().casefold()
+            == audio_device_type.casefold()
+            and str(getattr(target, 'requested_audio_output_device_name', getattr(target, 'audio_output_device_name', '')) or '').strip().casefold()
+            == audio_output_device_name.casefold()
         )
 
     def _begin_async_native_output_bridge_warm(
@@ -8804,9 +9019,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     if hasattr(self, '_live_midi_poll_timer'):
                         self._live_midi_poll_timer.stop()
                     if previous_direct_row != int(direct_idx):
+                        self._flush_native_vst_editor_state_rows([int(direct_idx)])
+                    if previous_direct_row != int(direct_idx):
                         self.statusBar().showMessage(f'Live monitoring routed directly through JUCE for {direct_entry.name}')
-                    if previous_direct_row != int(direct_idx) and self._native_vst_host_editor_visible(int(direct_idx)):
-                        self._handoff_track_editor_to_shared_output_bridge(int(direct_idx), direct_track, direct_entry)
                     return True
                 except Exception:
                     self._live_midi_direct_output_row = None
@@ -9031,6 +9246,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if row < 0 or row >= len(self.project.tracks):
             return
         track = self.project.tracks[row]
+        playback_active = bool(hasattr(self, 'playback_timer') and self.playback_timer.isActive())
+        if playback_active and not self._native_vst_host_bridge_alive(row):
+            return
         entry = self._native_instrument_entry_for_track(track)
         if (
             track.track_type == 'instrument'
@@ -9284,6 +9502,8 @@ class MainWindow(QtWidgets.QMainWindow):
         source_status = status if isinstance(status, dict) else self._native_output_status(bridge)
         if source_status is None:
             raise RuntimeError('Graph native transport bridge is unavailable')
+        self._set_native_track_meter_levels(self._native_graph_track_peak_levels(bridge, source_status))
+        self._update_track_meter_levels(self._native_track_meter_levels)
         current_frame = self._native_output_rendered_sample_frames(source_status)
         if self._realtime_reset_pending:
             self._realtime_reset_pending = False
@@ -9867,6 +10087,372 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             _APP_LOGGER.exception("Failed rescheduling active native transport after edit")
 
+    def _note_edit_is_live_safe_for_native_transport(self, changed_rows: set[int] | None = None) -> bool:
+        if not bool(hasattr(self, 'playback_timer') and self.playback_timer.isActive()):
+            return False
+        row_set = {int(row) for row in (changed_rows or set()) if int(row) >= 0}
+        if not row_set:
+            return False
+        if self._graph_native_transport_active():
+            return row_set.issubset(self._graph_native_transport_row_set())
+        if self._direct_native_transport_active():
+            direct_row = int(getattr(self, '_direct_native_transport_row', -1) or -1)
+            return bool(row_set) and row_set == {direct_row}
+        return False
+
+    def _reload_playback_after_note_edit(self, changed_rows: set[int] | None = None) -> None:
+        if self._note_edit_is_live_safe_for_native_transport(changed_rows):
+            return
+        self._reload_playback_mix_if_running()
+
+    def _mark_active_native_transport_track_reset_pending(
+        self,
+        row: int,
+        track: TrackState | None = None,
+    ) -> None:
+        row = int(row)
+        if track is None:
+            if row < 0 or row >= len(self.project.tracks):
+                return
+            track = self.project.tracks[row]
+        state = self._realtime_track_state(row, track)
+        state.instrument_reset_pending = True
+        state.loop_bootstrap_pending = False
+        state.native_host_epoch_flush_pending = False
+        state.fx_reset_pending = False
+        state.native_host_scheduled_until_frame = -1
+        state.native_host_render_failed = False
+        state.last_error = ""
+
+    def _reconfigure_active_graph_native_transport_live(
+        self,
+        bridge: object,
+        candidate_tracks: list[tuple[int, TrackState, VSTInstrument]],
+        target_signature: tuple[tuple[object, ...], ...],
+        *,
+        reschedule: bool = True,
+    ) -> bool:
+        previous_rows = {int(row) for row in getattr(self, '_graph_native_transport_rows', []) or []}
+        try:
+            bridge.command(
+                'configure_plugin_graph',
+                tracks=self._build_native_vst_graph_payload_tracks(candidate_tracks, include_events=False),
+            )
+        except Exception:
+            _APP_LOGGER.exception("Failed hot-swapping active native graph transport")
+            return False
+        candidate_rows = [int(row) for row, _track, _entry in candidate_tracks]
+        self._graph_native_transport_rows = list(candidate_rows)
+        bridge._aims_graph_track_rows = list(candidate_rows)
+        bridge._aims_graph_track_paths = [
+            self._normalized_vsti_path(str(getattr(entry, 'path', '') or ''))
+            for _row, _track, entry in candidate_tracks
+        ]
+        for removed_row in previous_rows.difference(candidate_rows):
+            self._native_track_meter_levels.pop(int(removed_row), None)
+        for row, track, _entry in candidate_tracks:
+            self._mark_active_native_transport_track_reset_pending(int(row), track)
+        bridge._aims_graph_config_signature = target_signature
+        self._native_output_status_cache = None
+        self._native_output_status_cache_at = 0.0
+        self._cancel_pending_transport_reprepare()
+        if reschedule:
+            self._reschedule_active_native_transport_for_edit()
+        return True
+
+    def _switch_active_direct_native_transport_to_graph_live(
+        self,
+        bridge: object,
+        candidate_tracks: list[tuple[int, TrackState, VSTInstrument]],
+    ) -> bool:
+        if bridge is None or not candidate_tracks:
+            return False
+        status = self._native_output_status(bridge)
+        if status is None:
+            return False
+
+        output_cursor_frame = int(getattr(self, '_direct_native_transport_output_cursor_frame', 0) or 0)
+        logical_frame = int(getattr(self, '_direct_native_transport_logical_frame', 0) or 0)
+        loop_start_frame = int(getattr(self, '_direct_native_transport_loop_start_frame', 0) or 0)
+        loop_end_frame = int(getattr(self, '_direct_native_transport_loop_end_frame', 0) or 0)
+        lead_frames = int(
+            getattr(self, '_direct_native_transport_lead_frames', 0)
+            or self._native_output_scheduling_lead_frames(bridge, status)
+        )
+
+        if not self._reconfigure_active_graph_native_transport_live(
+            bridge,
+            candidate_tracks,
+            self._native_vst_graph_config_signature(candidate_tracks),
+            reschedule=False,
+        ):
+            return False
+
+        try:
+            bridge.command('start_graph_transport')
+        except Exception:
+            _APP_LOGGER.exception("Failed starting hot-swapped native graph transport")
+            return False
+
+        self._clear_direct_native_transport_state()
+        self._graph_native_transport_origin_frame = int(logical_frame)
+        self._graph_native_transport_output_cursor_frame = int(output_cursor_frame)
+        self._graph_native_transport_logical_frame = int(logical_frame)
+        self._graph_native_transport_loop_start_frame = int(loop_start_frame)
+        self._graph_native_transport_loop_end_frame = int(loop_end_frame)
+        self._graph_native_transport_lead_frames = int(lead_frames)
+        self._graph_native_transport_startup_padding_frames = 0
+        self._graph_native_transport_schedule_padding_frames = 0
+        self._playback_logical_origin_frame = int(logical_frame)
+        self._playback_frame_position = int(logical_frame)
+        self._transport_uses_native_output_bridge = True
+        self._native_output_status_cache = None
+        self._native_output_status_cache_at = 0.0
+        self._cancel_pending_transport_reprepare()
+        self._reschedule_active_native_transport_for_edit()
+        return True
+
+    def _reload_active_direct_native_transport_plugin_live(
+        self,
+        bridge: object,
+        row: int,
+        track: TrackState,
+        entry: VSTInstrument,
+    ) -> bool:
+        plugin_path = self._normalized_vsti_path(str(getattr(entry, 'path', '') or ''))
+        if not plugin_path:
+            return False
+        try:
+            bridge.command('panic')
+            status = bridge.command('load', path=plugin_path)
+        except Exception:
+            _APP_LOGGER.exception(
+                "Failed hot-swapping active direct native transport row=%s rack=%s",
+                row,
+                entry.name,
+            )
+            return False
+
+        bridge.plugin_path = plugin_path
+        bridge.sample_rate = int(status.get('sample_rate') or getattr(bridge, 'sample_rate', 0) or self._native_vst_host_target_sample_rate())
+        bridge.buffer_size = int(status.get('buffer_size') or getattr(bridge, 'buffer_size', 0) or self._native_vst_host_target_buffer_size())
+        bridge.audio_device_type = str(status.get('audio_device_type') or getattr(bridge, 'audio_device_type', '') or '')
+        bridge.audio_output_device_name = str(status.get('audio_device_name') or getattr(bridge, 'audio_output_device_name', '') or '')
+        setattr(bridge, '_aims_rack_name', str(entry.name))
+        setattr(bridge, '_aims_supports_set_parameters', True)
+        self._discard_pending_native_vst_bridge_parameter_updates(bridge)
+
+        state_path, state_mtime_ns = self._native_vst_host_state_signature(track, entry)
+        if state_path:
+            if not self._load_native_vst_state_into_bridge(
+                bridge,
+                state_path,
+                parameter_values=track.vsti_parameters,
+                generation=self._track_vsti_parameter_generation(track),
+            ):
+                return False
+        else:
+            setattr(bridge, '_aims_loaded_state_path', '')
+            setattr(bridge, '_aims_loaded_state_mtime_ns', int(state_mtime_ns))
+
+        ok, _status = self._configure_native_vst_host_bridge_buses(bridge, track, entry)
+        if not ok:
+            return False
+        if not self._configure_direct_native_output_mix(bridge, track):
+            return False
+
+        self._apply_native_vst_bridge_parameter_values(
+            bridge,
+            track.vsti_parameters,
+            generation=self._track_vsti_parameter_generation(track),
+        )
+        setattr(bridge, '_aims_direct_output_row', int(row))
+        self._mark_active_native_transport_track_reset_pending(int(row), track)
+        self._native_output_status_cache = None
+        self._native_output_status_cache_at = 0.0
+        self._cancel_pending_transport_reprepare()
+        self._reschedule_active_native_transport_for_edit()
+        return True
+
+    def _try_live_safe_active_native_transport_refresh(self) -> bool:
+        if not bool(hasattr(self, 'playback_timer') and self.playback_timer.isActive()):
+            return False
+        bridge = getattr(self, '_native_output_bridge', None)
+        if bridge is None or not self._native_output_bridge_alive():
+            return False
+
+        if self._graph_native_transport_active():
+            slot_tracks = self._graph_native_transport_slot_tracks()
+            if not slot_tracks:
+                return False
+            candidate_tracks = self._graph_native_transport_candidates()
+            if not candidate_tracks:
+                return False
+            active_rows = [int(row) for _slot_index, row, _track, _entry in slot_tracks]
+            candidate_rows = [int(row) for row, _track, _entry in candidate_tracks]
+
+            target_signature = self._native_vst_graph_config_signature(candidate_tracks)
+            current_signature = tuple(getattr(bridge, '_aims_graph_config_signature', ()) or ())
+            requires_graph_reconfigure = (
+                not current_signature
+                or len(current_signature) != len(target_signature)
+                or candidate_rows != active_rows
+            )
+
+            slot_mix_payloads: list[dict[str, object]] = []
+            for slot_index, (row, track, entry) in enumerate(candidate_tracks):
+                row = int(row)
+                desired_gain = max(
+                    0.0,
+                    float(track.volume) * (10.0 ** (float(track.vsti_output_gain_db) / 20.0)),
+                )
+                desired_pan = float(clamp(float(track.pan), -1.0, 1.0))
+                slot_mix_payloads.append(
+                    {
+                        'slot_index': int(slot_index),
+                        'gain': float(desired_gain),
+                        'pan': float(desired_pan),
+                    }
+                )
+
+                if current_signature:
+                    if slot_index >= len(current_signature) or slot_index >= len(target_signature):
+                        requires_graph_reconfigure = True
+                        continue
+                    current_entry = current_signature[slot_index]
+                    target_entry = target_signature[slot_index]
+                    current_path = self._normalized_vsti_path(str(current_entry[1] if len(current_entry) > 1 else ''))
+                    target_path = self._normalized_vsti_path(str(target_entry[1] if len(target_entry) > 1 else ''))
+                    current_fx_signature = current_entry[5] if len(current_entry) > 5 else ()
+                    target_fx_signature = target_entry[5] if len(target_entry) > 5 else ()
+                    if current_path != target_path or tuple(current_fx_signature or ()) != tuple(target_fx_signature or ()):
+                        requires_graph_reconfigure = True
+                        continue
+
+                    current_state_path = str(current_entry[2] if len(current_entry) > 2 else '')
+                    target_state_path = str(target_entry[2] if len(target_entry) > 2 else '')
+                    current_state_mtime = int(current_entry[3] if len(current_entry) > 3 else 0)
+                    target_state_mtime = int(target_entry[3] if len(target_entry) > 3 else 0)
+                    if current_state_path != target_state_path or current_state_mtime != target_state_mtime:
+                        state_path = self._effective_vsti_state_path(track, entry)
+                        if state_path is None or not state_path.exists():
+                            return False
+                        if not self._load_native_vst_graph_slot_state(
+                            bridge,
+                            int(slot_index),
+                            state_path,
+                            parameter_values=track.vsti_parameters,
+                        ):
+                            return False
+                    elif tuple(current_entry[4] if len(current_entry) > 4 else ()) != tuple(target_entry[4] if len(target_entry) > 4 else ()):
+                        try:
+                            bridge.command(
+                                'set_graph_slot_parameters',
+                                slot_index=int(slot_index),
+                                parameters=dict(track.vsti_parameters),
+                                parameter_signature=self._native_vst_host_parameter_payload_signature_string(
+                                    self._sanitize_native_vst_bridge_parameter_values(track.vsti_parameters)
+                                ),
+                            )
+                        except Exception:
+                            _APP_LOGGER.exception(
+                                "Failed applying live-safe graph slot parameters row=%s rack=%s",
+                                row,
+                                track.rack_vsti,
+                            )
+                            return False
+
+            if requires_graph_reconfigure:
+                return self._reconfigure_active_graph_native_transport_live(
+                    bridge,
+                    candidate_tracks,
+                    target_signature,
+                )
+
+            if slot_mix_payloads:
+                try:
+                    bridge.command(
+                        'set_graph_transport_state',
+                        slot_mixes=slot_mix_payloads,
+                        reset_slots=[],
+                        base_offset_frames=0,
+                    )
+                except Exception:
+                    _APP_LOGGER.exception("Failed applying live-safe graph slot mix refresh")
+                    return False
+            bridge._aims_graph_config_signature = target_signature
+            self._cancel_pending_transport_reprepare()
+            self._reschedule_active_native_transport_for_edit()
+            return True
+
+        if self._direct_native_transport_active():
+            graph_tracks = self._graph_native_transport_candidates()
+            if graph_tracks:
+                target_signature = self._native_output_bridge_target_signature(None)
+                if not self._native_output_bridge_matches_audio_signature(target_signature, bridge=bridge):
+                    return False
+                return self._switch_active_direct_native_transport_to_graph_live(
+                    bridge,
+                    graph_tracks,
+                )
+
+            direct_candidate = self._direct_native_transport_candidate()
+            if direct_candidate is None:
+                return False
+            row, track, entry = direct_candidate
+            direct_row = int(getattr(self, '_direct_native_transport_row', -1) or -1)
+            if int(row) != direct_row:
+                return False
+            target_signature = self._native_output_bridge_target_signature(direct_candidate)
+            if not self._native_output_bridge_matches_audio_signature(
+                target_signature,
+                bridge=bridge,
+            ):
+                return False
+            if not self._native_output_bridge_matches_signature(target_signature, bridge=bridge):
+                return self._reload_active_direct_native_transport_plugin_live(
+                    bridge,
+                    int(row),
+                    track,
+                    entry,
+                )
+
+            desired_state_path, desired_state_mtime_ns = self._native_vst_host_state_signature(track, entry)
+            current_state_path = str(getattr(bridge, '_aims_loaded_state_path', '') or '')
+            current_state_mtime_ns = int(getattr(bridge, '_aims_loaded_state_mtime_ns', 0) or 0)
+            if current_state_path != desired_state_path or current_state_mtime_ns != desired_state_mtime_ns:
+                if not desired_state_path:
+                    return False
+                if not self._load_native_vst_state_into_bridge(
+                    bridge,
+                    desired_state_path,
+                    parameter_values=track.vsti_parameters,
+                    generation=self._track_vsti_parameter_generation(track),
+                ):
+                    return False
+
+            desired_bus_signature = self._native_vst_host_bus_payload_signature(
+                self._native_vst_host_bus_payload(track, entry)
+            )
+            if getattr(bridge, '_aims_bus_routing_signature', None) != desired_bus_signature:
+                ok, _status = self._configure_native_vst_host_bridge_buses(bridge, track, entry)
+                if not ok:
+                    return False
+
+            if not self._configure_direct_native_output_mix(bridge, track):
+                return False
+            self._queue_native_vst_bridge_parameter_values(
+                bridge,
+                track.vsti_parameters,
+                generation=self._track_vsti_parameter_generation(track),
+            )
+            setattr(bridge, '_aims_direct_output_row', int(row))
+            self._cancel_pending_transport_reprepare()
+            self._reschedule_active_native_transport_for_edit()
+            return True
+
+        return False
+
     def _force_note_off_for_track(self, row: int) -> None:
         row = int(row)
         if row < 0 or row >= len(self.project.tracks):
@@ -10304,6 +10890,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, '_transport_reprepare_timer'):
             self._transport_reprepare_timer.start(max(0, int(delay_ms)))
 
+    def _cancel_pending_transport_reprepare(self) -> None:
+        self._pending_transport_reprepare = False
+        self._pending_transport_reprepare_reason = ''
+        if hasattr(self, '_transport_reprepare_timer'):
+            self._transport_reprepare_timer.stop()
+
     def _flush_deferred_transport_reprepare(self) -> None:
         if not bool(getattr(self, '_pending_transport_reprepare', False)):
             return
@@ -10416,6 +11008,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if direct_row is not None and direct_track is not None:
             self._capture_shared_native_output_bridge_state()
             self._track_meter_levels[int(direct_row)] = 0.0
+            self._native_track_meter_levels.pop(int(direct_row), None)
         graph_transport_active = bool(cleanup.get('graph_transport_active', False))
         if graph_transport_active:
             bridge = getattr(self, '_native_output_bridge', None)
@@ -10486,6 +11079,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if not hasattr(self, 'playback_timer') or not self.playback_timer.isActive():
             return
         if self._graph_native_transport_active() or self._direct_native_transport_active():
+            if self._try_live_safe_active_native_transport_refresh():
+                return
             self._schedule_transport_reprepare(reason='transport edit', delay_ms=90)
             return
         if not bool(getattr(self, 'prefer_prerendered_vst_playback', False)):
@@ -10575,60 +11170,90 @@ class MainWindow(QtWidgets.QMainWindow):
         *,
         refresh_velocity: bool = False,
         refresh_timeline: bool = False,
+        timeline_rows: set[int] | list[int] | tuple[int, ...] | None = None,
         refresh_sample_timeline: bool = False,
         rebuild_sections: bool = False,
         refresh_arrangement: bool = False,
+        arrangement_rows: set[int] | list[int] | tuple[int, ...] | None = None,
         reload_mix: bool = False,
     ) -> None:
         self._deferred_refresh_velocity = self._deferred_refresh_velocity or refresh_velocity
         self._deferred_refresh_timeline = self._deferred_refresh_timeline or refresh_timeline
+        if refresh_timeline:
+            if timeline_rows is None:
+                self._deferred_timeline_rows = None
+            elif self._deferred_timeline_rows is not None:
+                self._deferred_timeline_rows.update(
+                    int(row) for row in timeline_rows if 0 <= int(row) < len(self.project.tracks)
+                )
         self._deferred_refresh_sample_timeline = self._deferred_refresh_sample_timeline or refresh_sample_timeline
         self._deferred_rebuild_sections = self._deferred_rebuild_sections or rebuild_sections
         self._deferred_refresh_arrangement = self._deferred_refresh_arrangement or refresh_arrangement
+        if refresh_arrangement:
+            if arrangement_rows is None:
+                self._deferred_arrangement_rows = None
+            elif self._deferred_arrangement_rows is not None:
+                self._deferred_arrangement_rows.update(
+                    int(row) for row in arrangement_rows if 0 <= int(row) < len(self.project.tracks)
+                )
         self._deferred_reload_mix = self._deferred_reload_mix or reload_mix
         if not self._deferred_note_refresh_timer.isActive():
-            self._deferred_note_refresh_timer.start(0)
+            self._deferred_note_refresh_timer.start()
 
     def _flush_deferred_note_refresh(self) -> None:
         refresh_velocity = self._deferred_refresh_velocity
         refresh_timeline = self._deferred_refresh_timeline
+        timeline_rows = None if self._deferred_timeline_rows is None else set(self._deferred_timeline_rows)
         refresh_sample_timeline = self._deferred_refresh_sample_timeline
         rebuild_sections = self._deferred_rebuild_sections
         refresh_arrangement = self._deferred_refresh_arrangement
+        arrangement_rows = None if self._deferred_arrangement_rows is None else set(self._deferred_arrangement_rows)
         reload_mix = self._deferred_reload_mix
 
         self._deferred_refresh_velocity = False
         self._deferred_refresh_timeline = False
+        self._deferred_timeline_rows = set()
         self._deferred_refresh_sample_timeline = False
         self._deferred_rebuild_sections = False
         self._deferred_refresh_arrangement = False
+        self._deferred_arrangement_rows = set()
         self._deferred_reload_mix = False
 
         if refresh_velocity:
             self.velocity_editor.refresh()
         if refresh_timeline:
-            self.timeline.refresh()
+            if timeline_rows is None:
+                self.timeline.refresh()
+            else:
+                self.timeline.refresh_rows(timeline_rows)
         if refresh_sample_timeline:
             self.sample_timeline.refresh()
         if rebuild_sections:
             self.rebuild_midi_sections()
         if refresh_arrangement:
-            self.arrangement_overview.refresh()
+            if arrangement_rows is None:
+                self.arrangement_overview.refresh()
+            else:
+                self.arrangement_overview.refresh_sections(arrangement_rows)
         if reload_mix:
             self._reload_playback_mix_if_running()
 
     def on_piano_roll_notes_committed(self) -> None:
-        self._prioritize_note_offs_for_edit()
-        self._invalidate_playback_caches()
         current_row = self.current_track_index()
+        changed_rows = {int(current_row)} if 0 <= int(current_row) < len(self.project.tracks) else set()
+        live_safe_native_edit = self._note_edit_is_live_safe_for_native_transport(changed_rows)
+        self._prioritize_note_offs_for_edit()
+        self._invalidate_playback_caches(reset_realtime=not live_safe_native_edit)
         if 0 <= current_row < len(self.project.tracks):
             self._schedule_native_vst_host_warm_for_row(current_row)
         self._schedule_deferred_note_refresh(
             refresh_velocity=True,
             refresh_timeline=True,
+            timeline_rows=changed_rows,
             rebuild_sections=True,
             refresh_arrangement=True,
-            reload_mix=True,
+            arrangement_rows=changed_rows,
+            reload_mix=not live_safe_native_edit,
         )
 
     def on_velocity_editor_changed(self) -> None:
@@ -10701,6 +11326,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._audio_pump_in_progress = False
         self._clear_graph_native_transport_state()
         self._track_meter_levels = {idx: 0.0 for idx in range(len(self.project.tracks))}
+        self._native_track_meter_levels = {}
         if hasattr(self, 'mixer'):
             self.mixer.refresh_meters()
         self._clear_realtime_mix_cache()
@@ -10810,6 +11436,7 @@ class MainWindow(QtWidgets.QMainWindow):
         direct_plugin: tuple[int, TrackState, VSTInstrument],
     ) -> bool:
         row, track, entry = direct_plugin
+        self._flush_native_vst_editor_state_rows([int(row)])
         bridge = self._ensure_native_output_bridge(direct_plugin=direct_plugin)
         if bridge is None:
             return False
@@ -10858,9 +11485,6 @@ class MainWindow(QtWidgets.QMainWindow):
         state.native_host_render_failed = False
         state.last_error = ""
 
-        if self._native_vst_host_editor_visible(int(row)):
-            self._handoff_track_editor_to_shared_output_bridge(int(row), track, entry)
-
         self._transport_uses_native_output_bridge = True
         self._playback_active = True
         self._pump_direct_native_transport()
@@ -10880,6 +11504,7 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> bool:
         if not graph_tracks:
             return False
+        self._flush_native_vst_editor_state_rows([int(row) for row, _track, _entry in graph_tracks])
         bridge = self._ensure_native_output_bridge()
         if bridge is None:
             return False
@@ -10935,9 +11560,6 @@ class MainWindow(QtWidgets.QMainWindow):
             state.native_host_loop_epoch = 0
             state.native_host_render_failed = False
             state.last_error = ""
-            if self._native_vst_host_editor_visible(int(row)):
-                self._close_track_vsti_window(int(row), teardown_host=True)
-                self._open_native_vst_graph_bridge_editor(int(row), track, entry)
 
         self._transport_uses_native_output_bridge = True
         self._playback_active = True
@@ -11253,6 +11875,66 @@ class MainWindow(QtWidgets.QMainWindow):
             maximum = max((abs(float(sample)) for sample in data), default=0.0)
             return max(0.0, min(1.0, maximum))
         return 0.0
+
+    @staticmethod
+    def _sanitize_meter_levels(raw_levels: object) -> dict[int, float]:
+        if not isinstance(raw_levels, dict):
+            return {}
+        levels: dict[int, float] = {}
+        for raw_key, raw_value in raw_levels.items():
+            try:
+                idx = int(raw_key)
+                level = max(0.0, min(1.0, float(raw_value)))
+            except Exception:
+                continue
+            if idx < 0:
+                continue
+            levels[idx] = level
+        return levels
+
+    def _set_native_track_meter_levels(self, meter_levels: object) -> None:
+        self._native_track_meter_levels = self._sanitize_meter_levels(meter_levels)
+
+    def _native_graph_track_peak_levels(
+        self,
+        bridge: object | None,
+        status: dict[str, object] | None,
+    ) -> dict[int, float]:
+        if bridge is None or not isinstance(status, dict):
+            return {}
+        rows = [int(row) for row in (getattr(bridge, '_aims_graph_track_rows', []) or [])]
+        raw_slots = status.get('graph_slots')
+        if not isinstance(raw_slots, list) or not rows:
+            return {}
+        levels: dict[int, float] = {}
+        for raw_slot in raw_slots:
+            if not isinstance(raw_slot, dict):
+                continue
+            try:
+                slot_index = int(raw_slot.get('slot_index', -1))
+            except Exception:
+                continue
+            if slot_index < 0 or slot_index >= len(rows):
+                continue
+            try:
+                level = max(0.0, min(1.0, float(raw_slot.get('peak_level', 0.0) or 0.0)))
+            except Exception:
+                level = 0.0
+            levels[int(rows[slot_index])] = level
+        return levels
+
+    def _update_track_meter_levels(self, meter_levels: object | None = None) -> None:
+        incoming = self._sanitize_meter_levels(meter_levels)
+        if not incoming and not self._track_meter_levels:
+            return
+        decayed_levels: dict[int, float] = {}
+        for idx in range(len(self.project.tracks)):
+            previous = float(self._track_meter_levels.get(idx, 0.0)) * 0.72
+            current = float(incoming.get(idx, 0.0))
+            level = max(previous, current)
+            if level > 0.001:
+                decayed_levels[idx] = level
+        self._track_meter_levels = decayed_levels
 
     def _realtime_track_state(self, idx: int, track: TrackState) -> RealtimeTrackPlaybackState:
         state = self._realtime_track_states.get(idx)
@@ -11863,15 +12545,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 for pos in range(frame_count):
                     mix[0][pos] += left[pos]
                     mix[1][pos] += right[pos]
-        if meter_levels or self._track_meter_levels:
-            decayed_levels: dict[int, float] = {}
-            for idx in range(len(self.project.tracks)):
-                previous = float(self._track_meter_levels.get(idx, 0.0)) * 0.72
-                current = float(meter_levels.get(idx, 0.0))
-                level = max(previous, current)
-                if level > 0.001:
-                    decayed_levels[idx] = level
-            self._track_meter_levels = decayed_levels
+        meter_levels.update(self._native_track_meter_levels)
+        self._update_track_meter_levels(meter_levels)
         if np is not None and isinstance(mix, np.ndarray):
             return np.clip(mix, -1.0, 1.0).astype(np.float32, copy=False)
         return [
@@ -12137,6 +12812,9 @@ class MainWindow(QtWidgets.QMainWindow):
             status = self._native_output_status(bridge)
             if status is None:
                 raise RuntimeError('Direct native transport bridge is unavailable')
+            direct_level = max(0.0, min(1.0, float(status.get('plugin_output_peak_level', 0.0) or 0.0)))
+            self._set_native_track_meter_levels({int(row): direct_level})
+            self._update_track_meter_levels(self._native_track_meter_levels)
 
             current_frame = self._native_output_rendered_sample_frames(status)
             if current_frame > int(self._direct_native_transport_output_cursor_frame):
@@ -12988,6 +13666,27 @@ class MainWindow(QtWidgets.QMainWindow):
                     names.append(name)
         return names
 
+    @staticmethod
+    def _native_vst_parameter_values_from_status(status: dict[str, object] | None) -> dict[str, float]:
+        if not isinstance(status, dict):
+            return {}
+        raw_parameters = status.get('plugin_parameters')
+        if not isinstance(raw_parameters, list):
+            return {}
+        values: dict[str, float] = {}
+        for index, raw_parameter in enumerate(raw_parameters, start=1):
+            if not isinstance(raw_parameter, dict):
+                continue
+            name = str(raw_parameter.get('name') or '').strip()
+            if not name or name in {'-', '--', '---'} or name in values:
+                name = f'Param {index}'
+            normalized_value = safe_finite_float(
+                raw_parameter.get('normalized_value', raw_parameter.get('value', 0.0)),
+                0.0,
+            )
+            values[name] = max(0.0, min(100.0, float(normalized_value) * 100.0))
+        return values
+
     def _store_native_vst_probe_metadata(self, plugin_path: str, status: dict[str, object] | None) -> None:
         if not isinstance(status, dict):
             return
@@ -13624,6 +14323,31 @@ class MainWindow(QtWidgets.QMainWindow):
     def _native_vst_bridge_parameter_signature(values: dict[str, float]) -> tuple[tuple[str, float], ...]:
         return tuple(sorted((str(key), round(float(value), 4)) for key, value in dict(values or {}).items()))
 
+    @staticmethod
+    def _native_vst_host_parameter_payload_signature_string(values: dict[str, float]) -> str:
+        entries = [
+            f"{str(key).strip()}={float(value):.6f}"
+            for key, value in sorted(dict(values or {}).items())
+            if str(key).strip()
+        ]
+        return "|".join(entries)
+
+    def _remember_native_vst_bridge_parameter_values(
+        self,
+        bridge: object | None,
+        values: dict[str, float],
+        *,
+        generation: int | None = None,
+    ) -> None:
+        if bridge is None:
+            return
+        sanitized = self._sanitize_native_vst_bridge_parameter_values(values)
+        self._discard_pending_native_vst_bridge_parameter_updates(bridge)
+        setattr(bridge, '_aims_live_parameter_signature', self._native_vst_bridge_parameter_signature(sanitized))
+        setattr(bridge, '_aims_live_parameter_values', dict(sanitized))
+        if generation is not None:
+            setattr(bridge, '_aims_live_parameter_generation', int(generation))
+
     def _discard_pending_native_vst_bridge_parameter_updates(self, bridge: object | None) -> None:
         if bridge is None:
             return
@@ -13633,22 +14357,367 @@ class MainWindow(QtWidgets.QMainWindow):
         setattr(bridge, '_aims_pending_parameter_signature', None)
         setattr(bridge, '_aims_pending_parameter_generation', None)
 
+    def _load_native_vst_state_into_bridge(
+        self,
+        bridge: object | None,
+        state_path: str | Path,
+        *,
+        parameter_values: dict[str, float] | None = None,
+        generation: int | None = None,
+    ) -> bool:
+        if bridge is None:
+            return False
+        state_file = Path(state_path)
+        if not state_file.exists():
+            return False
+        if getattr(bridge, '_aims_supports_load_state', True) is False:
+            return False
+        try:
+            bridge.command('load_state', path=str(state_file))
+        except Exception as exc:
+            if 'Unknown command: load_state' in str(exc):
+                setattr(bridge, '_aims_supports_load_state', False)
+                _APP_LOGGER.warning("Native VST host does not support load_state path=%s", state_file)
+                return False
+            _APP_LOGGER.exception("Failed loading native VST state into active bridge path=%s", state_file)
+            return False
+        setattr(bridge, '_aims_loaded_state_path', str(state_file))
+        setattr(bridge, '_aims_loaded_state_mtime_ns', int(self._path_mtime_ns(state_file)))
+        if parameter_values is not None:
+            self._remember_native_vst_bridge_parameter_values(
+                bridge,
+                parameter_values,
+                generation=generation,
+            )
+        return True
+
+    def _load_native_vst_graph_slot_state(
+        self,
+        bridge: object | None,
+        slot_index: int,
+        state_path: str | Path,
+        *,
+        parameter_values: dict[str, float] | None = None,
+    ) -> bool:
+        if bridge is None or int(slot_index) < 0:
+            return False
+        state_file = Path(state_path)
+        if not state_file.exists():
+            return False
+        if getattr(bridge, '_aims_supports_load_graph_slot_state', True) is False:
+            return False
+        payload = {
+            'slot_index': int(slot_index),
+            'path': str(state_file),
+        }
+        if parameter_values is not None:
+            payload['parameters'] = dict(parameter_values)
+            payload['parameter_signature'] = self._native_vst_host_parameter_payload_signature_string(
+                self._sanitize_native_vst_bridge_parameter_values(parameter_values)
+            )
+        try:
+            bridge.command('load_graph_slot_state', **payload)
+            return True
+        except Exception as exc:
+            if 'Unknown command: load_graph_slot_state' in str(exc):
+                setattr(bridge, '_aims_supports_load_graph_slot_state', False)
+                _APP_LOGGER.warning("Native VST host does not support load_graph_slot_state path=%s", state_file)
+                return False
+            _APP_LOGGER.exception(
+                "Failed loading native VST state into active graph slot slot=%s path=%s",
+                slot_index,
+                state_file,
+            )
+            return False
+
+    def _sync_native_vst_state_to_active_hosts(
+        self,
+        row: int,
+        track: TrackState,
+        entry: VSTInstrument,
+        *,
+        source_bridge: object | None = None,
+    ) -> None:
+        state_path = self._effective_vsti_state_path(track, entry)
+        if state_path is None or not state_path.exists():
+            return
+        parameter_values = self._sanitize_native_vst_bridge_parameter_values(track.vsti_parameters)
+        generation = self._track_vsti_parameter_generation(track)
+
+        shared_info = self._shared_native_output_bridge_track_info()
+        if shared_info is not None and int(shared_info[0]) == int(row):
+            shared_bridge = shared_info[1]
+            if shared_bridge is not source_bridge:
+                self._load_native_vst_state_into_bridge(
+                    shared_bridge,
+                    state_path,
+                    parameter_values=parameter_values,
+                    generation=generation,
+                )
+                self._queue_native_vst_bridge_parameter_values(
+                    shared_bridge,
+                    parameter_values,
+                    generation=generation,
+                )
+
+        graph_bridge = self._active_native_vst_graph_bridge()
+        graph_slot_index = self._native_vst_graph_bridge_slot_index(int(row), entry, bridge=graph_bridge)
+        if graph_bridge is not None and graph_slot_index >= 0 and graph_bridge is not source_bridge:
+            if not self._load_native_vst_graph_slot_state(
+                graph_bridge,
+                graph_slot_index,
+                state_path,
+                parameter_values=parameter_values,
+            ):
+                if parameter_values:
+                    try:
+                        graph_bridge.command(
+                            'set_graph_slot_parameters',
+                            slot_index=int(graph_slot_index),
+                            parameters=dict(parameter_values),
+                        )
+                    except Exception:
+                        _APP_LOGGER.exception(
+                            "Failed syncing active graph transport parameters row=%s rack=%s",
+                            row,
+                            track.rack_vsti,
+                        )
+
+    def _sync_track_native_vst_editor_bridge_state(
+        self,
+        row: int,
+        bridge: object,
+        track: TrackState,
+        entry: VSTInstrument,
+        *,
+        status: dict[str, object] | None = None,
+        force_save: bool = False,
+    ) -> bool:
+        if status is None:
+            try:
+                status = bridge.command('status')
+            except Exception:
+                return False
+        if not isinstance(status, dict):
+            return False
+
+        self._store_native_vst_probe_metadata(entry.path, status)
+        editor_open = bool(status.get('editor_open', False))
+        current_values = self._sanitize_native_vst_bridge_parameter_values(track.vsti_parameters)
+        status_values = self._sanitize_native_vst_bridge_parameter_values(
+            self._native_vst_parameter_values_from_status(status)
+        )
+        previous_editor_values = self._sanitize_native_vst_bridge_parameter_values(
+            getattr(
+                bridge,
+                '_aims_last_polled_parameter_values',
+                status_values if not current_values else current_values,
+            )
+        )
+        delta_values = {
+            key: value
+            for key, value in status_values.items()
+            if round(float(previous_editor_values.get(key, float('nan'))), 4) != round(float(value), 4)
+        }
+        setattr(bridge, '_aims_last_polled_parameter_values', dict(status_values))
+        live_native_playback_safe = self._native_vst_parameter_change_is_live_safe(track)
+        parameter_changed = (
+            bool(status_values)
+            and self._native_vst_bridge_parameter_signature(current_values)
+            != self._native_vst_bridge_parameter_signature(status_values)
+        )
+
+        state_captured = False
+        if force_save or (parameter_changed and not live_native_playback_safe):
+            state_captured = self._capture_native_vst_host_bridge_state(
+                row,
+                bridge=bridge,
+                track=track,
+                entry=entry,
+            )
+
+        if parameter_changed:
+            self._remember_native_vst_bridge_parameter_values(bridge, status_values)
+            sync_hosts = True
+            payload_values: dict[str, float] | None = None
+            if live_native_playback_safe:
+                if not delta_values:
+                    sync_hosts = False
+                elif len(delta_values) <= 16:
+                    payload_values = dict(delta_values)
+                else:
+                    sync_hosts = False
+            if live_native_playback_safe:
+                self._apply_track_vsti_parameters_live(
+                    track,
+                    status_values,
+                    payload_values=payload_values,
+                    sync_hosts=sync_hosts,
+                )
+            else:
+                self._apply_track_vsti_parameters_live(track, status_values)
+            self._remember_native_vst_bridge_parameter_values(
+                bridge,
+                status_values,
+                generation=self._track_vsti_parameter_generation(track),
+            )
+
+        if state_captured:
+            self._sync_native_vst_state_to_active_hosts(int(row), track, entry, source_bridge=bridge)
+
+        setattr(bridge, '_aims_editor_open', editor_open)
+        if not editor_open:
+            self._track_native_vsti_hwnds.pop(int(row), None)
+            self._track_native_vsti_close_events.pop(int(row), None)
+        return bool(parameter_changed or state_captured)
+
+    def _poll_native_vst_editor_state(self) -> None:
+        if not self._track_native_vst_host_bridges:
+            if hasattr(self, '_native_vst_editor_sync_timer'):
+                self._native_vst_editor_sync_timer.stop()
+            return
+
+        keep_polling = False
+        now = time.monotonic()
+        for row, bridge in list(self._track_native_vst_host_bridges.items()):
+            row = int(row)
+            if bridge is None or not self._native_vst_host_bridge_alive(row):
+                continue
+            if row < 0 or row >= len(self.project.tracks):
+                continue
+            was_open = bool(getattr(bridge, '_aims_editor_open', False))
+            poll_requested = bool(getattr(bridge, '_aims_editor_poll_requested', False))
+            poll_until = float(getattr(bridge, '_aims_editor_poll_until', 0.0) or 0.0)
+            if poll_requested and poll_until > 0.0 and now > poll_until and not was_open:
+                poll_requested = False
+                setattr(bridge, '_aims_editor_poll_requested', False)
+                setattr(bridge, '_aims_editor_poll_until', 0.0)
+            if not poll_requested and not was_open:
+                continue
+            track = self.project.tracks[row]
+            entry = self._native_instrument_entry_for_track(track)
+            if entry is None:
+                continue
+
+            try:
+                status = bridge.command('status')
+            except Exception:
+                keep_polling = keep_polling or was_open or poll_requested
+                continue
+
+            editor_open = bool(status.get('editor_open', False))
+            if editor_open:
+                setattr(bridge, '_aims_editor_poll_requested', True)
+                setattr(bridge, '_aims_editor_poll_until', 0.0)
+            elif was_open:
+                setattr(bridge, '_aims_editor_poll_requested', False)
+                setattr(bridge, '_aims_editor_poll_until', 0.0)
+            keep_polling = keep_polling or editor_open or was_open or bool(getattr(bridge, '_aims_editor_poll_requested', False))
+            try:
+                self._sync_track_native_vst_editor_bridge_state(
+                    row,
+                    bridge,
+                    track,
+                    entry,
+                    status=status,
+                    force_save=was_open and not editor_open,
+                )
+            except Exception:
+                _APP_LOGGER.exception("Failed syncing native VST editor state row=%s rack=%s", row, entry.name)
+            if was_open and not editor_open:
+                self._update_track_list_item(row)
+                if row == self.current_track_index():
+                    self._schedule_selected_track_panel_refresh(row)
+
+        if not keep_polling and hasattr(self, '_native_vst_editor_sync_timer'):
+            self._native_vst_editor_sync_timer.stop()
+
+    def _ensure_native_vst_editor_sync_polling(self, row: int | None = None) -> None:
+        if row is not None:
+            bridge = self._track_native_vst_host_bridges.get(int(row))
+            if bridge is not None:
+                setattr(bridge, '_aims_editor_poll_requested', True)
+                setattr(bridge, '_aims_editor_poll_until', time.monotonic() + 4.0)
+        if hasattr(self, '_native_vst_editor_sync_timer') and not self._native_vst_editor_sync_timer.isActive():
+            self._native_vst_editor_sync_timer.start()
+
+    def _flush_native_vst_editor_state_rows(self, rows: list[int] | None = None) -> None:
+        target_rows = list(self._track_native_vst_host_bridges.keys()) if rows is None else [int(row) for row in rows]
+        seen_rows: set[int] = set()
+        for row in target_rows:
+            row = int(row)
+            if row in seen_rows:
+                continue
+            seen_rows.add(row)
+            bridge = self._track_native_vst_host_bridges.get(row)
+            if bridge is None or not self._native_vst_host_bridge_alive(row):
+                continue
+            if row < 0 or row >= len(self.project.tracks):
+                continue
+            track = self.project.tracks[row]
+            entry = self._native_instrument_entry_for_track(track)
+            if entry is None:
+                continue
+            try:
+                status = bridge.command('status')
+            except Exception:
+                continue
+            self._sync_track_native_vst_editor_bridge_state(
+                row,
+                bridge,
+                track,
+                entry,
+                status=status,
+                force_save=bool(status.get('editor_open', False)),
+            )
+
+    def _close_playback_native_editor_for_row(self, row: int, entry: VSTInstrument | None) -> None:
+        row = int(row)
+        shared_info = self._shared_native_output_bridge_track_info()
+        if shared_info is not None and int(shared_info[0]) == row:
+            shared_entry = shared_info[3]
+            if entry is None or self._normalized_vsti_path(str(shared_entry.path)) == self._normalized_vsti_path(str(entry.path)):
+                try:
+                    shared_info[1].command('close_editor')
+                except Exception:
+                    _APP_LOGGER.exception("Failed closing shared playback editor row=%s", row)
+
+        graph_bridge = self._active_native_vst_graph_bridge()
+        graph_slot_index = self._native_vst_graph_bridge_slot_index(row, entry, bridge=graph_bridge)
+        if graph_bridge is None or graph_slot_index < 0:
+            return
+        try:
+            status = graph_bridge.command('status')
+            if int(status.get('graph_editor_slot', -1) or -1) == int(graph_slot_index):
+                graph_bridge.command('close_graph_editor')
+        except Exception:
+            _APP_LOGGER.exception("Failed closing graph playback editor row=%s slot=%s", row, graph_slot_index)
+
     def _flush_native_vst_parameter_updates(self) -> None:
         pending = dict(getattr(self, '_pending_native_vst_parameter_updates', {}) or {})
         self._pending_native_vst_parameter_updates = {}
-        for bridge, values, generation in pending.values():
-            self._apply_native_vst_bridge_parameter_values(bridge, values, generation=generation)
+        for bridge, values, payload_values, generation in pending.values():
+            self._apply_native_vst_bridge_parameter_values(
+                bridge,
+                values,
+                payload_values=payload_values,
+                generation=generation,
+            )
 
     def _queue_native_vst_bridge_parameter_values(
         self,
         bridge: object | None,
         values: dict[str, float],
         *,
+        payload_values: dict[str, float] | None = None,
         generation: int | None = None,
     ) -> bool:
         if bridge is None:
             return False
         sanitized = self._sanitize_native_vst_bridge_parameter_values(values)
+        sanitized_payload = self._sanitize_native_vst_bridge_parameter_values(
+            payload_values if payload_values is not None else values
+        )
         signature = self._native_vst_bridge_parameter_signature(sanitized)
         if getattr(bridge, '_aims_live_parameter_signature', None) == signature:
             if generation is not None:
@@ -13662,12 +14731,24 @@ class MainWindow(QtWidgets.QMainWindow):
                 setattr(bridge, '_aims_live_parameter_generation', int(generation))
             self._discard_pending_native_vst_bridge_parameter_updates(bridge)
             return True
+        if payload_values is not None and not sanitized_payload:
+            setattr(bridge, '_aims_live_parameter_signature', signature)
+            setattr(bridge, '_aims_live_parameter_values', dict(sanitized))
+            if generation is not None:
+                setattr(bridge, '_aims_live_parameter_generation', int(generation))
+            self._discard_pending_native_vst_bridge_parameter_updates(bridge)
+            return True
         if getattr(bridge, '_aims_supports_set_parameters', True) is False:
             return False
         if getattr(bridge, '_aims_pending_parameter_signature', None) == signature:
             pending = getattr(self, '_pending_native_vst_parameter_updates', None)
             if isinstance(pending, dict):
-                pending[id(bridge)] = (bridge, sanitized, None if generation is None else int(generation))
+                pending[id(bridge)] = (
+                    bridge,
+                    sanitized,
+                    sanitized_payload,
+                    None if generation is None else int(generation),
+                )
             if generation is not None:
                 setattr(bridge, '_aims_pending_parameter_generation', int(generation))
             return True
@@ -13675,7 +14756,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if not isinstance(pending, dict):
             self._pending_native_vst_parameter_updates = {}
             pending = self._pending_native_vst_parameter_updates
-        pending[id(bridge)] = (bridge, sanitized, None if generation is None else int(generation))
+        pending[id(bridge)] = (
+            bridge,
+            sanitized,
+            sanitized_payload,
+            None if generation is None else int(generation),
+        )
         setattr(bridge, '_aims_pending_parameter_signature', signature)
         setattr(bridge, '_aims_pending_parameter_generation', None if generation is None else int(generation))
         if hasattr(self, '_native_vst_parameter_flush_timer') and not self._native_vst_parameter_flush_timer.isActive():
@@ -13687,11 +14773,15 @@ class MainWindow(QtWidgets.QMainWindow):
         bridge: object | None,
         values: dict[str, float],
         *,
+        payload_values: dict[str, float] | None = None,
         generation: int | None = None,
     ) -> bool:
         if bridge is None:
             return False
         sanitized = self._sanitize_native_vst_bridge_parameter_values(values)
+        sanitized_payload = self._sanitize_native_vst_bridge_parameter_values(
+            payload_values if payload_values is not None else values
+        )
         signature = self._native_vst_bridge_parameter_signature(sanitized)
         if getattr(bridge, '_aims_live_parameter_signature', None) == signature:
             if generation is not None:
@@ -13701,6 +14791,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if not sanitized:
             setattr(bridge, '_aims_live_parameter_signature', signature)
             setattr(bridge, '_aims_live_parameter_values', {})
+            if generation is not None:
+                setattr(bridge, '_aims_live_parameter_generation', int(generation))
+            self._discard_pending_native_vst_bridge_parameter_updates(bridge)
+            return True
+        if payload_values is not None and not sanitized_payload:
+            setattr(bridge, '_aims_live_parameter_signature', signature)
+            setattr(bridge, '_aims_live_parameter_values', dict(sanitized))
             if generation is not None:
                 setattr(bridge, '_aims_live_parameter_generation', int(generation))
             self._discard_pending_native_vst_bridge_parameter_updates(bridge)
@@ -13715,17 +14812,18 @@ class MainWindow(QtWidgets.QMainWindow):
         }
         changed_values = {
             key: value
-            for key, value in sanitized.items()
+            for key, value in (sanitized_payload if payload_values is not None else sanitized).items()
             if round(float(cached_values.get(key, float('nan'))), 4) != round(float(value), 4)
         }
         if not changed_values and set(cached_values.keys()) == set(sanitized.keys()):
             setattr(bridge, '_aims_live_parameter_signature', signature)
+            setattr(bridge, '_aims_live_parameter_values', dict(sanitized))
             if generation is not None:
                 setattr(bridge, '_aims_live_parameter_generation', int(generation))
             self._discard_pending_native_vst_bridge_parameter_updates(bridge)
             return True
 
-        payload = dict(changed_values or sanitized)
+        payload = dict(changed_values or sanitized_payload or sanitized)
         rack_name = str(getattr(bridge, '_aims_rack_name', '') or '')
         if rack_name:
             parameter_names = [str(name) for name in self.vsti_parameter_names_for_rack(rack_name)]
@@ -13741,9 +14839,9 @@ class MainWindow(QtWidgets.QMainWindow):
             response = bridge.command('set_parameters', parameters=payload)
             if int(response.get('applied_parameter_count') or 0) <= 0:
                 return False
-            cached_values.update(changed_values or sanitized)
+            cached_values.update(changed_values or sanitized_payload or sanitized)
             setattr(bridge, '_aims_live_parameter_signature', signature)
-            setattr(bridge, '_aims_live_parameter_values', dict(cached_values))
+            setattr(bridge, '_aims_live_parameter_values', dict(sanitized))
             if generation is not None:
                 setattr(bridge, '_aims_live_parameter_generation', int(generation))
             self._discard_pending_native_vst_bridge_parameter_updates(bridge)
@@ -13761,6 +14859,7 @@ class MainWindow(QtWidgets.QMainWindow):
         track: TrackState,
         values: dict[str, float],
         *,
+        payload_values: dict[str, float] | None = None,
         include_output_bridge: bool = True,
     ) -> None:
         if track.instrument_mode != 'VSTI Rack' or not track.rack_vsti:
@@ -13776,7 +14875,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         bridge = self._track_native_vst_host_bridges.get(track_index)
         if bridge is not None and self._native_vst_host_bridge_alive(track_index):
-            self._queue_native_vst_bridge_parameter_values(bridge, values, generation=parameter_generation)
+            self._queue_native_vst_bridge_parameter_values(
+                bridge,
+                values,
+                payload_values=payload_values,
+                generation=parameter_generation,
+            )
 
         if include_output_bridge:
             direct_candidate = self._direct_native_transport_candidate()
@@ -13790,16 +14894,29 @@ class MainWindow(QtWidgets.QMainWindow):
                 and (direct_row == track_index or direct_candidate_row == track_index or live_direct_row == track_index)
                 and self._normalized_vsti_path(str(getattr(direct_bridge, 'plugin_path', '') or '')) == self._normalized_vsti_path(entry.path)
             ):
-                self._queue_native_vst_bridge_parameter_values(direct_bridge, values, generation=parameter_generation)
+                self._queue_native_vst_bridge_parameter_values(
+                    direct_bridge,
+                    values,
+                    payload_values=payload_values,
+                    generation=parameter_generation,
+                )
 
         graph_bridge = self._active_native_vst_graph_bridge()
         graph_slot_index = self._native_vst_graph_bridge_slot_index(track_index, entry, bridge=graph_bridge)
         if graph_bridge is not None and graph_slot_index >= 0:
+            graph_payload = self._sanitize_native_vst_bridge_parameter_values(
+                payload_values if payload_values is not None else values
+            )
+            if not graph_payload:
+                return
             try:
                 graph_bridge.command(
                     'set_graph_slot_parameters',
                     slot_index=int(graph_slot_index),
-                    parameters=dict(values),
+                    parameters=dict(graph_payload),
+                    parameter_signature=self._native_vst_host_parameter_payload_signature_string(
+                        self._sanitize_native_vst_bridge_parameter_values(values)
+                    ),
                 )
             except Exception:
                 _APP_LOGGER.exception(
@@ -13808,17 +14925,54 @@ class MainWindow(QtWidgets.QMainWindow):
                     track.rack_vsti,
                 )
 
+    def _native_vst_parameter_change_is_live_safe(self, track: TrackState) -> bool:
+        if not bool(getattr(self, '_playback_active', False)):
+            return False
+        if track.instrument_mode != 'VSTI Rack' or not track.rack_vsti:
+            return False
+
+        track_index = self._track_index_for_object(track)
+        if track_index < 0:
+            return False
+
+        entry = self._rack_vsti_entry(track.rack_vsti)
+        if entry is None or not self._can_use_native_vst_host(entry):
+            return False
+
+        if self._direct_native_transport_active():
+            direct_row = int(getattr(self, '_direct_native_transport_row', -1) or -1)
+            direct_bridge = getattr(self, '_native_output_bridge', None)
+            if (
+                direct_row == track_index
+                and direct_bridge is not None
+                and self._native_output_bridge_alive()
+                and self._normalized_vsti_path(str(getattr(direct_bridge, 'plugin_path', '') or ''))
+                == self._normalized_vsti_path(str(entry.path))
+            ):
+                return True
+
+        if self._graph_native_transport_active():
+            graph_bridge = self._active_native_vst_graph_bridge()
+            graph_slot_index = self._native_vst_graph_bridge_slot_index(track_index, entry, bridge=graph_bridge)
+            if graph_bridge is not None and graph_slot_index >= 0:
+                return True
+
+        return False
+
     def _apply_track_vsti_parameters_live(
         self,
         track: TrackState,
         values: dict[str, float],
         *,
+        payload_values: dict[str, float] | None = None,
+        sync_hosts: bool = True,
         editor_plugin=None,
     ) -> None:
         sanitized = self._sanitize_native_vst_bridge_parameter_values(values)
         prerender_playback_active = bool(getattr(self, '_playback_active', False)) and bool(
             getattr(self, '_use_prerendered_transport_mix', False)
         )
+        live_native_playback_safe = self._native_vst_parameter_change_is_live_safe(track)
         previous_signature = self._native_vst_bridge_parameter_signature(
             self._sanitize_native_vst_bridge_parameter_values(track.vsti_parameters)
         )
@@ -13826,11 +14980,13 @@ class MainWindow(QtWidgets.QMainWindow):
         track.vsti_parameters = sanitized
         if current_signature != previous_signature:
             self._mark_track_vsti_parameters_dirty(track)
-        self._sync_native_vst_host_parameters(
-            track,
-            sanitized,
-            include_output_bridge=not prerender_playback_active,
-        )
+        if sync_hosts:
+            self._sync_native_vst_host_parameters(
+                track,
+                sanitized,
+                payload_values=payload_values,
+                include_output_bridge=not prerender_playback_active,
+            )
         if editor_plugin is not None:
             self._apply_saved_plugin_parameters(editor_plugin, sanitized)
         track_index = self._track_index_for_object(track)
@@ -13851,6 +15007,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if prerender_playback_active:
             self._schedule_prerendered_playback_mix_refresh(reason='VST parameter change')
             self.statusBar().showMessage('Saved VST parameter change. Updating the next prerendered buffer section.')
+            return
+        if live_native_playback_safe:
+            self._invalidate_playback_caches(clear_track_audio=True, reset_realtime=False)
             return
         self._invalidate_playback_caches(clear_track_audio=False, reset_realtime=True)
         self._reload_playback_mix_if_running()
@@ -14932,16 +16091,22 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         return True
 
-    def _stop_native_vst_host_bridge(self, row: int) -> None:
+    def _stop_native_vst_host_bridge(self, row: int, *, capture_state: bool = True) -> None:
         row = int(row)
         bridge = self._track_native_vst_host_bridges.get(row)
         if bridge is None:
             return
         if bool(getattr(bridge, '_aims_skip_stop', False)):
             return
-        track = self.project.tracks[row] if 0 <= row < len(self.project.tracks) else None
-        entry = self._rack_vsti_entry(track.rack_vsti) if track is not None and track.rack_vsti else None
-        self._capture_native_vst_host_bridge_state(row, bridge=bridge, track=track, entry=entry)
+        if capture_state:
+            track = self.project.tracks[row] if 0 <= row < len(self.project.tracks) else None
+            entry = self._rack_vsti_entry(track.rack_vsti) if track is not None and track.rack_vsti else None
+            entry_path = self._normalized_vsti_path(str(entry.path)) if entry is not None else ''
+            bridge_path = self._normalized_vsti_path(str(getattr(bridge, 'plugin_path', '') or ''))
+            if not entry_path or not bridge_path or entry_path != bridge_path:
+                capture_state = False
+            else:
+                self._capture_native_vst_host_bridge_state(row, bridge=bridge, track=track, entry=entry)
         self._discard_pending_native_vst_bridge_parameter_updates(bridge)
         self._track_native_vst_host_bridges.pop(row, None)
         try:
@@ -15011,7 +16176,10 @@ class MainWindow(QtWidgets.QMainWindow):
                         existing = None
                     elif open_editor:
                         self._apply_native_vst_bridge_parameter_values(existing, track.vsti_parameters)
-                        existing.command('open_editor')
+                        status = existing.command('open_editor')
+                        self._ensure_native_vst_editor_sync_polling(int(row))
+                        if isinstance(status, dict):
+                            self._store_native_vst_bus_metadata(entry.path, status)
                         return True
                     else:
                         self._apply_native_vst_bridge_parameter_values(existing, track.vsti_parameters)
@@ -15019,6 +16187,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 elif open_editor:
                     self._apply_native_vst_bridge_parameter_values(existing, track.vsti_parameters)
                     status = existing.command('open_editor')
+                    self._ensure_native_vst_editor_sync_polling(int(row))
                     if isinstance(status, dict):
                         self._store_native_vst_bus_metadata(entry.path, status)
                     return True
@@ -15063,6 +16232,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.statusBar().showMessage(f'Opened native VST host: {entry.name}')
                 if open_editor:
                     bridge.command('open_editor')
+                    self._ensure_native_vst_editor_sync_polling(int(row))
                 return True
             except Exception as exc:
                 _APP_LOGGER.exception(
@@ -15162,7 +16332,13 @@ class MainWindow(QtWidgets.QMainWindow):
         data = self._apply_vst_fx_chain(track, data, sample_rate)
         return data, sample_rate
 
-    def _close_track_vsti_window(self, row: int, *, teardown_host: bool = False) -> None:
+    def _close_track_vsti_window(
+        self,
+        row: int,
+        *,
+        teardown_host: bool = False,
+        suppress_finished_reload: bool = False,
+    ) -> None:
         row = int(row)
         native_bridge_active = self._native_vst_host_bridge_alive(row)
         bridge = self._track_native_vst_host_bridges.get(row) if native_bridge_active else None
@@ -15179,6 +16355,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
         process = self._track_native_vsti_processes.pop(row, None)
         if process is not None:
+            if suppress_finished_reload:
+                try:
+                    process.setProperty('aims_skip_finished_reload', True)
+                except Exception:
+                    pass
             try:
                 if process.state() != QtCore.QProcess.ProcessState.NotRunning:
                     process.terminate()
@@ -15192,8 +16373,11 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
         if bridge is not None:
+            setattr(bridge, '_aims_editor_open', False)
+            setattr(bridge, '_aims_editor_poll_requested', False)
+            setattr(bridge, '_aims_editor_poll_until', 0.0)
             if teardown_host:
-                self._stop_native_vst_host_bridge(row)
+                self._stop_native_vst_host_bridge(row, capture_state=not suppress_finished_reload)
             else:
                 try:
                     bridge.command('close_editor')
@@ -15218,17 +16402,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
 
     def _focus_track_native_vsti_window(self, row: int) -> bool:
-        shared_info = self._shared_native_output_bridge_track_info()
-        if shared_info is not None and int(shared_info[0]) == int(row):
-            try:
-                shared_info[1].command('open_editor')
-                return True
-            except Exception:
-                _APP_LOGGER.exception("Failed focusing shared native VST editor for row=%s", row)
         bridge = self._track_native_vst_host_bridges.get(int(row))
         if bridge is not None and self._native_vst_host_bridge_alive(int(row)):
             try:
                 bridge.command('open_editor')
+                self._ensure_native_vst_editor_sync_polling(int(row))
                 return True
             except Exception:
                 _APP_LOGGER.exception("Failed focusing native VST host bridge for row=%s", row)
@@ -15269,26 +16447,19 @@ class MainWindow(QtWidgets.QMainWindow):
         process = self._track_native_vsti_processes.get(row)
         if process is not None and process.state() != QtCore.QProcess.ProcessState.NotRunning:
             return True
-        shared_info = self._shared_native_output_bridge_track_info()
-        if shared_info is not None and int(shared_info[0]) == row:
-            _shared_row, shared_bridge, _shared_track, _shared_entry = shared_info
-            try:
-                status = shared_bridge.command('status')
-            except Exception:
-                return True
-            return bool(status.get('editor_open', False))
         bridge = self._track_native_vst_host_bridges.get(row)
         if bridge is None or not self._native_vst_host_bridge_alive(row):
             return False
-        try:
-            status = bridge.command('status')
-        except Exception:
+        if bool(getattr(bridge, '_aims_editor_open', False)):
             return True
-        visible = bool(status.get('editor_open', False))
-        if not visible:
-            self._track_native_vsti_hwnds.pop(row, None)
-            self._track_native_vsti_close_events.pop(row, None)
-        return visible
+        poll_until = float(getattr(bridge, '_aims_editor_poll_until', 0.0) or 0.0)
+        if bool(getattr(bridge, '_aims_editor_poll_requested', False)) and (
+            poll_until <= 0.0 or time.monotonic() <= poll_until
+        ):
+            return True
+        self._track_native_vsti_hwnds.pop(row, None)
+        self._track_native_vsti_close_events.pop(row, None)
+        return False
 
     def _cleanup_previous_track_vsti(self, row: int, previous_rack_vsti: str) -> None:
         if not previous_rack_vsti:
@@ -15296,7 +16467,7 @@ class MainWindow(QtWidgets.QMainWindow):
         previous_entry = self._rack_vsti_entry(previous_rack_vsti)
         if previous_entry is not None:
             self._remember_native_vsti_window_bounds(row, previous_entry.path)
-        self._close_track_vsti_window(row, teardown_host=True)
+        self._close_track_vsti_window(row, teardown_host=True, suppress_finished_reload=True)
         live_state = self._live_midi_states.get(int(row))
         if live_state is not None and live_state.rack_name == str(previous_rack_vsti):
             self._release_live_midi_host(int(row))
@@ -15331,6 +16502,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self._stop_native_vst_host_bridge(row)
 
         process = QtCore.QProcess(self)
+        try:
+            process.setProperty('aims_rack_name', str(entry.name))
+            process.setProperty('aims_plugin_path', str(entry.path))
+            process.setProperty('aims_skip_finished_reload', False)
+        except Exception:
+            pass
         process.setProgram(str(NATIVE_VST_HOST_EXE))
         process.setArguments(
             [
@@ -15381,6 +16558,13 @@ class MainWindow(QtWidgets.QMainWindow):
         exit_status: QtCore.QProcess.ExitStatus,
     ) -> None:
         row = int(row)
+        skip_finished_reload = False
+        finished_rack_name = ''
+        try:
+            skip_finished_reload = bool(process.property('aims_skip_finished_reload'))
+            finished_rack_name = str(process.property('aims_rack_name') or '')
+        except Exception:
+            pass
         tracked = self._track_native_vsti_processes.get(row)
         if tracked is process:
             self._track_native_vsti_processes.pop(row, None)
@@ -15395,10 +16579,20 @@ class MainWindow(QtWidgets.QMainWindow):
             process.deleteLater()
         except Exception:
             pass
+        stale_finished_process = False
+        current_track: TrackState | None = None
         if 0 <= row < len(self.project.tracks):
-            track = self.project.tracks[row]
-            if state_path:
-                track.vsti_state_path = str(state_path)
+            current_track = self.project.tracks[row]
+            current_rack_name = str(current_track.rack_vsti or '')
+            if finished_rack_name and finished_rack_name != current_rack_name:
+                stale_finished_process = True
+            if state_path and not skip_finished_reload and not stale_finished_process:
+                current_track.vsti_state_path = str(state_path)
+        if skip_finished_reload or stale_finished_process:
+            self._update_track_list_item(row)
+            if row == self.current_track_index():
+                self._schedule_selected_track_panel_refresh(row)
+            return
         self._stop_native_vst_host_bridge(row)
         self._discard_realtime_track_state(row)
         self._invalidate_playback_caches()
@@ -15455,8 +16649,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         if not self._can_use_native_vst_host(entry):
             return False
-        if bool(track.vst_fx_chain):
-            return False
         if abs(float(track.vsti_wet_mix) - 100.0) > 0.001:
             return False
         if any(bool(route.get('enabled', False)) for route in self._sanitize_vsti_input_bus_routes(track.vsti_input_bus_routes)):
@@ -15464,6 +16656,19 @@ class MainWindow(QtWidgets.QMainWindow):
         if any(bool(route.get('enabled', False)) for route in self._sanitize_vsti_output_bus_routes(track.vsti_output_bus_routes)):
             return False
         return True
+
+    def _build_native_vst_graph_fx_payload(self, track: TrackState) -> list[dict[str, object]]:
+        payload: list[dict[str, object]] = []
+        for effect_entry in self._effect_chain_entries(track):
+            payload.append(
+                {
+                    'name': str(effect_entry.name),
+                    'plugin_path': str(effect_entry.path),
+                    'state_path': '',
+                    'parameters': {},
+                }
+            )
+        return payload
 
     def _build_native_vst_graph_payload_tracks(
         self,
@@ -15488,6 +16693,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 'gain': float(gain),
                 'pan': float(clamp(float(track.pan), -1.0, 1.0)),
             }
+            fx_chain = self._build_native_vst_graph_fx_payload(track)
+            if fx_chain:
+                payload_track['fx_chain'] = fx_chain
             if include_events:
                 payload_events: list[dict[str, object]] = []
                 events = self._collect_chunk_midi_events(
@@ -15524,6 +16732,10 @@ class MainWindow(QtWidgets.QMainWindow):
         for idx, track, entry in tracks:
             state_path = self._effective_vsti_state_path(track, entry)
             resolved_state_path = str(state_path) if state_path is not None and state_path.exists() else ''
+            fx_signature = tuple(
+                self._normalized_vsti_path(str(effect_entry.path))
+                for effect_entry in self._effect_chain_entries(track)
+            )
             signature.append(
                 (
                     int(idx),
@@ -15533,6 +16745,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._native_vst_bridge_parameter_signature(
                         self._sanitize_native_vst_bridge_parameter_values(track.vsti_parameters)
                     ),
+                    fx_signature,
                 )
             )
         return tuple(signature)
@@ -16013,12 +17226,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.native_vst_host_buffer_size = 0
         self.prefer_prerendered_vst_playback = bool(payload.get('prefer_prerendered_vst_playback', False))
         self.note_length_offset_ticks = self._coerce_int(payload.get('note_length_offset_ticks', 0), 0, -480, 480)
-        refresh_pref = payload.get('playback_ui_refresh_ms', 16)
+        refresh_pref = payload.get('playback_ui_refresh_ms', 33)
         try:
             refresh_value = float(refresh_pref)
         except Exception:
-            refresh_value = 16.0
-        self.playback_ui_refresh_ms = int(clamp(min(refresh_value, 16.0), 16, 200))
+            refresh_value = 33.0
+        self.playback_ui_refresh_ms = int(clamp(refresh_value, 16, 200))
         self.prefer_gpu_rendering = bool(payload.get('prefer_gpu_rendering', True))
         rack_paths = [p for p in payload.get('vsti_rack_paths', []) if isinstance(p, str)]
         saved_rack_state: dict[str, dict[str, object]] = {}
@@ -16508,29 +17721,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 QtWidgets.QMessageBox.information(self, 'Unsupported VSTI', f'{vst.name} does not have a usable native editor here.\n\n{detail}')
                 return
             if self._can_use_native_vst_host(vst):
-                shared_info = self._shared_native_output_bridge_track_info()
-                graph_editor_opened = False
-                if (
-                    bool(getattr(self, '_playback_active', False))
-                    and (
-                        bool(getattr(self, '_use_prerendered_transport_mix', False))
-                        or self._graph_native_transport_active()
-                    )
-                ):
-                    graph_editor_opened = self._open_native_vst_graph_bridge_editor(track_index, track, vst)
-                if graph_editor_opened:
-                    self._close_track_vsti_window(track_index, teardown_host=True)
-                    opened = True
-                elif (
-                    shared_info is not None
-                    and int(shared_info[0]) == int(track_index)
-                    and self._normalized_vsti_path(str(shared_info[3].path)) == self._normalized_vsti_path(str(vst.path))
-                ):
-                    self._close_track_vsti_window(track_index, teardown_host=True)
-                    opened = self._open_shared_native_output_bridge_editor(track_index, track, vst)
-                else:
-                    self._close_track_vsti_window(track_index, teardown_host=False)
-                    opened = self._open_native_vst_host_for_track(track_index, vst, open_editor=True, show_error=True)
+                self._close_playback_native_editor_for_row(track_index, vst)
+                opened = self._open_native_vst_host_for_track(track_index, vst, open_editor=True, show_error=True)
                 if opened:
                     self._update_track_list_item(track_index)
                 else:
@@ -17080,6 +18272,10 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._apply_track_sound_assignment(row, force_host_reset=force_host_reset, host_reset_rack_name=entry.name)
         self.statusBar().showMessage(f'Assigned rack VSTI to {track.name}: {entry.name}')
+        QtCore.QTimer.singleShot(
+            0,
+            lambda assigned_name=str(entry.name), assigned_row=int(row): self.open_vsti_gui_by_name(assigned_name, assigned_row),
+        )
         return True
 
     def assign_instrument_to_track(self, row: int) -> None:
@@ -18113,7 +19309,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._pending_track_list_row_refresh.update(valid_rows)
         if hasattr(self, '_track_list_row_refresh_timer'):
-            self._track_list_row_refresh_timer.start(0)
+            self._track_list_row_refresh_timer.start()
 
     def _flush_scheduled_track_list_row_refresh(self) -> None:
         rows = set(int(row) for row in getattr(self, '_pending_track_list_row_refresh', set()))
@@ -18210,6 +19406,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if track.track_type == 'instrument' and track.instrument_mode == 'VSTI Rack' and track.rack_vsti:
             edit_action = menu.addAction(f'Edit "{track.rack_vsti}" Parameters...')
             edit_action.triggered.connect(lambda _checked=False, idx=row, name=track.rack_vsti: self.open_vsti_gui_by_name(name, idx))
+            fx_action = menu.addAction('Configure Track VST FX...')
+            fx_action.setEnabled(bool(self.available_fx_plugin_names()))
+            fx_action.triggered.connect(lambda _checked=False, idx=row: self._open_track_vst_fx_dialog(idx))
             entry = self._rack_vsti_entry(track.rack_vsti)
             if entry is not None and entry.is_instrument and entry.host_supported and self._can_use_native_vst_host(entry):
                 routing_action = menu.addAction('Configure VST Routing...')
@@ -18223,6 +19422,128 @@ class MainWindow(QtWidgets.QMainWindow):
         delete_action.triggered.connect(lambda _checked=False, idx=row: self.delete_track(idx))
 
         menu.exec(global_pos)
+
+    def open_current_track_vst_fx_dialog(self) -> None:
+        self._open_track_vst_fx_dialog(self.current_track_index())
+
+    def _open_track_vst_fx_dialog(self, row: int) -> None:
+        if row < 0 or row >= len(self.project.tracks):
+            return
+        track = self.project.tracks[row]
+        if track.track_type != 'instrument' or track.instrument_mode != 'VSTI Rack' or not track.rack_vsti:
+            QtWidgets.QMessageBox.information(
+                self,
+                'Track VST FX unavailable',
+                'Assign a rack VST instrument to this track first.',
+            )
+            return
+
+        available_fx = self.available_fx_plugin_names()
+        if not available_fx:
+            QtWidgets.QMessageBox.information(
+                self,
+                'No VST FX available',
+                'Add at least one supported VST3 effect to the rack first.',
+            )
+            return
+
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(f'Track VST FX - {track.name}')
+        dialog.resize(560, 420)
+        layout = QtWidgets.QVBoxLayout(dialog)
+
+        info = QtWidgets.QLabel(
+            'Assign rack VST effects to this track in order. The chain runs top to bottom on the native JUCE graph path.'
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        add_row = QtWidgets.QHBoxLayout()
+        add_row.setContentsMargins(0, 0, 0, 0)
+        add_row.setSpacing(8)
+        fx_combo = QtWidgets.QComboBox()
+        fx_combo.addItems(available_fx)
+        add_btn = QtWidgets.QPushButton('Add FX')
+        add_row.addWidget(QtWidgets.QLabel('Rack FX'))
+        add_row.addWidget(fx_combo, 1)
+        add_row.addWidget(add_btn)
+        layout.addLayout(add_row)
+
+        chain_list = QtWidgets.QListWidget()
+        chain_list.addItems([str(name) for name in track.vst_fx_chain if str(name).strip()])
+        layout.addWidget(chain_list, 1)
+
+        controls = QtWidgets.QHBoxLayout()
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.setSpacing(8)
+        remove_btn = QtWidgets.QPushButton('Remove Selected')
+        move_up_btn = QtWidgets.QPushButton('Move Up')
+        move_down_btn = QtWidgets.QPushButton('Move Down')
+        controls.addWidget(remove_btn)
+        controls.addWidget(move_up_btn)
+        controls.addWidget(move_down_btn)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+
+        def add_selected_fx() -> None:
+            name = str(fx_combo.currentText() or '').strip()
+            if not name:
+                return
+            chain_list.addItem(name)
+            chain_list.setCurrentRow(chain_list.count() - 1)
+
+        def remove_selected_fx() -> None:
+            row_index = chain_list.currentRow()
+            if row_index < 0:
+                return
+            item = chain_list.takeItem(row_index)
+            del item
+            if chain_list.count() > 0:
+                chain_list.setCurrentRow(min(row_index, chain_list.count() - 1))
+
+        def move_selected_fx(step: int) -> None:
+            row_index = chain_list.currentRow()
+            if row_index < 0:
+                return
+            new_index = row_index + int(step)
+            if new_index < 0 or new_index >= chain_list.count():
+                return
+            item = chain_list.takeItem(row_index)
+            chain_list.insertItem(new_index, item)
+            chain_list.setCurrentRow(new_index)
+
+        add_btn.clicked.connect(add_selected_fx)
+        remove_btn.clicked.connect(remove_selected_fx)
+        move_up_btn.clicked.connect(lambda: move_selected_fx(-1))
+        move_down_btn.clicked.connect(lambda: move_selected_fx(1))
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        self._center_dialog(dialog)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+
+        new_chain = [
+            str(chain_list.item(index).text()).strip()
+            for index in range(chain_list.count())
+            if str(chain_list.item(index).text()).strip()
+        ]
+        if list(track.vst_fx_chain) == new_chain:
+            return
+
+        track.vst_fx_chain = new_chain
+        self._invalidate_playback_caches(clear_track_audio=False, reset_realtime=True)
+        self._reload_playback_mix_if_running()
+        if self.current_track_index() == int(row):
+            self.instruments.load_track()
+        self.statusBar().showMessage(
+            f'Updated track VST FX for {track.name}: {" > ".join(new_chain) if new_chain else "None"}'
+        )
 
     def _open_track_vst_routing_dialog(self, row: int) -> None:
         if row < 0 or row >= len(self.project.tracks):
@@ -18675,7 +19996,7 @@ class MainWindow(QtWidgets.QMainWindow):
         target_row = self.current_track_index() if row is None else int(row)
         self._selected_track_panel_refresh_row = target_row
         if hasattr(self, '_selected_track_panel_refresh_timer'):
-            self._selected_track_panel_refresh_timer.start(0)
+            self._selected_track_panel_refresh_timer.start()
 
     def _flush_selected_track_panel_refresh(self) -> None:
         row = int(self._selected_track_panel_refresh_row if self._selected_track_panel_refresh_row is not None else self.current_track_index())
@@ -18751,6 +20072,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._track_native_vsti_hwnds.clear()
         self._discard_realtime_track_states(schedule_gc=False)
         self._track_meter_levels = {}
+        self._native_track_meter_levels = {}
         return playback_was_active, current_tick
 
     def add_track(self, preferred_type: str | None = None, ask: bool = True) -> None:
@@ -18777,7 +20099,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.last_added_track_type = track_type
         self.project.tracks.append(state)
-        self._invalidate_playback_caches()
         target_row = idx - 1
         if hasattr(self, 'track_list') and self.track_list.count() == target_row:
             self._track_list_rebuilding = True
@@ -18947,21 +20268,32 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_window_title()
 
     def on_notes_changed(self) -> None:
+        current_row = self.current_track_index()
+        changed_rows = {int(current_row)} if 0 <= int(current_row) < len(self.project.tracks) else set()
+        live_safe_native_edit = self._note_edit_is_live_safe_for_native_transport(changed_rows)
         self._deferred_note_refresh_timer.stop()
         self._deferred_refresh_velocity = False
         self._deferred_refresh_timeline = False
+        self._deferred_timeline_rows = set()
         self._deferred_refresh_sample_timeline = False
         self._deferred_rebuild_sections = False
         self._deferred_refresh_arrangement = False
+        self._deferred_arrangement_rows = set()
         self._deferred_reload_mix = False
         self._prioritize_note_offs_for_edit()
-        self._invalidate_playback_caches()
+        self._invalidate_playback_caches(reset_realtime=not live_safe_native_edit)
         self.piano_roll.refresh()
         self.velocity_editor.refresh()
-        self.timeline.refresh()
+        if changed_rows:
+            self.timeline.refresh_rows(changed_rows)
+        else:
+            self.timeline.refresh()
         self.rebuild_midi_sections()
-        self.arrangement_overview.refresh()
-        self._reload_playback_mix_if_running()
+        if changed_rows:
+            self.arrangement_overview.refresh_sections(changed_rows)
+        else:
+            self.arrangement_overview.refresh()
+        self._reload_playback_after_note_edit(changed_rows)
 
     def save_project(self) -> None:
         if self.current_project_path is None:

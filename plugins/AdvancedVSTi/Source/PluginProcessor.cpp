@@ -163,10 +163,142 @@ bool isHatKind (DrumVoiceKind kind) noexcept
     return kind == DrumVoiceKind::closedHat || kind == DrumVoiceKind::openHat;
 }
 
+float normalizedLogValue (float value, float minValue, float maxValue) noexcept
+{
+    const auto safeValue = juce::jlimit (minValue, maxValue, value);
+    const auto minLog = std::log (minValue);
+    const auto maxLog = std::log (maxValue);
+    return juce::jlimit (0.0f, 1.0f, (std::log (safeValue) - minLog) / (maxLog - minLog));
+}
+
+float filterCascadeBlendForSlope (int slopeIndex) noexcept
+{
+    switch (slopeIndex)
+    {
+        case 1: return 1.0f / 3.0f; // Approximate a 16 dB roll-off between 12 and 24 dB.
+        case 2: return 1.0f;
+        default: return 0.0f;
+    }
+}
+
+float drumNoiseWeight (DrumVoiceKind kind) noexcept
+{
+    switch (kind)
+    {
+        case DrumVoiceKind::snare:
+        case DrumVoiceKind::clap:
+        case DrumVoiceKind::closedHat:
+        case DrumVoiceKind::openHat:
+        case DrumVoiceKind::crash:
+        case DrumVoiceKind::ride:
+        case DrumVoiceKind::maraca:
+            return 0.26f;
+        case DrumVoiceKind::rim:
+        case DrumVoiceKind::cowbell:
+        case DrumVoiceKind::clave:
+        case DrumVoiceKind::perc:
+            return 0.14f;
+        default:
+            return 0.08f;
+    }
+}
+
+float drumTransientWeight (DrumVoiceKind kind) noexcept
+{
+    switch (kind)
+    {
+        case DrumVoiceKind::kick:
+        case DrumVoiceKind::snare:
+        case DrumVoiceKind::rim:
+        case DrumVoiceKind::clap:
+            return 0.1f;
+        case DrumVoiceKind::closedHat:
+        case DrumVoiceKind::openHat:
+        case DrumVoiceKind::crash:
+        case DrumVoiceKind::ride:
+            return 0.05f;
+        default:
+            return 0.035f;
+    }
+}
+
 constexpr size_t drumVoiceIndex (DrumVoiceKind kind) noexcept
 {
     return static_cast<size_t> (kind);
 }
+
+constexpr std::array<DrumVoiceKind, 7> drumVoiceTuneKinds {
+    DrumVoiceKind::kick,
+    DrumVoiceKind::snare,
+    DrumVoiceKind::lowTom,
+    DrumVoiceKind::midTom,
+    DrumVoiceKind::highTom,
+    DrumVoiceKind::crash,
+    DrumVoiceKind::ride
+};
+
+constexpr std::array<const char*, 7> drumVoiceTuneParamIds {
+    "DRUMTUNE_KICK",
+    "DRUMTUNE_SNARE",
+    "DRUMTUNE_LOW_TOM",
+    "DRUMTUNE_MID_TOM",
+    "DRUMTUNE_HIGH_TOM",
+    "DRUMTUNE_CRASH",
+    "DRUMTUNE_RIDE"
+};
+
+constexpr std::array<const char*, 7> drumVoiceTuneNames {
+    "Bass Drum Tune",
+    "Snare Tune",
+    "Low Tom Tune",
+    "Mid Tom Tune",
+    "High Tom Tune",
+    "Crash Tune",
+    "Ride Tune"
+};
+
+constexpr std::array<DrumVoiceKind, 6> drumVoiceDecayKinds {
+    DrumVoiceKind::kick,
+    DrumVoiceKind::lowTom,
+    DrumVoiceKind::midTom,
+    DrumVoiceKind::highTom,
+    DrumVoiceKind::closedHat,
+    DrumVoiceKind::openHat
+};
+
+constexpr std::array<const char*, 6> drumVoiceDecayParamIds {
+    "DRUMDECAY_KICK",
+    "DRUMDECAY_LOW_TOM",
+    "DRUMDECAY_MID_TOM",
+    "DRUMDECAY_HIGH_TOM",
+    "DRUMDECAY_CLOSED_HAT",
+    "DRUMDECAY_OPEN_HAT"
+};
+
+constexpr std::array<const char*, 6> drumVoiceDecayNames {
+    "Bass Drum Decay",
+    "Low Tom Decay",
+    "Mid Tom Decay",
+    "High Tom Decay",
+    "Closed Hat Decay",
+    "Open Hat Decay"
+};
+
+constexpr std::array<float, 7> drumMachineVoiceTuneDefaults {
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f
+};
+
+constexpr std::array<float, 7> drum808VoiceTuneDefaults {
+    0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f
+};
+
+constexpr std::array<float, 6> drumMachineVoiceDecayDefaults {
+    0.52f, 0.5f, 0.5f, 0.48f, 0.32f, 0.58f
+};
+
+constexpr std::array<float, 6> drum808VoiceDecayDefaults {
+    0.72f, 0.62f, 0.58f, 0.54f, 0.28f, 0.74f
+};
 
 bool migrateLegacyDrumFilterChoice (juce::ValueTree state)
 {
@@ -233,8 +365,33 @@ void AdvancedVSTiAudioProcessor::prepareToPlay (double sampleRate, int samplesPe
     juce::dsp::ProcessSpec spec { sampleRate, static_cast<juce::uint32> (samplesPerBlock), 1 };
     leftFilter.prepare (spec);
     rightFilter.prepare (spec);
+    leftFilterCascade.prepare (spec);
+    rightFilterCascade.prepare (spec);
+    leftFilter2.prepare (spec);
+    rightFilter2.prepare (spec);
+    leftFilter2Cascade.prepare (spec);
+    rightFilter2Cascade.prepare (spec);
     leftFilter.reset();
     rightFilter.reset();
+    leftFilterCascade.reset();
+    rightFilterCascade.reset();
+    leftFilter2.reset();
+    rightFilter2.reset();
+    leftFilter2Cascade.reset();
+    rightFilter2Cascade.reset();
+
+    chorusLeft.prepare (spec);
+    chorusRight.prepare (spec);
+    chorusLeft.reset();
+    chorusRight.reset();
+    phaserLeft.prepare (spec);
+    phaserRight.prepare (spec);
+    phaserLeft.reset();
+    phaserRight.reset();
+    reverb.reset();
+    delayBuffer.setSize (2, juce::jmax (samplesPerBlock * 4, static_cast<int> (sampleRate * 3.0)));
+    delayBuffer.clear();
+    delayWritePosition = 0;
 
     for (auto& voice : voices)
     {
@@ -261,6 +418,20 @@ void AdvancedVSTiAudioProcessor::reset()
 
     leftFilter.reset();
     rightFilter.reset();
+    leftFilterCascade.reset();
+    rightFilterCascade.reset();
+    leftFilter2.reset();
+    rightFilter2.reset();
+    leftFilter2Cascade.reset();
+    rightFilter2Cascade.reset();
+    chorusLeft.reset();
+    chorusRight.reset();
+    phaserLeft.reset();
+    phaserRight.reset();
+    reverb.reset();
+    delayBuffer.clear();
+    delayWritePosition = 0;
+    currentFilterEnvPeak = 0.0f;
 
     for (auto& voice : voices)
     {
@@ -268,6 +439,8 @@ void AdvancedVSTiAudioProcessor::reset()
         voice.midiNote = -1;
         voice.velocity = 0.0f;
         voice.phase = 0.0f;
+        voice.osc2Phase = 0.0f;
+        voice.subPhase = 0.0f;
         voice.fmPhase = 0.0f;
         voice.syncPhase = 0.0f;
         voice.samplePos = 0.0f;
@@ -555,6 +728,8 @@ void AdvancedVSTiAudioProcessor::handleMidiMessage (const juce::MidiMessage& msg
         voice.midiNote = msg.getNoteNumber();
         voice.velocity = msg.getFloatVelocity();
         voice.phase = 0.0f;
+        voice.osc2Phase = 0.0f;
+        voice.subPhase = 0.0f;
         voice.fmPhase = 0.0f;
         voice.syncPhase = 0.0f;
         voice.samplePos = 0.0f;
@@ -644,6 +819,23 @@ float AdvancedVSTiAudioProcessor::oscSample (VoiceState& voice, float baseFreq, 
     }
 }
 
+float AdvancedVSTiAudioProcessor::basicOscSample (float& phase, float frequency, OscType type)
+{
+    const auto increment = frequency / static_cast<float> (currentSampleRate);
+    phase = std::fmod (phase + increment, 1.0f);
+
+    switch (type)
+    {
+        case OscType::saw: return (2.0f * phase) - 1.0f;
+        case OscType::square: return phase < 0.5f ? 1.0f : -1.0f;
+        case OscType::noise: return random.nextFloat() * 2.0f - 1.0f;
+        case OscType::sample:
+        case OscType::sine:
+        default:
+            return std::sin (twoPi * phase);
+    }
+}
+
 float AdvancedVSTiAudioProcessor::renderDrumVoiceSample (VoiceState& voice)
 {
     if (! voice.active)
@@ -653,13 +845,29 @@ float AdvancedVSTiAudioProcessor::renderDrumVoiceSample (VoiceState& voice)
     const auto dt = 1.0f / static_cast<float> (currentSampleRate);
     const auto noise = random.nextFloat() * 2.0f - 1.0f;
     const auto kind = drumKindForMidi (voice.midiNote);
-    const auto punch = juce::jlimit (0.0f, 1.0f, renderParams.fmAmount / 1000.0f);
-    const auto snap = juce::jlimit (0.0f, 1.0f, renderParams.syncAmount / 4.0f);
-    const auto brightness = juce::jlimit (0.0f, 1.0f, (renderParams.cutoff - 20.0f) / (20000.0f - 20.0f));
+    const auto voiceIndex = drumVoiceIndex (kind);
+    const auto voiceTune = renderParams.detune + renderParams.drumVoiceTunes[voiceIndex];
+    const auto tuneRatio = std::pow (2.0f, voiceTune / 12.0f);
+    const auto accent = juce::jlimit (0.0f, 1.0f, renderParams.fmAmount / 200.0f);
+    const auto punch = accent;
+    const auto attack = juce::jlimit (0.0f, 1.0f, renderParams.syncAmount);
+    const auto kickAttack = juce::jlimit (0.0f, 1.0f, 0.35f * attack + 0.65f * renderParams.drumKickAttack);
+    const auto snareTone = juce::jlimit (0.0f, 1.0f, renderParams.drumSnareTone);
+    const auto snareSnappy = juce::jlimit (0.0f, 1.0f, renderParams.drumSnareSnappy);
+    const auto decayMacro = std::sqrt (juce::jlimit (0.0f, 1.0f, renderParams.gateLength / 2.4f));
+    const auto decayScale = juce::jmap (decayMacro, 0.68f, buildFlavor() == InstrumentFlavor::drum808 ? 2.25f : 1.95f);
+    const auto voiceDecayScale = 0.4f + renderParams.drumVoiceDecays[voiceIndex] * 1.2f;
+    const auto brightness = normalizedLogValue (renderParams.cutoff, 120.0f, 20000.0f);
+    const auto noiseMacro = juce::jlimit (0.0f, 1.0f, renderParams.filterEnvAmount);
     const auto ring = juce::jlimit (0.0f, 1.0f, (renderParams.resonance - 0.1f) / 1.1f);
+    const auto pitchScale = tuneRatio * juce::jmap (brightness, 0.94f, 1.08f);
 
     float output = 0.0f;
     float duration = 0.4f;
+    auto scaledHz = [pitchScale] (float hz) -> float
+    {
+        return hz * pitchScale;
+    };
     auto advanceSine = [dt] (float& phase, float hz) -> float
     {
         phase = std::fmod (phase + hz * dt, 1.0f);
@@ -677,27 +885,29 @@ float AdvancedVSTiAudioProcessor::renderDrumVoiceSample (VoiceState& voice)
         {
             case DrumVoiceKind::kick:
             {
-                duration = 1.45f + (renderParams.gateLength * 0.18f);
-                const auto pitch = 34.0f + (82.0f + (punch * 26.0f)) * std::exp (-age * (7.5f + snap * 4.0f));
+                duration = 1.45f;
+                const auto pitch = scaledHz (34.0f + (82.0f + (punch * 26.0f)) * std::exp (-age * (7.5f + kickAttack * 5.0f)));
                 voice.auxPhase = std::fmod (voice.auxPhase + pitch * dt, 1.0f);
                 const auto body = std::sin (twoPi * voice.auxPhase) * std::exp (-age * (2.2f + ring * 0.6f));
                 const auto sub = std::sin (twoPi * std::fmod (voice.auxPhase * 0.5f, 1.0f)) * std::exp (-age * 1.8f);
-                const auto beater = noise * (0.03f + punch * 0.06f) * std::exp (-age * 95.0f);
+                const auto beater = noise * (0.03f + punch * 0.06f + kickAttack * 0.06f) * std::exp (-age * 95.0f);
                 output = (body * 0.92f) + (sub * 0.42f) + beater;
                 break;
             }
             case DrumVoiceKind::snare:
             {
                 duration = 0.62f;
-                const auto body = ((advanceSine (voice.phase, 182.0f) * 0.6f) + (advanceSine (voice.fmPhase, 331.0f) * 0.38f)) * std::exp (-age * 8.0f);
-                const auto rattle = noise * std::exp (-age * (13.0f - brightness * 2.0f));
-                output = (body * 0.58f) + (rattle * 0.82f);
+                const auto toneScale = juce::jmap (snareTone, 0.84f, 1.28f);
+                const auto body = ((advanceSine (voice.phase, scaledHz (182.0f * toneScale)) * 0.6f)
+                                   + (advanceSine (voice.fmPhase, scaledHz (331.0f * toneScale)) * 0.38f)) * std::exp (-age * (8.4f - snareTone * 1.8f));
+                const auto rattle = noise * std::exp (-age * (14.0f - brightness * 2.0f - snareSnappy * 3.0f));
+                output = (body * juce::jmap (snareTone, 0.66f, 0.52f)) + (rattle * juce::jmap (snareSnappy, 0.62f, 0.96f));
                 break;
             }
             case DrumVoiceKind::rim:
             {
                 duration = 0.12f;
-                const auto wood = (advanceSine (voice.phase, 1710.0f) * 0.54f) + (advanceSine (voice.fmPhase, 2440.0f) * 0.24f);
+                const auto wood = (advanceSine (voice.phase, scaledHz (1710.0f)) * 0.54f) + (advanceSine (voice.fmPhase, scaledHz (2440.0f)) * 0.24f);
                 const auto click = noise * std::exp (-age * 78.0f);
                 output = (wood * std::exp (-age * 26.0f)) + (click * 0.12f);
                 break;
@@ -717,12 +927,13 @@ float AdvancedVSTiAudioProcessor::renderDrumVoiceSample (VoiceState& voice)
             {
                 duration = kind == DrumVoiceKind::closedHat ? 0.16f : 0.72f;
                 const auto metallic =
-                    advanceSine (voice.phase, 4180.0f)
-                    + advanceSine (voice.fmPhase, 6450.0f)
-                    + advanceSine (voice.auxPhase, 8630.0f)
-                    + advanceSine (voice.syncPhase, 10940.0f);
-                const auto env = std::exp (-age * (kind == DrumVoiceKind::closedHat ? 34.0f : 10.5f));
-                const auto airy = noise * std::exp (-age * (kind == DrumVoiceKind::closedHat ? 42.0f : 12.5f));
+                    advanceSine (voice.phase, scaledHz (4180.0f))
+                    + advanceSine (voice.fmPhase, scaledHz (6450.0f))
+                    + advanceSine (voice.auxPhase, scaledHz (8630.0f))
+                    + advanceSine (voice.syncPhase, scaledHz (10940.0f));
+                const auto decayWeight = juce::jmap (voiceDecayScale, 1.18f, 0.74f);
+                const auto env = std::exp (-age * (kind == DrumVoiceKind::closedHat ? 34.0f : 10.5f) / decayWeight);
+                const auto airy = noise * std::exp (-age * (kind == DrumVoiceKind::closedHat ? 42.0f : 12.5f) / decayWeight);
                 output = (metallic * 0.13f + airy * 0.78f) * env;
                 break;
             }
@@ -736,7 +947,7 @@ float AdvancedVSTiAudioProcessor::renderDrumVoiceSample (VoiceState& voice)
                 duration = kind == DrumVoiceKind::lowTom ? 1.0f
                            : kind == DrumVoiceKind::midTom ? 0.86f
                                                            : 0.7f;
-                const auto pitch = juce::jlimit (72.0f, 250.0f, basePitch + (voice.midiNote - 45) * 1.6f);
+                const auto pitch = scaledHz (juce::jlimit (72.0f, 250.0f, basePitch + (voice.midiNote - 45) * 1.6f));
                 const auto sweep = 1.0f + 0.42f * std::exp (-age * 5.4f);
                 const auto fundamental = advanceSine (voice.auxPhase, pitch * sweep);
                 const auto overtone = advanceSine (voice.syncPhase, (pitch * 1.49f) * (0.95f + std::exp (-age * 4.6f) * 0.1f));
@@ -747,10 +958,10 @@ float AdvancedVSTiAudioProcessor::renderDrumVoiceSample (VoiceState& voice)
             {
                 duration = 1.28f;
                 const auto cluster =
-                    advanceSine (voice.phase, 2890.0f)
-                    + advanceSine (voice.fmPhase, 4310.0f)
-                    + advanceSine (voice.auxPhase, 6120.0f)
-                    + advanceSine (voice.syncPhase, 9150.0f);
+                    advanceSine (voice.phase, scaledHz (2890.0f))
+                    + advanceSine (voice.fmPhase, scaledHz (4310.0f))
+                    + advanceSine (voice.auxPhase, scaledHz (6120.0f))
+                    + advanceSine (voice.syncPhase, scaledHz (9150.0f));
                 const auto wash = noise * (0.86f + brightness * 0.08f);
                 output = (cluster * 0.11f + wash * 0.82f) * std::exp (-age * 2.9f);
                 output += noise * 0.08f * std::exp (-age * 10.0f);
@@ -759,19 +970,19 @@ float AdvancedVSTiAudioProcessor::renderDrumVoiceSample (VoiceState& voice)
             case DrumVoiceKind::ride:
             {
                 duration = 1.85f;
-                const auto bell = advanceSine (voice.phase, 612.0f);
+                const auto bell = advanceSine (voice.phase, scaledHz (612.0f));
                 const auto metallic =
-                    advanceSine (voice.fmPhase, 3020.0f)
-                    + advanceSine (voice.auxPhase, 4680.0f)
-                    + advanceSine (voice.syncPhase, 7010.0f);
+                    advanceSine (voice.fmPhase, scaledHz (3020.0f))
+                    + advanceSine (voice.auxPhase, scaledHz (4680.0f))
+                    + advanceSine (voice.syncPhase, scaledHz (7010.0f));
                 output = (bell * 0.34f * std::exp (-age * 2.1f)) + ((metallic * 0.16f) + (noise * 0.22f)) * std::exp (-age * 2.7f);
                 break;
             }
             case DrumVoiceKind::cowbell:
             {
                 duration = 0.42f;
-                const auto bellA = advanceSquare (voice.phase, 541.0f);
-                const auto bellB = advanceSquare (voice.fmPhase, 811.0f);
+                const auto bellA = advanceSquare (voice.phase, scaledHz (541.0f));
+                const auto bellB = advanceSquare (voice.fmPhase, scaledHz (811.0f));
                 const auto env = std::exp (-age * 8.8f);
                 output = ((bellA * 0.46f) + (bellB * 0.34f)) * env;
                 break;
@@ -779,7 +990,7 @@ float AdvancedVSTiAudioProcessor::renderDrumVoiceSample (VoiceState& voice)
             case DrumVoiceKind::clave:
             {
                 duration = 0.14f;
-                const auto body = advanceSine (voice.phase, 2470.0f) * std::exp (-age * 28.0f);
+                const auto body = advanceSine (voice.phase, scaledHz (2470.0f)) * std::exp (-age * 28.0f);
                 const auto click = noise * std::exp (-age * 96.0f);
                 output = body + (click * 0.05f);
                 break;
@@ -788,7 +999,7 @@ float AdvancedVSTiAudioProcessor::renderDrumVoiceSample (VoiceState& voice)
             {
                 duration = 0.18f;
                 const auto shaker = noise * std::exp (-age * 20.0f);
-                const auto grain = advanceSine (voice.phase, 5200.0f) * 0.08f * std::exp (-age * 26.0f);
+                const auto grain = advanceSine (voice.phase, scaledHz (5200.0f)) * 0.08f * std::exp (-age * 26.0f);
                 output = shaker * 0.82f + grain;
                 break;
             }
@@ -796,14 +1007,13 @@ float AdvancedVSTiAudioProcessor::renderDrumVoiceSample (VoiceState& voice)
             default:
             {
                 duration = 0.38f;
-                const auto squareA = advanceSquare (voice.phase, 540.0f);
-                const auto squareB = advanceSquare (voice.fmPhase, 846.0f);
+                const auto squareA = advanceSquare (voice.phase, scaledHz (540.0f));
+                const auto squareB = advanceSquare (voice.fmPhase, scaledHz (846.0f));
                 output = (squareA * 0.42f + squareB * 0.34f) * std::exp (-age * 9.4f);
                 output += noise * 0.08f * std::exp (-age * 20.0f);
                 break;
             }
         }
-        output = softSaturate (output * (1.16f + punch * 0.2f)) * 0.94f;
     }
     else
     {
@@ -811,27 +1021,29 @@ float AdvancedVSTiAudioProcessor::renderDrumVoiceSample (VoiceState& voice)
         {
             case DrumVoiceKind::kick:
             {
-                duration = 1.0f + (renderParams.gateLength * 0.08f);
-                const auto pitch = 46.0f + (126.0f + (punch * 40.0f)) * std::exp (-age * (10.5f + snap * 4.2f));
+                duration = 1.0f;
+                const auto pitch = scaledHz (46.0f + (126.0f + (punch * 40.0f)) * std::exp (-age * (10.5f + kickAttack * 4.8f)));
                 voice.auxPhase = std::fmod (voice.auxPhase + pitch * dt, 1.0f);
                 const auto tone = std::sin (twoPi * voice.auxPhase) * std::exp (-age * (4.7f + ring * 1.3f));
                 const auto thump = std::sin (twoPi * std::fmod (voice.auxPhase * 0.5f, 1.0f)) * 0.22f * std::exp (-age * 3.6f);
-                const auto click = noise * (0.13f + punch * 0.11f) * std::exp (-age * 85.0f);
+                const auto click = noise * (0.13f + punch * 0.11f + kickAttack * 0.07f) * std::exp (-age * 85.0f);
                 output = tone + thump + click;
                 break;
             }
             case DrumVoiceKind::snare:
             {
                 duration = 0.48f;
-                const auto body = ((advanceSine (voice.phase, 186.0f) * 0.56f) + (advanceSine (voice.fmPhase, 329.0f) * 0.31f)) * std::exp (-age * 10.6f);
-                const auto sizzle = noise * std::exp (-age * (17.0f - brightness * 4.0f));
-                output = (body * 0.58f) + (sizzle * 0.88f);
+                const auto toneScale = juce::jmap (snareTone, 0.82f, 1.22f);
+                const auto body = ((advanceSine (voice.phase, scaledHz (186.0f * toneScale)) * 0.56f)
+                                   + (advanceSine (voice.fmPhase, scaledHz (329.0f * toneScale)) * 0.31f)) * std::exp (-age * (10.6f - snareTone * 2.2f));
+                const auto sizzle = noise * std::exp (-age * (17.0f - brightness * 4.0f - snareSnappy * 3.5f));
+                output = (body * juce::jmap (snareTone, 0.68f, 0.52f)) + (sizzle * juce::jmap (snareSnappy, 0.66f, 1.02f));
                 break;
             }
             case DrumVoiceKind::rim:
             {
                 duration = 0.11f;
-                const auto crack = (advanceSine (voice.phase, 1825.0f) * 0.46f) + (advanceSine (voice.fmPhase, 2510.0f) * 0.26f);
+                const auto crack = (advanceSine (voice.phase, scaledHz (1825.0f)) * 0.46f) + (advanceSine (voice.fmPhase, scaledHz (2510.0f)) * 0.26f);
                 const auto click = noise * std::exp (-age * 92.0f);
                 output = (crack * std::exp (-age * 30.0f)) + (click * 0.08f);
                 break;
@@ -851,13 +1063,14 @@ float AdvancedVSTiAudioProcessor::renderDrumVoiceSample (VoiceState& voice)
             {
                 duration = kind == DrumVoiceKind::closedHat ? 0.13f : 0.56f;
                 const auto metallic =
-                    advanceSine (voice.phase, 4620.0f)
-                    + advanceSine (voice.fmPhase, 6840.0f)
-                    + advanceSine (voice.auxPhase, 9470.0f)
-                    + advanceSine (voice.syncPhase, 12030.0f);
+                    advanceSine (voice.phase, scaledHz (4620.0f))
+                    + advanceSine (voice.fmPhase, scaledHz (6840.0f))
+                    + advanceSine (voice.auxPhase, scaledHz (9470.0f))
+                    + advanceSine (voice.syncPhase, scaledHz (12030.0f));
                 const auto body = metallic * 0.1f;
                 const auto air = noise * (0.74f + brightness * 0.14f);
-                const auto env = std::exp (-age * (kind == DrumVoiceKind::closedHat ? 44.0f : 12.8f));
+                const auto decayWeight = juce::jmap (voiceDecayScale, 1.18f, 0.74f);
+                const auto env = std::exp (-age * (kind == DrumVoiceKind::closedHat ? 44.0f : 12.8f) / decayWeight);
                 output = (body + air) * env;
                 break;
             }
@@ -871,7 +1084,7 @@ float AdvancedVSTiAudioProcessor::renderDrumVoiceSample (VoiceState& voice)
                 duration = kind == DrumVoiceKind::lowTom ? 0.82f
                            : kind == DrumVoiceKind::midTom ? 0.66f
                                                            : 0.5f;
-                const auto pitch = juce::jlimit (90.0f, 280.0f, basePitch + (voice.midiNote - 45) * 1.8f);
+                const auto pitch = scaledHz (juce::jlimit (90.0f, 280.0f, basePitch + (voice.midiNote - 45) * 1.8f));
                 const auto sweep = 0.84f + 0.31f * std::exp (-age * 6.2f);
                 const auto ringTone = advanceSine (voice.auxPhase, pitch * sweep) * std::exp (-age * 5.1f);
                 const auto overtone = advanceSine (voice.syncPhase, pitch * 1.52f) * 0.18f * std::exp (-age * 7.2f);
@@ -882,10 +1095,10 @@ float AdvancedVSTiAudioProcessor::renderDrumVoiceSample (VoiceState& voice)
             {
                 duration = 1.14f;
                 const auto metallic =
-                    advanceSine (voice.phase, 3420.0f)
-                    + advanceSine (voice.fmPhase, 5180.0f)
-                    + advanceSine (voice.auxPhase, 7760.0f)
-                    + advanceSine (voice.syncPhase, 10520.0f);
+                    advanceSine (voice.phase, scaledHz (3420.0f))
+                    + advanceSine (voice.fmPhase, scaledHz (5180.0f))
+                    + advanceSine (voice.auxPhase, scaledHz (7760.0f))
+                    + advanceSine (voice.syncPhase, scaledHz (10520.0f));
                 const auto air = noise * (0.82f + brightness * 0.12f);
                 output = (metallic * 0.12f + air * 0.78f) * std::exp (-age * 3.8f);
                 break;
@@ -893,19 +1106,19 @@ float AdvancedVSTiAudioProcessor::renderDrumVoiceSample (VoiceState& voice)
             case DrumVoiceKind::ride:
             {
                 duration = 1.72f;
-                const auto bell = advanceSine (voice.phase, 680.0f);
+                const auto bell = advanceSine (voice.phase, scaledHz (680.0f));
                 const auto metallic =
-                    advanceSine (voice.fmPhase, 3510.0f)
-                    + advanceSine (voice.auxPhase, 5630.0f)
-                    + advanceSine (voice.syncPhase, 8240.0f);
+                    advanceSine (voice.fmPhase, scaledHz (3510.0f))
+                    + advanceSine (voice.auxPhase, scaledHz (5630.0f))
+                    + advanceSine (voice.syncPhase, scaledHz (8240.0f));
                 output = (bell * 0.32f * std::exp (-age * 2.4f)) + ((metallic * 0.14f) + (noise * 0.18f)) * std::exp (-age * 3.0f);
                 break;
             }
             case DrumVoiceKind::cowbell:
             {
                 duration = 0.34f;
-                const auto bellA = advanceSquare (voice.phase, 587.0f);
-                const auto bellB = advanceSquare (voice.fmPhase, 845.0f);
+                const auto bellA = advanceSquare (voice.phase, scaledHz (587.0f));
+                const auto bellB = advanceSquare (voice.fmPhase, scaledHz (845.0f));
                 const auto env = std::exp (-age * 10.5f);
                 output = ((bellA * 0.4f) + (bellB * 0.28f)) * env;
                 break;
@@ -913,7 +1126,7 @@ float AdvancedVSTiAudioProcessor::renderDrumVoiceSample (VoiceState& voice)
             case DrumVoiceKind::clave:
             {
                 duration = 0.12f;
-                const auto body = advanceSine (voice.phase, 2860.0f) * std::exp (-age * 36.0f);
+                const auto body = advanceSine (voice.phase, scaledHz (2860.0f)) * std::exp (-age * 36.0f);
                 const auto click = noise * std::exp (-age * 120.0f);
                 output = body + (click * 0.04f);
                 break;
@@ -922,7 +1135,7 @@ float AdvancedVSTiAudioProcessor::renderDrumVoiceSample (VoiceState& voice)
             {
                 duration = 0.16f;
                 const auto shaker = noise * std::exp (-age * 24.0f);
-                const auto grit = advanceSine (voice.phase, 6100.0f) * 0.05f * std::exp (-age * 28.0f);
+                const auto grit = advanceSine (voice.phase, scaledHz (6100.0f)) * 0.05f * std::exp (-age * 28.0f);
                 output = shaker * 0.88f + grit;
                 break;
             }
@@ -930,21 +1143,32 @@ float AdvancedVSTiAudioProcessor::renderDrumVoiceSample (VoiceState& voice)
             default:
             {
                 duration = 0.28f;
-                const auto metallic = (advanceSine (voice.phase, 460.0f) * 0.52f) + (advanceSine (voice.fmPhase, 744.0f) * 0.31f);
-                const auto chop = advanceSquare (voice.syncPhase, 1220.0f);
+                const auto metallic = (advanceSine (voice.phase, scaledHz (460.0f)) * 0.52f) + (advanceSine (voice.fmPhase, scaledHz (744.0f)) * 0.31f);
+                const auto chop = advanceSquare (voice.syncPhase, scaledHz (1220.0f));
                 output = (metallic + chop * 0.16f) * std::exp (-age * 13.0f);
                 output += noise * 0.11f * std::exp (-age * 26.0f);
                 break;
             }
         }
-        output = softSaturate (output * (1.28f + punch * 0.28f)) * 0.92f;
     }
+
+    const auto transientDrive = kind == DrumVoiceKind::kick ? kickAttack : attack;
+    duration *= decayScale * voiceDecayScale;
+    output *= std::exp (-age * juce::jmap (decayMacro, 10.5f, 1.15f) / voiceDecayScale);
+    output += noise * drumTransientWeight (kind) * (transientDrive * 0.45f + punch * 0.12f) * std::exp (-age * 120.0f);
+    output += noise * drumNoiseWeight (kind) * noiseMacro * std::exp (-age * juce::jmap (brightness, 30.0f, 12.0f));
+
+    const auto toneCoeff = juce::jmap (brightness, 0.035f, 0.22f);
+    const auto body = smoothTowards (output, toneCoeff, voice.colourState);
+    const auto edge = output - body;
+    output = (body * juce::jmap (brightness, 1.2f, 0.8f)) + (edge * juce::jmap (brightness, 0.3f, 1.7f));
+    output = softSaturate (output * (1.08f + punch * 0.26f + noiseMacro * 0.08f)) * (buildFlavor() == InstrumentFlavor::drum808 ? 0.94f : 0.92f);
 
     voice.noteAge += dt;
     if (voice.noteAge >= duration)
         voice.active = false;
 
-    return output * voice.velocity * renderParams.drumVoiceLevels[drumVoiceIndex (kind)];
+    return output * voice.velocity * renderParams.drumVoiceLevels[voiceIndex] * renderParams.drumMasterLevel;
 }
 
 float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice)
@@ -1039,6 +1263,23 @@ float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice)
         s = smoothTowards (s, 0.14f, voice.toneState);
         s = softSaturate (s * (1.45f + (params.resonance * 0.42f))) * 0.92f * accent;
     }
+    else if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+    {
+        const auto osc2Ratio = std::pow (2.0f, (params.osc2Semitone + params.osc2Detune) / 12.0f);
+        const auto osc2Hz = juce::jlimit (20.0f, 18000.0f, baseHz * osc2Ratio);
+        const auto osc2 = basicOscSample (voice.osc2Phase, osc2Hz, static_cast<OscType> (params.osc2Type));
+        const auto sub = basicOscSample (voice.subPhase, juce::jlimit (10.0f, 12000.0f, baseHz * 0.5f), OscType::square);
+        const auto ring = (s * osc2) * params.ringModAmount;
+        const auto noiseBed = (random.nextFloat() * 2.0f - 1.0f) * params.noiseLevel;
+        const auto oscBlend = juce::jlimit (0.0f, 1.0f, params.osc2Mix);
+        const auto fmGrip = juce::jlimit (0.0f, 1.0f, params.fmAmount / 1000.0f);
+        const auto syncEdge = std::sin (twoPi * std::fmod ((voice.phase * (2.0f + params.syncAmount * 0.8f)) + (voice.osc2Phase * 0.37f), 1.0f));
+
+        s = (s * (1.0f - oscBlend * 0.75f)) + (osc2 * oscBlend);
+        s += (sub * (params.osc3Enabled ? params.subOscLevel : 0.0f)) + noiseBed + ring + (syncEdge * fmGrip * 0.22f);
+        s = smoothTowards (s, 0.08f + (params.reverbMix * 0.02f), voice.toneState);
+        s = softSaturate (s * (1.2f + (params.fxIntensity * 0.3f))) * 0.94f;
+    }
     else
     {
         s = softSaturate (s * 1.12f) * 0.94f;
@@ -1052,13 +1293,7 @@ float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice)
 
     const auto rg = 0.5f * (1.0f + std::sin (twoPi * params.rhythmGateRate * voice.noteAge));
     const auto rhythmGate = 1.0f - params.rhythmGateDepth + params.rhythmGateDepth * rg;
-
-    auto cutoff = params.cutoff;
-    cutoff += filtEnv * params.filterEnvAmount * 10000.0f;
-    cutoff += lfoValue (params.lfo2Shape, lfo2Phase) * params.lfo2Filter * 5000.0f;
-
-    leftFilter.setCutoffFrequency (juce::jlimit (20.0f, 20000.0f, cutoff));
-    rightFilter.setCutoffFrequency (juce::jlimit (20.0f, 20000.0f, cutoff));
+    currentFilterEnvPeak = juce::jmax (currentFilterEnvPeak, filtEnv);
 
     if (! voice.ampEnv.isActive())
         voice.active = false;
@@ -1102,19 +1337,51 @@ void AdvancedVSTiAudioProcessor::updateRenderParameters()
     renderParams.lfo1Shape = paramIndex (apvts, "LFO1SHAPE");
     renderParams.lfo2Shape = paramIndex (apvts, "LFO2SHAPE");
     renderParams.arpMode = paramIndex (apvts, "ARPMODE");
+    renderParams.filterSlope = juce::jlimit (0, 2, paramIndex (apvts, "FILTERSLOPE"));
+    renderParams.osc2Type = paramIndex (apvts, "OSC2TYPE");
+    renderParams.filter2Type = paramIndex (apvts, "FILTER2TYPE");
+    renderParams.filter2Slope = juce::jlimit (0, 2, paramIndex (apvts, "FILTER2SLOPE"));
+    renderParams.fxType = paramIndex (apvts, "FXTYPE");
+    renderParams.masterLevel = 1.0f;
     if constexpr (isDrumFlavor())
         renderParams.filterType = juce::jlimit (0, 4, paramIndex (apvts, "FILTERTYPE"));
     else
         renderParams.filterType = juce::jlimit (0, 3, paramIndex (apvts, "FILTERTYPE"));
 
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+        renderParams.masterLevel = paramValue (apvts, "MASTERLEVEL");
+
     renderParams.detune = paramValue (apvts, "DETUNE");
-    renderParams.fmAmount = paramValue (apvts, "FMAMOUNT");
-    renderParams.syncAmount = paramValue (apvts, "SYNC");
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+    {
+        const auto fmEnabled = paramValue (apvts, "FMENABLE") >= 0.5f;
+        const auto syncEnabled = paramValue (apvts, "SYNCENABLE") >= 0.5f;
+        const auto ringModEnabled = paramValue (apvts, "RINGMODENABLE") >= 0.5f;
+        renderParams.fmAmount = fmEnabled ? paramValue (apvts, "FMAMOUNT") : 0.0f;
+        renderParams.syncAmount = syncEnabled ? paramValue (apvts, "SYNC") : 0.0f;
+        renderParams.ringModAmount = ringModEnabled ? paramValue (apvts, "RINGMOD") : 0.0f;
+    }
+    else
+    {
+        renderParams.fmAmount = paramValue (apvts, "FMAMOUNT");
+        renderParams.syncAmount = paramValue (apvts, "SYNC");
+        renderParams.ringModAmount = paramValue (apvts, "RINGMOD");
+    }
     renderParams.gateLength = paramValue (apvts, "OSCGATE");
+    renderParams.osc2Semitone = paramValue (apvts, "OSC2SEMITONE");
+    renderParams.osc2Detune = paramValue (apvts, "OSC2DETUNE");
+    renderParams.osc2Mix = paramValue (apvts, "OSC2MIX");
+    renderParams.subOscLevel = paramValue (apvts, "SUBOSCLEVEL");
+    renderParams.osc3Enabled = true;
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+        renderParams.osc3Enabled = paramValue (apvts, "OSC3ENABLE") >= 0.5f;
+    renderParams.noiseLevel = paramValue (apvts, "NOISELEVEL");
     renderParams.envCurve = paramValue (apvts, "ENVCURVE");
     renderParams.cutoff = paramValue (apvts, "CUTOFF");
+    renderParams.cutoff2 = paramValue (apvts, "CUTOFF2");
     renderParams.resonance = paramValue (apvts, "RESONANCE");
     renderParams.filterEnvAmount = paramValue (apvts, "FILTERENVAMOUNT");
+    renderParams.filterBalance = paramValue (apvts, "FILTERBALANCE");
     renderParams.sampleBank = paramIndex (apvts, "SAMPLEBANK");
     renderParams.sampleStart = paramValue (apvts, "SAMPLESTART");
     renderParams.sampleEnd = juce::jlimit (0.02f, 1.0f, paramValue (apvts, "SAMPLEEND"));
@@ -1127,14 +1394,39 @@ void AdvancedVSTiAudioProcessor::updateRenderParameters()
     renderParams.arpRate = paramValue (apvts, "ARPRATE");
     renderParams.rhythmGateRate = paramValue (apvts, "RHYTHMGATE_RATE");
     renderParams.rhythmGateDepth = paramValue (apvts, "RHYTHMGATE_DEPTH");
+    renderParams.fxMix = paramValue (apvts, "FXMIX");
+    renderParams.fxIntensity = paramValue (apvts, "FXINTENSITY");
+    renderParams.delaySend = paramValue (apvts, "DELAYSEND");
+    renderParams.delayTimeSec = paramValue (apvts, "DELAYTIME");
+    renderParams.delayFeedback = paramValue (apvts, "DELAYFEEDBACK");
+    renderParams.reverbMix = paramValue (apvts, "REVERBMIX");
 
     if constexpr (isDrumFlavor())
     {
+        renderParams.drumMasterLevel = paramValue (apvts, "DRUMMASTERLEVEL");
+        renderParams.drumKickAttack = paramValue (apvts, "DRUM_KICK_ATTACK");
+        renderParams.drumSnareTone = paramValue (apvts, "DRUM_SNARE_TONE");
+        renderParams.drumSnareSnappy = paramValue (apvts, "DRUM_SNARE_SNAPPY");
+        renderParams.drumVoiceTunes.fill (0.0f);
+        renderParams.drumVoiceDecays.fill (0.5f);
+
+        for (size_t index = 0; index < drumVoiceTuneParamIds.size(); ++index)
+            renderParams.drumVoiceTunes[drumVoiceIndex (drumVoiceTuneKinds[index])] = paramValue (apvts, drumVoiceTuneParamIds[index]);
+
+        for (size_t index = 0; index < drumVoiceDecayParamIds.size(); ++index)
+            renderParams.drumVoiceDecays[drumVoiceIndex (drumVoiceDecayKinds[index])] = paramValue (apvts, drumVoiceDecayParamIds[index]);
+
         for (size_t index = 0; index < drumVoiceLevelParamIds.size(); ++index)
             renderParams.drumVoiceLevels[index] = paramValue (apvts, drumVoiceLevelParamIds[index]);
     }
     else
     {
+        renderParams.drumMasterLevel = 1.0f;
+        renderParams.drumKickAttack = 0.5f;
+        renderParams.drumSnareTone = 0.5f;
+        renderParams.drumSnareSnappy = 0.5f;
+        renderParams.drumVoiceTunes.fill (0.0f);
+        renderParams.drumVoiceDecays.fill (0.5f);
         renderParams.drumVoiceLevels.fill (1.0f);
     }
 
@@ -1167,6 +1459,39 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
     leftFilter.setResonance (renderParams.resonance);
     rightFilter.setResonance (renderParams.resonance);
+    leftFilterCascade.setResonance (renderParams.resonance);
+    rightFilterCascade.setResonance (renderParams.resonance);
+    leftFilter2.setResonance (renderParams.resonance);
+    rightFilter2.setResonance (renderParams.resonance);
+    leftFilter2Cascade.setResonance (renderParams.resonance);
+    rightFilter2Cascade.setResonance (renderParams.resonance);
+
+    chorusLeft.setRate (0.12f + renderParams.fxIntensity * 1.8f);
+    chorusRight.setRate (0.14f + renderParams.fxIntensity * 1.7f);
+    chorusLeft.setDepth (0.1f + renderParams.fxIntensity * 0.75f);
+    chorusRight.setDepth (0.12f + renderParams.fxIntensity * 0.72f);
+    chorusLeft.setCentreDelay (6.0f + renderParams.fxIntensity * 12.0f);
+    chorusRight.setCentreDelay (7.0f + renderParams.fxIntensity * 11.0f);
+    chorusLeft.setFeedback (0.05f + renderParams.fxIntensity * 0.18f);
+    chorusRight.setFeedback (0.04f + renderParams.fxIntensity * 0.18f);
+
+    phaserLeft.setRate (0.08f + renderParams.fxIntensity * 1.3f);
+    phaserRight.setRate (0.09f + renderParams.fxIntensity * 1.35f);
+    phaserLeft.setDepth (0.15f + renderParams.fxIntensity * 0.72f);
+    phaserRight.setDepth (0.17f + renderParams.fxIntensity * 0.68f);
+    phaserLeft.setCentreFrequency (400.0f + renderParams.fxIntensity * 1600.0f);
+    phaserRight.setCentreFrequency (520.0f + renderParams.fxIntensity * 1500.0f);
+    phaserLeft.setFeedback (0.05f + renderParams.fxIntensity * 0.25f);
+    phaserRight.setFeedback (0.05f + renderParams.fxIntensity * 0.25f);
+
+    juce::Reverb::Parameters reverbParams;
+    reverbParams.roomSize = 0.2f + renderParams.reverbMix * 0.65f;
+    reverbParams.damping = 0.25f + renderParams.fxIntensity * 0.5f;
+    reverbParams.wetLevel = 1.0f;
+    reverbParams.dryLevel = 0.0f;
+    reverbParams.width = 0.8f;
+    reverbParams.freezeMode = 0.0f;
+    reverb.setParameters (reverbParams);
 
     bool bypassFilter = false;
     if constexpr (isDrumFlavor())
@@ -1177,12 +1502,20 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             const auto filterMode = juce::jlimit (0, 3, renderParams.filterType - 1);
             leftFilter.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (filterMode));
             rightFilter.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (filterMode));
+            leftFilterCascade.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (filterMode));
+            rightFilterCascade.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (filterMode));
         }
     }
     else
     {
         leftFilter.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (renderParams.filterType));
         rightFilter.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (renderParams.filterType));
+        leftFilterCascade.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (renderParams.filterType));
+        rightFilterCascade.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (renderParams.filterType));
+        leftFilter2.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (juce::jlimit (0, 3, renderParams.filter2Type)));
+        rightFilter2.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (juce::jlimit (0, 3, renderParams.filter2Type)));
+        leftFilter2Cascade.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (juce::jlimit (0, 3, renderParams.filter2Type)));
+        rightFilter2Cascade.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (juce::jlimit (0, 3, renderParams.filter2Type)));
     }
 
     int arpCounter = 0;
@@ -1218,15 +1551,54 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             }
         }
 
+        currentFilterEnvPeak = 0.0f;
         float sum = 0.0f;
         for (auto& voice : voices)
             sum += renderVoiceSample (voice);
 
-        const auto filteredL = bypassFilter ? sum : leftFilter.processSample (0, sum);
-        const auto filteredR = bypassFilter ? sum : rightFilter.processSample (0, sum);
+        auto cutoff = renderParams.cutoff;
+        cutoff += currentFilterEnvPeak * renderParams.filterEnvAmount * 10000.0f;
+        cutoff += lfoValue (renderParams.lfo2Shape, lfo2Phase) * renderParams.lfo2Filter * 5000.0f;
+        cutoff = juce::jlimit (20.0f, 20000.0f, cutoff);
+        leftFilter.setCutoffFrequency (cutoff);
+        rightFilter.setCutoffFrequency (cutoff);
+        leftFilterCascade.setCutoffFrequency (cutoff);
+        rightFilterCascade.setCutoffFrequency (cutoff);
 
-        buffer.setSample (0, sample, filteredL);
-        buffer.setSample (1, sample, filteredR);
+        auto cutoff2 = renderParams.cutoff2;
+        cutoff2 += currentFilterEnvPeak * renderParams.filterEnvAmount * 6500.0f;
+        cutoff2 -= lfoValue (renderParams.lfo2Shape, lfo2Phase) * renderParams.lfo2Filter * 2600.0f;
+        cutoff2 = juce::jlimit (20.0f, 20000.0f, cutoff2);
+        leftFilter2.setCutoffFrequency (cutoff2);
+        rightFilter2.setCutoffFrequency (cutoff2);
+        leftFilter2Cascade.setCutoffFrequency (cutoff2);
+        rightFilter2Cascade.setCutoffFrequency (cutoff2);
+
+        auto processSlope = [] (auto& firstStage, auto& secondStage, float input, int slopeIndex) -> float
+        {
+            const auto firstStageOutput = firstStage.processSample (0, input);
+            if (slopeIndex <= 0)
+                return firstStageOutput;
+
+            const auto secondStageOutput = secondStage.processSample (0, firstStageOutput);
+            return juce::jmap (filterCascadeBlendForSlope (slopeIndex), firstStageOutput, secondStageOutput);
+        };
+
+        const auto filteredL = bypassFilter ? sum : processSlope (leftFilter, leftFilterCascade, sum, renderParams.filterSlope);
+        const auto filteredR = bypassFilter ? sum : processSlope (rightFilter, rightFilterCascade, sum, renderParams.filterSlope);
+        auto mixedL = filteredL;
+        auto mixedR = filteredR;
+        if constexpr (! isDrumFlavor())
+        {
+            const auto filtered2L = processSlope (leftFilter2, leftFilter2Cascade, sum, renderParams.filter2Slope);
+            const auto filtered2R = processSlope (rightFilter2, rightFilter2Cascade, sum, renderParams.filter2Slope);
+            const auto balance = juce::jlimit (0.0f, 1.0f, renderParams.filterBalance);
+            mixedL = juce::jmap (balance, filteredL, filtered2L);
+            mixedR = juce::jmap (balance, filteredR, filtered2R);
+        }
+
+        buffer.setSample (0, sample, mixedL);
+        buffer.setSample (1, sample, mixedR);
 
         lfo1Phase = std::fmod (lfo1Phase + renderParams.lfo1Rate / static_cast<float> (currentSampleRate), 1.0f);
         lfo2Phase = std::fmod (lfo2Phase + renderParams.lfo2Rate / static_cast<float> (currentSampleRate), 1.0f);
@@ -1236,6 +1608,116 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     {
         handleMidiMessage (nextMidiMessage);
         hasMidi = midiIterator.getNextEvent (nextMidiMessage, nextMidiSample);
+    }
+
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+    {
+        applyAdvancedEffects (buffer);
+        buffer.applyGain (juce::jlimit (0.0f, 1.5f, renderParams.masterLevel));
+    }
+}
+
+void AdvancedVSTiAudioProcessor::applyAdvancedEffects (juce::AudioBuffer<float>& buffer)
+{
+    auto* left = buffer.getWritePointer (0);
+    auto* right = buffer.getWritePointer (1);
+    const auto numSamples = buffer.getNumSamples();
+    const auto fxMix = juce::jlimit (0.0f, 1.0f, renderParams.fxMix);
+    const auto delaySend = juce::jlimit (0.0f, 1.0f, renderParams.delaySend);
+    const auto reverbMix = juce::jlimit (0.0f, 1.0f, renderParams.reverbMix);
+    const auto feedback = juce::jlimit (0.0f, 0.95f, renderParams.delayFeedback);
+
+    if (fxMix > 0.0001f)
+    {
+        if (renderParams.fxType == 2 || renderParams.fxType == 3)
+        {
+            juce::AudioBuffer<float> wetBuffer;
+            wetBuffer.makeCopyOf (buffer, true);
+            juce::dsp::AudioBlock<float> wetBlock (wetBuffer);
+            auto leftBlock = wetBlock.getSingleChannelBlock (0);
+            auto rightBlock = wetBlock.getSingleChannelBlock (1);
+            juce::dsp::ProcessContextReplacing<float> leftContext (leftBlock);
+            juce::dsp::ProcessContextReplacing<float> rightContext (rightBlock);
+
+            if (renderParams.fxType == 2)
+            {
+                phaserLeft.process (leftContext);
+                phaserRight.process (rightContext);
+            }
+            else
+            {
+                chorusLeft.process (leftContext);
+                chorusRight.process (rightContext);
+            }
+
+            for (int sample = 0; sample < numSamples; ++sample)
+            {
+                left[sample] = juce::jmap (fxMix, left[sample], wetBuffer.getSample (0, sample));
+                right[sample] = juce::jmap (fxMix, right[sample], wetBuffer.getSample (1, sample));
+            }
+        }
+        else
+        {
+            for (int sample = 0; sample < numSamples; ++sample)
+            {
+                const auto dryL = left[sample];
+                const auto dryR = right[sample];
+                float wetL = dryL;
+                float wetR = dryR;
+
+                switch (renderParams.fxType)
+                {
+                    case 1:
+                    {
+                        const auto drive = 1.2f + renderParams.fxIntensity * 10.0f;
+                        wetL = std::tanh (dryL * drive);
+                        wetR = std::tanh (dryR * drive);
+                        break;
+                    }
+                    default:
+                        break;
+                }
+
+                left[sample] = juce::jmap (fxMix, dryL, wetL);
+                right[sample] = juce::jmap (fxMix, dryR, wetR);
+            }
+        }
+    }
+
+    if (delaySend > 0.0001f && delayBuffer.getNumSamples() > 0)
+    {
+        const auto delaySamples = juce::jlimit (1, delayBuffer.getNumSamples() - 1,
+                                                juce::roundToInt (renderParams.delayTimeSec * static_cast<float> (currentSampleRate)));
+        const auto bufferSize = delayBuffer.getNumSamples();
+        auto* delayLeft = delayBuffer.getWritePointer (0);
+        auto* delayRight = delayBuffer.getWritePointer (1);
+
+        for (int sample = 0; sample < numSamples; ++sample)
+        {
+            const auto readPosition = (delayWritePosition + bufferSize - delaySamples) % bufferSize;
+            const auto wetL = delayLeft[readPosition];
+            const auto wetR = delayRight[readPosition];
+            const auto inputL = left[sample];
+            const auto inputR = right[sample];
+
+            delayLeft[delayWritePosition] = inputL * delaySend + wetL * feedback;
+            delayRight[delayWritePosition] = inputR * delaySend + wetR * feedback;
+
+            left[sample] = inputL + wetL;
+            right[sample] = inputR + wetR;
+            delayWritePosition = (delayWritePosition + 1) % bufferSize;
+        }
+    }
+
+    if (reverbMix > 0.0001f)
+    {
+        juce::AudioBuffer<float> wetBuffer;
+        wetBuffer.makeCopyOf (buffer, true);
+        reverb.processStereo (wetBuffer.getWritePointer (0), wetBuffer.getWritePointer (1), wetBuffer.getNumSamples());
+
+        buffer.applyGain (1.0f - reverbMix);
+        buffer.addFrom (0, 0, wetBuffer, 0, 0, wetBuffer.getNumSamples(), reverbMix);
+        buffer.addFrom (1, 0, wetBuffer, 1, 0, wetBuffer.getNumSamples(), reverbMix);
     }
 }
 
@@ -1294,6 +1776,13 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
     float fmDefault = 0.0f;
     float syncDefault = 0.0f;
     float gateDefault = 8.0f;
+    int osc2TypeDefault = 1;
+    float osc2SemitoneDefault = 0.0f;
+    float osc2DetuneDefault = 0.02f;
+    float osc2MixDefault = 0.35f;
+    float subOscLevelDefault = 0.0f;
+    float noiseLevelDefault = 0.0f;
+    float ringModDefault = 0.0f;
 
     float ampAttackDefault = 0.01f;
     float ampDecayDefault = 0.2f;
@@ -1307,9 +1796,16 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
     float envCurveDefault = 0.0f;
 
     int filterTypeDefault = 0;
+    int filterSlopeDefault = 0;
+    int filter2TypeDefault = 0;
+    int filter2SlopeDefault = 0;
+    float masterLevelDefault = 1.0f;
     float cutoffDefault = 1200.0f;
+    float cutoff2Default = 2400.0f;
     float resonanceDefault = 0.4f;
+    float resonanceMax = 10.0f;
     float filterEnvAmountDefault = 0.5f;
+    float filterBalanceDefault = 0.0f;
     int sampleBankDefault = 0;
     float sampleStartDefault = 0.0f;
     float sampleEndDefault = 1.0f;
@@ -1321,12 +1817,29 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
     float lfo2RateDefault = 3.0f;
     int lfo2ShapeDefault = 0;
     float lfo2FilterDefault = 0.0f;
+    int fxTypeDefault = 0;
+    float fxMixDefault = 0.0f;
+    float fxIntensityDefault = 0.0f;
+    float delaySendDefault = 0.0f;
+    float delayTimeDefault = 0.34f;
+    float delayFeedbackDefault = 0.25f;
+    float reverbMixDefault = 0.0f;
+    float drumMasterLevelDefault = 1.0f;
+    float drumKickAttackDefault = 0.5f;
+    float drumSnareToneDefault = 0.5f;
+    float drumSnareSnappyDefault = 0.5f;
 
     int presetDefault = 0;
     int arpModeDefault = 0;
     float arpRateDefault = 4.0f;
     float rhythmRateDefault = 8.0f;
     float rhythmDepthDefault = 0.0f;
+    std::array<float, 7> drumVoiceTuneDefaults {
+        0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f
+    };
+    std::array<float, 6> drumVoiceDecayDefaults {
+        0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f
+    };
     std::array<float, 15> drumVoiceLevelDefaults {
         1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
         1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
@@ -1336,6 +1849,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
     if constexpr (buildFlavor() == InstrumentFlavor::drumMachine)
     {
         oscDefault = 3;
+        detuneDefault = 0.0f;
         filterTypeDefault = 1;
         gateDefault = 0.42f;
         ampAttackDefault = 0.001f;
@@ -1353,11 +1867,18 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
         filterEnvAmountDefault = 0.12f;
         rhythmRateDefault = 16.0f;
         rhythmDepthDefault = 0.0f;
+        drumMasterLevelDefault = 1.0f;
+        drumKickAttackDefault = 0.72f;
+        drumSnareToneDefault = 0.56f;
+        drumSnareSnappyDefault = 0.62f;
+        drumVoiceTuneDefaults = drumMachineVoiceTuneDefaults;
+        drumVoiceDecayDefaults = drumMachineVoiceDecayDefaults;
         drumVoiceLevelDefaults = drumMachineVoiceLevelDefaults;
     }
     else if constexpr (buildFlavor() == InstrumentFlavor::drum808)
     {
         oscDefault = 0;
+        detuneDefault = 0.0f;
         filterTypeDefault = 1;
         gateDefault = 0.95f;
         ampAttackDefault = 0.001f;
@@ -1375,6 +1896,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
         filterEnvAmountDefault = 0.05f;
         rhythmRateDefault = 16.0f;
         rhythmDepthDefault = 0.0f;
+        drumMasterLevelDefault = 1.0f;
+        drumKickAttackDefault = 0.34f;
+        drumSnareToneDefault = 0.48f;
+        drumSnareSnappyDefault = 0.54f;
+        drumVoiceTuneDefaults = drum808VoiceTuneDefaults;
+        drumVoiceDecayDefaults = drum808VoiceDecayDefaults;
         drumVoiceLevelDefaults = drum808VoiceLevelDefaults;
     }
     else if constexpr (buildFlavor() == InstrumentFlavor::bassSynth)
@@ -1541,22 +2068,114 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
         envCurveDefault = 0.45f;
         cutoffDefault = 540.0f;
         resonanceDefault = 0.82f;
+        resonanceMax = 10.0f;
         filterEnvAmountDefault = 0.94f;
         lfo1RateDefault = 0.14f;
         lfo2RateDefault = 0.22f;
         lfo2FilterDefault = 0.06f;
     }
+    else if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+    {
+        oscDefault = 1;
+        osc2TypeDefault = 2;
+        unisonDefault = 2;
+        masterLevelDefault = 1.0f;
+        detuneDefault = 0.045f;
+        osc2SemitoneDefault = 0.0f;
+        osc2DetuneDefault = 0.08f;
+        osc2MixDefault = 0.42f;
+        subOscLevelDefault = 0.18f;
+        noiseLevelDefault = 0.04f;
+        ringModDefault = 0.08f;
+        fmDefault = 120.0f;
+        syncDefault = 0.24f;
+        gateDefault = 3.2f;
+        ampAttackDefault = 0.004f;
+        ampDecayDefault = 0.28f;
+        ampSustainDefault = 0.74f;
+        ampReleaseDefault = 0.36f;
+        filtAttackDefault = 0.001f;
+        filtDecayDefault = 0.24f;
+        filtSustainDefault = 0.42f;
+        filtReleaseDefault = 0.24f;
+        envCurveDefault = 0.08f;
+        filterTypeDefault = 0;
+        filter2TypeDefault = 2;
+        cutoffDefault = 2200.0f;
+        cutoff2Default = 5400.0f;
+        resonanceDefault = 0.36f;
+        filterEnvAmountDefault = 0.42f;
+        filterBalanceDefault = 0.28f;
+        lfo1RateDefault = 0.18f;
+        lfo1PitchDefault = 0.0f;
+        lfo2RateDefault = 0.22f;
+        lfo2FilterDefault = 0.12f;
+        fxTypeDefault = 3;
+        fxMixDefault = 0.18f;
+        fxIntensityDefault = 0.32f;
+        delaySendDefault = 0.16f;
+        delayTimeDefault = 0.36f;
+        delayFeedbackDefault = 0.28f;
+        reverbMixDefault = 0.12f;
+    }
 
     params.push_back (std::make_unique<juce::AudioParameterChoice> ("PRESET", "Preset", presetChoicesForFlavor(), presetDefault));
     params.push_back (std::make_unique<juce::AudioParameterChoice> ("OSCTYPE", "Osc Type", juce::StringArray { "Sine", "Saw", "Square", "Noise", "Sample" }, oscDefault));
+    params.push_back (std::make_unique<juce::AudioParameterChoice> ("OSC2TYPE", "Osc 2 Type", juce::StringArray { "Sine", "Saw", "Square", "Noise", "Sample" }, osc2TypeDefault));
     params.push_back (std::make_unique<juce::AudioParameterChoice> ("SAMPLEBANK", "Sample Bank", sampleBankChoices(), sampleBankDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("SAMPLESTART", "Sample Start", 0.0f, 0.95f, sampleStartDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("SAMPLEEND", "Sample End", 0.05f, 1.0f, sampleEndDefault));
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("MASTERLEVEL", "Master Level", 0.0f, 1.5f, masterLevelDefault));
     params.push_back (std::make_unique<juce::AudioParameterInt> ("UNISON", "Unison", 1, maxUnisonForFlavor(), unisonDefault));
-    params.push_back (std::make_unique<juce::AudioParameterFloat> ("DETUNE", "Detune", 0.0f, 1.0f, detuneDefault));
-    params.push_back (std::make_unique<juce::AudioParameterFloat> ("FMAMOUNT", "FM Amount", 0.0f, 1000.0f, fmDefault));
-    params.push_back (std::make_unique<juce::AudioParameterFloat> ("SYNC", "Sync", 0.0f, 4.0f, syncDefault));
-    params.push_back (std::make_unique<juce::AudioParameterFloat> ("OSCGATE", "Osc Note Length Gate", 0.01f, 8.0f, gateDefault));
+    if constexpr (isDrumFlavor())
+    {
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("DETUNE", "Detune", -6.0f, 6.0f, detuneDefault));
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("FMAMOUNT", "FM Amount", 0.0f, 200.0f, fmDefault));
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("SYNC", "Sync", 0.0f, 1.0f, syncDefault));
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("OSCGATE", "Osc Note Length Gate", 0.1f, 2.4f, gateDefault));
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("DRUMMASTERLEVEL", "Drum Master Level", 0.0f, 1.5f, drumMasterLevelDefault));
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("DRUM_KICK_ATTACK", "Bass Drum Attack", 0.0f, 1.0f, drumKickAttackDefault));
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("DRUM_SNARE_TONE", "Snare Tone", 0.0f, 1.0f, drumSnareToneDefault));
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("DRUM_SNARE_SNAPPY", "Snare Snappy", 0.0f, 1.0f, drumSnareSnappyDefault));
+
+        for (size_t index = 0; index < drumVoiceTuneParamIds.size(); ++index)
+        {
+            params.push_back (std::make_unique<juce::AudioParameterFloat> (drumVoiceTuneParamIds[index],
+                                                                            drumVoiceTuneNames[index],
+                                                                            -12.0f, 12.0f,
+                                                                            drumVoiceTuneDefaults[index]));
+        }
+
+        for (size_t index = 0; index < drumVoiceDecayParamIds.size(); ++index)
+        {
+            params.push_back (std::make_unique<juce::AudioParameterFloat> (drumVoiceDecayParamIds[index],
+                                                                            drumVoiceDecayNames[index],
+                                                                            0.0f, 1.0f,
+                                                                            drumVoiceDecayDefaults[index]));
+        }
+    }
+    else
+    {
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("DETUNE", "Detune", 0.0f, 1.0f, detuneDefault));
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("FMAMOUNT", "FM Amount", 0.0f, 1000.0f, fmDefault));
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("SYNC", "Sync", 0.0f, 4.0f, syncDefault));
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("OSCGATE", "Osc Note Length Gate", 0.01f, 8.0f, gateDefault));
+    }
+    params.push_back (std::make_unique<juce::AudioParameterFloat> ("OSC2SEMITONE", "Osc 2 Semitone", -24.0f, 24.0f, osc2SemitoneDefault));
+    params.push_back (std::make_unique<juce::AudioParameterFloat> ("OSC2DETUNE", "Osc 2 Detune", -1.0f, 1.0f, osc2DetuneDefault));
+    params.push_back (std::make_unique<juce::AudioParameterFloat> ("OSC2MIX", "Osc 2 Mix", 0.0f, 1.0f, osc2MixDefault));
+    params.push_back (std::make_unique<juce::AudioParameterFloat> ("SUBOSCLEVEL", "Sub Osc Level", 0.0f, 1.0f, subOscLevelDefault));
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+        params.push_back (std::make_unique<juce::AudioParameterBool> ("OSC3ENABLE", "Osc 3 Enabled", subOscLevelDefault > 0.0001f));
+    params.push_back (std::make_unique<juce::AudioParameterFloat> ("NOISELEVEL", "Noise Level", 0.0f, 1.0f, noiseLevelDefault));
+    params.push_back (std::make_unique<juce::AudioParameterFloat> ("RINGMOD", "Ring Mod", 0.0f, 1.0f, ringModDefault));
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+    {
+        params.push_back (std::make_unique<juce::AudioParameterBool> ("RINGMODENABLE", "Ring Mod Enabled", true));
+        params.push_back (std::make_unique<juce::AudioParameterBool> ("FMENABLE", "FM Enabled", true));
+        params.push_back (std::make_unique<juce::AudioParameterBool> ("SYNCENABLE", "Sync Enabled", true));
+    }
 
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("AMPATTACK", "Amp Attack", 0.001f, 10.0f, ampAttackDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("AMPDECAY", "Amp Decay", 0.001f, 10.0f, ampDecayDefault));
@@ -1573,9 +2192,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
         params.push_back (std::make_unique<juce::AudioParameterChoice> ("FILTERTYPE", "Filter Type", juce::StringArray { "Off", "LP", "BP", "HP", "Notch" }, filterTypeDefault));
     else
         params.push_back (std::make_unique<juce::AudioParameterChoice> ("FILTERTYPE", "Filter Type", juce::StringArray { "LP", "BP", "HP", "Notch" }, filterTypeDefault));
+    params.push_back (std::make_unique<juce::AudioParameterChoice> ("FILTER2TYPE", "Filter 2 Type", juce::StringArray { "LP", "BP", "HP", "Notch" }, filter2TypeDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("CUTOFF", "Cutoff", 20.0f, 20000.0f, cutoffDefault));
-    params.push_back (std::make_unique<juce::AudioParameterFloat> ("RESONANCE", "Resonance", 0.1f, 1.2f, resonanceDefault));
+    params.push_back (std::make_unique<juce::AudioParameterFloat> ("CUTOFF2", "Cutoff 2", 20.0f, 20000.0f, cutoff2Default));
+    params.push_back (std::make_unique<juce::AudioParameterFloat> ("RESONANCE", "Resonance", 0.1f, resonanceMax, resonanceDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("FILTERENVAMOUNT", "Filter Env Amount", 0.0f, 1.0f, filterEnvAmountDefault));
+    params.push_back (std::make_unique<juce::AudioParameterFloat> ("FILTERBALANCE", "Filter Balance", 0.0f, 1.0f, filterBalanceDefault));
 
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("LFO1RATE", "LFO1 Rate", 0.05f, 40.0f, lfo1RateDefault));
     params.push_back (std::make_unique<juce::AudioParameterChoice> ("LFO1SHAPE", "LFO1 Shape", juce::StringArray { "Sine", "Saw", "Square" }, lfo1ShapeDefault));
@@ -1590,6 +2212,13 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
 
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("RHYTHMGATE_RATE", "Rhythm Gate Rate", 0.25f, 32.0f, rhythmRateDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("RHYTHMGATE_DEPTH", "Rhythm Gate Depth", 0.0f, 1.0f, rhythmDepthDefault));
+    params.push_back (std::make_unique<juce::AudioParameterChoice> ("FXTYPE", "FX Type", juce::StringArray { "Off", "Dist", "Phaser", "Chorus" }, fxTypeDefault));
+    params.push_back (std::make_unique<juce::AudioParameterFloat> ("FXMIX", "FX Mix", 0.0f, 1.0f, fxMixDefault));
+    params.push_back (std::make_unique<juce::AudioParameterFloat> ("FXINTENSITY", "FX Intensity", 0.0f, 1.0f, fxIntensityDefault));
+    params.push_back (std::make_unique<juce::AudioParameterFloat> ("DELAYSEND", "Delay Send", 0.0f, 1.0f, delaySendDefault));
+    params.push_back (std::make_unique<juce::AudioParameterFloat> ("DELAYTIME", "Delay Time", 0.05f, 1.2f, delayTimeDefault));
+    params.push_back (std::make_unique<juce::AudioParameterFloat> ("DELAYFEEDBACK", "Delay Feedback", 0.0f, 0.92f, delayFeedbackDefault));
+    params.push_back (std::make_unique<juce::AudioParameterFloat> ("REVERBMIX", "Reverb Mix", 0.0f, 1.0f, reverbMixDefault));
 
     if constexpr (isDrumFlavor())
     {
@@ -1601,6 +2230,13 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
                                                                             drumVoiceLevelDefaults[index]));
         }
     }
+
+    params.push_back (std::make_unique<juce::AudioParameterChoice> ("FILTERSLOPE", "Filter Slope",
+                                                                    juce::StringArray { "12 dB", "16 dB", "24 dB" },
+                                                                    filterSlopeDefault));
+    params.push_back (std::make_unique<juce::AudioParameterChoice> ("FILTER2SLOPE", "Filter 2 Slope",
+                                                                    juce::StringArray { "12 dB", "16 dB", "24 dB" },
+                                                                    filter2SlopeDefault));
 
     return { params.begin(), params.end() };
 }
@@ -1628,6 +2264,10 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
     setParameterActual ("ARPRATE", 4.0f);
     setParameterActual ("LFO1RATE", 0.1f);
     setParameterActual ("LFO2RATE", 0.1f);
+    setParameterActual ("FILTERSLOPE", 0.0f);
+    setParameterActual ("FILTER2SLOPE", 0.0f);
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+        setParameterActual ("MASTERLEVEL", 1.0f);
 
     if constexpr (buildFlavor() == InstrumentFlavor::bassSynth)
     {
@@ -1879,26 +2519,185 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
                 break;
         }
     }
+    else if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+    {
+        switch (presetIndex)
+        {
+            case 1:
+                setParameterActual ("OSCTYPE", 2.0f);
+                setParameterActual ("OSC2TYPE", 1.0f);
+                setParameterActual ("UNISON", 2.0f);
+                setParameterActual ("DETUNE", 0.03f);
+                setParameterActual ("OSC2SEMITONE", 0.0f);
+                setParameterActual ("OSC2DETUNE", 0.04f);
+                setParameterActual ("OSC2MIX", 0.36f);
+                setParameterActual ("SUBOSCLEVEL", 0.14f);
+                setParameterActual ("NOISELEVEL", 0.02f);
+                setParameterActual ("RINGMOD", 0.04f);
+                setParameterActual ("FMAMOUNT", 80.0f);
+                setParameterActual ("SYNC", 0.18f);
+                setParameterActual ("FILTERTYPE", 0.0f);
+                setParameterActual ("FILTER2TYPE", 2.0f);
+                setParameterActual ("CUTOFF", 1800.0f);
+                setParameterActual ("CUTOFF2", 4200.0f);
+                setParameterActual ("RESONANCE", 0.3f);
+                setParameterActual ("FILTERENVAMOUNT", 0.34f);
+                setParameterActual ("FILTERBALANCE", 0.22f);
+                setParameterActual ("AMPATTACK", 0.004f);
+                setParameterActual ("AMPDECAY", 0.24f);
+                setParameterActual ("AMPSUSTAIN", 0.78f);
+                setParameterActual ("AMPRELEASE", 0.32f);
+                setParameterActual ("FILTATTACK", 0.001f);
+                setParameterActual ("FILTDECAY", 0.18f);
+                setParameterActual ("FILTSUSTAIN", 0.34f);
+                setParameterActual ("FILTRELEASE", 0.18f);
+                setParameterActual ("FXTYPE", 3.0f);
+                setParameterActual ("FXMIX", 0.16f);
+                setParameterActual ("FXINTENSITY", 0.28f);
+                setParameterActual ("DELAYSEND", 0.12f);
+                setParameterActual ("DELAYTIME", 0.32f);
+                setParameterActual ("DELAYFEEDBACK", 0.22f);
+                setParameterActual ("REVERBMIX", 0.08f);
+                break;
+            case 2:
+                setParameterActual ("OSCTYPE", 1.0f);
+                setParameterActual ("OSC2TYPE", 2.0f);
+                setParameterActual ("UNISON", 2.0f);
+                setParameterActual ("DETUNE", 0.06f);
+                setParameterActual ("OSC2SEMITONE", 12.0f);
+                setParameterActual ("OSC2DETUNE", 0.08f);
+                setParameterActual ("OSC2MIX", 0.52f);
+                setParameterActual ("SUBOSCLEVEL", 0.08f);
+                setParameterActual ("NOISELEVEL", 0.06f);
+                setParameterActual ("RINGMOD", 0.18f);
+                setParameterActual ("FMAMOUNT", 160.0f);
+                setParameterActual ("SYNC", 0.36f);
+                setParameterActual ("FILTERTYPE", 1.0f);
+                setParameterActual ("FILTER2TYPE", 2.0f);
+                setParameterActual ("CUTOFF", 3200.0f);
+                setParameterActual ("CUTOFF2", 7600.0f);
+                setParameterActual ("RESONANCE", 0.42f);
+                setParameterActual ("FILTERENVAMOUNT", 0.52f);
+                setParameterActual ("FILTERBALANCE", 0.34f);
+                setParameterActual ("FXTYPE", 2.0f);
+                setParameterActual ("FXMIX", 0.28f);
+                setParameterActual ("FXINTENSITY", 0.42f);
+                setParameterActual ("DELAYSEND", 0.18f);
+                setParameterActual ("DELAYTIME", 0.44f);
+                setParameterActual ("DELAYFEEDBACK", 0.3f);
+                setParameterActual ("REVERBMIX", 0.12f);
+                break;
+            case 3:
+                setParameterActual ("OSCTYPE", 0.0f);
+                setParameterActual ("OSC2TYPE", 4.0f);
+                setParameterActual ("UNISON", 1.0f);
+                setParameterActual ("DETUNE", 0.02f);
+                setParameterActual ("OSC2SEMITONE", 7.0f);
+                setParameterActual ("OSC2DETUNE", -0.06f);
+                setParameterActual ("OSC2MIX", 0.28f);
+                setParameterActual ("SUBOSCLEVEL", 0.22f);
+                setParameterActual ("NOISELEVEL", 0.08f);
+                setParameterActual ("RINGMOD", 0.0f);
+                setParameterActual ("FMAMOUNT", 44.0f);
+                setParameterActual ("SYNC", 0.1f);
+                setParameterActual ("FILTERTYPE", 0.0f);
+                setParameterActual ("FILTER2TYPE", 1.0f);
+                setParameterActual ("CUTOFF", 980.0f);
+                setParameterActual ("CUTOFF2", 2400.0f);
+                setParameterActual ("RESONANCE", 0.24f);
+                setParameterActual ("FILTERENVAMOUNT", 0.24f);
+                setParameterActual ("FILTERBALANCE", 0.12f);
+                setParameterActual ("FXTYPE", 1.0f);
+                setParameterActual ("FXMIX", 0.14f);
+                setParameterActual ("FXINTENSITY", 0.36f);
+                setParameterActual ("DELAYSEND", 0.06f);
+                setParameterActual ("DELAYTIME", 0.26f);
+                setParameterActual ("DELAYFEEDBACK", 0.18f);
+                setParameterActual ("REVERBMIX", 0.04f);
+                break;
+            default:
+                setParameterActual ("OSCTYPE", 1.0f);
+                setParameterActual ("OSC2TYPE", 2.0f);
+                setParameterActual ("UNISON", 2.0f);
+                setParameterActual ("DETUNE", 0.045f);
+                setParameterActual ("OSC2SEMITONE", 0.0f);
+                setParameterActual ("OSC2DETUNE", 0.08f);
+                setParameterActual ("OSC2MIX", 0.42f);
+                setParameterActual ("SUBOSCLEVEL", 0.18f);
+                setParameterActual ("NOISELEVEL", 0.04f);
+                setParameterActual ("RINGMOD", 0.08f);
+                setParameterActual ("FMAMOUNT", 120.0f);
+                setParameterActual ("SYNC", 0.24f);
+                setParameterActual ("FILTERTYPE", 0.0f);
+                setParameterActual ("FILTER2TYPE", 2.0f);
+                setParameterActual ("CUTOFF", 2200.0f);
+                setParameterActual ("CUTOFF2", 5400.0f);
+                setParameterActual ("RESONANCE", 0.36f);
+                setParameterActual ("FILTERENVAMOUNT", 0.42f);
+                setParameterActual ("FILTERBALANCE", 0.28f);
+                setParameterActual ("AMPATTACK", 0.004f);
+                setParameterActual ("AMPDECAY", 0.28f);
+                setParameterActual ("AMPSUSTAIN", 0.74f);
+                setParameterActual ("AMPRELEASE", 0.36f);
+                setParameterActual ("FILTATTACK", 0.001f);
+                setParameterActual ("FILTDECAY", 0.24f);
+                setParameterActual ("FILTSUSTAIN", 0.42f);
+                setParameterActual ("FILTRELEASE", 0.24f);
+                setParameterActual ("FXTYPE", 3.0f);
+                setParameterActual ("FXMIX", 0.18f);
+                setParameterActual ("FXINTENSITY", 0.32f);
+                setParameterActual ("DELAYSEND", 0.16f);
+                setParameterActual ("DELAYTIME", 0.36f);
+                setParameterActual ("DELAYFEEDBACK", 0.28f);
+                setParameterActual ("REVERBMIX", 0.12f);
+                break;
+        }
+    }
     else if constexpr (buildFlavor() == InstrumentFlavor::drumMachine)
     {
+        setParameterActual ("DRUMMASTERLEVEL", 1.0f);
+        setParameterActual ("DRUM_KICK_ATTACK", 0.72f);
+        setParameterActual ("DRUM_SNARE_TONE", 0.56f);
+        setParameterActual ("DRUM_SNARE_SNAPPY", 0.62f);
+
+        for (size_t index = 0; index < drumVoiceTuneParamIds.size(); ++index)
+            setParameterActual (drumVoiceTuneParamIds[index], drumMachineVoiceTuneDefaults[index]);
+
+        for (size_t index = 0; index < drumVoiceDecayParamIds.size(); ++index)
+            setParameterActual (drumVoiceDecayParamIds[index], drumMachineVoiceDecayDefaults[index]);
+
         for (size_t index = 0; index < drumVoiceLevelParamIds.size(); ++index)
             setParameterActual (drumVoiceLevelParamIds[index], drumMachineVoiceLevelDefaults[index]);
 
         switch (presetIndex)
         {
             case 1:
+                setParameterActual ("DETUNE", 0.0f);
+                setParameterActual ("SYNC", 0.34f);
                 setParameterActual ("FMAMOUNT", 120.0f);
                 setParameterActual ("OSCGATE", 0.34f);
                 setParameterActual ("CUTOFF", 10000.0f);
                 setParameterActual ("FILTERENVAMOUNT", 0.08f);
+                setParameterActual ("DRUM_KICK_ATTACK", 0.78f);
+                setParameterActual ("DRUM_SNARE_SNAPPY", 0.58f);
+                setParameterActual ("DRUMDECAY_CLOSED_HAT", 0.26f);
+                setParameterActual ("DRUMDECAY_OPEN_HAT", 0.52f);
                 break;
             case 2:
+                setParameterActual ("DETUNE", 0.0f);
+                setParameterActual ("SYNC", 0.22f);
                 setParameterActual ("FMAMOUNT", 90.0f);
                 setParameterActual ("OSCGATE", 0.52f);
                 setParameterActual ("CUTOFF", 7600.0f);
                 setParameterActual ("FILTERENVAMOUNT", 0.18f);
+                setParameterActual ("DRUM_SNARE_TONE", 0.42f);
+                setParameterActual ("DRUM_SNARE_SNAPPY", 0.78f);
+                setParameterActual ("DRUMDECAY_KICK", 0.6f);
+                setParameterActual ("DRUMDECAY_OPEN_HAT", 0.68f);
                 break;
             default:
+                setParameterActual ("DETUNE", 0.0f);
+                setParameterActual ("SYNC", 0.28f);
                 setParameterActual ("FMAMOUNT", 150.0f);
                 setParameterActual ("OSCGATE", 0.42f);
                 setParameterActual ("CUTOFF", 14000.0f);
@@ -1908,24 +2707,47 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
     }
     else if constexpr (buildFlavor() == InstrumentFlavor::drum808)
     {
+        setParameterActual ("DRUMMASTERLEVEL", 1.0f);
+        setParameterActual ("DRUM_KICK_ATTACK", 0.34f);
+        setParameterActual ("DRUM_SNARE_TONE", 0.48f);
+        setParameterActual ("DRUM_SNARE_SNAPPY", 0.54f);
+
+        for (size_t index = 0; index < drumVoiceTuneParamIds.size(); ++index)
+            setParameterActual (drumVoiceTuneParamIds[index], drum808VoiceTuneDefaults[index]);
+
+        for (size_t index = 0; index < drumVoiceDecayParamIds.size(); ++index)
+            setParameterActual (drumVoiceDecayParamIds[index], drum808VoiceDecayDefaults[index]);
+
         for (size_t index = 0; index < drumVoiceLevelParamIds.size(); ++index)
             setParameterActual (drumVoiceLevelParamIds[index], drum808VoiceLevelDefaults[index]);
 
         switch (presetIndex)
         {
             case 1:
+                setParameterActual ("DETUNE", -1.5f);
+                setParameterActual ("SYNC", 0.06f);
                 setParameterActual ("FMAMOUNT", 70.0f);
                 setParameterActual ("OSCGATE", 1.35f);
                 setParameterActual ("CUTOFF", 8400.0f);
                 setParameterActual ("FILTERENVAMOUNT", 0.04f);
+                setParameterActual ("DRUMDECAY_KICK", 0.82f);
+                setParameterActual ("DRUMDECAY_OPEN_HAT", 0.86f);
+                setParameterActual ("DRUM_KICK_ATTACK", 0.26f);
                 break;
             case 2:
+                setParameterActual ("DETUNE", 0.8f);
+                setParameterActual ("SYNC", 0.12f);
                 setParameterActual ("FMAMOUNT", 120.0f);
                 setParameterActual ("OSCGATE", 0.75f);
                 setParameterActual ("CUTOFF", 11200.0f);
                 setParameterActual ("FILTERENVAMOUNT", 0.08f);
+                setParameterActual ("DRUM_SNARE_TONE", 0.58f);
+                setParameterActual ("DRUM_SNARE_SNAPPY", 0.66f);
+                setParameterActual ("DRUMTUNE_CRASH", 1.5f);
                 break;
             default:
+                setParameterActual ("DETUNE", 0.0f);
+                setParameterActual ("SYNC", 0.08f);
                 setParameterActual ("FMAMOUNT", 90.0f);
                 setParameterActual ("OSCGATE", 0.95f);
                 setParameterActual ("CUTOFF", 9200.0f);
@@ -1974,6 +2796,14 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
                 setParameterActual ("FILTERENVAMOUNT", 0.26f);
                 break;
         }
+    }
+
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+    {
+        setParameterActual ("OSC3ENABLE", paramValue (apvts, "SUBOSCLEVEL") > 0.0001f ? 1.0f : 0.0f);
+        setParameterActual ("RINGMODENABLE", paramValue (apvts, "RINGMOD") > 0.0001f ? 1.0f : 0.0f);
+        setParameterActual ("FMENABLE", paramValue (apvts, "FMAMOUNT") > 0.0001f ? 1.0f : 0.0f);
+        setParameterActual ("SYNCENABLE", paramValue (apvts, "SYNC") > 0.0001f ? 1.0f : 0.0f);
     }
 
     updateRenderParameters();

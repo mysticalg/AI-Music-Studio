@@ -448,6 +448,7 @@ public:
                 || command == "set_graph_slot_mix"
                 || command == "set_graph_transport_state"
                 || command == "set_graph_slot_parameters"
+                || command == "load_graph_slot_state"
                 || command == "queue_audio" || command == "clear_audio_queue"
                 || command == "start_audio_stream")
             {
@@ -498,14 +499,26 @@ private:
 
     struct PersistentGraphSlot
     {
+        struct GraphEffectSlot
+        {
+            juce::String name;
+            juce::String pluginPath;
+            juce::String statePath;
+            juce::String parameterSignature;
+            std::unique_ptr<juce::AudioPluginInstance> plugin;
+        };
+
         juce::String name;
         juce::String pluginPath;
         juce::String statePath;
         juce::String parameterSignature;
+        juce::String fxChainSignature;
         std::unique_ptr<juce::AudioPluginInstance> plugin;
+        std::vector<GraphEffectSlot> fxChain;
         juce::Array<ScheduledMidiEvent> scheduledEvents;
         float gain = 1.0f;
         float pan = 0.0f;
+        float peakLevel = 0.0f;
     };
 
     struct OfflineGraphTrack
@@ -673,6 +686,11 @@ private:
 
         if (command == "start_graph_transport")
         {
+            {
+                juce::ScopedLock lock(pluginLock);
+                for (auto& slot : persistentGraphSlots)
+                    resetPersistentGraphSlotProcessingState(slot);
+            }
             graphTransportEnabled.store(true);
             auto response = makeResponse(true, "Graph transport started");
             appendStatusFields(response);
@@ -694,7 +712,7 @@ private:
                     slot.scheduledEvents.clear();
                     if (sendPanic)
                         panicPersistentGraphSlot(slot, 0);
-                    slot.plugin->reset();
+                    resetPersistentGraphSlotProcessingState(slot);
                 }
             }
             auto response = makeResponse(true, "Graph transport stopped");
@@ -857,10 +875,79 @@ private:
                 }
             }
 
-            slot.parameterSignature = parameterPayloadSignature(object->getProperty("parameters"));
+            const auto parameterSignature = object->hasProperty("parameter_signature")
+                ? object->getProperty("parameter_signature").toString().trim()
+                : parameterPayloadSignature(object->getProperty("parameters"));
+            slot.parameterSignature = parameterSignature;
             auto response = makeResponse(true, "Graph slot parameters updated");
             appendStatusFields(response);
             setResponseField(response, "graph_editor_slot", slotIndex);
+            setResponseField(response, "applied_parameter_count", appliedCount);
+            if (!unmatchedParameters.isEmpty())
+            {
+                juce::Array<juce::var> unmatched;
+                for (const auto& name : unmatchedParameters)
+                    unmatched.add(name);
+                setResponseField(response, "unmatched_parameters", juce::var(unmatched));
+            }
+            return response;
+        }
+
+        if (command == "load_graph_slot_state")
+        {
+            const auto slotIndex = static_cast<int>(object->hasProperty("slot_index")
+                ? object->getProperty("slot_index")
+                : juce::var(-1));
+            if (!juce::isPositiveAndBelow(slotIndex, static_cast<int>(persistentGraphSlots.size())))
+                return makeResponse(false, "Graph slot not loaded");
+
+            auto& slot = persistentGraphSlots[static_cast<size_t>(slotIndex)];
+            if (slot.plugin == nullptr)
+                return makeResponse(false, "Graph slot not loaded");
+
+            const auto path = object->getProperty("path").toString().trim();
+            if (path.isEmpty())
+                return makeResponse(false, "Missing state path");
+
+            const auto stateFile = juce::File(path);
+            if (!stateFile.existsAsFile())
+                return makeResponse(false, "State file not found");
+
+            juce::String error;
+            int appliedCount = 0;
+            juce::StringArray unmatchedParameters;
+            {
+                juce::ScopedLock lock(pluginLock);
+                clearPersistentGraphScheduledEvents(slot, 0);
+                panicPersistentGraphSlot(slot, 0);
+                resetPersistentGraphSlotProcessingState(slot);
+                if (!loadPluginStateIntoInstance(*slot.plugin, stateFile))
+                    return makeResponse(false, "Could not load graph slot state");
+
+                if (object->hasProperty("parameters") && object->getProperty("parameters").isObject())
+                {
+                    if (!applyRequestedParameterValuesToPlugin(
+                            *slot.plugin,
+                            object->getProperty("parameters"),
+                            error,
+                            appliedCount,
+                            unmatchedParameters))
+                    {
+                        return makeResponse(false, error.isNotEmpty() ? error : "Could not update graph slot parameters");
+                    }
+                    const auto parameterSignature = object->hasProperty("parameter_signature")
+                        ? object->getProperty("parameter_signature").toString().trim()
+                        : parameterPayloadSignature(object->getProperty("parameters"));
+                    slot.parameterSignature = parameterSignature;
+                }
+
+                slot.statePath = stateFile.getFullPathName();
+            }
+
+            auto response = makeResponse(true, "Graph slot state loaded");
+            appendStatusFields(response);
+            setResponseField(response, "graph_editor_slot", slotIndex);
+            setResponseField(response, "state_path", stateFile.getFullPathName());
             setResponseField(response, "applied_parameter_count", appliedCount);
             if (!unmatchedParameters.isEmpty())
             {
@@ -1268,9 +1355,11 @@ private:
         juce::Array<juce::var> availableAudioSampleRates;
         juce::Array<juce::var> availableAudioBufferSizes;
         juce::Array<juce::var> graphSlots;
+        float currentPluginOutputPeakLevel = 0.0f;
 
         {
             juce::ScopedLock lock(pluginLock);
+            currentPluginOutputPeakLevel = pluginOutputPeakLevel;
             if (pluginInstance != nullptr)
             {
                 pluginIsInstrument = pluginDescription.isInstrument
@@ -1309,6 +1398,8 @@ private:
                 slotObject->setProperty("state_path", slot.statePath);
                 slotObject->setProperty("gain", slot.gain);
                 slotObject->setProperty("pan", slot.pan);
+                slotObject->setProperty("peak_level", slot.peakLevel);
+                slotObject->setProperty("fx_count", static_cast<int>(slot.fxChain.size()));
                 graphSlots.add(juce::var(slotObject));
             }
         }
@@ -1351,6 +1442,7 @@ private:
         setResponseField(response, "bridge_mode", bridgeMode);
         setResponseField(response, "plugin_output_gain", pluginOutputGain.load());
         setResponseField(response, "plugin_output_pan", pluginOutputPan.load());
+        setResponseField(response, "plugin_output_peak_level", currentPluginOutputPeakLevel);
         setResponseField(response, "graph_slot_count", static_cast<int>(graphSlots.size()));
         setResponseField(response, "graph_slots", juce::var(graphSlots));
         setResponseField(response, "graph_editor_open", graphEditorWindow != nullptr);
@@ -1836,6 +1928,11 @@ private:
                 appendScheduledMidiMessages(midi, numSamples);
                 plugin->processBlock(buffer, midi);
                 applyPluginOutputMix(buffer);
+                pluginOutputPeakLevel = peakLevelForBuffer(buffer);
+            }
+            else
+            {
+                pluginOutputPeakLevel = 0.0f;
             }
             if (graphTransportEnabled.load())
                 processPersistentPluginGraphTransport(buffer, numSamples, renderedSampleFrames.load());
@@ -1869,6 +1966,69 @@ private:
             buffer.applyGain(1, 0, buffer.getNumSamples(), rightGain);
         for (int channel = 2; channel < buffer.getNumChannels(); ++channel)
             buffer.applyGain(channel, 0, buffer.getNumSamples(), gain);
+    }
+
+    static float peakLevelForBuffer(const juce::AudioBuffer<float>& buffer)
+    {
+        float peak = 0.0f;
+        for (int channel = 0; channel < buffer.getNumChannels(); ++channel)
+        {
+            const auto* data = buffer.getReadPointer(channel);
+            for (int sample = 0; sample < buffer.getNumSamples(); ++sample)
+                peak = juce::jmax(peak, std::abs(data[sample]));
+        }
+        return juce::jlimit(0.0f, 1.0f, peak);
+    }
+
+    static void copyStereoBufferToPluginInput(
+        juce::AudioPluginInstance& plugin,
+        juce::AudioBuffer<float>& processBuffer,
+        const juce::AudioBuffer<float>& inputBuffer
+    )
+    {
+        if (plugin.getBusCount(true) > 0)
+        {
+            auto inputBus = plugin.getBusBuffer(processBuffer, true, 0);
+            for (int channel = 0; channel < inputBus.getNumChannels(); ++channel)
+            {
+                const auto sourceChannel = channel < inputBuffer.getNumChannels() ? channel : 0;
+                inputBus.copyFrom(channel, 0, inputBuffer, sourceChannel, 0, inputBuffer.getNumSamples());
+            }
+            return;
+        }
+
+        for (int channel = 0; channel < processBuffer.getNumChannels(); ++channel)
+        {
+            const auto sourceChannel = channel < inputBuffer.getNumChannels() ? channel : 0;
+            processBuffer.copyFrom(channel, 0, inputBuffer, sourceChannel, 0, inputBuffer.getNumSamples());
+        }
+    }
+
+    static void extractPluginOutputToStereo(
+        juce::AudioPluginInstance& plugin,
+        juce::AudioBuffer<float>& processBuffer,
+        juce::AudioBuffer<float>& stereoBuffer
+    )
+    {
+        stereoBuffer.clear();
+        if (plugin.getBusCount(false) > 0)
+        {
+            auto outputBus = plugin.getBusBuffer(processBuffer, false, 0);
+            if (outputBus.getNumChannels() > 0)
+            {
+                const auto leftChannel = 0;
+                const auto rightChannel = outputBus.getNumChannels() > 1 ? 1 : 0;
+                stereoBuffer.copyFrom(0, 0, outputBus, leftChannel, 0, stereoBuffer.getNumSamples());
+                stereoBuffer.copyFrom(1, 0, outputBus, rightChannel, 0, stereoBuffer.getNumSamples());
+            }
+            return;
+        }
+
+        if (processBuffer.getNumChannels() <= 0)
+            return;
+        const auto rightChannel = processBuffer.getNumChannels() > 1 ? 1 : 0;
+        stereoBuffer.copyFrom(0, 0, processBuffer, 0, 0, stereoBuffer.getNumSamples());
+        stereoBuffer.copyFrom(1, 0, processBuffer, rightChannel, 0, stereoBuffer.getNumSamples());
     }
 
     void enqueueMidiMessage(const juce::MidiMessage& message)
@@ -2624,7 +2784,82 @@ private:
         return entries.joinIntoString("|");
     }
 
-    void releasePersistentGraphSlot(PersistentGraphSlot& slot)
+    static juce::String graphEffectChainPayloadSignature(const juce::var& fxChainVar)
+    {
+        auto* fxArray = fxChainVar.getArray();
+        if (fxArray == nullptr || fxArray->isEmpty())
+            return {};
+
+        juce::StringArray entries;
+        entries.ensureStorageAllocated(fxArray->size());
+        for (const auto& fxVar : *fxArray)
+        {
+            auto* fxObject = fxVar.getDynamicObject();
+            if (fxObject == nullptr)
+                continue;
+            const auto pluginPath = normaliseVst3PathForSettings(
+                fxObject->getProperty("plugin_path").toString().trim()
+            );
+            const auto statePath = fxObject->getProperty("state_path").toString().trim();
+            const auto parameterSignature = parameterPayloadSignature(fxObject->getProperty("parameters"));
+            entries.add(pluginPath + "|" + statePath + "|" + parameterSignature);
+        }
+        return entries.joinIntoString(">");
+    }
+
+    std::unique_ptr<juce::AudioPluginInstance> createPreparedGraphPluginInstance(
+        const juce::String& pluginPath,
+        const juce::String& statePath,
+        const juce::var& parametersVar,
+        juce::String& error
+    )
+    {
+        const juce::File pluginFile(pluginPath);
+        auto descriptions = describePlugin(pluginFile);
+        if (descriptions.isEmpty())
+        {
+            error = "No loadable VST3 plugin description found";
+            return {};
+        }
+
+        juce::String createError;
+        auto instance = formatManager.createPluginInstance(*descriptions[0], currentSampleRate, currentBlockSize, createError);
+        if (instance == nullptr)
+        {
+            error = createError.isNotEmpty() ? createError : "Could not create plugin instance";
+            return {};
+        }
+
+        instance->disableNonMainBuses();
+        instance->setRateAndBufferSizeDetails(currentSampleRate, currentBlockSize);
+        instance->prepareToPlay(currentSampleRate, currentBlockSize);
+        instance->suspendProcessing(false);
+
+        if (statePath.isNotEmpty())
+        {
+            const auto stateFile = juce::File(statePath);
+            if (stateFile.existsAsFile())
+                loadPluginStateIntoInstance(*instance, stateFile);
+        }
+
+        if (parametersVar.isObject())
+        {
+            juce::String parameterError;
+            int appliedParameterCount = 0;
+            juce::StringArray unmatchedParameters;
+            applyRequestedParameterValuesToPlugin(
+                *instance,
+                parametersVar,
+                parameterError,
+                appliedParameterCount,
+                unmatchedParameters
+            );
+        }
+
+        return instance;
+    }
+
+    void releasePersistentGraphEffectSlot(PersistentGraphSlot::GraphEffectSlot& slot)
     {
         if (slot.plugin != nullptr)
         {
@@ -2636,9 +2871,28 @@ private:
         slot.pluginPath.clear();
         slot.statePath.clear();
         slot.parameterSignature.clear();
+    }
+
+    void releasePersistentGraphSlot(PersistentGraphSlot& slot)
+    {
+        if (slot.plugin != nullptr)
+        {
+            slot.plugin->suspendProcessing(true);
+            slot.plugin->releaseResources();
+        }
+        for (auto& effectSlot : slot.fxChain)
+            releasePersistentGraphEffectSlot(effectSlot);
+        slot.plugin.reset();
+        slot.fxChain.clear();
+        slot.name.clear();
+        slot.pluginPath.clear();
+        slot.statePath.clear();
+        slot.parameterSignature.clear();
+        slot.fxChainSignature.clear();
         slot.scheduledEvents.clear();
         slot.gain = 1.0f;
         slot.pan = 0.0f;
+        slot.peakLevel = 0.0f;
     }
 
     void clearPersistentPluginGraph()
@@ -2928,6 +3182,121 @@ private:
         return true;
     }
 
+    bool configurePersistentGraphEffectChain(
+        PersistentGraphSlot& slot,
+        const juce::var& fxChainVar,
+        int trackIndex,
+        juce::Array<juce::var>& trackErrors
+    )
+    {
+        for (auto& effectSlot : slot.fxChain)
+            releasePersistentGraphEffectSlot(effectSlot);
+        slot.fxChain.clear();
+
+        auto* fxArray = fxChainVar.getArray();
+        if (fxArray == nullptr || fxArray->isEmpty())
+            return true;
+
+        slot.fxChain.reserve(static_cast<size_t>(fxArray->size()));
+        for (int fxIndex = 0; fxIndex < fxArray->size(); ++fxIndex)
+        {
+            auto* fxObject = fxArray->getReference(fxIndex).getDynamicObject();
+            if (fxObject == nullptr)
+            {
+                auto* errorObject = new juce::DynamicObject();
+                errorObject->setProperty("track_index", trackIndex);
+                errorObject->setProperty("fx_index", fxIndex);
+                errorObject->setProperty("message", "FX payload must be an object");
+                trackErrors.add(juce::var(errorObject));
+                continue;
+            }
+
+            const auto pluginPath = normaliseVst3PathForSettings(
+                fxObject->getProperty("plugin_path").toString().trim()
+            );
+            const auto statePath = fxObject->getProperty("state_path").toString().trim();
+            const auto parameterSignature = parameterPayloadSignature(fxObject->getProperty("parameters"));
+            const auto name = fxObject->hasProperty("name")
+                ? fxObject->getProperty("name").toString().trim()
+                : juce::String();
+
+            if (pluginPath.isEmpty())
+            {
+                auto* errorObject = new juce::DynamicObject();
+                errorObject->setProperty("track_index", trackIndex);
+                errorObject->setProperty("fx_index", fxIndex);
+                errorObject->setProperty("message", "Missing FX plugin path");
+                trackErrors.add(juce::var(errorObject));
+                continue;
+            }
+
+            juce::String createError;
+            auto instance = createPreparedGraphPluginInstance(
+                pluginPath,
+                statePath,
+                fxObject->getProperty("parameters"),
+                createError
+            );
+            if (instance == nullptr)
+            {
+                auto* errorObject = new juce::DynamicObject();
+                errorObject->setProperty("track_index", trackIndex);
+                errorObject->setProperty("fx_index", fxIndex);
+                errorObject->setProperty("plugin_path", pluginPath);
+                errorObject->setProperty("message", createError.isNotEmpty() ? createError : "Could not create FX instance");
+                trackErrors.add(juce::var(errorObject));
+                continue;
+            }
+
+            PersistentGraphSlot::GraphEffectSlot effectSlot;
+            effectSlot.name = name.isNotEmpty() ? name : juce::File(pluginPath).getFileNameWithoutExtension();
+            effectSlot.pluginPath = pluginPath;
+            effectSlot.statePath = statePath;
+            effectSlot.parameterSignature = parameterSignature;
+            effectSlot.plugin = std::move(instance);
+            slot.fxChain.push_back(std::move(effectSlot));
+        }
+
+        return true;
+    }
+
+    void resetPersistentGraphSlotProcessingState(PersistentGraphSlot& slot)
+    {
+        if (slot.plugin != nullptr)
+            slot.plugin->reset();
+        for (auto& effectSlot : slot.fxChain)
+        {
+            if (effectSlot.plugin != nullptr)
+                effectSlot.plugin->reset();
+        }
+        slot.peakLevel = 0.0f;
+    }
+
+    void processPersistentGraphEffectChain(PersistentGraphSlot& slot, juce::AudioBuffer<float>& stereoBuffer)
+    {
+        if (slot.fxChain.empty() || stereoBuffer.getNumSamples() <= 0)
+            return;
+
+        for (auto& effectSlot : slot.fxChain)
+        {
+            auto* plugin = effectSlot.plugin.get();
+            if (plugin == nullptr)
+                continue;
+
+            const auto channelCount = juce::jmax(
+                2,
+                juce::jmax(plugin->getTotalNumInputChannels(), plugin->getTotalNumOutputChannels())
+            );
+            juce::AudioBuffer<float> processBuffer(channelCount, stereoBuffer.getNumSamples());
+            processBuffer.clear();
+            copyStereoBufferToPluginInput(*plugin, processBuffer, stereoBuffer);
+
+            juce::MidiBuffer midi;
+            plugin->processBlock(processBuffer, midi);
+            extractPluginOutputToStereo(*plugin, processBuffer, stereoBuffer);
+        }
+    }
+
     void preparePersistentPluginGraphForPlayback()
     {
         for (auto& slot : persistentGraphSlots)
@@ -2937,6 +3306,15 @@ private:
             slot.plugin->setRateAndBufferSizeDetails(currentSampleRate, currentBlockSize);
             slot.plugin->prepareToPlay(currentSampleRate, currentBlockSize);
             slot.plugin->suspendProcessing(false);
+            for (auto& effectSlot : slot.fxChain)
+            {
+                if (effectSlot.plugin == nullptr)
+                    continue;
+                effectSlot.plugin->setRateAndBufferSizeDetails(currentSampleRate, currentBlockSize);
+                effectSlot.plugin->prepareToPlay(currentSampleRate, currentBlockSize);
+                effectSlot.plugin->suspendProcessing(false);
+            }
+            resetPersistentGraphSlotProcessingState(slot);
         }
     }
 
@@ -2948,6 +3326,13 @@ private:
                 continue;
             slot.plugin->suspendProcessing(true);
             slot.plugin->releaseResources();
+            for (auto& effectSlot : slot.fxChain)
+            {
+                if (effectSlot.plugin == nullptr)
+                    continue;
+                effectSlot.plugin->suspendProcessing(true);
+                effectSlot.plugin->releaseResources();
+            }
         }
     }
 
@@ -2993,6 +3378,7 @@ private:
             const auto pluginPath = normaliseVst3PathForSettings(trackObject->getProperty("plugin_path").toString().trim());
             const auto statePath = trackObject->getProperty("state_path").toString().trim();
             const auto parameterSignature = parameterPayloadSignature(trackObject->getProperty("parameters"));
+            const auto fxChainSignature = graphEffectChainPayloadSignature(trackObject->getProperty("fx_chain"));
             const auto name = trackObject->hasProperty("name")
                 ? trackObject->getProperty("name").toString().trim()
                 : juce::String();
@@ -3016,13 +3402,15 @@ private:
             const auto canReuse = slot.plugin != nullptr
                 && slot.pluginPath == pluginPath
                 && slot.statePath == statePath
-                && slot.parameterSignature == parameterSignature;
+                && slot.parameterSignature == parameterSignature
+                && slot.fxChainSignature == fxChainSignature;
             if (canReuse)
             {
                 slot.name = name.isNotEmpty() ? name : juce::File(pluginPath).getFileNameWithoutExtension();
                 slot.scheduledEvents.clear();
                 slot.gain = gain;
                 slot.pan = pan;
+                slot.peakLevel = 0.0f;
                 ++loadedCount;
                 continue;
             }
@@ -3031,20 +3419,13 @@ private:
                 closeGraphEditorWindow();
             releasePersistentGraphSlot(slot);
 
-            const juce::File pluginFile(pluginPath);
-            auto descriptions = describePlugin(pluginFile);
-            if (descriptions.isEmpty())
-            {
-                auto* errorObject = new juce::DynamicObject();
-                errorObject->setProperty("track_index", index);
-                errorObject->setProperty("plugin_path", pluginPath);
-                errorObject->setProperty("message", "No loadable VST3 plugin description found");
-                trackErrors.add(juce::var(errorObject));
-                continue;
-            }
-
             juce::String createError;
-            auto instance = formatManager.createPluginInstance(*descriptions[0], currentSampleRate, currentBlockSize, createError);
+            auto instance = createPreparedGraphPluginInstance(
+                pluginPath,
+                statePath,
+                trackObject->getProperty("parameters"),
+                createError
+            );
             if (instance == nullptr)
             {
                 auto* errorObject = new juce::DynamicObject();
@@ -3055,40 +3436,17 @@ private:
                 continue;
             }
 
-            instance->disableNonMainBuses();
-            instance->setRateAndBufferSizeDetails(currentSampleRate, currentBlockSize);
-            instance->prepareToPlay(currentSampleRate, currentBlockSize);
-            instance->suspendProcessing(false);
-
-            if (statePath.isNotEmpty())
-            {
-                const auto stateFile = juce::File(statePath);
-                if (stateFile.existsAsFile())
-                    loadPluginStateIntoInstance(*instance, stateFile);
-            }
-
-            if (trackObject->hasProperty("parameters"))
-            {
-                juce::String parameterError;
-                int appliedParameterCount = 0;
-                juce::StringArray unmatchedParameters;
-                applyRequestedParameterValuesToPlugin(
-                    *instance,
-                    trackObject->getProperty("parameters"),
-                    parameterError,
-                    appliedParameterCount,
-                    unmatchedParameters
-                );
-            }
-
-            slot.name = name.isNotEmpty() ? name : pluginFile.getFileNameWithoutExtension();
+            slot.name = name.isNotEmpty() ? name : juce::File(pluginPath).getFileNameWithoutExtension();
             slot.pluginPath = pluginPath;
             slot.statePath = statePath;
             slot.parameterSignature = parameterSignature;
+            slot.fxChainSignature = fxChainSignature;
             slot.plugin = std::move(instance);
+            configurePersistentGraphEffectChain(slot, trackObject->getProperty("fx_chain"), index, trackErrors);
             slot.scheduledEvents.clear();
             slot.gain = gain;
             slot.pan = pan;
+            slot.peakLevel = 0.0f;
             ++loadedCount;
         }
 
@@ -3258,6 +3616,7 @@ private:
             }
         }
 
+        pluginOutputPeakLevel = peakLevelForBuffer(mainBusBuffer);
         setResponseField(response, "audio_b64", encodeInterleavedBusAudio(mainBusBuffer));
         setResponseField(response, "channels", 2);
         setResponseField(response, "format", "f32le-interleaved");
@@ -3422,32 +3781,10 @@ private:
                 plugin->processBlock(processBuffer, midi);
 
                 juce::AudioBuffer<float> stereoBuffer(2, blockSamples);
-                stereoBuffer.clear();
-                if (plugin->getBusCount(false) > 0)
-                {
-                    auto busBuffer = plugin->getBusBuffer(processBuffer, false, 0);
-                    if (busBuffer.getNumChannels() > 0)
-                    {
-                        const auto leftChannel = 0;
-                        const auto rightChannel = busBuffer.getNumChannels() > 1 ? 1 : 0;
-                        for (int sample = 0; sample < blockSamples; ++sample)
-                        {
-                            stereoBuffer.setSample(0, sample, busBuffer.getSample(leftChannel, sample));
-                            stereoBuffer.setSample(1, sample, busBuffer.getSample(rightChannel, sample));
-                        }
-                    }
-                }
-                else
-                {
-                    const auto rightChannel = processBuffer.getNumChannels() > 1 ? 1 : 0;
-                    for (int sample = 0; sample < blockSamples; ++sample)
-                    {
-                        stereoBuffer.setSample(0, sample, processBuffer.getSample(0, sample));
-                        stereoBuffer.setSample(1, sample, processBuffer.getSample(rightChannel, sample));
-                    }
-                }
-
+                extractPluginOutputToStereo(*plugin, processBuffer, stereoBuffer);
+                processPersistentGraphEffectChain(*graphTrack.slot, stereoBuffer);
                 applyOutputMixToBuffer(stereoBuffer, graphTrack.gain, graphTrack.pan);
+                graphTrack.slot->peakLevel = peakLevelForBuffer(stereoBuffer);
                 mixBuffer.addFrom(0, blockStart, stereoBuffer, 0, 0, blockSamples);
                 mixBuffer.addFrom(1, blockStart, stereoBuffer, 1, 0, blockSamples);
             }
@@ -3487,32 +3824,10 @@ private:
             plugin->processBlock(processBuffer, midi);
 
             juce::AudioBuffer<float> stereoBuffer(2, numSamples);
-            stereoBuffer.clear();
-            if (plugin->getBusCount(false) > 0)
-            {
-                auto busBuffer = plugin->getBusBuffer(processBuffer, false, 0);
-                if (busBuffer.getNumChannels() > 0)
-                {
-                    const auto leftChannel = 0;
-                    const auto rightChannel = busBuffer.getNumChannels() > 1 ? 1 : 0;
-                    for (int sample = 0; sample < numSamples; ++sample)
-                    {
-                        stereoBuffer.setSample(0, sample, busBuffer.getSample(leftChannel, sample));
-                        stereoBuffer.setSample(1, sample, busBuffer.getSample(rightChannel, sample));
-                    }
-                }
-            }
-            else
-            {
-                const auto rightChannel = processBuffer.getNumChannels() > 1 ? 1 : 0;
-                for (int sample = 0; sample < numSamples; ++sample)
-                {
-                    stereoBuffer.setSample(0, sample, processBuffer.getSample(0, sample));
-                    stereoBuffer.setSample(1, sample, processBuffer.getSample(rightChannel, sample));
-                }
-            }
-
+            extractPluginOutputToStereo(*plugin, processBuffer, stereoBuffer);
+            processPersistentGraphEffectChain(slot, stereoBuffer);
             applyOutputMixToBuffer(stereoBuffer, slot.gain, slot.pan);
+            slot.peakLevel = peakLevelForBuffer(stereoBuffer);
             buffer.addFrom(0, 0, stereoBuffer, 0, 0, numSamples);
             buffer.addFrom(1, 0, stereoBuffer, 1, 0, numSamples);
         }
@@ -3683,6 +3998,7 @@ private:
 
     double currentSampleRate = 44100.0;
     int currentBlockSize = 512;
+    float pluginOutputPeakLevel = 0.0f;
 };
 
 HostCommandServer::HostCommandServer(HostComponent& ownerIn, int requestedPortIn)
