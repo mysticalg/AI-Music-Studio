@@ -450,7 +450,10 @@ public:
                 || command == "set_graph_slot_parameters"
                 || command == "load_graph_slot_state"
                 || command == "queue_audio" || command == "clear_audio_queue"
-                || command == "start_audio_stream")
+                || command == "start_audio_stream"
+                || command == "set_transport_notes"
+                || command == "start_inprocess_transport"
+                || command == "stop_inprocess_transport")
             {
                 const auto result = handleRemoteCommand(request);
                 return juce::JSON::toString(result, true);
@@ -485,6 +488,127 @@ private:
         int64_t sequence = 0;
         int64_t loopEpoch = 0;
         juce::MidiMessage message;
+    };
+
+    // In-process transport: the host owns the note list and generates MIDI
+    // sample-accurately inside the audio callback, eliminating IPC drift.
+    struct TransportNote
+    {
+        int startTick = 0;
+        int endTick = 0;
+        int pitch = 60;
+        int velocity = 100;
+        int channel = 1;
+    };
+
+    struct InProcessTransport
+    {
+        std::vector<TransportNote> notes;
+        double bpm = 120.0;
+        int ticksPerBeat = 480;
+        int64_t positionFrame = 0;      // current playback position in samples
+        int64_t loopStartTick = 0;
+        int64_t loopEndTick = 0;
+        bool loopEnabled = false;
+        bool running = false;
+
+        // Convert tick to sample frame (floor division, matching Python side)
+        int64_t tickToFrame(int64_t tick, double sampleRate) const
+        {
+            return static_cast<int64_t>(
+                (static_cast<double>(tick) * sampleRate * 60.0)
+                / (bpm * static_cast<double>(ticksPerBeat))
+            );
+        }
+
+        // Convert sample frame to tick (floor)
+        int64_t frameToTick(int64_t frame, double sampleRate) const
+        {
+            return static_cast<int64_t>(
+                (static_cast<double>(frame) * bpm * static_cast<double>(ticksPerBeat))
+                / (sampleRate * 60.0)
+            );
+        }
+
+        // Generate MIDI events for a block [blockStartFrame, blockStartFrame + numSamples)
+        void generateMidi(juce::MidiBuffer& midi, int numSamples, double sampleRate)
+        {
+            if (!running || notes.empty())
+                return;
+
+            const auto blockStart = positionFrame;
+            const auto blockEnd = positionFrame + numSamples;
+
+            // Convert block boundaries to ticks for note matching
+            const auto loopLenTick = (loopEnabled && loopEndTick > loopStartTick)
+                ? (loopEndTick - loopStartTick) : int64_t(0);
+            const auto loopLenFrame = loopLenTick > 0
+                ? tickToFrame(loopLenTick, sampleRate) : int64_t(0);
+
+            for (const auto& note : notes)
+            {
+                const auto noteStartFrame = tickToFrame(note.startTick, sampleRate);
+                auto noteEndFrame = tickToFrame(note.endTick, sampleRate);
+                // Small note-off advance to avoid collision with next note-on
+                const auto noteOffAdvance = juce::jmax<int64_t>(1, static_cast<int64_t>(sampleRate) / 1000);
+                noteEndFrame = juce::jmax(noteStartFrame + 1, noteEndFrame - noteOffAdvance);
+
+                // Clamp note end at loop boundary
+                int64_t loopEndFrame = loopLenFrame > 0 ? tickToFrame(loopEndTick, sampleRate) : int64_t(0);
+                if (loopLenFrame > 0 && noteStartFrame < loopEndFrame && noteEndFrame > loopEndFrame)
+                    noteEndFrame = loopEndFrame;
+
+                // Check if this note falls within the current block,
+                // accounting for the logical position within the loop
+                auto checkNote = [&](int64_t logicalOffset)
+                {
+                    const auto adjStart = noteStartFrame + logicalOffset;
+                    const auto adjEnd = noteEndFrame + logicalOffset;
+
+                    if (adjStart >= blockStart && adjStart < blockEnd)
+                    {
+                        const auto samplePos = static_cast<int>(adjStart - blockStart);
+                        midi.addEvent(
+                            juce::MidiMessage::noteOn(note.channel, note.pitch,
+                                static_cast<float>(note.velocity) / 127.0f),
+                            samplePos);
+                    }
+                    if (adjEnd >= blockStart && adjEnd < blockEnd)
+                    {
+                        const auto samplePos = static_cast<int>(adjEnd - blockStart);
+                        midi.addEvent(
+                            juce::MidiMessage::noteOff(note.channel, note.pitch, 0.0f),
+                            samplePos);
+                    }
+                };
+
+                if (loopLenFrame > 0)
+                {
+                    // Find which loop iterations overlap this block
+                    const auto loopStartFrame = tickToFrame(loopStartTick, sampleRate);
+                    const auto firstIter = juce::jmax<int64_t>(0, (blockStart - loopEndFrame + loopLenFrame) / loopLenFrame);
+                    const auto lastIter = juce::jmax<int64_t>(0, (blockEnd - loopStartFrame) / loopLenFrame) + 1;
+                    for (auto iter = firstIter; iter <= lastIter; ++iter)
+                        checkNote(iter * loopLenFrame);
+                }
+                else
+                {
+                    checkNote(0);
+                }
+            }
+
+            positionFrame += numSamples;
+
+            // Wrap position for looping
+            if (loopLenFrame > 0)
+            {
+                const auto loopStartFrame = tickToFrame(loopStartTick, sampleRate);
+                while (positionFrame >= tickToFrame(loopEndTick, sampleRate))
+                    positionFrame -= loopLenFrame;
+                if (positionFrame < loopStartFrame)
+                    positionFrame = loopStartFrame;
+            }
+        }
     };
 
     struct BufferedOutputStream
@@ -1150,6 +1274,93 @@ private:
             return response;
         }
 
+        if (command == "set_transport_notes")
+        {
+            const auto bpm = object->hasProperty("bpm")
+                ? static_cast<double>(object->getProperty("bpm")) : 120.0;
+            const auto ticksPerBeat = object->hasProperty("ticks_per_beat")
+                ? static_cast<int>(object->getProperty("ticks_per_beat")) : 480;
+            const auto loopEnabled = object->hasProperty("loop_enabled")
+                ? static_cast<bool>(object->getProperty("loop_enabled")) : false;
+            const auto loopStartTick = object->hasProperty("loop_start_tick")
+                ? static_cast<int64_t>(static_cast<double>(object->getProperty("loop_start_tick"))) : int64_t(0);
+            const auto loopEndTick = object->hasProperty("loop_end_tick")
+                ? static_cast<int64_t>(static_cast<double>(object->getProperty("loop_end_tick"))) : int64_t(0);
+            const auto notesVar = object->getProperty("notes");
+
+            std::vector<TransportNote> notes;
+            if (auto* notesArray = notesVar.getArray())
+            {
+                notes.reserve(static_cast<size_t>(notesArray->size()));
+                for (const auto& noteVar : *notesArray)
+                {
+                    auto* noteObj = noteVar.getDynamicObject();
+                    if (noteObj == nullptr) continue;
+                    TransportNote note;
+                    note.startTick = static_cast<int>(noteObj->getProperty("start_tick"));
+                    note.endTick = static_cast<int>(noteObj->getProperty("end_tick"));
+                    note.pitch = clampMidiNote(static_cast<int>(noteObj->getProperty("pitch")));
+                    note.velocity = juce::jlimit(1, 127, static_cast<int>(noteObj->getProperty("velocity")));
+                    note.channel = clampMidiChannel(
+                        noteObj->hasProperty("channel")
+                            ? static_cast<int>(noteObj->getProperty("channel"))
+                            : kDefaultMidiChannel);
+                    notes.push_back(note);
+                }
+            }
+
+            {
+                juce::ScopedLock lock(pluginLock);
+                inProcessTransport.notes = std::move(notes);
+                inProcessTransport.bpm = juce::jmax(1.0, bpm);
+                inProcessTransport.ticksPerBeat = juce::jmax(1, ticksPerBeat);
+                inProcessTransport.loopEnabled = loopEnabled;
+                inProcessTransport.loopStartTick = loopStartTick;
+                inProcessTransport.loopEndTick = loopEndTick;
+            }
+
+            auto response = makeResponse(true, "Transport notes updated");
+            appendStatusFields(response);
+            setResponseField(response, "note_count", static_cast<int>(inProcessTransport.notes.size()));
+            return response;
+        }
+
+        if (command == "start_inprocess_transport")
+        {
+            const auto startTick = object->hasProperty("start_tick")
+                ? static_cast<int64_t>(static_cast<double>(object->getProperty("start_tick")))
+                : int64_t(0);
+
+            {
+                juce::ScopedLock lock(pluginLock);
+                inProcessTransport.positionFrame = inProcessTransport.tickToFrame(
+                    startTick, currentSampleRate);
+                inProcessTransport.running = true;
+                // Clear any leftover scheduled events from the old IPC-based path
+                clearScheduledMidiEvents();
+                renderedSampleFrames.store(0);
+            }
+
+            auto response = makeResponse(true, "In-process transport started");
+            appendStatusFields(response);
+            setResponseField(response, "start_tick", static_cast<double>(startTick));
+            setResponseField(response, "position_frame", static_cast<double>(inProcessTransport.positionFrame));
+            return response;
+        }
+
+        if (command == "stop_inprocess_transport")
+        {
+            {
+                juce::ScopedLock lock(pluginLock);
+                inProcessTransport.running = false;
+                enqueuePanicMessages(0);
+            }
+
+            auto response = makeResponse(true, "In-process transport stopped");
+            appendStatusFields(response);
+            return response;
+        }
+
         if (command == "schedule_midi")
         {
             const auto baseOffsetFrames = juce::jmax<int64_t>(
@@ -1426,6 +1637,9 @@ private:
         setResponseField(response, "graph_editor_open", graphEditorWindow != nullptr);
         setResponseField(response, "graph_editor_slot", graphEditorSlotIndex);
         setResponseField(response, "graph_transport_enabled", static_cast<bool>(graphTransportEnabled.load()));
+        setResponseField(response, "inprocess_transport_running", inProcessTransport.running);
+        setResponseField(response, "inprocess_transport_position_frame",
+                         static_cast<double>(inProcessTransport.positionFrame));
         setResponseField(response, "graph_scheduled_event_count", totalPersistentGraphScheduledEventCount());
         setResponseField(response, "input_buses", describeBuses(true));
         setResponseField(response, "output_buses", describeBuses(false));
@@ -1905,7 +2119,10 @@ private:
                 juce::MidiBuffer midi;
                 keyboardState.processNextMidiBuffer(midi, 0, numSamples, true);
                 appendPendingMidiMessages(midi);
-                appendScheduledMidiMessages(midi, numSamples);
+                if (inProcessTransport.running)
+                    inProcessTransport.generateMidi(midi, numSamples, currentSampleRate);
+                else
+                    appendScheduledMidiMessages(midi, numSamples);
                 plugin->processBlock(buffer, midi);
                 applyPluginOutputMix(buffer);
                 pluginOutputPeakLevel = peakLevelForBuffer(buffer);
@@ -3981,6 +4198,7 @@ private:
     std::atomic<bool> graphTransportEnabled { false };
     std::atomic<int64_t> renderedSampleFrames { 0 };
     std::atomic<int64_t> scheduledMidiSequence { 0 };
+    InProcessTransport inProcessTransport;
 
     juce::Label pathLabel;
     juce::TextEditor pathEditor;
