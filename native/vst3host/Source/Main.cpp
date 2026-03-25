@@ -2140,7 +2140,7 @@ private:
 
     void clearScheduledMidiEvents(int channel = 0,
                                   int64_t beforeLoopEpoch = -1,
-                                  int64_t minFrame = -1)
+                                  int64_t /*minFrame*/ = -1)
     {
         juce::ScopedLock lock(scheduledMidiLock);
         if (channel <= 0)
@@ -2155,10 +2155,21 @@ private:
         const auto targetChannel = clampMidiChannel(channel);
         for (const auto& event : scheduledMidiEvents)
         {
-            if (event.message.getChannel() != targetChannel
-                || (beforeLoopEpoch >= 0 && event.loopEpoch >= beforeLoopEpoch)
-                || (minFrame >= 0 && event.frame < minFrame))
+            if (event.message.getChannel() != targetChannel)
+            {
                 keep.add(event);
+                continue;
+            }
+            // Keep events from the current or future epoch unconditionally.
+            if (beforeLoopEpoch >= 0 && event.loopEpoch >= beforeLoopEpoch)
+            {
+                keep.add(event);
+                continue;
+            }
+            // Old-epoch events are removed regardless of frame position.
+            // The bootstrap logic will re-trigger any notes that should
+            // still be sounding after the loop wrap, so keeping "near
+            // playback" old events just causes double triggers.
         }
         scheduledMidiEvents.swapWith(keep);
     }
@@ -2919,7 +2930,7 @@ private:
     void clearPersistentGraphScheduledEvents(PersistentGraphSlot& slot,
                                              int channel = 0,
                                              int64_t beforeLoopEpoch = -1,
-                                             int64_t minFrame = -1)
+                                             int64_t /* minFrame */ = -1)
     {
         if (channel <= 0)
         {
@@ -2931,12 +2942,18 @@ private:
         const auto targetChannel = clampMidiChannel(channel);
         for (const auto& event : slot.scheduledEvents)
         {
-            if (event.message.getChannel() != targetChannel
-                || (beforeLoopEpoch >= 0 && event.loopEpoch >= beforeLoopEpoch)
-                || (minFrame >= 0 && event.frame < minFrame))
+            if (event.message.getChannel() != targetChannel)
             {
                 keep.add(event);
+                continue;
             }
+            if (beforeLoopEpoch >= 0 && event.loopEpoch >= beforeLoopEpoch)
+            {
+                keep.add(event);
+                continue;
+            }
+            // Old-epoch events removed unconditionally — bootstrap re-triggers
+            // any notes that should still be sounding after loop wrap.
         }
         slot.scheduledEvents.swapWith(keep);
     }
