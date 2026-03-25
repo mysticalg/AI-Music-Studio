@@ -9409,11 +9409,18 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         queued_output_frames = max(0, int(lead_frames)) + max(0, int(output_offset_frames))
         target_channel = int(clamp(track.midi_channel, 0, 15)) + 1
-        # A normal loop wrap already schedules fresh MIDI for the new epoch.
-        # Forcing an all-notes-off at the same frame can click on some VSTs.
+        # On instrument reset or epoch flush, send a full panic (all-notes-off)
+        # so the VST silences stale tails before the new notes arrive.
         reset_channels = [target_channel] if (
             state.instrument_reset_pending
             or state.native_host_epoch_flush_pending
+        ) else None
+        # On a normal loop wrap, clear old-epoch events that were scheduled
+        # ahead but haven't been consumed yet — this prevents double notes
+        # without sending an audible all-notes-off panic burst.
+        clear_channels = [target_channel] if (
+            state.loop_bootstrap_pending
+            and not reset_channels
         ) else None
         if not self._schedule_native_vst_host_messages(
             idx,
@@ -9421,6 +9428,7 @@ class MainWindow(QtWidgets.QMainWindow):
             events,
             queued_output_frames,
             reset_channels=reset_channels,
+            clear_channels=clear_channels,
             loop_epoch=state.native_host_loop_epoch,
         ):
             return False
@@ -9475,7 +9483,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 state.instrument_reset_pending
                 or state.native_host_epoch_flush_pending
             ) else None
-            if not payload_events and not reset_channels:
+            # On loop wrap, clear old-epoch future events to prevent double notes
+            clear_channels = [target_channel] if (
+                state.loop_bootstrap_pending
+                and not reset_channels
+            ) else None
+            if not payload_events and not reset_channels and not clear_channels:
                 state.native_host_scheduled_until_frame = max(0, int(start_frame) + max(1, int(frame_count)))
                 continue
             slot_payload: dict[str, object] = {
@@ -9485,6 +9498,8 @@ class MainWindow(QtWidgets.QMainWindow):
             }
             if reset_channels:
                 slot_payload['reset_channels'] = [max(1, min(16, int(channel))) for channel in reset_channels]
+            if clear_channels:
+                slot_payload['clear_channels'] = [max(1, min(16, int(channel))) for channel in clear_channels]
             slot_payloads.append(slot_payload)
             state.instrument_reset_pending = False
             state.loop_bootstrap_pending = False
@@ -11720,7 +11735,11 @@ class MainWindow(QtWidgets.QMainWindow):
         events: list[tuple[int, int, mido.Message]] = []
         loop_restart_releases: set[tuple[int, int]] = set()
 
-        note_off_advance_frames = 1
+        # Place note-offs a small margin before the note end so they don't
+        # collide with the re-triggered note-on at a loop boundary.  At
+        # 44.1kHz, 64 frames ≈ 1.5ms — enough for the VST to release the
+        # voice before the new attack, eliminating "sticky" double triggers.
+        note_off_advance_frames = max(1, min(64, sample_rate // 1000))
         for note in track.notes:
             note_start_frame = tick_to_sample_frame(note.start_tick, sample_rate, self.project.bpm)
             note_end_frame = max(

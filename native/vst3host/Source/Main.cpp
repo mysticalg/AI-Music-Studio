@@ -1255,28 +1255,6 @@ private:
                         continue;
 
                     const auto targetFrame = currentFrame + baseOffsetFrames + sampleOffset;
-                    const auto isDuplicate = std::any_of(
-                        scheduledMidiEvents.begin(),
-                        scheduledMidiEvents.end(),
-                        [&](const ScheduledMidiEvent& existing)
-                        {
-                            if (existing.loopEpoch != loopEpoch || existing.frame != targetFrame)
-                                return false;
-                            if (existing.message.getChannel() != message.getChannel())
-                                return false;
-                            if (existing.message.isNoteOn() && message.isNoteOn())
-                                return existing.message.getNoteNumber() == message.getNoteNumber();
-                            if (existing.message.isNoteOff() && message.isNoteOff())
-                                return existing.message.getNoteNumber() == message.getNoteNumber();
-                            if (existing.message.isController() && message.isController())
-                                return existing.message.getControllerNumber() == message.getControllerNumber()
-                                    && existing.message.getControllerValue() == message.getControllerValue();
-                            return false;
-                        }
-                    );
-                    if (isDuplicate)
-                        continue;
-
                     scheduledMidiEvents.add({
                         targetFrame,
                         priority,
@@ -3179,28 +3157,6 @@ private:
                     continue;
 
                 const auto targetFrame = currentFrame + baseOffsetFrames + sampleOffset;
-                const auto isDuplicate = std::any_of(
-                    slot.scheduledEvents.begin(),
-                    slot.scheduledEvents.end(),
-                    [&](const ScheduledMidiEvent& existing)
-                    {
-                        if (existing.loopEpoch != loopEpoch || existing.frame != targetFrame)
-                            return false;
-                        if (existing.message.getChannel() != message.getChannel())
-                            return false;
-                        if (existing.message.isNoteOn() && message.isNoteOn())
-                            return existing.message.getNoteNumber() == message.getNoteNumber();
-                        if (existing.message.isNoteOff() && message.isNoteOff())
-                            return existing.message.getNoteNumber() == message.getNoteNumber();
-                        if (existing.message.isController() && message.isController())
-                            return existing.message.getControllerNumber() == message.getControllerNumber()
-                                && existing.message.getControllerValue() == message.getControllerValue();
-                        return false;
-                    }
-                );
-                if (isDuplicate)
-                    continue;
-
                 slot.scheduledEvents.add({
                     targetFrame,
                     priority,
