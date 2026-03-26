@@ -57,6 +57,9 @@ public:
     [[nodiscard]] ExternalPadState getExternalPadState (int padIndex) const;
     void stepExternalPadSample (int padIndex, int delta);
     [[nodiscard]] juce::String externalPadLevelParameterId (int padIndex) const;
+    [[nodiscard]] juce::String externalPadSustainParameterId (int padIndex) const;
+    [[nodiscard]] juce::String externalPadReleaseParameterId (int padIndex) const;
+    [[nodiscard]] juce::MidiKeyboardState& getKeyboardState() noexcept { return keyboardState; }
 
     juce::AudioProcessorValueTreeState apvts;
 
@@ -77,7 +80,7 @@ private:
     };
 
     static constexpr int drumVoiceLevelCount = 15;
-    static constexpr int vecPadCount = 16;
+    static constexpr int vecPadCount = 23;
 
     enum class OscType
     {
@@ -126,11 +129,15 @@ private:
         int unisonVoices = 1;
         int lfo1Shape = 0;
         int lfo2Shape = 0;
+        int lfo3Shape = 0;
         int arpMode = 0;
         bool arpEnabled = false;
         bool lfo1Enabled = true;
         bool lfo2Enabled = true;
         bool lfo3Enabled = true;
+        bool lfo1EnvMode = false;
+        bool lfo2EnvMode = false;
+        bool lfo3EnvMode = true;
         bool filter1Enabled = true;
         bool filter2Enabled = true;
         int filterType = 0;
@@ -202,12 +209,24 @@ private:
             1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
             1.0f, 1.0f, 1.0f, 1.0f, 1.0f
         };
-        std::array<float, vecPadCount> externalPadLevels {
-            1.0f, 1.0f, 1.0f, 1.0f,
-            1.0f, 1.0f, 1.0f, 1.0f,
-            1.0f, 1.0f, 1.0f, 1.0f,
-            1.0f, 1.0f, 1.0f, 1.0f
-        };
+        std::array<float, vecPadCount> externalPadLevels = []
+        {
+            std::array<float, vecPadCount> values {};
+            values.fill (1.0f);
+            return values;
+        }();
+        std::array<float, vecPadCount> externalPadSustainTimes = []
+        {
+            std::array<float, vecPadCount> values {};
+            values.fill (120.0f);
+            return values;
+        }();
+        std::array<float, vecPadCount> externalPadReleaseTimes = []
+        {
+            std::array<float, vecPadCount> values {};
+            values.fill (0.2f);
+            return values;
+        }();
 
         juce::ADSR::Parameters ampEnv;
         juce::ADSR::Parameters filterEnv;
@@ -247,12 +266,12 @@ private:
     juce::AudioFormatManager audioFormatManager;
     std::vector<ExternalPadDefinition> externalPads;
     std::array<std::shared_ptr<const ExternalSampleData>, vecPadCount> externalPadSamples {};
-    std::array<int, vecPadCount> loadedExternalPadIndices {
-        -1, -1, -1, -1,
-        -1, -1, -1, -1,
-        -1, -1, -1, -1,
-        -1, -1, -1, -1
-    };
+    std::array<int, vecPadCount> loadedExternalPadIndices = []
+    {
+        std::array<int, vecPadCount> values {};
+        values.fill (-1);
+        return values;
+    }();
 
     juce::dsp::StateVariableTPTFilter<float> leftFilter;
     juce::dsp::StateVariableTPTFilter<float> rightFilter;
@@ -275,8 +294,10 @@ private:
 
     float lfo1Phase = 0.0f;
     float lfo2Phase = 0.0f;
+    float lfo3Phase = 0.0f;
     int arpStep = 0;
     juce::Array<int> heldNotes;
+    juce::MidiKeyboardState keyboardState;
     std::atomic<int> pendingPresetIndex { -1 };
     std::atomic<bool> pendingExternalPadReload { false };
     int currentProgramIndex = 0;
@@ -394,6 +415,8 @@ private:
     [[nodiscard]] int externalPadIndexForMidi (int midiNote) const noexcept;
     [[nodiscard]] static juce::String externalPadSampleParameterIdForIndex (int padIndex);
     [[nodiscard]] static juce::String externalPadLevelParameterIdForIndex (int padIndex);
+    [[nodiscard]] static juce::String externalPadSustainParameterIdForIndex (int padIndex);
+    [[nodiscard]] static juce::String externalPadReleaseParameterIdForIndex (int padIndex);
     void applyAdvancedEffects (juce::AudioBuffer<float>& buffer);
 
     void updateRenderParameters();

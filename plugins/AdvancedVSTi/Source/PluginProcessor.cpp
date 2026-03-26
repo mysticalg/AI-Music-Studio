@@ -59,10 +59,17 @@ constexpr std::array<float, 15> drum808VoiceLevelDefaults {
 
 constexpr int vecPadMidiStart = 36;
 constexpr int maxVecPadSampleChoices = 4096;
-constexpr std::array<const char*, 16> vecPadFolderOrder {
+constexpr std::array<const char*, 23> vecPadFolderOrder {
+    "VEC1 Bassdrums",
     "VEC1 Bassdrums",
     "VEC1 Snares",
+    "VEC1 Snares",
     "VEC1 Claps",
+    "VEC1 Claps",
+    "VEC1 Cymbals",
+    "VEC1 Cymbals",
+    "VEC1 Cymbals",
+    "VEC1 Cymbals",
     "VEC1 Cymbals",
     "VEC1 Percussion",
     "VEC1 FX",
@@ -78,30 +85,63 @@ constexpr std::array<const char*, 16> vecPadFolderOrder {
     "VEC1 Vinyl FX and Scratches"
 };
 
-constexpr std::array<const char*, 16> vecPadTitles {
-    "Bassdrums",
-    "Snares",
-    "Claps",
-    "Cymbals",
-    "Percussion",
+constexpr std::array<const char*, 23> vecPadTitles {
+    "Bassdrum C",
+    "Bassdrum C#",
+    "Snare D",
+    "Snare D#",
+    "Clap E",
+    "Clap F",
+    "Closed HH",
+    "Open HH",
+    "Ride",
+    "Crash",
+    "Rev Crash",
+    "Perc",
     "FX",
     "Fills",
-    "BreakBeats",
+    "Breaks",
     "303 Acid",
-    "Long Basses",
-    "Offbeat Bass",
+    "Long Bass",
+    "Offbeat",
     "Loops",
     "Multis",
     "Sounds",
-    "Special Sounds",
+    "Special",
     "Vinyl FX"
 };
 
-constexpr std::array<const char*, 16> vecPadNotes {
-    "C1", "C#1", "D1", "D#1",
-    "E1", "F1", "F#1", "G1",
-    "G#1", "A1", "A#1", "B1",
-    "C2", "C#2", "D2", "D#2"
+constexpr std::array<const char*, 23> vecPadNotes {
+    "C1",  "C#1", "D1",  "D#1", "E1",  "F1",
+    "F#1", "G1",  "G#1", "A1",  "A#1", "B1",
+    "C2",  "C#2", "D2",  "D#2", "E2",  "F2",
+    "F#2", "G2",  "G#2", "A2",  "A#2"
+};
+
+constexpr std::array<const char*, 23> vecPadSubfolderNames {
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "VEC1 Close HH",
+    "VEC1 Open HH",
+    "VEC1 Ride",
+    "VEC1 Crash",
+    "VEC1 Reverse Crash",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    "",
+    ""
 };
 
 juce::File vecPadLibraryRoot()
@@ -525,6 +565,16 @@ juce::String AdvancedVSTiAudioProcessor::externalPadLevelParameterId (int padInd
     return externalPadLevelParameterIdForIndex (padIndex);
 }
 
+juce::String AdvancedVSTiAudioProcessor::externalPadSustainParameterId (int padIndex) const
+{
+    return externalPadSustainParameterIdForIndex (padIndex);
+}
+
+juce::String AdvancedVSTiAudioProcessor::externalPadReleaseParameterId (int padIndex) const
+{
+    return externalPadReleaseParameterIdForIndex (padIndex);
+}
+
 AdvancedVSTiAudioProcessor::ExternalPadState AdvancedVSTiAudioProcessor::getExternalPadState (int padIndex) const
 {
     ExternalPadState state;
@@ -647,6 +697,7 @@ void AdvancedVSTiAudioProcessor::reset()
     arpStep = 0;
     lfo1Phase = 0.0f;
     lfo2Phase = 0.0f;
+    lfo3Phase = 0.0f;
 
     leftFilter.reset();
     rightFilter.reset();
@@ -726,7 +777,13 @@ juce::StringArray AdvancedVSTiAudioProcessor::presetChoicesForFlavor()
         return { "Dusty Keys", "Tape Choir", "Velvet Pluck", "Vox Chop", "Sub Stab", "Glass Bell" };
     if constexpr (buildFlavor() == InstrumentFlavor::acid303)
         return { "Acid Saw", "Acid Square", "Rounded 303", "Reso Line" };
-    return { "Init Saw", "Init Square", "Wide Pad", "Mono Lead" };
+    return {
+        "Init Saw", "Init Square", "Wide Pad", "Mono Lead",
+        "TF Rectify Cm", "Feedy Seq Cm", "Rhy Arp", "Solar Systems Seq Cm",
+        "Zipp Cm", "Squib Fm", "Infinity Dbm", "Rev UFO Cm",
+        "Lazer Gallop Bbm", "Deep Solar Bass Cm", "Wavepad Cm", "Tweeker",
+        "Poly Sin Fm", "Omni Cm", "Mystery G", "Big Sweep Cm"
+    };
 }
 
 juce::String AdvancedVSTiAudioProcessor::externalPadSampleParameterIdForIndex (int padIndex)
@@ -737,6 +794,16 @@ juce::String AdvancedVSTiAudioProcessor::externalPadSampleParameterIdForIndex (i
 juce::String AdvancedVSTiAudioProcessor::externalPadLevelParameterIdForIndex (int padIndex)
 {
     return "VECPADLEVEL_" + juce::String (padIndex + 1);
+}
+
+juce::String AdvancedVSTiAudioProcessor::externalPadSustainParameterIdForIndex (int padIndex)
+{
+    return "VECPADSUSTAIN_" + juce::String (padIndex + 1);
+}
+
+juce::String AdvancedVSTiAudioProcessor::externalPadReleaseParameterIdForIndex (int padIndex)
+{
+    return "VECPADRELEASE_" + juce::String (padIndex + 1);
 }
 
 void AdvancedVSTiAudioProcessor::initializeExternalPadLibrary()
@@ -757,6 +824,7 @@ void AdvancedVSTiAudioProcessor::initializeExternalPadLibrary()
         pad.displayName = vecPadTitles[static_cast<size_t> (padIndex)];
         pad.noteName = vecPadNotes[static_cast<size_t> (padIndex)];
         pad.midiNote = vecPadMidiStart + padIndex;
+        const auto preferredSubfolder = juce::String (vecPadSubfolderNames[static_cast<size_t> (padIndex)]).trim();
 
         auto folderIt = std::find_if (topLevelFolders.begin(), topLevelFolders.end(),
                                       [&pad] (const juce::File& candidate)
@@ -767,15 +835,39 @@ void AdvancedVSTiAudioProcessor::initializeExternalPadLibrary()
         if (folderIt != topLevelFolders.end())
         {
             auto presetFolders = findSortedChildDirectories (*folderIt);
-            for (const auto& presetFolder : presetFolders)
+
+            if (preferredSubfolder.isNotEmpty())
             {
-                for (const auto& sampleFile : findSortedAudioFiles (presetFolder))
+                auto presetIt = std::find_if (presetFolders.begin(), presetFolders.end(),
+                                              [&preferredSubfolder] (const juce::File& candidate)
+                                              {
+                                                  return candidate.getFileName().compareIgnoreCase (preferredSubfolder) == 0;
+                                              });
+
+                if (presetIt != presetFolders.end())
                 {
-                    pad.samples.push_back ({
-                        sampleFile.getFullPathName(),
-                        cleanedExternalSampleName (sampleFile),
-                        presetFolder.getFileName().replace ("VEC1 ", "", true).trim()
-                    });
+                    for (const auto& sampleFile : findSortedAudioFiles (*presetIt))
+                    {
+                        pad.samples.push_back ({
+                            sampleFile.getFullPathName(),
+                            cleanedExternalSampleName (sampleFile),
+                            presetIt->getFileName().replace ("VEC1 ", "", true).trim()
+                        });
+                    }
+                }
+            }
+            else
+            {
+                for (const auto& presetFolder : presetFolders)
+                {
+                    for (const auto& sampleFile : findSortedAudioFiles (presetFolder))
+                    {
+                        pad.samples.push_back ({
+                            sampleFile.getFullPathName(),
+                            cleanedExternalSampleName (sampleFile),
+                            presetFolder.getFileName().replace ("VEC1 ", "", true).trim()
+                        });
+                    }
                 }
             }
 
@@ -1157,6 +1249,13 @@ void AdvancedVSTiAudioProcessor::handleMidiMessage (const juce::MidiMessage& msg
         voice.ampEnv.noteOn();
         voice.filterEnv.noteOn();
 
+        if (renderParams.lfo1EnvMode)
+            lfo1Phase = 0.0f;
+        if (renderParams.lfo2EnvMode)
+            lfo2Phase = 0.0f;
+        if (renderParams.lfo3EnvMode)
+            lfo3Phase = 0.0f;
+
         if constexpr (! isDrumFlavor())
             heldNotes.addIfNotAlreadyThere (voice.midiNote);
         return;
@@ -1164,6 +1263,29 @@ void AdvancedVSTiAudioProcessor::handleMidiMessage (const juce::MidiMessage& msg
 
     if (msg.isNoteOff())
     {
+        if constexpr (buildFlavor() == InstrumentFlavor::vec1DrumPad)
+        {
+            const auto note = msg.getNoteNumber();
+            for (auto& voice : voices)
+            {
+                if (! voice.active || voice.midiNote != note || ! juce::isPositiveAndBelow (voice.externalPadIndex, vecPadCount))
+                    continue;
+
+                const auto padIndex = static_cast<size_t> (voice.externalPadIndex);
+                const auto sustainTime = juce::jmax (0.0f, renderParams.externalPadSustainTimes[padIndex]);
+                const auto releaseTime = juce::jmax (0.0f, renderParams.externalPadReleaseTimes[padIndex]);
+                if (releaseTime <= 0.0f)
+                {
+                    voice.active = false;
+                }
+                else
+                {
+                    voice.noteAge = juce::jmax (voice.noteAge, sustainTime);
+                }
+            }
+            return;
+        }
+
         if constexpr (isDrumFlavor())
             return;
 
@@ -1182,11 +1304,19 @@ void AdvancedVSTiAudioProcessor::handleMidiMessage (const juce::MidiMessage& msg
 
 float AdvancedVSTiAudioProcessor::lfoValue (int shape, float phase) const
 {
+    const auto wrapped = phase - std::floor (phase);
     if (shape == 1)
-        return 2.0f * phase - 1.0f;
+        return 1.0f - 4.0f * std::abs (wrapped - 0.5f);
     if (shape == 2)
-        return phase < 0.5f ? 1.0f : -1.0f;
-    return std::sin (twoPi * phase);
+        return 2.0f * wrapped - 1.0f;
+    if (shape == 3)
+    {
+        const auto hashed = std::sin ((wrapped + 1.0f) * 12345.6789f) * 43758.5453f;
+        return 2.0f * (hashed - std::floor (hashed)) - 1.0f;
+    }
+    if (shape == 4)
+        return wrapped < 0.5f ? 1.0f : -1.0f;
+    return std::sin (twoPi * wrapped);
 }
 
 float AdvancedVSTiAudioProcessor::fmOperator (VoiceState& voice, float baseFreq, float amount)
@@ -1621,15 +1751,47 @@ float AdvancedVSTiAudioProcessor::renderExternalPadVoiceSample (VoiceState& voic
     const auto sampleA = sampleData->audio.getSample (0, indexA);
     const auto sampleB = sampleData->audio.getSample (0, indexB);
     const auto output = juce::jmap (alpha, sampleA, sampleB);
+    const auto padIndex = juce::jlimit (0, vecPadCount - 1, voice.externalPadIndex);
+    const auto sustainTime = juce::jmax (0.0f, renderParams.externalPadSustainTimes[static_cast<size_t> (padIndex)]);
+    const auto releaseTime = juce::jmax (0.0f, renderParams.externalPadReleaseTimes[static_cast<size_t> (padIndex)]);
+    auto envelope = 1.0f;
+
+    if (releaseTime <= 0.0f)
+    {
+        if (voice.noteAge > sustainTime)
+        {
+            voice.active = false;
+            return 0.0f;
+        }
+    }
+    else if (voice.noteAge > sustainTime)
+    {
+        envelope = juce::jlimit (0.0f, 1.0f, 1.0f - ((voice.noteAge - sustainTime) / releaseTime));
+        if (envelope <= 0.0f)
+        {
+            voice.active = false;
+            return 0.0f;
+        }
+    }
+
     const auto increment = juce::jlimit (0.125, 8.0, sampleData->sampleRate / currentSampleRate);
 
     voice.externalSamplePosition += increment;
     voice.noteAge += 1.0f / static_cast<float> (currentSampleRate);
     if (voice.externalSamplePosition >= static_cast<double> (totalSamples))
         voice.active = false;
+    if (releaseTime <= 0.0f)
+    {
+        if (voice.noteAge > sustainTime)
+            voice.active = false;
+    }
+    else if (voice.noteAge > (sustainTime + releaseTime))
+    {
+        voice.active = false;
+    }
 
-    const auto padLevel = renderParams.externalPadLevels[static_cast<size_t> (juce::jlimit (0, vecPadCount - 1, voice.externalPadIndex))];
-    return output * voice.velocity * padLevel * renderParams.drumMasterLevel;
+    const auto padLevel = renderParams.externalPadLevels[static_cast<size_t> (padIndex)];
+    return output * envelope * voice.velocity * padLevel * renderParams.drumMasterLevel;
 }
 
 float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice)
@@ -1767,7 +1929,8 @@ float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice)
     voice.noteAge += 1.0f / static_cast<float> (currentSampleRate);
     const auto gatePass = voice.noteAge < params.gateLength ? 1.0f : 0.0f;
 
-    const auto rg = 0.5f * (1.0f + std::sin (twoPi * params.rhythmGateRate * voice.noteAge));
+    const auto gatePhase = params.lfo3EnvMode ? std::fmod (params.rhythmGateRate * voice.noteAge, 1.0f) : lfo3Phase;
+    const auto rg = 0.5f * (1.0f + lfoValue (params.lfo3Shape, gatePhase));
     const auto rhythmGate = 1.0f - params.rhythmGateDepth + params.rhythmGateDepth * rg;
     currentFilterEnvPeak = juce::jmax (currentFilterEnvPeak, filtEnv);
 
@@ -1816,11 +1979,17 @@ void AdvancedVSTiAudioProcessor::updateRenderParameters()
     renderParams.unisonVoices = juce::jlimit (1, maxUnisonForFlavor(), paramIndex (apvts, "UNISON"));
     renderParams.lfo1Shape = paramIndex (apvts, "LFO1SHAPE");
     renderParams.lfo2Shape = paramIndex (apvts, "LFO2SHAPE");
+    renderParams.lfo3Shape = 0;
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+        renderParams.lfo3Shape = paramIndex (apvts, "LFO3SHAPE");
     renderParams.arpMode = paramIndex (apvts, "ARPMODE");
     renderParams.arpEnabled = false;
     renderParams.lfo1Enabled = true;
     renderParams.lfo2Enabled = true;
     renderParams.lfo3Enabled = true;
+    renderParams.lfo1EnvMode = false;
+    renderParams.lfo2EnvMode = false;
+    renderParams.lfo3EnvMode = true;
     renderParams.filter1Enabled = true;
     renderParams.filter2Enabled = true;
     renderParams.filterSlope = juce::jlimit (0, 2, paramIndex (apvts, "FILTERSLOPE"));
@@ -1874,6 +2043,9 @@ void AdvancedVSTiAudioProcessor::updateRenderParameters()
         renderParams.lfo1Enabled = paramValue (apvts, "LFO1ENABLE") >= 0.5f;
         renderParams.lfo2Enabled = paramValue (apvts, "LFO2ENABLE") >= 0.5f;
         renderParams.lfo3Enabled = paramValue (apvts, "LFO3ENABLE") >= 0.5f;
+        renderParams.lfo1EnvMode = paramValue (apvts, "LFO1ENVMODE") >= 0.5f;
+        renderParams.lfo2EnvMode = paramValue (apvts, "LFO2ENVMODE") >= 0.5f;
+        renderParams.lfo3EnvMode = paramValue (apvts, "LFO3ENVMODE") >= 0.5f;
         renderParams.filter1Enabled = paramValue (apvts, "FILTER1ENABLE") >= 0.5f;
         renderParams.filter2Enabled = paramValue (apvts, "FILTER2ENABLE") >= 0.5f;
         renderParams.osc3Type = paramIndex (apvts, "OSC3TYPE");
@@ -1931,6 +2103,8 @@ void AdvancedVSTiAudioProcessor::updateRenderParameters()
         renderParams.drumVoiceTunes.fill (0.0f);
         renderParams.drumVoiceDecays.fill (0.5f);
         renderParams.externalPadLevels.fill (1.0f);
+        renderParams.externalPadSustainTimes.fill (120.0f);
+        renderParams.externalPadReleaseTimes.fill (0.2f);
 
         for (size_t index = 0; index < drumVoiceTuneParamIds.size(); ++index)
             renderParams.drumVoiceTunes[drumVoiceIndex (drumVoiceTuneKinds[index])] = paramValue (apvts, drumVoiceTuneParamIds[index]);
@@ -1950,9 +2124,15 @@ void AdvancedVSTiAudioProcessor::updateRenderParameters()
         renderParams.drumVoiceTunes.fill (0.0f);
         renderParams.drumVoiceDecays.fill (0.5f);
         renderParams.drumVoiceLevels.fill (1.0f);
+        renderParams.externalPadSustainTimes.fill (120.0f);
+        renderParams.externalPadReleaseTimes.fill (0.2f);
 
         for (int padIndex = 0; padIndex < vecPadCount; ++padIndex)
+        {
             renderParams.externalPadLevels[static_cast<size_t> (padIndex)] = paramValue (apvts, externalPadLevelParameterIdForIndex (padIndex).toRawUTF8());
+            renderParams.externalPadSustainTimes[static_cast<size_t> (padIndex)] = paramValue (apvts, externalPadSustainParameterIdForIndex (padIndex).toRawUTF8());
+            renderParams.externalPadReleaseTimes[static_cast<size_t> (padIndex)] = paramValue (apvts, externalPadReleaseParameterIdForIndex (padIndex).toRawUTF8());
+        }
     }
     else
     {
@@ -1964,6 +2144,8 @@ void AdvancedVSTiAudioProcessor::updateRenderParameters()
         renderParams.drumVoiceDecays.fill (0.5f);
         renderParams.drumVoiceLevels.fill (1.0f);
         renderParams.externalPadLevels.fill (1.0f);
+        renderParams.externalPadSustainTimes.fill (120.0f);
+        renderParams.externalPadReleaseTimes.fill (0.2f);
     }
 
     renderParams.ampEnv.attack = paramValue (apvts, "AMPATTACK");
@@ -1993,6 +2175,8 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         midiMessages.addEvents (pendingPreviewMidi, 0, -1, 0);
         pendingPreviewMidi.clear();
     }
+
+    keyboardState.processNextMidiBuffer (midiMessages, 0, buffer.getNumSamples(), true);
 
     leftFilter.setResonance (renderParams.resonance);
     rightFilter.setResonance (renderParams.resonance);
@@ -2163,6 +2347,7 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
         lfo1Phase = std::fmod (lfo1Phase + renderParams.lfo1Rate / static_cast<float> (currentSampleRate), 1.0f);
         lfo2Phase = std::fmod (lfo2Phase + renderParams.lfo2Rate / static_cast<float> (currentSampleRate), 1.0f);
+        lfo3Phase = std::fmod (lfo3Phase + renderParams.rhythmGateRate / static_cast<float> (currentSampleRate), 1.0f);
     }
 
     while (hasMidi)
@@ -2391,10 +2576,14 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
 
     float lfo1RateDefault = 2.0f;
     int lfo1ShapeDefault = 0;
+    bool lfo1EnvModeDefault = false;
     float lfo1PitchDefault = 0.0f;
 
     float lfo2RateDefault = 3.0f;
     int lfo2ShapeDefault = 0;
+    bool lfo2EnvModeDefault = false;
+    int lfo3ShapeDefault = 0;
+    bool lfo3EnvModeDefault = true;
     float lfo2FilterDefault = 0.0f;
     int fxTypeDefault = 0;
     float fxMixDefault = 0.0f;
@@ -2839,15 +3028,19 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("FILTERBALANCE", "Filter Balance", 0.0f, 1.0f, filterBalanceDefault));
 
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("LFO1RATE", "LFO1 Rate", 0.05f, 40.0f, lfo1RateDefault));
-    params.push_back (std::make_unique<juce::AudioParameterChoice> ("LFO1SHAPE", "LFO1 Shape", juce::StringArray { "Sine", "Saw", "Square" }, lfo1ShapeDefault));
+    params.push_back (std::make_unique<juce::AudioParameterChoice> ("LFO1SHAPE", "LFO1 Shape", juce::StringArray { "Sine", "Triangle", "Saw", "Noise", "Square" }, lfo1ShapeDefault));
     if constexpr (buildFlavor() == InstrumentFlavor::advanced)
         params.push_back (std::make_unique<juce::AudioParameterBool> ("LFO1ENABLE", "LFO1 Enabled", true));
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+        params.push_back (std::make_unique<juce::AudioParameterBool> ("LFO1ENVMODE", "LFO1 Env Mode", lfo1EnvModeDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("LFO1PITCH", "LFO1 -> Pitch", 0.0f, 24.0f, lfo1PitchDefault));
 
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("LFO2RATE", "LFO2 Rate", 0.05f, 40.0f, lfo2RateDefault));
-    params.push_back (std::make_unique<juce::AudioParameterChoice> ("LFO2SHAPE", "LFO2 Shape", juce::StringArray { "Sine", "Saw", "Square" }, lfo2ShapeDefault));
+    params.push_back (std::make_unique<juce::AudioParameterChoice> ("LFO2SHAPE", "LFO2 Shape", juce::StringArray { "Sine", "Triangle", "Saw", "Noise", "Square" }, lfo2ShapeDefault));
     if constexpr (buildFlavor() == InstrumentFlavor::advanced)
         params.push_back (std::make_unique<juce::AudioParameterBool> ("LFO2ENABLE", "LFO2 Enabled", true));
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+        params.push_back (std::make_unique<juce::AudioParameterBool> ("LFO2ENVMODE", "LFO2 Env Mode", lfo2EnvModeDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("LFO2FILTER", "LFO2 -> Filter", 0.0f, 1.0f, lfo2FilterDefault));
 
     params.push_back (std::make_unique<juce::AudioParameterChoice> ("ARPMODE", "Arp Mode", juce::StringArray { "Up", "Down", "UpDown", "Random" }, arpModeDefault));
@@ -2858,6 +3051,10 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("RHYTHMGATE_RATE", "Rhythm Gate Rate", 0.25f, 32.0f, rhythmRateDefault));
     if constexpr (buildFlavor() == InstrumentFlavor::advanced)
         params.push_back (std::make_unique<juce::AudioParameterBool> ("LFO3ENABLE", "LFO3 Enabled", true));
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+        params.push_back (std::make_unique<juce::AudioParameterChoice> ("LFO3SHAPE", "LFO3 Shape", juce::StringArray { "Sine", "Triangle", "Saw", "Noise", "Square" }, lfo3ShapeDefault));
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+        params.push_back (std::make_unique<juce::AudioParameterBool> ("LFO3ENVMODE", "LFO3 Env Mode", lfo3EnvModeDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("RHYTHMGATE_DEPTH", "Rhythm Gate Depth", 0.0f, 1.0f, rhythmDepthDefault));
     params.push_back (std::make_unique<juce::AudioParameterChoice> ("FXTYPE", "FX Type", juce::StringArray { "Off", "Dist", "Phaser", "Chorus", "Flanger" }, fxTypeDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("FXMIX", "FX Mix", 0.0f, 1.0f, fxMixDefault));
@@ -2879,6 +3076,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
     }
     else if constexpr (buildFlavor() == InstrumentFlavor::vec1DrumPad)
     {
+        const auto sustainRange = juce::NormalisableRange<float> (0.0f, 120.0f, 0.01f, 0.35f);
+        const auto releaseRange = juce::NormalisableRange<float> (0.0f, 12.0f, 0.01f, 0.4f);
         for (int padIndex = 0; padIndex < vecPadCount; ++padIndex)
         {
             const auto padTitle = juce::String (vecPadTitles[static_cast<size_t> (padIndex)]);
@@ -2886,6 +3085,14 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
                                                                             padTitle + " Level",
                                                                             0.0f, 1.5f,
                                                                             1.0f));
+            params.push_back (std::make_unique<juce::AudioParameterFloat> (externalPadSustainParameterIdForIndex (padIndex),
+                                                                            padTitle + " Sustain",
+                                                                            sustainRange,
+                                                                            120.0f));
+            params.push_back (std::make_unique<juce::AudioParameterFloat> (externalPadReleaseParameterIdForIndex (padIndex),
+                                                                            padTitle + " Release",
+                                                                            releaseRange,
+                                                                            0.2f));
             params.push_back (std::make_unique<juce::AudioParameterInt> (externalPadSampleParameterIdForIndex (padIndex),
                                                                           padTitle + " Sample",
                                                                           0,
@@ -2927,6 +3134,13 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
     setParameterActual ("ARPRATE", 4.0f);
     setParameterActual ("LFO1RATE", 0.1f);
     setParameterActual ("LFO2RATE", 0.1f);
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+    {
+        setParameterActual ("LFO1ENVMODE", 0.0f);
+        setParameterActual ("LFO2ENVMODE", 0.0f);
+        setParameterActual ("LFO3SHAPE", 0.0f);
+        setParameterActual ("LFO3ENVMODE", 1.0f);
+    }
     setParameterActual ("FILTERSLOPE", 0.0f);
     setParameterActual ("FILTER2SLOPE", 0.0f);
     if constexpr (buildFlavor() == InstrumentFlavor::advanced)
@@ -3418,135 +3632,320 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
     }
     else if constexpr (buildFlavor() == InstrumentFlavor::advanced)
     {
+        auto applyAdvancedSettings = [this] (std::initializer_list<std::pair<const char*, float>> settings)
+        {
+            for (const auto& setting : settings)
+                setParameterActual (setting.first, setting.second);
+        };
+
+        applyAdvancedSettings ({
+            { "MASTERLEVEL", 1.0f },
+            { "MONOENABLE", 0.0f },
+            { "ARPENABLE", 0.0f },
+            { "ARPMODE", 0.0f },
+            { "ARPRATE", 4.0f },
+            { "OSCTYPE", 1.0f },
+            { "OSC2TYPE", 2.0f },
+            { "OSC3TYPE", 2.0f },
+            { "UNISON", 2.0f },
+            { "DETUNE", 0.045f },
+            { "OSC1SEMITONE", 0.0f },
+            { "OSC1DETUNE", 0.0f },
+            { "OSC1PW", 0.5f },
+            { "OSC2SEMITONE", 0.0f },
+            { "OSC2DETUNE", 0.08f },
+            { "OSC2PW", 0.5f },
+            { "OSC2MIX", 0.42f },
+            { "OSC3ENABLE", 1.0f },
+            { "OSC3SEMITONE", -12.0f },
+            { "OSC3DETUNE", 0.0f },
+            { "OSC3PW", 0.5f },
+            { "SUBOSCLEVEL", 0.18f },
+            { "NOISELEVEL", 0.04f },
+            { "RINGMOD", 0.08f },
+            { "RINGMODENABLE", 1.0f },
+            { "FMENABLE", 1.0f },
+            { "SYNCENABLE", 1.0f },
+            { "FMAMOUNT", 120.0f },
+            { "SYNC", 0.24f },
+            { "FILTER1ENABLE", 1.0f },
+            { "FILTER2ENABLE", 1.0f },
+            { "FILTERTYPE", 0.0f },
+            { "FILTER2TYPE", 2.0f },
+            { "FILTERSLOPE", 0.0f },
+            { "FILTER2SLOPE", 0.0f },
+            { "CUTOFF", 2200.0f },
+            { "CUTOFF2", 5400.0f },
+            { "RESONANCE", 0.36f },
+            { "FILTERENVAMOUNT", 0.42f },
+            { "FILTERBALANCE", 0.28f },
+            { "AMPATTACK", 0.004f },
+            { "AMPDECAY", 0.28f },
+            { "AMPSUSTAIN", 0.74f },
+            { "AMPRELEASE", 0.36f },
+            { "FILTATTACK", 0.001f },
+            { "FILTDECAY", 0.24f },
+            { "FILTSUSTAIN", 0.42f },
+            { "FILTRELEASE", 0.24f },
+            { "LFO1ENABLE", 1.0f },
+            { "LFO1RATE", 0.18f },
+            { "LFO1SHAPE", 0.0f },
+            { "LFO1ENVMODE", 0.0f },
+            { "LFO1PITCH", 0.0f },
+            { "LFO2ENABLE", 1.0f },
+            { "LFO2RATE", 0.22f },
+            { "LFO2SHAPE", 0.0f },
+            { "LFO2ENVMODE", 0.0f },
+            { "LFO2FILTER", 0.12f },
+            { "LFO3ENABLE", 1.0f },
+            { "LFO3SHAPE", 0.0f },
+            { "LFO3ENVMODE", 1.0f },
+            { "RHYTHMGATE_RATE", 8.0f },
+            { "RHYTHMGATE_DEPTH", 0.0f },
+            { "FXTYPE", 3.0f },
+            { "FXMIX", 0.18f },
+            { "FXINTENSITY", 0.32f },
+            { "DELAYSEND", 0.16f },
+            { "DELAYTIME", 0.36f },
+            { "DELAYFEEDBACK", 0.28f },
+            { "REVERBMIX", 0.12f },
+        });
+
         switch (presetIndex)
         {
             case 1:
-                setParameterActual ("OSCTYPE", 2.0f);
-                setParameterActual ("OSC2TYPE", 1.0f);
-                setParameterActual ("UNISON", 2.0f);
-                setParameterActual ("DETUNE", 0.03f);
-                setParameterActual ("OSC2SEMITONE", 0.0f);
-                setParameterActual ("OSC2DETUNE", 0.04f);
-                setParameterActual ("OSC2MIX", 0.36f);
-                setParameterActual ("SUBOSCLEVEL", 0.14f);
-                setParameterActual ("NOISELEVEL", 0.02f);
-                setParameterActual ("RINGMOD", 0.04f);
-                setParameterActual ("FMAMOUNT", 80.0f);
-                setParameterActual ("SYNC", 0.18f);
-                setParameterActual ("FILTERTYPE", 0.0f);
-                setParameterActual ("FILTER2TYPE", 2.0f);
-                setParameterActual ("CUTOFF", 1800.0f);
-                setParameterActual ("CUTOFF2", 4200.0f);
-                setParameterActual ("RESONANCE", 0.3f);
-                setParameterActual ("FILTERENVAMOUNT", 0.34f);
-                setParameterActual ("FILTERBALANCE", 0.22f);
-                setParameterActual ("AMPATTACK", 0.004f);
-                setParameterActual ("AMPDECAY", 0.24f);
-                setParameterActual ("AMPSUSTAIN", 0.78f);
-                setParameterActual ("AMPRELEASE", 0.32f);
-                setParameterActual ("FILTATTACK", 0.001f);
-                setParameterActual ("FILTDECAY", 0.18f);
-                setParameterActual ("FILTSUSTAIN", 0.34f);
-                setParameterActual ("FILTRELEASE", 0.18f);
-                setParameterActual ("FXTYPE", 3.0f);
-                setParameterActual ("FXMIX", 0.16f);
-                setParameterActual ("FXINTENSITY", 0.28f);
-                setParameterActual ("DELAYSEND", 0.12f);
-                setParameterActual ("DELAYTIME", 0.32f);
-                setParameterActual ("DELAYFEEDBACK", 0.22f);
-                setParameterActual ("REVERBMIX", 0.08f);
+                applyAdvancedSettings ({
+                    { "OSCTYPE", 2.0f }, { "OSC2TYPE", 1.0f }, { "UNISON", 2.0f }, { "DETUNE", 0.03f },
+                    { "OSC2DETUNE", 0.04f }, { "OSC2MIX", 0.36f }, { "SUBOSCLEVEL", 0.14f }, { "NOISELEVEL", 0.02f },
+                    { "RINGMOD", 0.04f }, { "FMAMOUNT", 80.0f }, { "SYNC", 0.18f }, { "CUTOFF", 1800.0f },
+                    { "CUTOFF2", 4200.0f }, { "RESONANCE", 0.3f }, { "FILTERENVAMOUNT", 0.34f },
+                    { "FILTERBALANCE", 0.22f }, { "AMPDECAY", 0.24f }, { "AMPSUSTAIN", 0.78f },
+                    { "AMPRELEASE", 0.32f }, { "FILTDECAY", 0.18f }, { "FILTSUSTAIN", 0.34f },
+                    { "FILTRELEASE", 0.18f }, { "FXMIX", 0.16f }, { "FXINTENSITY", 0.28f },
+                    { "DELAYSEND", 0.12f }, { "DELAYTIME", 0.32f }, { "DELAYFEEDBACK", 0.22f },
+                    { "REVERBMIX", 0.08f },
+                });
                 break;
             case 2:
-                setParameterActual ("OSCTYPE", 1.0f);
-                setParameterActual ("OSC2TYPE", 2.0f);
-                setParameterActual ("UNISON", 2.0f);
-                setParameterActual ("DETUNE", 0.06f);
-                setParameterActual ("OSC2SEMITONE", 12.0f);
-                setParameterActual ("OSC2DETUNE", 0.08f);
-                setParameterActual ("OSC2MIX", 0.52f);
-                setParameterActual ("SUBOSCLEVEL", 0.08f);
-                setParameterActual ("NOISELEVEL", 0.06f);
-                setParameterActual ("RINGMOD", 0.18f);
-                setParameterActual ("FMAMOUNT", 160.0f);
-                setParameterActual ("SYNC", 0.36f);
-                setParameterActual ("FILTERTYPE", 1.0f);
-                setParameterActual ("FILTER2TYPE", 2.0f);
-                setParameterActual ("CUTOFF", 3200.0f);
-                setParameterActual ("CUTOFF2", 7600.0f);
-                setParameterActual ("RESONANCE", 0.42f);
-                setParameterActual ("FILTERENVAMOUNT", 0.52f);
-                setParameterActual ("FILTERBALANCE", 0.34f);
-                setParameterActual ("FXTYPE", 2.0f);
-                setParameterActual ("FXMIX", 0.28f);
-                setParameterActual ("FXINTENSITY", 0.42f);
-                setParameterActual ("DELAYSEND", 0.18f);
-                setParameterActual ("DELAYTIME", 0.44f);
-                setParameterActual ("DELAYFEEDBACK", 0.3f);
-                setParameterActual ("REVERBMIX", 0.12f);
+                applyAdvancedSettings ({
+                    { "DETUNE", 0.06f }, { "OSC2SEMITONE", 12.0f }, { "OSC2MIX", 0.52f },
+                    { "SUBOSCLEVEL", 0.08f }, { "NOISELEVEL", 0.06f }, { "RINGMOD", 0.18f },
+                    { "FMAMOUNT", 160.0f }, { "SYNC", 0.36f }, { "FILTERTYPE", 1.0f },
+                    { "CUTOFF", 3200.0f }, { "CUTOFF2", 7600.0f }, { "RESONANCE", 0.42f },
+                    { "FILTERENVAMOUNT", 0.52f }, { "FILTERBALANCE", 0.34f }, { "FXTYPE", 2.0f },
+                    { "FXMIX", 0.28f }, { "FXINTENSITY", 0.42f }, { "DELAYSEND", 0.18f },
+                    { "DELAYTIME", 0.44f }, { "DELAYFEEDBACK", 0.3f },
+                });
                 break;
             case 3:
-                setParameterActual ("OSCTYPE", 0.0f);
-                setParameterActual ("OSC2TYPE", 4.0f);
-                setParameterActual ("UNISON", 1.0f);
-                setParameterActual ("DETUNE", 0.02f);
-                setParameterActual ("OSC2SEMITONE", 7.0f);
-                setParameterActual ("OSC2DETUNE", -0.06f);
-                setParameterActual ("OSC2MIX", 0.28f);
-                setParameterActual ("SUBOSCLEVEL", 0.22f);
-                setParameterActual ("NOISELEVEL", 0.08f);
-                setParameterActual ("RINGMOD", 0.0f);
-                setParameterActual ("FMAMOUNT", 44.0f);
-                setParameterActual ("SYNC", 0.1f);
-                setParameterActual ("FILTERTYPE", 0.0f);
-                setParameterActual ("FILTER2TYPE", 1.0f);
-                setParameterActual ("CUTOFF", 980.0f);
-                setParameterActual ("CUTOFF2", 2400.0f);
-                setParameterActual ("RESONANCE", 0.24f);
-                setParameterActual ("FILTERENVAMOUNT", 0.24f);
-                setParameterActual ("FILTERBALANCE", 0.12f);
-                setParameterActual ("FXTYPE", 1.0f);
-                setParameterActual ("FXMIX", 0.14f);
-                setParameterActual ("FXINTENSITY", 0.36f);
-                setParameterActual ("DELAYSEND", 0.06f);
-                setParameterActual ("DELAYTIME", 0.26f);
-                setParameterActual ("DELAYFEEDBACK", 0.18f);
-                setParameterActual ("REVERBMIX", 0.04f);
+                applyAdvancedSettings ({
+                    { "OSCTYPE", 0.0f }, { "OSC2TYPE", 4.0f }, { "UNISON", 1.0f }, { "DETUNE", 0.02f },
+                    { "OSC2SEMITONE", 7.0f }, { "OSC2DETUNE", -0.06f }, { "OSC2MIX", 0.28f },
+                    { "SUBOSCLEVEL", 0.22f }, { "NOISELEVEL", 0.08f }, { "RINGMOD", 0.0f },
+                    { "FMAMOUNT", 44.0f }, { "SYNC", 0.1f }, { "FILTER2TYPE", 1.0f }, { "CUTOFF", 980.0f },
+                    { "CUTOFF2", 2400.0f }, { "RESONANCE", 0.24f }, { "FILTERENVAMOUNT", 0.24f },
+                    { "FILTERBALANCE", 0.12f }, { "FXTYPE", 1.0f }, { "FXMIX", 0.14f },
+                    { "FXINTENSITY", 0.36f }, { "DELAYSEND", 0.06f }, { "DELAYTIME", 0.26f },
+                    { "DELAYFEEDBACK", 0.18f }, { "REVERBMIX", 0.04f },
+                });
+                break;
+            case 4:
+                applyAdvancedSettings ({
+                    { "MONOENABLE", 1.0f }, { "OSCTYPE", 2.0f }, { "OSC2TYPE", 1.0f }, { "UNISON", 1.0f },
+                    { "DETUNE", 0.01f }, { "OSC2DETUNE", 0.02f }, { "OSC2MIX", 0.22f }, { "SUBOSCLEVEL", 0.38f },
+                    { "NOISELEVEL", 0.0f }, { "RINGMOD", 0.0f }, { "FMAMOUNT", 28.0f }, { "SYNC", 0.06f },
+                    { "CUTOFF", 340.0f }, { "CUTOFF2", 1800.0f }, { "RESONANCE", 0.62f }, { "FILTERENVAMOUNT", 0.78f },
+                    { "FILTERBALANCE", 0.16f }, { "AMPATTACK", 0.001f }, { "AMPDECAY", 0.18f },
+                    { "AMPSUSTAIN", 0.46f }, { "AMPRELEASE", 0.1f }, { "FILTDECAY", 0.2f },
+                    { "FILTSUSTAIN", 0.08f }, { "FILTRELEASE", 0.16f }, { "FXTYPE", 1.0f }, { "FXMIX", 0.1f },
+                    { "FXINTENSITY", 0.34f }, { "DELAYSEND", 0.02f }, { "REVERBMIX", 0.0f }, { "MASTERLEVEL", 0.95f },
+                });
+                break;
+            case 5:
+                applyAdvancedSettings ({
+                    { "MONOENABLE", 1.0f }, { "ARPENABLE", 1.0f }, { "ARPMODE", 2.0f }, { "ARPRATE", 8.0f },
+                    { "OSCTYPE", 1.0f }, { "OSC2TYPE", 2.0f }, { "DETUNE", 0.03f }, { "OSC2SEMITONE", 12.0f },
+                    { "OSC2MIX", 0.36f }, { "SUBOSCLEVEL", 0.08f }, { "NOISELEVEL", 0.05f }, { "RINGMOD", 0.14f },
+                    { "FMAMOUNT", 90.0f }, { "SYNC", 0.22f }, { "FILTERTYPE", 1.0f }, { "CUTOFF", 1500.0f },
+                    { "CUTOFF2", 5200.0f }, { "RESONANCE", 0.72f }, { "FILTERENVAMOUNT", 0.68f },
+                    { "FILTERBALANCE", 0.38f }, { "AMPDECAY", 0.22f }, { "AMPSUSTAIN", 0.22f },
+                    { "AMPRELEASE", 0.08f }, { "FILTDECAY", 0.14f }, { "FILTSUSTAIN", 0.04f },
+                    { "LFO2RATE", 5.2f }, { "LFO2FILTER", 0.16f }, { "FXTYPE", 2.0f }, { "FXMIX", 0.24f },
+                    { "FXINTENSITY", 0.36f }, { "DELAYSEND", 0.1f }, { "DELAYTIME", 0.29f },
+                    { "DELAYFEEDBACK", 0.18f }, { "REVERBMIX", 0.04f },
+                });
+                break;
+            case 6:
+                applyAdvancedSettings ({
+                    { "ARPENABLE", 1.0f }, { "ARPMODE", 0.0f }, { "ARPRATE", 6.0f }, { "OSCTYPE", 1.0f },
+                    { "OSC2TYPE", 1.0f }, { "DETUNE", 0.02f }, { "OSC2SEMITONE", 7.0f }, { "OSC2MIX", 0.32f },
+                    { "SUBOSCLEVEL", 0.12f }, { "NOISELEVEL", 0.01f }, { "FMAMOUNT", 30.0f }, { "SYNC", 0.1f },
+                    { "CUTOFF", 1200.0f }, { "CUTOFF2", 3800.0f }, { "RESONANCE", 0.38f }, { "FILTERENVAMOUNT", 0.42f },
+                    { "AMPDECAY", 0.3f }, { "AMPSUSTAIN", 0.5f }, { "AMPRELEASE", 0.15f }, { "FXMIX", 0.14f },
+                    { "FXINTENSITY", 0.3f }, { "DELAYSEND", 0.18f }, { "DELAYTIME", 0.36f },
+                    { "DELAYFEEDBACK", 0.24f }, { "REVERBMIX", 0.08f },
+                });
+                break;
+            case 7:
+                applyAdvancedSettings ({
+                    { "MONOENABLE", 1.0f }, { "ARPENABLE", 1.0f }, { "ARPMODE", 3.0f }, { "ARPRATE", 10.0f },
+                    { "OSCTYPE", 1.0f }, { "OSC2TYPE", 2.0f }, { "DETUNE", 0.04f }, { "OSC2SEMITONE", 12.0f },
+                    { "OSC2MIX", 0.46f }, { "NOISELEVEL", 0.12f }, { "RINGMOD", 0.22f }, { "FMAMOUNT", 180.0f },
+                    { "SYNC", 0.4f }, { "FILTERTYPE", 1.0f }, { "CUTOFF", 2800.0f }, { "CUTOFF2", 7800.0f },
+                    { "RESONANCE", 0.66f }, { "FILTERENVAMOUNT", 0.54f }, { "FILTERBALANCE", 0.48f },
+                    { "AMPDECAY", 0.18f }, { "AMPSUSTAIN", 0.16f }, { "AMPRELEASE", 0.06f }, { "FILTDECAY", 0.12f },
+                    { "FILTSUSTAIN", 0.06f }, { "LFO2RATE", 7.0f }, { "LFO2FILTER", 0.22f }, { "FXTYPE", 4.0f },
+                    { "FXMIX", 0.28f }, { "FXINTENSITY", 0.52f }, { "DELAYSEND", 0.18f }, { "DELAYTIME", 0.41f },
+                    { "DELAYFEEDBACK", 0.28f }, { "REVERBMIX", 0.06f },
+                });
+                break;
+            case 8:
+                applyAdvancedSettings ({
+                    { "MONOENABLE", 1.0f }, { "OSCTYPE", 0.0f }, { "OSC2TYPE", 0.0f }, { "UNISON", 1.0f },
+                    { "DETUNE", 0.0f }, { "OSC2SEMITONE", 12.0f }, { "OSC2MIX", 0.18f }, { "SUBOSCLEVEL", 0.0f },
+                    { "NOISELEVEL", 0.05f }, { "RINGMOD", 0.0f }, { "FMAMOUNT", 420.0f }, { "SYNC", 0.0f },
+                    { "CUTOFF", 6400.0f }, { "CUTOFF2", 12000.0f }, { "RESONANCE", 0.24f }, { "FILTERENVAMOUNT", 0.82f },
+                    { "FILTERBALANCE", 0.1f }, { "AMPDECAY", 0.06f }, { "AMPSUSTAIN", 0.0f }, { "AMPRELEASE", 0.04f },
+                    { "FILTDECAY", 0.08f }, { "FILTSUSTAIN", 0.0f }, { "FILTRELEASE", 0.05f }, { "FXTYPE", 0.0f },
+                    { "FXMIX", 0.0f }, { "FXINTENSITY", 0.0f }, { "DELAYSEND", 0.0f }, { "REVERBMIX", 0.05f },
+                });
+                break;
+            case 9:
+                applyAdvancedSettings ({
+                    { "MONOENABLE", 1.0f }, { "OSCTYPE", 0.0f }, { "OSC2TYPE", 0.0f }, { "UNISON", 1.0f },
+                    { "OSC2SEMITONE", 19.0f }, { "OSC2MIX", 0.12f }, { "SUBOSCLEVEL", 0.0f }, { "NOISELEVEL", 0.0f },
+                    { "RINGMOD", 0.0f }, { "FMAMOUNT", 760.0f }, { "SYNC", 0.0f }, { "FILTERTYPE", 1.0f },
+                    { "FILTER2ENABLE", 0.0f }, { "CUTOFF", 3200.0f }, { "CUTOFF2", 4200.0f }, { "RESONANCE", 0.68f },
+                    { "FILTERENVAMOUNT", 0.48f }, { "FILTERBALANCE", 0.0f }, { "AMPDECAY", 0.035f },
+                    { "AMPSUSTAIN", 0.0f }, { "AMPRELEASE", 0.05f }, { "FILTDECAY", 0.05f }, { "FILTSUSTAIN", 0.0f },
+                    { "FILTRELEASE", 0.05f }, { "FXTYPE", 0.0f }, { "FXMIX", 0.0f }, { "FXINTENSITY", 0.0f },
+                    { "DELAYSEND", 0.0f }, { "REVERBMIX", 0.0f }, { "MASTERLEVEL", 1.1f },
+                });
+                break;
+            case 10:
+                applyAdvancedSettings ({
+                    { "OSCTYPE", 1.0f }, { "OSC2TYPE", 1.0f }, { "UNISON", 6.0f }, { "DETUNE", 0.08f },
+                    { "OSC2DETUNE", 0.12f }, { "OSC2MIX", 0.48f }, { "SUBOSCLEVEL", 0.12f }, { "NOISELEVEL", 0.02f },
+                    { "RINGMOD", 0.0f }, { "FILTER2ENABLE", 0.0f }, { "CUTOFF", 1800.0f }, { "RESONANCE", 0.22f },
+                    { "FILTERENVAMOUNT", 0.14f }, { "FILTERBALANCE", 0.12f }, { "AMPATTACK", 0.8f },
+                    { "AMPDECAY", 1.2f }, { "AMPSUSTAIN", 0.88f }, { "AMPRELEASE", 2.8f }, { "FILTATTACK", 0.3f },
+                    { "FILTDECAY", 1.8f }, { "FILTSUSTAIN", 0.54f }, { "FILTRELEASE", 1.8f }, { "LFO2RATE", 0.18f },
+                    { "LFO2SHAPE", 1.0f }, { "LFO2FILTER", 0.18f }, { "FXTYPE", 3.0f }, { "FXMIX", 0.28f },
+                    { "FXINTENSITY", 0.4f }, { "DELAYSEND", 0.24f }, { "DELAYTIME", 0.58f },
+                    { "DELAYFEEDBACK", 0.42f }, { "REVERBMIX", 0.32f },
+                });
+                break;
+            case 11:
+                applyAdvancedSettings ({
+                    { "OSCTYPE", 3.0f }, { "OSC2TYPE", 1.0f }, { "UNISON", 1.0f }, { "DETUNE", 0.02f },
+                    { "OSC2SEMITONE", -12.0f }, { "OSC2MIX", 0.22f }, { "SUBOSCLEVEL", 0.0f }, { "NOISELEVEL", 0.28f },
+                    { "RINGMOD", 0.06f }, { "FMAMOUNT", 40.0f }, { "SYNC", 0.0f }, { "FILTERTYPE", 3.0f },
+                    { "CUTOFF", 3200.0f }, { "CUTOFF2", 6800.0f }, { "RESONANCE", 0.74f }, { "FILTERENVAMOUNT", 0.22f },
+                    { "FILTERBALANCE", 0.52f }, { "AMPATTACK", 0.42f }, { "AMPDECAY", 0.7f }, { "AMPSUSTAIN", 0.38f },
+                    { "AMPRELEASE", 1.1f }, { "FILTATTACK", 0.58f }, { "FILTDECAY", 1.6f }, { "FILTSUSTAIN", 0.22f },
+                    { "FILTRELEASE", 1.0f }, { "LFO2RATE", 0.34f }, { "LFO2SHAPE", 2.0f }, { "LFO2FILTER", 0.28f },
+                    { "FXTYPE", 2.0f }, { "FXMIX", 0.32f }, { "FXINTENSITY", 0.62f }, { "DELAYSEND", 0.1f },
+                    { "DELAYTIME", 0.47f }, { "DELAYFEEDBACK", 0.36f }, { "REVERBMIX", 0.22f },
+                });
+                break;
+            case 12:
+                applyAdvancedSettings ({
+                    { "MONOENABLE", 1.0f }, { "ARPENABLE", 1.0f }, { "ARPMODE", 2.0f }, { "ARPRATE", 12.0f },
+                    { "OSCTYPE", 1.0f }, { "OSC2TYPE", 2.0f }, { "UNISON", 1.0f }, { "DETUNE", 0.015f },
+                    { "OSC2SEMITONE", 12.0f }, { "OSC2MIX", 0.3f }, { "SUBOSCLEVEL", 0.0f }, { "NOISELEVEL", 0.02f },
+                    { "RINGMOD", 0.04f }, { "FMAMOUNT", 220.0f }, { "SYNC", 0.55f }, { "FILTERTYPE", 1.0f },
+                    { "CUTOFF", 2400.0f }, { "CUTOFF2", 7600.0f }, { "RESONANCE", 0.56f }, { "FILTERENVAMOUNT", 0.64f },
+                    { "FILTERBALANCE", 0.46f }, { "AMPDECAY", 0.14f }, { "AMPSUSTAIN", 0.12f }, { "AMPRELEASE", 0.08f },
+                    { "FILTDECAY", 0.12f }, { "FILTSUSTAIN", 0.06f }, { "FXTYPE", 4.0f }, { "FXMIX", 0.18f },
+                    { "FXINTENSITY", 0.44f }, { "DELAYSEND", 0.08f }, { "REVERBMIX", 0.04f },
+                });
+                break;
+            case 13:
+                applyAdvancedSettings ({
+                    { "MONOENABLE", 1.0f }, { "OSCTYPE", 1.0f }, { "OSC2TYPE", 1.0f }, { "UNISON", 1.0f },
+                    { "DETUNE", 0.0f }, { "OSC2DETUNE", 0.02f }, { "OSC2MIX", 0.24f }, { "SUBOSCLEVEL", 0.52f },
+                    { "NOISELEVEL", 0.0f }, { "RINGMOD", 0.0f }, { "FMAMOUNT", 16.0f }, { "SYNC", 0.0f },
+                    { "FILTER2ENABLE", 0.0f }, { "CUTOFF", 180.0f }, { "RESONANCE", 0.22f }, { "FILTERENVAMOUNT", 0.42f },
+                    { "AMPATTACK", 0.001f }, { "AMPDECAY", 0.22f }, { "AMPSUSTAIN", 0.54f }, { "AMPRELEASE", 0.12f },
+                    { "FILTDECAY", 0.2f }, { "FILTSUSTAIN", 0.08f }, { "FXTYPE", 1.0f }, { "FXMIX", 0.06f },
+                    { "FXINTENSITY", 0.28f }, { "DELAYSEND", 0.0f }, { "REVERBMIX", 0.0f }, { "MASTERLEVEL", 1.1f },
+                });
+                break;
+            case 14:
+                applyAdvancedSettings ({
+                    { "OSCTYPE", 1.0f }, { "OSC2TYPE", 1.0f }, { "UNISON", 7.0f }, { "DETUNE", 0.09f },
+                    { "OSC2MIX", 0.5f }, { "SUBOSCLEVEL", 0.12f }, { "NOISELEVEL", 0.03f }, { "RINGMOD", 0.0f },
+                    { "FILTER2ENABLE", 0.0f }, { "CUTOFF", 4200.0f }, { "RESONANCE", 0.18f }, { "FILTERENVAMOUNT", 0.18f },
+                    { "AMPATTACK", 0.9f }, { "AMPDECAY", 1.2f }, { "AMPSUSTAIN", 0.92f }, { "AMPRELEASE", 3.0f },
+                    { "FILTATTACK", 0.24f }, { "FILTDECAY", 1.1f }, { "FILTSUSTAIN", 0.64f }, { "FILTRELEASE", 1.8f },
+                    { "LFO2RATE", 0.12f }, { "LFO2SHAPE", 1.0f }, { "LFO2FILTER", 0.14f }, { "FXTYPE", 3.0f },
+                    { "FXMIX", 0.26f }, { "FXINTENSITY", 0.34f }, { "DELAYSEND", 0.18f }, { "DELAYTIME", 0.52f },
+                    { "DELAYFEEDBACK", 0.38f }, { "REVERBMIX", 0.26f },
+                });
+                break;
+            case 15:
+                applyAdvancedSettings ({
+                    { "MONOENABLE", 1.0f }, { "OSCTYPE", 2.0f }, { "OSC2TYPE", 1.0f }, { "UNISON", 2.0f },
+                    { "DETUNE", 0.028f }, { "OSC2SEMITONE", 7.0f }, { "OSC2MIX", 0.34f }, { "SUBOSCLEVEL", 0.08f },
+                    { "NOISELEVEL", 0.02f }, { "RINGMOD", 0.0f }, { "FMAMOUNT", 110.0f }, { "SYNC", 0.18f },
+                    { "FILTERTYPE", 1.0f }, { "CUTOFF", 1100.0f }, { "CUTOFF2", 4200.0f }, { "RESONANCE", 0.52f },
+                    { "FILTERENVAMOUNT", 0.58f }, { "FILTERBALANCE", 0.34f }, { "AMPATTACK", 0.01f },
+                    { "AMPDECAY", 0.18f }, { "AMPSUSTAIN", 0.36f }, { "AMPRELEASE", 0.14f }, { "FILTDECAY", 0.16f },
+                    { "FILTSUSTAIN", 0.08f }, { "FXTYPE", 2.0f }, { "FXMIX", 0.16f }, { "FXINTENSITY", 0.44f },
+                    { "DELAYSEND", 0.06f }, { "REVERBMIX", 0.04f },
+                });
+                break;
+            case 16:
+                applyAdvancedSettings ({
+                    { "OSCTYPE", 0.0f }, { "OSC2TYPE", 0.0f }, { "UNISON", 2.0f }, { "DETUNE", 0.016f },
+                    { "OSC2SEMITONE", 7.0f }, { "OSC2MIX", 0.36f }, { "SUBOSCLEVEL", 0.0f }, { "NOISELEVEL", 0.0f },
+                    { "RINGMOD", 0.04f }, { "FMAMOUNT", 260.0f }, { "SYNC", 0.0f }, { "FILTER2ENABLE", 0.0f },
+                    { "CUTOFF", 3600.0f }, { "RESONANCE", 0.16f }, { "FILTERENVAMOUNT", 0.28f }, { "AMPATTACK", 0.02f },
+                    { "AMPDECAY", 0.62f }, { "AMPSUSTAIN", 0.68f }, { "AMPRELEASE", 0.74f }, { "FILTATTACK", 0.01f },
+                    { "FILTDECAY", 0.38f }, { "FILTSUSTAIN", 0.42f }, { "FILTRELEASE", 0.44f }, { "FXTYPE", 3.0f },
+                    { "FXMIX", 0.12f }, { "FXINTENSITY", 0.22f }, { "DELAYSEND", 0.08f }, { "REVERBMIX", 0.18f },
+                });
+                break;
+            case 17:
+                applyAdvancedSettings ({
+                    { "OSCTYPE", 1.0f }, { "OSC2TYPE", 0.0f }, { "UNISON", 5.0f }, { "DETUNE", 0.055f },
+                    { "OSC2SEMITONE", 12.0f }, { "OSC2MIX", 0.42f }, { "SUBOSCLEVEL", 0.12f }, { "NOISELEVEL", 0.02f },
+                    { "RINGMOD", 0.0f }, { "CUTOFF", 2400.0f }, { "CUTOFF2", 5200.0f }, { "RESONANCE", 0.24f },
+                    { "FILTERENVAMOUNT", 0.16f }, { "FILTERBALANCE", 0.2f }, { "AMPATTACK", 0.36f },
+                    { "AMPDECAY", 0.92f }, { "AMPSUSTAIN", 0.84f }, { "AMPRELEASE", 2.2f }, { "FILTATTACK", 0.12f },
+                    { "FILTDECAY", 0.76f }, { "FILTSUSTAIN", 0.52f }, { "FILTRELEASE", 1.1f }, { "LFO2RATE", 0.09f },
+                    { "LFO2FILTER", 0.12f }, { "FXTYPE", 3.0f }, { "FXMIX", 0.22f }, { "FXINTENSITY", 0.3f },
+                    { "DELAYSEND", 0.14f }, { "DELAYTIME", 0.48f }, { "DELAYFEEDBACK", 0.32f },
+                    { "REVERBMIX", 0.26f },
+                });
+                break;
+            case 18:
+                applyAdvancedSettings ({
+                    { "OSCTYPE", 2.0f }, { "OSC2TYPE", 0.0f }, { "UNISON", 3.0f }, { "DETUNE", 0.03f },
+                    { "OSC2SEMITONE", -12.0f }, { "OSC2MIX", 0.2f }, { "SUBOSCLEVEL", 0.14f }, { "NOISELEVEL", 0.06f },
+                    { "RINGMOD", 0.0f }, { "FMAMOUNT", 60.0f }, { "SYNC", 0.04f }, { "FILTERTYPE", 3.0f },
+                    { "FILTER2TYPE", 0.0f }, { "CUTOFF", 900.0f }, { "CUTOFF2", 2800.0f }, { "RESONANCE", 0.48f },
+                    { "FILTERENVAMOUNT", 0.26f }, { "FILTERBALANCE", 0.32f }, { "AMPATTACK", 0.06f },
+                    { "AMPDECAY", 0.52f }, { "AMPSUSTAIN", 0.58f }, { "AMPRELEASE", 0.44f }, { "FILTATTACK", 0.08f },
+                    { "FILTDECAY", 0.46f }, { "FILTSUSTAIN", 0.18f }, { "FILTRELEASE", 0.38f }, { "LFO2RATE", 0.3f },
+                    { "LFO2FILTER", 0.1f }, { "FXTYPE", 2.0f }, { "FXMIX", 0.18f }, { "FXINTENSITY", 0.38f },
+                    { "DELAYSEND", 0.08f }, { "REVERBMIX", 0.14f },
+                });
+                break;
+            case 19:
+                applyAdvancedSettings ({
+                    { "OSCTYPE", 1.0f }, { "OSC2TYPE", 1.0f }, { "UNISON", 6.0f }, { "DETUNE", 0.075f },
+                    { "OSC2MIX", 0.44f }, { "SUBOSCLEVEL", 0.1f }, { "NOISELEVEL", 0.04f }, { "RINGMOD", 0.0f },
+                    { "FILTER2TYPE", 3.0f }, { "CUTOFF", 1400.0f }, { "CUTOFF2", 5200.0f }, { "RESONANCE", 0.28f },
+                    { "FILTERENVAMOUNT", 0.72f }, { "FILTERBALANCE", 0.38f }, { "AMPATTACK", 0.22f },
+                    { "AMPDECAY", 1.0f }, { "AMPSUSTAIN", 0.78f }, { "AMPRELEASE", 2.0f }, { "FILTATTACK", 0.08f },
+                    { "FILTDECAY", 2.2f }, { "FILTSUSTAIN", 0.12f }, { "FILTRELEASE", 1.4f }, { "LFO2RATE", 0.18f },
+                    { "LFO2SHAPE", 1.0f }, { "LFO2FILTER", 0.22f }, { "FXTYPE", 4.0f }, { "FXMIX", 0.16f },
+                    { "FXINTENSITY", 0.3f }, { "DELAYSEND", 0.12f }, { "DELAYTIME", 0.46f },
+                    { "DELAYFEEDBACK", 0.34f }, { "REVERBMIX", 0.22f },
+                });
                 break;
             default:
-                setParameterActual ("OSCTYPE", 1.0f);
-                setParameterActual ("OSC2TYPE", 2.0f);
-                setParameterActual ("UNISON", 2.0f);
-                setParameterActual ("DETUNE", 0.045f);
-                setParameterActual ("OSC2SEMITONE", 0.0f);
-                setParameterActual ("OSC2DETUNE", 0.08f);
-                setParameterActual ("OSC2MIX", 0.42f);
-                setParameterActual ("SUBOSCLEVEL", 0.18f);
-                setParameterActual ("NOISELEVEL", 0.04f);
-                setParameterActual ("RINGMOD", 0.08f);
-                setParameterActual ("FMAMOUNT", 120.0f);
-                setParameterActual ("SYNC", 0.24f);
-                setParameterActual ("FILTERTYPE", 0.0f);
-                setParameterActual ("FILTER2TYPE", 2.0f);
-                setParameterActual ("CUTOFF", 2200.0f);
-                setParameterActual ("CUTOFF2", 5400.0f);
-                setParameterActual ("RESONANCE", 0.36f);
-                setParameterActual ("FILTERENVAMOUNT", 0.42f);
-                setParameterActual ("FILTERBALANCE", 0.28f);
-                setParameterActual ("AMPATTACK", 0.004f);
-                setParameterActual ("AMPDECAY", 0.28f);
-                setParameterActual ("AMPSUSTAIN", 0.74f);
-                setParameterActual ("AMPRELEASE", 0.36f);
-                setParameterActual ("FILTATTACK", 0.001f);
-                setParameterActual ("FILTDECAY", 0.24f);
-                setParameterActual ("FILTSUSTAIN", 0.42f);
-                setParameterActual ("FILTRELEASE", 0.24f);
-                setParameterActual ("FXTYPE", 3.0f);
-                setParameterActual ("FXMIX", 0.18f);
-                setParameterActual ("FXINTENSITY", 0.32f);
-                setParameterActual ("DELAYSEND", 0.16f);
-                setParameterActual ("DELAYTIME", 0.36f);
-                setParameterActual ("DELAYFEEDBACK", 0.28f);
-                setParameterActual ("REVERBMIX", 0.12f);
                 break;
         }
     }
@@ -3667,6 +4066,8 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
         for (int padIndex = 0; padIndex < vecPadCount; ++padIndex)
         {
             setParameterActual (externalPadLevelParameterIdForIndex (padIndex).toRawUTF8(), 1.0f);
+            setParameterActual (externalPadSustainParameterIdForIndex (padIndex).toRawUTF8(), 120.0f);
+            setParameterActual (externalPadReleaseParameterIdForIndex (padIndex).toRawUTF8(), 0.2f);
             setParameterActual (externalPadSampleParameterIdForIndex (padIndex).toRawUTF8(), 0.0f);
         }
     }

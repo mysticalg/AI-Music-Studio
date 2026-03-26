@@ -930,9 +930,34 @@ AdvancedVSTiAudioProcessorEditor::DrumPad::DrumPad (
     const juce::String& noteText)
     : lookAndFeel (lf)
 {
+    const bool compactVecPad = lf.theme.vecPadMachine;
+    auto configurePadSlider = [this, compactVecPad, &lf] (PreviewSlider& targetSlider, const juce::String& tooltip)
+    {
+        targetSlider.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
+        targetSlider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, compactVecPad ? 42 : (lf.theme.tribute909 ? 52 : 58), compactVecPad ? 16 : 20);
+        targetSlider.setLookAndFeel (&lookAndFeel);
+        targetSlider.setColour (juce::Slider::textBoxTextColourId, lf.theme.text);
+        targetSlider.setColour (juce::Slider::textBoxBackgroundColourId, lf.theme.tribute909 ? lf.theme.faceplate.brighter (0.08f) : lf.theme.panel.brighter (0.08f));
+        targetSlider.setColour (juce::Slider::textBoxOutlineColourId, lf.theme.tribute909 ? lf.theme.trim : lf.theme.panelEdge);
+        targetSlider.setColour (juce::Slider::textBoxHighlightColourId, lf.theme.accent.withAlpha (0.16f));
+        targetSlider.setMouseDragSensitivity (compactVecPad ? 190 : 160);
+        targetSlider.setTooltip (tooltip);
+        addAndMakeVisible (targetSlider);
+    };
+    auto configureFooterLabel = [this, compactVecPad, &lf] (juce::Label& label, const juce::String& text)
+    {
+        label.setText (text, juce::dontSendNotification);
+        label.setJustificationType (juce::Justification::centred);
+        label.setFont (juce::Font (juce::FontOptions { compactVecPad ? 8.0f : 8.8f, juce::Font::bold }));
+        label.setColour (juce::Label::textColourId, lf.theme.hint.brighter (0.4f));
+        label.setInterceptsMouseClicks (false, false);
+        label.setVisible (false);
+        addAndMakeVisible (label);
+    };
+
     titleLabel.setText (titleText, juce::dontSendNotification);
     titleLabel.setJustificationType (juce::Justification::centred);
-    titleLabel.setFont (juce::Font (juce::FontOptions { lf.theme.tribute909 ? 12.0f : 13.0f, juce::Font::bold }));
+    titleLabel.setFont (juce::Font (juce::FontOptions { compactVecPad ? 11.5f : (lf.theme.tribute909 ? 12.0f : 13.0f), juce::Font::bold }));
     titleLabel.setColour (juce::Label::textColourId, lf.theme.tribute909 ? lf.theme.legend : lf.theme.text);
     titleLabel.setMinimumHorizontalScale (0.7f);
     titleLabel.setInterceptsMouseClicks (false, false);
@@ -940,35 +965,34 @@ AdvancedVSTiAudioProcessorEditor::DrumPad::DrumPad (
 
     noteLabel.setText (noteText, juce::dontSendNotification);
     noteLabel.setJustificationType (juce::Justification::centred);
-    noteLabel.setFont (juce::Font (juce::FontOptions { lf.theme.tribute909 ? 9.5f : 10.5f, juce::Font::plain }));
+    noteLabel.setFont (juce::Font (juce::FontOptions { compactVecPad ? 8.8f : (lf.theme.tribute909 ? 9.5f : 10.5f), juce::Font::plain }));
     noteLabel.setColour (juce::Label::textColourId, lf.theme.tribute909 ? lf.theme.panelEdge.darker (0.42f) : lf.theme.hint);
     noteLabel.setInterceptsMouseClicks (false, false);
     addAndMakeVisible (noteLabel);
 
     presetLabel.setJustificationType (juce::Justification::centred);
-    presetLabel.setFont (juce::Font (juce::FontOptions { lf.theme.vecPadMachine ? 9.5f : 9.0f, juce::Font::bold }));
+    presetLabel.setFont (juce::Font (juce::FontOptions { compactVecPad ? 8.3f : 9.0f, juce::Font::bold }));
     presetLabel.setColour (juce::Label::textColourId, lf.theme.accent.brighter (0.25f));
     presetLabel.setInterceptsMouseClicks (false, false);
     presetLabel.setVisible (false);
     addAndMakeVisible (presetLabel);
 
     sampleLabel.setJustificationType (juce::Justification::centred);
-    sampleLabel.setFont (juce::Font (juce::FontOptions { lf.theme.vecPadMachine ? 12.5f : 10.5f, juce::Font::bold }));
+    sampleLabel.setFont (juce::Font (juce::FontOptions { compactVecPad ? 10.8f : 10.5f, juce::Font::bold }));
     sampleLabel.setColour (juce::Label::textColourId, lf.theme.text);
-    sampleLabel.setMinimumHorizontalScale (0.66f);
+    sampleLabel.setMinimumHorizontalScale (compactVecPad ? 0.58f : 0.66f);
     sampleLabel.setInterceptsMouseClicks (false, false);
     sampleLabel.setVisible (false);
     addAndMakeVisible (sampleLabel);
 
-    slider.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
-    slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, lf.theme.tribute909 ? 52 : 58, 20);
-    slider.setLookAndFeel (&lookAndFeel);
-    slider.setColour (juce::Slider::textBoxTextColourId, lf.theme.text);
-    slider.setColour (juce::Slider::textBoxBackgroundColourId, lf.theme.tribute909 ? lf.theme.faceplate.brighter (0.08f) : lf.theme.panel.brighter (0.08f));
-    slider.setColour (juce::Slider::textBoxOutlineColourId, lf.theme.tribute909 ? lf.theme.trim : lf.theme.panelEdge);
-    slider.setColour (juce::Slider::textBoxHighlightColourId, lf.theme.accent.withAlpha (0.16f));
-    slider.setMouseDragSensitivity (160);
-    addAndMakeVisible (slider);
+    configurePadSlider (slider, compactVecPad ? "Click to audition, drag to set level" : "Drag to set level");
+    configurePadSlider (sustainSlider, "Click to audition, drag to set sustain time");
+    configurePadSlider (releaseSlider, "Click to audition, drag to set release time");
+    sustainSlider.setVisible (false);
+    releaseSlider.setVisible (false);
+    configureFooterLabel (levelLabel, "LVL");
+    configureFooterLabel (sustainLabel, "SUS");
+    configureFooterLabel (releaseLabel, "REL");
 
     auto configureButton = [this] (juce::TextButton& button)
     {
@@ -1032,7 +1056,7 @@ void AdvancedVSTiAudioProcessorEditor::DrumPad::paint (juce::Graphics& g)
         g.setColour (lookAndFeel.theme.panelEdge.withAlpha (0.9f));
         g.drawRoundedRectangle (shell, 16.0f, 1.2f);
 
-        auto padFace = shell.reduced (12.0f, 14.0f).withTrimmedTop (34.0f).withTrimmedBottom (58.0f);
+        auto padFace = shell.reduced (10.0f, 12.0f).withTrimmedTop (30.0f).withTrimmedBottom (showEnvelopeControls ? 82.0f : 50.0f);
         juce::ColourGradient faceFill (lookAndFeel.theme.panel.brighter (0.24f), padFace.getTopLeft(),
                                        lookAndFeel.theme.panel.darker (0.28f), padFace.getBottomRight(), false);
         g.setGradientFill (faceFill);
@@ -1084,23 +1108,66 @@ void AdvancedVSTiAudioProcessorEditor::DrumPad::setStepperEnabled (bool canStepL
     rightButton.setEnabled (canStepRight);
 }
 
+void AdvancedVSTiAudioProcessorEditor::DrumPad::setEnvelopeControlsVisible (bool shouldShowEnvelopeControls)
+{
+    showEnvelopeControls = shouldShowEnvelopeControls;
+    sustainSlider.setVisible (shouldShowEnvelopeControls);
+    releaseSlider.setVisible (shouldShowEnvelopeControls);
+    levelLabel.setVisible (shouldShowEnvelopeControls);
+    sustainLabel.setVisible (shouldShowEnvelopeControls);
+    releaseLabel.setVisible (shouldShowEnvelopeControls);
+    resized();
+}
+
 void AdvancedVSTiAudioProcessorEditor::DrumPad::resized()
 {
-    auto area = getLocalBounds().reduced (lookAndFeel.theme.tribute909 ? 8 : 12);
-    titleLabel.setBounds (area.removeFromTop (lookAndFeel.theme.tribute909 ? 18 : 20));
-    noteLabel.setBounds (area.removeFromTop (lookAndFeel.theme.tribute909 ? 12 : 16));
+    const bool compactVecPad = lookAndFeel.theme.vecPadMachine;
+    auto area = getLocalBounds().reduced (lookAndFeel.theme.tribute909 ? 8 : (compactVecPad ? 8 : 12));
+    titleLabel.setBounds (area.removeFromTop (lookAndFeel.theme.tribute909 ? 18 : (compactVecPad ? 18 : 20)));
+    noteLabel.setBounds (area.removeFromTop (lookAndFeel.theme.tribute909 ? 12 : (compactVecPad ? 12 : 16)));
 
     if (showStepper)
     {
-        area.removeFromTop (4);
-        presetLabel.setBounds (area.removeFromTop (14));
-        sampleLabel.setBounds (area.removeFromTop (24));
-        auto footer = area.removeFromBottom (54);
-        auto buttonArea = footer.removeFromLeft (64);
-        leftButton.setBounds (buttonArea.removeFromLeft (28));
-        buttonArea.removeFromLeft (8);
-        rightButton.setBounds (buttonArea.removeFromLeft (28));
-        slider.setBounds (footer.removeFromRight (70).reduced (0, 2));
+        area.removeFromTop (compactVecPad ? 2 : 4);
+        presetLabel.setBounds (area.removeFromTop (compactVecPad ? 12 : 14));
+        sampleLabel.setBounds (area.removeFromTop (compactVecPad ? 18 : 24));
+        auto footer = area.removeFromBottom (showEnvelopeControls ? (compactVecPad ? 86 : 96) : (compactVecPad ? 46 : 54));
+
+        if (showEnvelopeControls)
+        {
+            auto stepperRow = footer.removeFromTop (compactVecPad ? 18 : 22);
+            auto buttonArea = juce::Rectangle<int> (compactVecPad ? 52 : 64, stepperRow.getHeight()).withCentre (stepperRow.getCentre());
+            leftButton.setBounds (buttonArea.removeFromLeft (compactVecPad ? 22 : 28));
+            buttonArea.removeFromLeft (compactVecPad ? 6 : 8);
+            rightButton.setBounds (buttonArea.removeFromLeft (compactVecPad ? 22 : 28));
+
+            footer.removeFromTop (compactVecPad ? 10 : 12);
+            auto sliderArea = footer.reduced (compactVecPad ? 0 : 2, 0);
+            const int spacing = compactVecPad ? 4 : 6;
+            const int sliderWidth = (sliderArea.getWidth() - (spacing * 2)) / 3;
+            auto layoutSliderWithLabel = [] (juce::Rectangle<int> bounds, juce::Label& label, PreviewSlider& targetSlider)
+            {
+                auto labelBounds = bounds.removeFromTop (10);
+                label.setBounds (labelBounds);
+                targetSlider.setBounds (bounds);
+            };
+
+            auto levelArea = sliderArea.removeFromLeft (sliderWidth);
+            layoutSliderWithLabel (levelArea, levelLabel, slider);
+            sliderArea.removeFromLeft (spacing);
+            auto sustainArea = sliderArea.removeFromLeft (sliderWidth);
+            layoutSliderWithLabel (sustainArea, sustainLabel, sustainSlider);
+            sliderArea.removeFromLeft (spacing);
+            layoutSliderWithLabel (sliderArea, releaseLabel, releaseSlider);
+        }
+        else
+        {
+            auto buttonArea = footer.removeFromLeft (compactVecPad ? 52 : 64);
+            leftButton.setBounds (buttonArea.removeFromLeft (compactVecPad ? 22 : 28));
+            buttonArea.removeFromLeft (compactVecPad ? 6 : 8);
+            rightButton.setBounds (buttonArea.removeFromLeft (compactVecPad ? 22 : 28));
+            slider.setBounds (footer.removeFromRight (compactVecPad ? 60 : 70).reduced (0, compactVecPad ? 1 : 2));
+        }
         return;
     }
 
@@ -1108,8 +1175,13 @@ void AdvancedVSTiAudioProcessorEditor::DrumPad::resized()
     sampleLabel.setBounds ({});
     leftButton.setBounds ({});
     rightButton.setBounds ({});
-    area.removeFromTop (lookAndFeel.theme.tribute909 ? 0 : 2);
-    slider.setBounds (area.reduced (lookAndFeel.theme.tribute909 ? 2 : 6, 0));
+    levelLabel.setBounds ({});
+    sustainLabel.setBounds ({});
+    releaseLabel.setBounds ({});
+    sustainSlider.setBounds ({});
+    releaseSlider.setBounds ({});
+    area.removeFromTop (lookAndFeel.theme.tribute909 ? 0 : (compactVecPad ? 1 : 2));
+    slider.setBounds (area.reduced (lookAndFeel.theme.tribute909 ? 2 : (compactVecPad ? 4 : 6), 0));
 }
 
 AdvancedVSTiAudioProcessorEditor::AdvancedVSTiAudioProcessorEditor (AdvancedVSTiAudioProcessor& p)
@@ -1287,9 +1359,12 @@ void AdvancedVSTiAudioProcessorEditor::buildEditor()
                 audioProcessor.previewDrumPad (midiNote);
             };
             pad->slider.onPreviewRequested = pad->onPreviewRequested;
+            pad->sustainSlider.onPreviewRequested = pad->onPreviewRequested;
+            pad->releaseSlider.onPreviewRequested = pad->onPreviewRequested;
             if (audioProcessor.isVec1DrumPadFlavor())
             {
                 pad->setStepperVisible (true);
+                pad->setEnvelopeControlsVisible (true);
                 pad->onStepLeftRequested = [this, padIndex, midiNote = spec.midiNote]
                 {
                     audioProcessor.stepExternalPadSample (padIndex, -1);
@@ -1303,7 +1378,16 @@ void AdvancedVSTiAudioProcessorEditor::buildEditor()
                     syncExternalPadDisplays();
                 };
             }
-            sliderAttachments.push_back (std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (audioProcessor.apvts, spec.paramId, pad->slider));
+            else
+            {
+                pad->setEnvelopeControlsVisible (false);
+            }
+
+            sliderAttachments.push_back (std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (audioProcessor.apvts, spec.levelParamId, pad->slider));
+            if (spec.sustainParamId.isNotEmpty())
+                sliderAttachments.push_back (std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (audioProcessor.apvts, spec.sustainParamId, pad->sustainSlider));
+            if (spec.releaseParamId.isNotEmpty())
+                sliderAttachments.push_back (std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (audioProcessor.apvts, spec.releaseParamId, pad->releaseSlider));
             addAndMakeVisible (pad);
             ++padIndex;
         }
@@ -2443,6 +2527,8 @@ std::vector<AdvancedVSTiAudioProcessorEditor::DrumPadSpec> AdvancedVSTiAudioProc
             const auto state = audioProcessor.getExternalPadState (padIndex);
             specs.push_back ({
                 audioProcessor.externalPadLevelParameterId (padIndex),
+                audioProcessor.externalPadSustainParameterId (padIndex),
+                audioProcessor.externalPadReleaseParameterId (padIndex),
                 state.title,
                 state.note,
                 state.midiNote
@@ -2452,21 +2538,21 @@ std::vector<AdvancedVSTiAudioProcessorEditor::DrumPadSpec> AdvancedVSTiAudioProc
     }
 
     return {
-        { "DRUMLEVEL_KICK", "Bass Drum", "C1", 36 },
-        { "DRUMLEVEL_RIM", "Rim Shot", "C#1", 37 },
-        { "DRUMLEVEL_SNARE", "Snare", "D1", 38 },
-        { "DRUMLEVEL_CLAP", "Clap", "D#1", 39 },
-        { "DRUMLEVEL_CLOSED_HAT", "Closed Hat", "E1", 40 },
-        { "DRUMLEVEL_OPEN_HAT", "Open Hat", "F1", 41 },
-        { "DRUMLEVEL_LOW_TOM", "Low Tom", "F#1", 42 },
-        { "DRUMLEVEL_MID_TOM", "Mid Tom", "G1", 43 },
-        { "DRUMLEVEL_HIGH_TOM", "High Tom", "G#1", 44 },
-        { "DRUMLEVEL_CRASH", "Crash", "A1", 45 },
-        { "DRUMLEVEL_RIDE", "Ride", "A#1", 46 },
-        { "DRUMLEVEL_COWBELL", "Cowbell", "B1", 47 },
-        { "DRUMLEVEL_CLAVE", "Clave", "C2", 48 },
-        { "DRUMLEVEL_MARACA", "Maraca", "C#2", 49 },
-        { "DRUMLEVEL_PERC", "Perc", "D2", 50 },
+        { "DRUMLEVEL_KICK", {}, {}, "Bass Drum", "C1", 36 },
+        { "DRUMLEVEL_RIM", {}, {}, "Rim Shot", "C#1", 37 },
+        { "DRUMLEVEL_SNARE", {}, {}, "Snare", "D1", 38 },
+        { "DRUMLEVEL_CLAP", {}, {}, "Clap", "D#1", 39 },
+        { "DRUMLEVEL_CLOSED_HAT", {}, {}, "Closed Hat", "E1", 40 },
+        { "DRUMLEVEL_OPEN_HAT", {}, {}, "Open Hat", "F1", 41 },
+        { "DRUMLEVEL_LOW_TOM", {}, {}, "Low Tom", "F#1", 42 },
+        { "DRUMLEVEL_MID_TOM", {}, {}, "Mid Tom", "G1", 43 },
+        { "DRUMLEVEL_HIGH_TOM", {}, {}, "High Tom", "G#1", 44 },
+        { "DRUMLEVEL_CRASH", {}, {}, "Crash", "A1", 45 },
+        { "DRUMLEVEL_RIDE", {}, {}, "Ride", "A#1", 46 },
+        { "DRUMLEVEL_COWBELL", {}, {}, "Cowbell", "B1", 47 },
+        { "DRUMLEVEL_CLAVE", {}, {}, "Clave", "C2", 48 },
+        { "DRUMLEVEL_MARACA", {}, {}, "Maraca", "C#2", 49 },
+        { "DRUMLEVEL_PERC", {}, {}, "Perc", "D2", 50 },
     };
 }
 
@@ -3490,23 +3576,26 @@ void AdvancedVSTiAudioProcessorEditor::resized()
 
     if (usesDrumPadLayout())
     {
-        const auto uiScale = juce::jlimit (0.8f, 1.4f, juce::jmin (getWidth() / 1180.0f, getHeight() / 860.0f));
-        badgeLabel.setFont (juce::Font (11.0f * uiScale, juce::Font::bold));
-        titleLabel.setFont (juce::Font (28.0f * uiScale, juce::Font::bold));
-        subtitleLabel.setFont (juce::Font (13.0f * uiScale, juce::Font::plain));
+        const bool vecPadLayout = audioProcessor.isVec1DrumPadFlavor();
+        const auto uiScale = vecPadLayout
+                                 ? juce::jlimit (0.72f, 1.15f, juce::jmin (getWidth() / 1280.0f, getHeight() / 900.0f))
+                                 : juce::jlimit (0.8f, 1.4f, juce::jmin (getWidth() / 1180.0f, getHeight() / 860.0f));
+        badgeLabel.setFont (juce::Font ((vecPadLayout ? 10.0f : 11.0f) * uiScale, juce::Font::bold));
+        titleLabel.setFont (juce::Font ((vecPadLayout ? 24.0f : 28.0f) * uiScale, juce::Font::bold));
+        subtitleLabel.setFont (juce::Font ((vecPadLayout ? 11.5f : 13.0f) * uiScale, juce::Font::plain));
         for (auto* card : knobCards)
             card->setScale (uiScale);
         for (auto* card : choiceCards)
             card->setScale (uiScale);
 
-        auto area = getLocalBounds().reduced (isTribute909() ? 26 : 22);
-        auto hero = area.removeFromTop (isTribute909() ? 88 : 96);
+        auto area = getLocalBounds().reduced (isTribute909() ? 26 : (vecPadLayout ? 18 : 22));
+        auto hero = area.removeFromTop (isTribute909() ? 88 : (vecPadLayout ? 82 : 96));
         badgeLabel.setBounds (hero.removeFromTop (18));
-        titleLabel.setBounds (hero.removeFromTop (isTribute909() ? 40 : 36));
-        subtitleLabel.setBounds (hero.removeFromTop (36));
-        area.removeFromTop (audioProcessor.isVec1DrumPadFlavor() ? 6 : (isTribute909() ? 18 : 10));
+        titleLabel.setBounds (hero.removeFromTop (isTribute909() ? 40 : (vecPadLayout ? 32 : 36)));
+        subtitleLabel.setBounds (hero.removeFromTop (vecPadLayout ? 28 : 36));
+        area.removeFromTop (vecPadLayout ? 4 : (isTribute909() ? 18 : 10));
 
-        if (! audioProcessor.isVec1DrumPadFlavor())
+        if (! vecPadLayout)
         {
             auto controlBand = area.removeFromTop (isTribute909() ? 164 : 204);
             if (! choiceCards.isEmpty())
@@ -3540,11 +3629,12 @@ void AdvancedVSTiAudioProcessorEditor::resized()
         }
 
         auto padArea = area;
-        const int spacing = isTribute909() ? 10 : 14;
-        const int columns = isTribute909() ? 5 : 4;
-        const int rows = isTribute909() ? 3 : 4;
-        const int padWidth = (padArea.getWidth() - ((columns - 1) * spacing)) / columns;
-        const int padHeight = (padArea.getHeight() - ((rows - 1) * spacing)) / rows;
+        const int spacing = vecPadLayout ? 10 : (isTribute909() ? 10 : 14);
+        const int columns = vecPadLayout ? 5 : (isTribute909() ? 5 : 4);
+        const int rows = vecPadLayout ? juce::jmax (1, (drumPads.size() + columns - 1) / columns)
+                                      : (isTribute909() ? 3 : 4);
+        const int padWidth = juce::jmax (80, (padArea.getWidth() - ((columns - 1) * spacing)) / columns);
+        const int padHeight = juce::jmax (116, (padArea.getHeight() - ((rows - 1) * spacing)) / rows);
 
         int x = padArea.getX();
         int y = padArea.getY();
