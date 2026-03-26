@@ -3,16 +3,20 @@
 #include <JuceHeader.h>
 #include "PluginProcessor.h"
 
-class AdvancedVSTiAudioProcessorEditor final : public juce::AudioProcessorEditor
+class AdvancedVSTiAudioProcessorEditor final : public juce::AudioProcessorEditor,
+                                               private juce::Timer
 {
 public:
     explicit AdvancedVSTiAudioProcessorEditor (AdvancedVSTiAudioProcessor&);
     ~AdvancedVSTiAudioProcessorEditor() override = default;
 
     void paint (juce::Graphics&) override;
+    void paintOverChildren (juce::Graphics&) override;
     void resized() override;
 
 private:
+    void timerCallback() override;
+
     struct Theme
     {
         juce::String title;
@@ -32,6 +36,7 @@ private:
         bool tribute303 = false;
         bool tribute909 = false;
         bool tributeVirus = false;
+        bool vecPadMachine = false;
     };
 
     class AccentLookAndFeel final : public juce::LookAndFeel_V4
@@ -50,14 +55,22 @@ private:
     public:
         LedToggleButton (Theme themeToUse, const juce::String& text, bool latching = true);
         void setScale (float scaleFactor);
+        void setVirusIndicatorOnly (bool shouldBeIndicatorOnly);
+        void setVirusTopLedVisible (bool shouldShowTopLed);
         void paintButton (juce::Graphics&, bool shouldDrawButtonAsHighlighted, bool shouldDrawButtonAsDown) override;
+        void mouseDown (const juce::MouseEvent&) override;
+        void mouseUp (const juce::MouseEvent&) override;
 
     private:
         Theme theme;
         float scale = 1.0f;
+        bool virusIndicatorOnly = false;
+        bool virusTopLedVisible = false;
+        double pressVisualUntilMs = 0.0;
     };
 
-    class KnobCard final : public juce::Component
+    class KnobCard final : public juce::Component,
+                           public juce::SettableTooltipClient
     {
     public:
         class PreviewSlider final : public juce::Slider
@@ -99,7 +112,8 @@ private:
 
     struct ChoiceSpec;
 
-    class ChoiceCard final : public juce::Component
+    class ChoiceCard final : public juce::Component,
+                             public juce::SettableTooltipClient
     {
     public:
         explicit ChoiceCard (Theme themeToUse, const ChoiceSpec& spec);
@@ -148,14 +162,24 @@ private:
         void mouseDown (const juce::MouseEvent&) override;
         void resized() override;
         void paint (juce::Graphics&) override;
+        void setSampleInfo (const juce::String& presetText, const juce::String& sampleText);
+        void setStepperVisible (bool shouldShowStepper);
+        void setStepperEnabled (bool canStepLeft, bool canStepRight);
 
         std::function<void()> onPreviewRequested;
+        std::function<void()> onStepLeftRequested;
+        std::function<void()> onStepRightRequested;
         PreviewSlider slider;
 
     private:
         juce::Label titleLabel;
         juce::Label noteLabel;
+        juce::Label presetLabel;
+        juce::Label sampleLabel;
+        juce::TextButton leftButton { "<" };
+        juce::TextButton rightButton { ">" };
         AccentLookAndFeel& lookAndFeel;
+        bool showStepper = false;
 
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (DrumPad)
     };
@@ -197,11 +221,18 @@ private:
     [[nodiscard]] bool isTribute909() const noexcept;
     [[nodiscard]] bool isTributeVirus() const noexcept;
     [[nodiscard]] bool usesDrumPadLayout() const noexcept;
+    void syncExternalPadDisplays();
+    void updateVirusOscillatorBindings();
+    void syncVirusPanelButtons();
+    void buildVirusPanelButtons();
+    LedToggleButton* addVirusPanelButton (const juce::String& key, const juce::String& text, const juce::String& tooltip, bool latching = true);
+    [[nodiscard]] LedToggleButton* findVirusPanelButton (const juce::String& key) const;
     void buildEditor();
 
     AdvancedVSTiAudioProcessor& audioProcessor;
     Theme theme;
     AccentLookAndFeel lookAndFeel;
+    juce::TooltipWindow tooltipWindow;
 
     juce::Label badgeLabel;
     juce::Label titleLabel;
@@ -209,6 +240,19 @@ private:
     juce::OwnedArray<KnobCard> knobCards;
     juce::OwnedArray<ChoiceCard> choiceCards;
     juce::OwnedArray<DrumPad> drumPads;
+    juce::OwnedArray<LedToggleButton> virusPanelButtons;
+    std::vector<juce::String> virusPanelButtonKeys;
+    std::unique_ptr<LedToggleButton> virusBackgroundToggle;
+    juce::Image virusTemplateImage;
+    juce::Image backgroundImage;
+    bool virusShowBackground = true;
+    int virusMatrixSlotIndex = 0;
+    int virusModulatorIndex = 0;
+    int virusOscillatorIndex = 0;
+    int virusFilterEditIndex = 0;
+    int virusUpperFxLegendIndex = 0;
+    int virusLowerFxLegendIndex = 0;
+    int virusPanelModeIndex = 2;
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>> sliderAttachments;
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment>> comboAttachments;
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment>> buttonAttachments;

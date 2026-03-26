@@ -1,6 +1,7 @@
 #pragma once
 
 #include <JuceHeader.h>
+#include <memory>
 
 #ifndef AIMS_INSTRUMENT_FLAVOR
 #define AIMS_INSTRUMENT_FLAVOR 0
@@ -11,6 +12,17 @@ class AdvancedVSTiAudioProcessor final : public juce::AudioProcessor,
                                          private juce::AsyncUpdater
 {
 public:
+    struct ExternalPadState
+    {
+        juce::String title;
+        juce::String note;
+        juce::String preset;
+        juce::String sample;
+        int midiNote = 36;
+        bool canStepLeft = false;
+        bool canStepRight = false;
+    };
+
     AdvancedVSTiAudioProcessor();
     ~AdvancedVSTiAudioProcessor() override;
 
@@ -40,6 +52,11 @@ public:
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
     [[nodiscard]] juce::StringArray presetNames() const;
     void previewDrumPad (int midiNote, float velocity = 0.9f);
+    [[nodiscard]] bool isVec1DrumPadFlavor() const noexcept;
+    [[nodiscard]] int externalPadCount() const noexcept;
+    [[nodiscard]] ExternalPadState getExternalPadState (int padIndex) const;
+    void stepExternalPadSample (int padIndex, int delta);
+    [[nodiscard]] juce::String externalPadLevelParameterId (int padIndex) const;
 
     juce::AudioProcessorValueTreeState apvts;
 
@@ -55,10 +72,12 @@ private:
         pluckSynth,
         sampler,
         drum808,
-        acid303
+        acid303,
+        vec1DrumPad
     };
 
     static constexpr int drumVoiceLevelCount = 15;
+    static constexpr int vecPadCount = 16;
 
     enum class OscType
     {
@@ -68,6 +87,8 @@ private:
         noise,
         sample
     };
+
+    struct ExternalSampleData;
 
     static constexpr int maxVoices = 256;
     static constexpr int maxUnisonOscillators = 8;
@@ -87,6 +108,9 @@ private:
         float auxPhase = 0.0f;
         float toneState = 0.0f;
         float colourState = 0.0f;
+        int externalPadIndex = -1;
+        double externalSamplePosition = 0.0;
+        std::shared_ptr<const ExternalSampleData> externalSample;
         std::array<float, maxUnisonOscillators> unisonPhases {};
         std::array<float, maxUnisonOscillators> unisonSyncPhases {};
         std::array<float, maxUnisonOscillators> unisonSamplePositions {};
@@ -103,9 +127,16 @@ private:
         int lfo1Shape = 0;
         int lfo2Shape = 0;
         int arpMode = 0;
+        bool arpEnabled = false;
+        bool lfo1Enabled = true;
+        bool lfo2Enabled = true;
+        bool lfo3Enabled = true;
+        bool filter1Enabled = true;
+        bool filter2Enabled = true;
         int filterType = 0;
         int filterSlope = 0;
         int osc2Type = 0;
+        int osc3Type = static_cast<int> (OscType::square);
         int filter2Type = 0;
         int filter2Slope = 0;
         int fxType = 0;
@@ -115,11 +146,19 @@ private:
         float fmAmount = 0.0f;
         float syncAmount = 0.0f;
         float gateLength = 8.0f;
+        float osc1Semitone = 0.0f;
+        float osc1Detune = 0.0f;
+        float osc1PulseWidth = 0.5f;
         float osc2Semitone = 0.0f;
         float osc2Detune = 0.0f;
+        float osc2PulseWidth = 0.5f;
+        float osc3Semitone = -12.0f;
+        float osc3Detune = 0.0f;
+        float osc3PulseWidth = 0.5f;
         float osc2Mix = 0.0f;
         float subOscLevel = 0.0f;
         bool osc3Enabled = true;
+        bool monoEnabled = false;
         float noiseLevel = 0.0f;
         float ringModAmount = 0.0f;
         float envCurve = 0.0f;
@@ -163,10 +202,41 @@ private:
             1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
             1.0f, 1.0f, 1.0f, 1.0f, 1.0f
         };
+        std::array<float, vecPadCount> externalPadLevels {
+            1.0f, 1.0f, 1.0f, 1.0f,
+            1.0f, 1.0f, 1.0f, 1.0f,
+            1.0f, 1.0f, 1.0f, 1.0f,
+            1.0f, 1.0f, 1.0f, 1.0f
+        };
 
         juce::ADSR::Parameters ampEnv;
         juce::ADSR::Parameters filterEnv;
     };
+
+    struct ExternalSampleEntry
+    {
+        juce::String filePath;
+        juce::String displayName;
+        juce::String presetName;
+    };
+
+    struct ExternalPadDefinition
+    {
+        juce::String folderName;
+        juce::String displayName;
+        juce::String noteName;
+        int midiNote = 36;
+        std::vector<ExternalSampleEntry> samples;
+    };
+
+    struct ExternalSampleData
+    {
+        juce::AudioBuffer<float> audio;
+        double sampleRate = 44100.0;
+        juce::String displayName;
+        juce::String presetName;
+    };
+
     std::array<VoiceState, maxVoices> voices;
     RenderParameters renderParams;
 
@@ -174,6 +244,15 @@ private:
     juce::Random random;
     juce::AudioBuffer<float> loadedSample;
     int loadedSampleBank = -1;
+    juce::AudioFormatManager audioFormatManager;
+    std::vector<ExternalPadDefinition> externalPads;
+    std::array<std::shared_ptr<const ExternalSampleData>, vecPadCount> externalPadSamples {};
+    std::array<int, vecPadCount> loadedExternalPadIndices {
+        -1, -1, -1, -1,
+        -1, -1, -1, -1,
+        -1, -1, -1, -1,
+        -1, -1, -1, -1
+    };
 
     juce::dsp::StateVariableTPTFilter<float> leftFilter;
     juce::dsp::StateVariableTPTFilter<float> rightFilter;
@@ -199,6 +278,7 @@ private:
     int arpStep = 0;
     juce::Array<int> heldNotes;
     std::atomic<int> pendingPresetIndex { -1 };
+    std::atomic<bool> pendingExternalPadReload { false };
     int currentProgramIndex = 0;
     bool suppressPresetCallback = false;
     juce::SpinLock pendingPreviewMidiLock;
@@ -224,12 +304,21 @@ private:
         return InstrumentFlavor::drum808;
 #elif AIMS_INSTRUMENT_FLAVOR == 9
         return InstrumentFlavor::acid303;
+#elif AIMS_INSTRUMENT_FLAVOR == 10
+        return InstrumentFlavor::vec1DrumPad;
 #else
         return InstrumentFlavor::advanced;
 #endif
     }
 
     [[nodiscard]] static constexpr bool isDrumFlavor() noexcept
+    {
+        return buildFlavor() == InstrumentFlavor::drumMachine
+               || buildFlavor() == InstrumentFlavor::drum808
+               || buildFlavor() == InstrumentFlavor::vec1DrumPad;
+    }
+
+    [[nodiscard]] static constexpr bool isSynthDrumFlavor() noexcept
     {
         return buildFlavor() == InstrumentFlavor::drumMachine || buildFlavor() == InstrumentFlavor::drum808;
     }
@@ -245,6 +334,8 @@ private:
             return 1;
         if constexpr (buildFlavor() == InstrumentFlavor::drumMachine || buildFlavor() == InstrumentFlavor::drum808)
             return 8;
+        if constexpr (buildFlavor() == InstrumentFlavor::vec1DrumPad)
+            return 24;
         if constexpr (buildFlavor() == InstrumentFlavor::stringSynth)
             return maxVoices;
         if constexpr (buildFlavor() == InstrumentFlavor::leadSynth)
@@ -267,6 +358,7 @@ private:
         if constexpr (buildFlavor() == InstrumentFlavor::bassSynth
                       || buildFlavor() == InstrumentFlavor::drumMachine
                       || buildFlavor() == InstrumentFlavor::drum808
+                      || buildFlavor() == InstrumentFlavor::vec1DrumPad
                       || buildFlavor() == InstrumentFlavor::sampler
                       || buildFlavor() == InstrumentFlavor::pluckSynth
                       || buildFlavor() == InstrumentFlavor::acid303)
@@ -286,15 +378,22 @@ private:
     void handleMidiMessage (const juce::MidiMessage& message);
     float renderVoiceSample (VoiceState& voice);
     float renderDrumVoiceSample (VoiceState& voice);
-    float oscSample (VoiceState& voice, float baseFreq, OscType type, float syncAmount);
-    float oscSampleForState (float& phase, float& syncPhase, float& samplePos, float baseFreq, OscType type, float syncAmount);
-    float basicOscSample (float& phase, float frequency, OscType type);
+    float renderExternalPadVoiceSample (VoiceState& voice);
+    float oscSample (VoiceState& voice, float baseFreq, OscType type, float syncAmount, float pulseWidth);
+    float oscSampleForState (float& phase, float& syncPhase, float& samplePos, float baseFreq, OscType type, float syncAmount, float pulseWidth);
+    float basicOscSample (float& phase, float frequency, OscType type, float pulseWidth);
     float fmOperator (VoiceState& voice, float baseFreq, float amount);
     float lfoValue (int shape, float phase) const;
     void refreshSampleBank();
     void buildGeneratedSampleBank (int bankIndex);
     [[nodiscard]] static juce::StringArray sampleBankChoices();
     [[nodiscard]] static juce::StringArray presetChoicesForFlavor();
+    void initializeExternalPadLibrary();
+    void refreshExternalPadSamples();
+    void loadExternalPadSample (int padIndex);
+    [[nodiscard]] int externalPadIndexForMidi (int midiNote) const noexcept;
+    [[nodiscard]] static juce::String externalPadSampleParameterIdForIndex (int padIndex);
+    [[nodiscard]] static juce::String externalPadLevelParameterIdForIndex (int padIndex);
     void applyAdvancedEffects (juce::AudioBuffer<float>& buffer);
 
     void updateRenderParameters();

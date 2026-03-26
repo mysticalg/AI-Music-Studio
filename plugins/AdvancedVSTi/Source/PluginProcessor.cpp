@@ -1,6 +1,10 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 
+#if JUCE_WINDOWS
+#include <windows.h>
+#endif
+
 namespace
 {
 constexpr float twoPi = juce::MathConstants<float>::twoPi;
@@ -52,6 +56,143 @@ constexpr std::array<float, 15> drum808VoiceLevelDefaults {
     0.8f, 0.88f, 0.84f, 0.8f, 0.72f,
     0.74f, 0.68f, 0.64f, 0.66f, 0.72f
 };
+
+constexpr int vecPadMidiStart = 36;
+constexpr int maxVecPadSampleChoices = 4096;
+constexpr std::array<const char*, 16> vecPadFolderOrder {
+    "VEC1 Bassdrums",
+    "VEC1 Snares",
+    "VEC1 Claps",
+    "VEC1 Cymbals",
+    "VEC1 Percussion",
+    "VEC1 FX",
+    "VEC1 Fills",
+    "VEC1 BreakBeats",
+    "VEC1 303 Acid",
+    "VEC1 Long Basses",
+    "VEC1 Offbeat Bass",
+    "VEC1 Loops",
+    "VEC1 Multis",
+    "VEC1 Sounds",
+    "VEC1 Special Sounds From Produc",
+    "VEC1 Vinyl FX and Scratches"
+};
+
+constexpr std::array<const char*, 16> vecPadTitles {
+    "Bassdrums",
+    "Snares",
+    "Claps",
+    "Cymbals",
+    "Percussion",
+    "FX",
+    "Fills",
+    "BreakBeats",
+    "303 Acid",
+    "Long Basses",
+    "Offbeat Bass",
+    "Loops",
+    "Multis",
+    "Sounds",
+    "Special Sounds",
+    "Vinyl FX"
+};
+
+constexpr std::array<const char*, 16> vecPadNotes {
+    "C1", "C#1", "D1", "D#1",
+    "E1", "F1", "F#1", "G1",
+    "G#1", "A1", "A#1", "B1",
+    "C2", "C#2", "D2", "D#2"
+};
+
+juce::File vecPadLibraryRoot()
+{
+   #if JUCE_WINDOWS
+    HMODULE moduleHandle = nullptr;
+    if (GetModuleHandleExW (GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR> (&vecPadLibraryRoot),
+                            &moduleHandle) != 0)
+    {
+        wchar_t modulePath[MAX_PATH] {};
+        if (GetModuleFileNameW (moduleHandle, modulePath, MAX_PATH) > 0)
+        {
+            auto moduleFile = juce::File (juce::String (modulePath));
+            auto contentsDir = moduleFile.getParentDirectory();
+            if (contentsDir.getFileName().equalsIgnoreCase ("x86_64-win"))
+                contentsDir = contentsDir.getParentDirectory();
+
+            if (contentsDir.getFileName().equalsIgnoreCase ("Contents"))
+            {
+                const auto bundledRoot = contentsDir.getChildFile ("Resources").getChildFile ("VEC1");
+                if (bundledRoot.isDirectory())
+                    return bundledRoot;
+
+                const auto legacyBundledRoot = contentsDir.getParentDirectory().getChildFile ("Resources").getChildFile ("VEC1");
+                if (legacyBundledRoot.isDirectory())
+                    return legacyBundledRoot;
+            }
+        }
+    }
+   #endif
+
+    return juce::File::createFileWithoutCheckingPath (R"(D:\OneDrive\Music\Sound Design\Sample Library\sample library\VEC1)");
+}
+
+bool isSupportedExternalSampleFile (const juce::File& file)
+{
+    const auto extension = file.getFileExtension().toLowerCase();
+    return extension == ".wav" || extension == ".aif" || extension == ".aiff" || extension == ".flac" || extension == ".ogg";
+}
+
+juce::String cleanedExternalSampleName (const juce::File& file)
+{
+    auto name = file.getFileNameWithoutExtension();
+    if (name.startsWithIgnoreCase ("VEC1 "))
+        name = name.fromFirstOccurrenceOf (" ", false, false).trim();
+    return name;
+}
+
+std::vector<juce::File> findSortedChildDirectories (const juce::File& folder)
+{
+    auto directories = folder.findChildFiles (juce::File::findDirectories, false);
+    std::vector<juce::File> result;
+    result.reserve (static_cast<size_t> (directories.size()));
+
+    for (const auto& directory : directories)
+    {
+        const auto name = directory.getFileName();
+        if (name.startsWithChar ('.') || name.startsWithIgnoreCase ("__") || name.containsIgnoreCase ("exs"))
+            continue;
+
+        result.push_back (directory);
+    }
+
+    std::sort (result.begin(), result.end(),
+               [] (const juce::File& lhs, const juce::File& rhs)
+               {
+                   return lhs.getFileName().compareIgnoreCase (rhs.getFileName()) < 0;
+               });
+    return result;
+}
+
+std::vector<juce::File> findSortedAudioFiles (const juce::File& folder)
+{
+    auto files = folder.findChildFiles (juce::File::findFiles, false);
+    std::vector<juce::File> result;
+    result.reserve (static_cast<size_t> (files.size()));
+
+    for (const auto& file : files)
+    {
+        if (isSupportedExternalSampleFile (file))
+            result.push_back (file);
+    }
+
+    std::sort (result.begin(), result.end(),
+               [] (const juce::File& lhs, const juce::File& rhs)
+               {
+                   return lhs.getFileName().compareIgnoreCase (rhs.getFileName()) < 0;
+               });
+    return result;
+}
 
 float paramValue (const juce::AudioProcessorValueTreeState& apvts, const char* paramId)
 {
@@ -335,13 +476,25 @@ AdvancedVSTiAudioProcessor::AdvancedVSTiAudioProcessor()
 {
     loadedSample.setSize (1, 1);
     loadedSample.clear();
+    audioFormatManager.registerBasicFormats();
+    initializeExternalPadLibrary();
     apvts.addParameterListener ("PRESET", this);
+    if constexpr (buildFlavor() == InstrumentFlavor::vec1DrumPad)
+    {
+        for (int padIndex = 0; padIndex < vecPadCount; ++padIndex)
+            apvts.addParameterListener (externalPadSampleParameterIdForIndex (padIndex), this);
+    }
     currentProgramIndex = juce::jlimit (0, juce::jmax (0, presetChoicesForFlavor().size() - 1), paramIndex (apvts, "PRESET"));
 }
 
 AdvancedVSTiAudioProcessor::~AdvancedVSTiAudioProcessor()
 {
     cancelPendingUpdate();
+    if constexpr (buildFlavor() == InstrumentFlavor::vec1DrumPad)
+    {
+        for (int padIndex = 0; padIndex < vecPadCount; ++padIndex)
+            apvts.removeParameterListener (externalPadSampleParameterIdForIndex (padIndex), this);
+    }
     apvts.removeParameterListener ("PRESET", this);
 }
 
@@ -355,6 +508,80 @@ void AdvancedVSTiAudioProcessor::previewDrumPad (int midiNote, float velocity)
                                                             juce::jlimit (0, 127, midiNote),
                                                             juce::jlimit (0.0f, 1.0f, velocity)),
                                  0);
+}
+
+bool AdvancedVSTiAudioProcessor::isVec1DrumPadFlavor() const noexcept
+{
+    return buildFlavor() == InstrumentFlavor::vec1DrumPad;
+}
+
+int AdvancedVSTiAudioProcessor::externalPadCount() const noexcept
+{
+    return isVec1DrumPadFlavor() ? vecPadCount : 0;
+}
+
+juce::String AdvancedVSTiAudioProcessor::externalPadLevelParameterId (int padIndex) const
+{
+    return externalPadLevelParameterIdForIndex (padIndex);
+}
+
+AdvancedVSTiAudioProcessor::ExternalPadState AdvancedVSTiAudioProcessor::getExternalPadState (int padIndex) const
+{
+    ExternalPadState state;
+    if (! isVec1DrumPadFlavor() || ! juce::isPositiveAndBelow (padIndex, vecPadCount))
+        return state;
+
+    state.title = vecPadTitles[static_cast<size_t> (padIndex)];
+    state.note = vecPadNotes[static_cast<size_t> (padIndex)];
+    state.midiNote = vecPadMidiStart + padIndex;
+
+    if (! juce::isPositiveAndBelow (padIndex, static_cast<int> (externalPads.size())))
+    {
+        state.sample = "Library missing";
+        return state;
+    }
+
+    const auto& pad = externalPads[static_cast<size_t> (padIndex)];
+    if (! pad.displayName.isEmpty())
+        state.title = pad.displayName;
+    if (! pad.noteName.isEmpty())
+        state.note = pad.noteName;
+    state.midiNote = pad.midiNote;
+
+    if (pad.samples.empty())
+    {
+        state.sample = "No samples";
+        return state;
+    }
+
+    const auto selectedIndex = juce::jlimit (0,
+                                             juce::jmax (0, static_cast<int> (pad.samples.size()) - 1),
+                                             paramIndex (apvts, externalPadSampleParameterIdForIndex (padIndex).toRawUTF8()));
+    const auto& selectedSample = pad.samples[static_cast<size_t> (selectedIndex)];
+    state.preset = selectedSample.presetName;
+    state.sample = selectedSample.displayName;
+    state.canStepLeft = selectedIndex > 0;
+    state.canStepRight = selectedIndex + 1 < static_cast<int> (pad.samples.size());
+    return state;
+}
+
+void AdvancedVSTiAudioProcessor::stepExternalPadSample (int padIndex, int delta)
+{
+    if (! isVec1DrumPadFlavor() || ! juce::isPositiveAndBelow (padIndex, static_cast<int> (externalPads.size())) || delta == 0)
+        return;
+
+    const auto& pad = externalPads[static_cast<size_t> (padIndex)];
+    if (pad.samples.empty())
+        return;
+
+    const auto currentIndex = juce::jlimit (0,
+                                            juce::jmax (0, static_cast<int> (pad.samples.size()) - 1),
+                                            paramIndex (apvts, externalPadSampleParameterIdForIndex (padIndex).toRawUTF8()));
+    const auto nextIndex = juce::jlimit (0, static_cast<int> (pad.samples.size()) - 1, currentIndex + delta);
+    if (nextIndex == currentIndex)
+        return;
+
+    setParameterActual (externalPadSampleParameterIdForIndex (padIndex).toRawUTF8(), static_cast<float> (nextIndex));
 }
 
 void AdvancedVSTiAudioProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
@@ -407,6 +634,7 @@ void AdvancedVSTiAudioProcessor::prepareToPlay (double sampleRate, int samplesPe
 
     updateRenderParameters();
     refreshSampleBank();
+    refreshExternalPadSamples();
     applyEnvelopeSettings();
     reset();
 }
@@ -454,6 +682,9 @@ void AdvancedVSTiAudioProcessor::reset()
         voice.auxPhase = 0.0f;
         voice.toneState = 0.0f;
         voice.colourState = 0.0f;
+        voice.externalPadIndex = -1;
+        voice.externalSamplePosition = 0.0;
+        voice.externalSample.reset();
         voice.unisonPhases.fill (0.0f);
         voice.unisonSyncPhases.fill (0.0f);
         voice.unisonSamplePositions.fill (0.0f);
@@ -473,6 +704,8 @@ juce::StringArray AdvancedVSTiAudioProcessor::presetChoicesForFlavor()
         return { "Classic 909", "Tight Club", "Dusty Machine" };
     if constexpr (buildFlavor() == InstrumentFlavor::drum808)
         return { "Classic 808", "Deep 808", "Sharp Electro" };
+    if constexpr (buildFlavor() == InstrumentFlavor::vec1DrumPad)
+        return { "VEC1 Default" };
     if constexpr (buildFlavor() == InstrumentFlavor::bassSynth)
         return { "Sub Bass", "Saw Bass", "Square Bass", "Picked Bass" };
     if constexpr (buildFlavor() == InstrumentFlavor::stringSynth)
@@ -494,6 +727,148 @@ juce::StringArray AdvancedVSTiAudioProcessor::presetChoicesForFlavor()
     if constexpr (buildFlavor() == InstrumentFlavor::acid303)
         return { "Acid Saw", "Acid Square", "Rounded 303", "Reso Line" };
     return { "Init Saw", "Init Square", "Wide Pad", "Mono Lead" };
+}
+
+juce::String AdvancedVSTiAudioProcessor::externalPadSampleParameterIdForIndex (int padIndex)
+{
+    return "VECPADSELECT_" + juce::String (padIndex + 1);
+}
+
+juce::String AdvancedVSTiAudioProcessor::externalPadLevelParameterIdForIndex (int padIndex)
+{
+    return "VECPADLEVEL_" + juce::String (padIndex + 1);
+}
+
+void AdvancedVSTiAudioProcessor::initializeExternalPadLibrary()
+{
+    if constexpr (buildFlavor() != InstrumentFlavor::vec1DrumPad)
+        return;
+
+    externalPads.clear();
+    externalPads.reserve (vecPadCount);
+
+    const auto libraryRoot = vecPadLibraryRoot();
+    const auto topLevelFolders = findSortedChildDirectories (libraryRoot);
+
+    for (int padIndex = 0; padIndex < vecPadCount; ++padIndex)
+    {
+        ExternalPadDefinition pad;
+        pad.folderName = vecPadFolderOrder[static_cast<size_t> (padIndex)];
+        pad.displayName = vecPadTitles[static_cast<size_t> (padIndex)];
+        pad.noteName = vecPadNotes[static_cast<size_t> (padIndex)];
+        pad.midiNote = vecPadMidiStart + padIndex;
+
+        auto folderIt = std::find_if (topLevelFolders.begin(), topLevelFolders.end(),
+                                      [&pad] (const juce::File& candidate)
+                                      {
+                                          return candidate.getFileName().compareIgnoreCase (pad.folderName) == 0;
+                                      });
+
+        if (folderIt != topLevelFolders.end())
+        {
+            auto presetFolders = findSortedChildDirectories (*folderIt);
+            for (const auto& presetFolder : presetFolders)
+            {
+                for (const auto& sampleFile : findSortedAudioFiles (presetFolder))
+                {
+                    pad.samples.push_back ({
+                        sampleFile.getFullPathName(),
+                        cleanedExternalSampleName (sampleFile),
+                        presetFolder.getFileName().replace ("VEC1 ", "", true).trim()
+                    });
+                }
+            }
+
+            if (pad.samples.empty())
+            {
+                for (const auto& sampleFile : findSortedAudioFiles (*folderIt))
+                {
+                    pad.samples.push_back ({
+                        sampleFile.getFullPathName(),
+                        cleanedExternalSampleName (sampleFile),
+                        {}
+                    });
+                }
+            }
+        }
+
+        externalPads.push_back (std::move (pad));
+    }
+}
+
+void AdvancedVSTiAudioProcessor::refreshExternalPadSamples()
+{
+    if constexpr (buildFlavor() != InstrumentFlavor::vec1DrumPad)
+        return;
+
+    for (int padIndex = 0; padIndex < vecPadCount; ++padIndex)
+        loadExternalPadSample (padIndex);
+}
+
+void AdvancedVSTiAudioProcessor::loadExternalPadSample (int padIndex)
+{
+    if constexpr (buildFlavor() != InstrumentFlavor::vec1DrumPad)
+        return;
+
+    if (! juce::isPositiveAndBelow (padIndex, static_cast<int> (externalPads.size())))
+        return;
+
+    const auto& pad = externalPads[static_cast<size_t> (padIndex)];
+    if (pad.samples.empty())
+    {
+        std::atomic_store (&externalPadSamples[static_cast<size_t> (padIndex)], std::shared_ptr<const ExternalSampleData> {});
+        loadedExternalPadIndices[static_cast<size_t> (padIndex)] = -1;
+        return;
+    }
+
+    const auto desiredIndex = juce::jlimit (0,
+                                            juce::jmax (0, static_cast<int> (pad.samples.size()) - 1),
+                                            paramIndex (apvts, externalPadSampleParameterIdForIndex (padIndex).toRawUTF8()));
+    if (loadedExternalPadIndices[static_cast<size_t> (padIndex)] == desiredIndex
+        && std::atomic_load (&externalPadSamples[static_cast<size_t> (padIndex)]) != nullptr)
+        return;
+
+    const auto sourceFile = juce::File::createFileWithoutCheckingPath (pad.samples[static_cast<size_t> (desiredIndex)].filePath);
+    std::unique_ptr<juce::AudioFormatReader> reader (audioFormatManager.createReaderFor (sourceFile));
+    if (reader == nullptr || reader->lengthInSamples <= 0)
+    {
+        std::atomic_store (&externalPadSamples[static_cast<size_t> (padIndex)], std::shared_ptr<const ExternalSampleData> {});
+        loadedExternalPadIndices[static_cast<size_t> (padIndex)] = -1;
+        return;
+    }
+
+    auto sampleData = std::make_shared<ExternalSampleData>();
+    sampleData->sampleRate = reader->sampleRate;
+    sampleData->displayName = pad.samples[static_cast<size_t> (desiredIndex)].displayName;
+    sampleData->presetName = pad.samples[static_cast<size_t> (desiredIndex)].presetName;
+    sampleData->audio.setSize (1, static_cast<int> (reader->lengthInSamples));
+    sampleData->audio.clear();
+
+    juce::AudioBuffer<float> sourceBuffer (juce::jmax (1, static_cast<int> (reader->numChannels)),
+                                           static_cast<int> (reader->lengthInSamples));
+    reader->read (&sourceBuffer, 0, static_cast<int> (reader->lengthInSamples), 0, true, true);
+
+    auto* destination = sampleData->audio.getWritePointer (0);
+    for (int sample = 0; sample < sourceBuffer.getNumSamples(); ++sample)
+    {
+        float mixedSample = 0.0f;
+        for (int channel = 0; channel < sourceBuffer.getNumChannels(); ++channel)
+            mixedSample += sourceBuffer.getSample (channel, sample);
+
+        destination[sample] = mixedSample / static_cast<float> (juce::jmax (1, sourceBuffer.getNumChannels()));
+    }
+
+    std::atomic_store (&externalPadSamples[static_cast<size_t> (padIndex)], std::shared_ptr<const ExternalSampleData> (sampleData));
+    loadedExternalPadIndices[static_cast<size_t> (padIndex)] = desiredIndex;
+}
+
+int AdvancedVSTiAudioProcessor::externalPadIndexForMidi (int midiNote) const noexcept
+{
+    if (! isVec1DrumPadFlavor())
+        return -1;
+
+    const auto index = midiNote - vecPadMidiStart;
+    return juce::isPositiveAndBelow (index, vecPadCount) ? index : -1;
 }
 
 juce::StringArray AdvancedVSTiAudioProcessor::presetNames() const
@@ -678,6 +1053,9 @@ int AdvancedVSTiAudioProcessor::activeVoiceLimit() const noexcept
     if constexpr (buildFlavor() == InstrumentFlavor::stringSynth)
         return juce::jlimit (1, voiceLimitForFlavor(), renderParams.polyphony);
 
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+        return renderParams.monoEnabled ? 1 : voiceLimitForFlavor();
+
     return voiceLimitForFlavor();
 }
 
@@ -686,7 +1064,15 @@ void AdvancedVSTiAudioProcessor::handleMidiMessage (const juce::MidiMessage& msg
     if (msg.isNoteOn())
     {
         const auto polyphonyLimit = activeVoiceLimit();
-        if constexpr (isDrumFlavor())
+        int externalPadIndex = -1;
+        if constexpr (buildFlavor() == InstrumentFlavor::vec1DrumPad)
+        {
+            externalPadIndex = externalPadIndexForMidi (msg.getNoteNumber());
+            if (externalPadIndex < 0)
+                return;
+        }
+
+        if constexpr (isSynthDrumFlavor())
         {
             const auto triggeredKind = drumKindForMidi (msg.getNoteNumber());
             if (isHatKind (triggeredKind))
@@ -760,6 +1146,11 @@ void AdvancedVSTiAudioProcessor::handleMidiMessage (const juce::MidiMessage& msg
         voice.auxPhase = 0.0f;
         voice.toneState = 0.0f;
         voice.colourState = 0.0f;
+        voice.externalPadIndex = externalPadIndex;
+        voice.externalSamplePosition = 0.0;
+        voice.externalSample = (externalPadIndex >= 0 && juce::isPositiveAndBelow (externalPadIndex, vecPadCount))
+                                   ? std::atomic_load (&externalPadSamples[static_cast<size_t> (externalPadIndex)])
+                                   : std::shared_ptr<const ExternalSampleData> {};
         voice.unisonPhases.fill (0.0f);
         voice.unisonSyncPhases.fill (0.0f);
         voice.unisonSamplePositions.fill (0.0f);
@@ -805,15 +1196,16 @@ float AdvancedVSTiAudioProcessor::fmOperator (VoiceState& voice, float baseFreq,
     return std::sin (twoPi * voice.fmPhase) * amount;
 }
 
-float AdvancedVSTiAudioProcessor::oscSample (VoiceState& voice, float baseFreq, OscType type, float syncAmount)
+float AdvancedVSTiAudioProcessor::oscSample (VoiceState& voice, float baseFreq, OscType type, float syncAmount, float pulseWidth)
 {
-    return oscSampleForState (voice.phase, voice.syncPhase, voice.samplePos, baseFreq, type, syncAmount);
+    return oscSampleForState (voice.phase, voice.syncPhase, voice.samplePos, baseFreq, type, syncAmount, pulseWidth);
 }
 
 float AdvancedVSTiAudioProcessor::oscSampleForState (float& phase, float& syncPhase, float& samplePos,
-                                                     float baseFreq, OscType type, float syncAmount)
+                                                     float baseFreq, OscType type, float syncAmount, float pulseWidth)
 {
     auto increment = baseFreq / static_cast<float> (currentSampleRate);
+    const auto clampedPulseWidth = juce::jlimit (0.05f, 0.95f, pulseWidth);
 
     syncPhase = std::fmod (syncPhase + increment * (1.0f + syncAmount), 1.0f);
     if (syncPhase < increment)
@@ -824,7 +1216,7 @@ float AdvancedVSTiAudioProcessor::oscSampleForState (float& phase, float& syncPh
     switch (type)
     {
         case OscType::saw: return 2.0f * phase - 1.0f;
-        case OscType::square: return phase < 0.5f ? 1.0f : -1.0f;
+        case OscType::square: return phase < clampedPulseWidth ? 1.0f : -1.0f;
         case OscType::noise: return random.nextFloat() * 2.0f - 1.0f;
         case OscType::sample:
         {
@@ -851,15 +1243,16 @@ float AdvancedVSTiAudioProcessor::oscSampleForState (float& phase, float& syncPh
     }
 }
 
-float AdvancedVSTiAudioProcessor::basicOscSample (float& phase, float frequency, OscType type)
+float AdvancedVSTiAudioProcessor::basicOscSample (float& phase, float frequency, OscType type, float pulseWidth)
 {
     const auto increment = frequency / static_cast<float> (currentSampleRate);
+    const auto clampedPulseWidth = juce::jlimit (0.05f, 0.95f, pulseWidth);
     phase = std::fmod (phase + increment, 1.0f);
 
     switch (type)
     {
         case OscType::saw: return (2.0f * phase) - 1.0f;
-        case OscType::square: return phase < 0.5f ? 1.0f : -1.0f;
+        case OscType::square: return phase < clampedPulseWidth ? 1.0f : -1.0f;
         case OscType::noise: return random.nextFloat() * 2.0f - 1.0f;
         case OscType::sample:
         case OscType::sine:
@@ -1203,12 +1596,51 @@ float AdvancedVSTiAudioProcessor::renderDrumVoiceSample (VoiceState& voice)
     return output * voice.velocity * renderParams.drumVoiceLevels[voiceIndex] * renderParams.drumMasterLevel;
 }
 
+float AdvancedVSTiAudioProcessor::renderExternalPadVoiceSample (VoiceState& voice)
+{
+    if (! voice.active)
+        return 0.0f;
+
+    const auto sampleData = voice.externalSample;
+    if (sampleData == nullptr || sampleData->audio.getNumSamples() <= 0 || voice.externalPadIndex < 0)
+    {
+        voice.active = false;
+        return 0.0f;
+    }
+
+    const auto totalSamples = sampleData->audio.getNumSamples();
+    if (voice.externalSamplePosition >= static_cast<double> (totalSamples))
+    {
+        voice.active = false;
+        return 0.0f;
+    }
+
+    const auto indexA = juce::jlimit (0, totalSamples - 1, static_cast<int> (voice.externalSamplePosition));
+    const auto indexB = juce::jmin (totalSamples - 1, indexA + 1);
+    const auto alpha = static_cast<float> (voice.externalSamplePosition - static_cast<double> (indexA));
+    const auto sampleA = sampleData->audio.getSample (0, indexA);
+    const auto sampleB = sampleData->audio.getSample (0, indexB);
+    const auto output = juce::jmap (alpha, sampleA, sampleB);
+    const auto increment = juce::jlimit (0.125, 8.0, sampleData->sampleRate / currentSampleRate);
+
+    voice.externalSamplePosition += increment;
+    voice.noteAge += 1.0f / static_cast<float> (currentSampleRate);
+    if (voice.externalSamplePosition >= static_cast<double> (totalSamples))
+        voice.active = false;
+
+    const auto padLevel = renderParams.externalPadLevels[static_cast<size_t> (juce::jlimit (0, vecPadCount - 1, voice.externalPadIndex))];
+    return output * voice.velocity * padLevel * renderParams.drumMasterLevel;
+}
+
 float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice)
 {
     if (! voice.active)
         return 0.0f;
 
-    if constexpr (isDrumFlavor())
+    if constexpr (buildFlavor() == InstrumentFlavor::vec1DrumPad)
+        return renderExternalPadVoiceSample (voice);
+
+    if constexpr (isSynthDrumFlavor())
         return renderDrumVoiceSample (voice);
 
     const auto& params = renderParams;
@@ -1222,12 +1654,14 @@ float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice)
     for (int i = 0; i < params.unisonVoices; ++i)
     {
         const auto spread = (static_cast<float> (i) - (params.unisonVoices - 1) * 0.5f) * params.detune;
+        const auto osc1Pitch = params.osc1Semitone + params.osc1Detune + spread;
         s += oscSampleForState (voice.unisonPhases[static_cast<size_t> (i)],
                                 voice.unisonSyncPhases[static_cast<size_t> (i)],
                                 voice.unisonSamplePositions[static_cast<size_t> (i)],
-                                baseHz * std::pow (2.0f, spread / 12.0f) + fm,
+                                baseHz * std::pow (2.0f, osc1Pitch / 12.0f) + fm,
                                 params.oscType,
-                                params.syncAmount);
+                                params.syncAmount,
+                                params.osc1PulseWidth);
     }
     s /= static_cast<float> (params.unisonVoices);
     voice.phase = voice.unisonPhases[0];
@@ -1307,8 +1741,10 @@ float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice)
     {
         const auto osc2Ratio = std::pow (2.0f, (params.osc2Semitone + params.osc2Detune) / 12.0f);
         const auto osc2Hz = juce::jlimit (20.0f, 18000.0f, baseHz * osc2Ratio);
-        const auto osc2 = basicOscSample (voice.osc2Phase, osc2Hz, static_cast<OscType> (params.osc2Type));
-        const auto sub = basicOscSample (voice.subPhase, juce::jlimit (10.0f, 12000.0f, baseHz * 0.5f), OscType::square);
+        const auto osc3Ratio = std::pow (2.0f, (params.osc3Semitone + params.osc3Detune) / 12.0f);
+        const auto osc3Hz = juce::jlimit (10.0f, 12000.0f, baseHz * osc3Ratio);
+        const auto osc2 = basicOscSample (voice.osc2Phase, osc2Hz, static_cast<OscType> (params.osc2Type), params.osc2PulseWidth);
+        const auto sub = basicOscSample (voice.subPhase, osc3Hz, static_cast<OscType> (params.osc3Type), params.osc3PulseWidth);
         const auto ring = (s * osc2) * params.ringModAmount;
         const auto noiseBed = (random.nextFloat() * 2.0f - 1.0f) * params.noiseLevel;
         const auto oscBlend = juce::jlimit (0.0f, 1.0f, params.osc2Mix);
@@ -1381,11 +1817,18 @@ void AdvancedVSTiAudioProcessor::updateRenderParameters()
     renderParams.lfo1Shape = paramIndex (apvts, "LFO1SHAPE");
     renderParams.lfo2Shape = paramIndex (apvts, "LFO2SHAPE");
     renderParams.arpMode = paramIndex (apvts, "ARPMODE");
+    renderParams.arpEnabled = false;
+    renderParams.lfo1Enabled = true;
+    renderParams.lfo2Enabled = true;
+    renderParams.lfo3Enabled = true;
+    renderParams.filter1Enabled = true;
+    renderParams.filter2Enabled = true;
     renderParams.filterSlope = juce::jlimit (0, 2, paramIndex (apvts, "FILTERSLOPE"));
     renderParams.osc2Type = paramIndex (apvts, "OSC2TYPE");
     renderParams.filter2Type = paramIndex (apvts, "FILTER2TYPE");
     renderParams.filter2Slope = juce::jlimit (0, 2, paramIndex (apvts, "FILTER2SLOPE"));
     renderParams.fxType = paramIndex (apvts, "FXTYPE");
+    renderParams.osc3Type = static_cast<int> (OscType::square);
     renderParams.masterLevel = 1.0f;
     if constexpr (isDrumFlavor())
         renderParams.filterType = juce::jlimit (0, 4, paramIndex (apvts, "FILTERTYPE"));
@@ -1412,13 +1855,38 @@ void AdvancedVSTiAudioProcessor::updateRenderParameters()
         renderParams.ringModAmount = paramValue (apvts, "RINGMOD");
     }
     renderParams.gateLength = paramValue (apvts, "OSCGATE");
+    renderParams.osc1Semitone = 0.0f;
+    renderParams.osc1Detune = 0.0f;
+    renderParams.osc1PulseWidth = 0.5f;
     renderParams.osc2Semitone = paramValue (apvts, "OSC2SEMITONE");
     renderParams.osc2Detune = paramValue (apvts, "OSC2DETUNE");
+    renderParams.osc2PulseWidth = 0.5f;
+    renderParams.osc3Semitone = -12.0f;
+    renderParams.osc3Detune = 0.0f;
+    renderParams.osc3PulseWidth = 0.5f;
     renderParams.osc2Mix = paramValue (apvts, "OSC2MIX");
     renderParams.subOscLevel = paramValue (apvts, "SUBOSCLEVEL");
     renderParams.osc3Enabled = true;
+    renderParams.monoEnabled = false;
     if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+    {
+        renderParams.arpEnabled = paramValue (apvts, "ARPENABLE") >= 0.5f;
+        renderParams.lfo1Enabled = paramValue (apvts, "LFO1ENABLE") >= 0.5f;
+        renderParams.lfo2Enabled = paramValue (apvts, "LFO2ENABLE") >= 0.5f;
+        renderParams.lfo3Enabled = paramValue (apvts, "LFO3ENABLE") >= 0.5f;
+        renderParams.filter1Enabled = paramValue (apvts, "FILTER1ENABLE") >= 0.5f;
+        renderParams.filter2Enabled = paramValue (apvts, "FILTER2ENABLE") >= 0.5f;
+        renderParams.osc3Type = paramIndex (apvts, "OSC3TYPE");
         renderParams.osc3Enabled = paramValue (apvts, "OSC3ENABLE") >= 0.5f;
+        renderParams.monoEnabled = paramValue (apvts, "MONOENABLE") >= 0.5f;
+        renderParams.osc1Semitone = paramValue (apvts, "OSC1SEMITONE");
+        renderParams.osc1Detune = paramValue (apvts, "OSC1DETUNE");
+        renderParams.osc1PulseWidth = paramValue (apvts, "OSC1PW");
+        renderParams.osc2PulseWidth = paramValue (apvts, "OSC2PW");
+        renderParams.osc3Semitone = paramValue (apvts, "OSC3SEMITONE");
+        renderParams.osc3Detune = paramValue (apvts, "OSC3DETUNE");
+        renderParams.osc3PulseWidth = paramValue (apvts, "OSC3PW");
+    }
     renderParams.noiseLevel = paramValue (apvts, "NOISELEVEL");
     renderParams.envCurve = paramValue (apvts, "ENVCURVE");
     renderParams.cutoff = paramValue (apvts, "CUTOFF");
@@ -1426,18 +1894,27 @@ void AdvancedVSTiAudioProcessor::updateRenderParameters()
     renderParams.resonance = paramValue (apvts, "RESONANCE");
     renderParams.filterEnvAmount = paramValue (apvts, "FILTERENVAMOUNT");
     renderParams.filterBalance = paramValue (apvts, "FILTERBALANCE");
-    renderParams.sampleBank = paramIndex (apvts, "SAMPLEBANK");
-    renderParams.sampleStart = paramValue (apvts, "SAMPLESTART");
-    renderParams.sampleEnd = juce::jlimit (0.02f, 1.0f, paramValue (apvts, "SAMPLEEND"));
-    if (renderParams.sampleEnd <= renderParams.sampleStart)
-        renderParams.sampleEnd = juce::jlimit (0.02f, 1.0f, renderParams.sampleStart + 0.02f);
+    if constexpr (buildFlavor() != InstrumentFlavor::vec1DrumPad)
+    {
+        renderParams.sampleBank = paramIndex (apvts, "SAMPLEBANK");
+        renderParams.sampleStart = paramValue (apvts, "SAMPLESTART");
+        renderParams.sampleEnd = juce::jlimit (0.02f, 1.0f, paramValue (apvts, "SAMPLEEND"));
+        if (renderParams.sampleEnd <= renderParams.sampleStart)
+            renderParams.sampleEnd = juce::jlimit (0.02f, 1.0f, renderParams.sampleStart + 0.02f);
+    }
+    else
+    {
+        renderParams.sampleBank = 0;
+        renderParams.sampleStart = 0.0f;
+        renderParams.sampleEnd = 1.0f;
+    }
     renderParams.lfo1Rate = paramValue (apvts, "LFO1RATE");
-    renderParams.lfo1Pitch = paramValue (apvts, "LFO1PITCH");
+    renderParams.lfo1Pitch = renderParams.lfo1Enabled ? paramValue (apvts, "LFO1PITCH") : 0.0f;
     renderParams.lfo2Rate = paramValue (apvts, "LFO2RATE");
-    renderParams.lfo2Filter = paramValue (apvts, "LFO2FILTER");
+    renderParams.lfo2Filter = renderParams.lfo2Enabled ? paramValue (apvts, "LFO2FILTER") : 0.0f;
     renderParams.arpRate = paramValue (apvts, "ARPRATE");
     renderParams.rhythmGateRate = paramValue (apvts, "RHYTHMGATE_RATE");
-    renderParams.rhythmGateDepth = paramValue (apvts, "RHYTHMGATE_DEPTH");
+    renderParams.rhythmGateDepth = renderParams.lfo3Enabled ? paramValue (apvts, "RHYTHMGATE_DEPTH") : 0.0f;
     renderParams.fxMix = paramValue (apvts, "FXMIX");
     renderParams.fxIntensity = paramValue (apvts, "FXINTENSITY");
     renderParams.delaySend = paramValue (apvts, "DELAYSEND");
@@ -1445,7 +1922,7 @@ void AdvancedVSTiAudioProcessor::updateRenderParameters()
     renderParams.delayFeedback = paramValue (apvts, "DELAYFEEDBACK");
     renderParams.reverbMix = paramValue (apvts, "REVERBMIX");
 
-    if constexpr (isDrumFlavor())
+    if constexpr (isSynthDrumFlavor())
     {
         renderParams.drumMasterLevel = paramValue (apvts, "DRUMMASTERLEVEL");
         renderParams.drumKickAttack = paramValue (apvts, "DRUM_KICK_ATTACK");
@@ -1453,6 +1930,7 @@ void AdvancedVSTiAudioProcessor::updateRenderParameters()
         renderParams.drumSnareSnappy = paramValue (apvts, "DRUM_SNARE_SNAPPY");
         renderParams.drumVoiceTunes.fill (0.0f);
         renderParams.drumVoiceDecays.fill (0.5f);
+        renderParams.externalPadLevels.fill (1.0f);
 
         for (size_t index = 0; index < drumVoiceTuneParamIds.size(); ++index)
             renderParams.drumVoiceTunes[drumVoiceIndex (drumVoiceTuneKinds[index])] = paramValue (apvts, drumVoiceTuneParamIds[index]);
@@ -1463,6 +1941,19 @@ void AdvancedVSTiAudioProcessor::updateRenderParameters()
         for (size_t index = 0; index < drumVoiceLevelParamIds.size(); ++index)
             renderParams.drumVoiceLevels[index] = paramValue (apvts, drumVoiceLevelParamIds[index]);
     }
+    else if constexpr (buildFlavor() == InstrumentFlavor::vec1DrumPad)
+    {
+        renderParams.drumMasterLevel = paramValue (apvts, "DRUMMASTERLEVEL");
+        renderParams.drumKickAttack = 0.5f;
+        renderParams.drumSnareTone = 0.5f;
+        renderParams.drumSnareSnappy = 0.5f;
+        renderParams.drumVoiceTunes.fill (0.0f);
+        renderParams.drumVoiceDecays.fill (0.5f);
+        renderParams.drumVoiceLevels.fill (1.0f);
+
+        for (int padIndex = 0; padIndex < vecPadCount; ++padIndex)
+            renderParams.externalPadLevels[static_cast<size_t> (padIndex)] = paramValue (apvts, externalPadLevelParameterIdForIndex (padIndex).toRawUTF8());
+    }
     else
     {
         renderParams.drumMasterLevel = 1.0f;
@@ -1472,6 +1963,7 @@ void AdvancedVSTiAudioProcessor::updateRenderParameters()
         renderParams.drumVoiceTunes.fill (0.0f);
         renderParams.drumVoiceDecays.fill (0.5f);
         renderParams.drumVoiceLevels.fill (1.0f);
+        renderParams.externalPadLevels.fill (1.0f);
     }
 
     renderParams.ampEnv.attack = paramValue (apvts, "AMPATTACK");
@@ -1484,7 +1976,8 @@ void AdvancedVSTiAudioProcessor::updateRenderParameters()
     renderParams.filterEnv.sustain = paramValue (apvts, "FILTSUSTAIN");
     renderParams.filterEnv.release = paramValue (apvts, "FILTRELEASE");
 
-    refreshSampleBank();
+    if constexpr (buildFlavor() != InstrumentFlavor::vec1DrumPad)
+        refreshSampleBank();
 }
 
 void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages)
@@ -1586,7 +2079,7 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             hasMidi = midiIterator.getNextEvent (nextMidiMessage, nextMidiSample);
         }
 
-        if (++arpCounter >= arpIntervalSamples)
+        if (renderParams.arpEnabled && ++arpCounter >= arpIntervalSamples)
         {
             arpCounter = 0;
             advanceArpIfNeeded();
@@ -1638,17 +2131,31 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             return juce::jmap (filterCascadeBlendForSlope (slopeIndex), firstStageOutput, secondStageOutput);
         };
 
-        const auto filteredL = bypassFilter ? sum : processSlope (leftFilter, leftFilterCascade, sum, renderParams.filterSlope);
-        const auto filteredR = bypassFilter ? sum : processSlope (rightFilter, rightFilterCascade, sum, renderParams.filterSlope);
+        const auto filteredL = (bypassFilter || ! renderParams.filter1Enabled) ? sum : processSlope (leftFilter, leftFilterCascade, sum, renderParams.filterSlope);
+        const auto filteredR = (bypassFilter || ! renderParams.filter1Enabled) ? sum : processSlope (rightFilter, rightFilterCascade, sum, renderParams.filterSlope);
         auto mixedL = filteredL;
         auto mixedR = filteredR;
         if constexpr (! isDrumFlavor())
         {
-            const auto filtered2L = processSlope (leftFilter2, leftFilter2Cascade, sum, renderParams.filter2Slope);
-            const auto filtered2R = processSlope (rightFilter2, rightFilter2Cascade, sum, renderParams.filter2Slope);
-            const auto balance = juce::jlimit (0.0f, 1.0f, renderParams.filterBalance);
-            mixedL = juce::jmap (balance, filteredL, filtered2L);
-            mixedR = juce::jmap (balance, filteredR, filtered2R);
+            const auto filtered2L = renderParams.filter2Enabled ? processSlope (leftFilter2, leftFilter2Cascade, sum, renderParams.filter2Slope) : sum;
+            const auto filtered2R = renderParams.filter2Enabled ? processSlope (rightFilter2, rightFilter2Cascade, sum, renderParams.filter2Slope) : sum;
+
+            if (renderParams.filter1Enabled && renderParams.filter2Enabled)
+            {
+                const auto balance = juce::jlimit (0.0f, 1.0f, renderParams.filterBalance);
+                mixedL = juce::jmap (balance, filteredL, filtered2L);
+                mixedR = juce::jmap (balance, filteredR, filtered2R);
+            }
+            else if (renderParams.filter2Enabled)
+            {
+                mixedL = filtered2L;
+                mixedR = filtered2R;
+            }
+            else if (! renderParams.filter1Enabled)
+            {
+                mixedL = sum;
+                mixedR = sum;
+            }
         }
 
         buffer.setSample (0, sample, mixedL);
@@ -1822,7 +2329,10 @@ void AdvancedVSTiAudioProcessor::setStateInformation (const void* data, int size
     pendingPresetIndex.store (-1);
     currentProgramIndex = juce::jlimit (0, juce::jmax (0, getNumPrograms() - 1), paramIndex (apvts, "PRESET"));
     updateRenderParameters();
-    refreshSampleBank();
+    if constexpr (buildFlavor() != InstrumentFlavor::vec1DrumPad)
+        refreshSampleBank();
+    else
+        refreshExternalPadSamples();
     applyEnvelopeSettings();
 }
 
@@ -1837,9 +2347,17 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
     float fmDefault = 0.0f;
     float syncDefault = 0.0f;
     float gateDefault = 8.0f;
+    float osc1SemitoneDefault = 0.0f;
+    float osc1DetuneDefault = 0.0f;
+    float osc1PulseWidthDefault = 0.5f;
     int osc2TypeDefault = 1;
     float osc2SemitoneDefault = 0.0f;
     float osc2DetuneDefault = 0.02f;
+    float osc2PulseWidthDefault = 0.5f;
+    int osc3TypeDefault = static_cast<int> (OscType::square);
+    float osc3SemitoneDefault = -12.0f;
+    float osc3DetuneDefault = 0.0f;
+    float osc3PulseWidthDefault = 0.5f;
     float osc2MixDefault = 0.35f;
     float subOscLevelDefault = 0.0f;
     float noiseLevelDefault = 0.0f;
@@ -1964,6 +2482,29 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
         drumVoiceTuneDefaults = drum808VoiceTuneDefaults;
         drumVoiceDecayDefaults = drum808VoiceDecayDefaults;
         drumVoiceLevelDefaults = drum808VoiceLevelDefaults;
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::vec1DrumPad)
+    {
+        oscDefault = 4;
+        detuneDefault = 0.0f;
+        filterTypeDefault = 0;
+        gateDefault = 1.0f;
+        ampAttackDefault = 0.001f;
+        ampDecayDefault = 0.2f;
+        ampSustainDefault = 0.0f;
+        ampReleaseDefault = 0.05f;
+        filtAttackDefault = 0.001f;
+        filtDecayDefault = 0.1f;
+        filtSustainDefault = 0.0f;
+        filtReleaseDefault = 0.05f;
+        fmDefault = 0.0f;
+        syncDefault = 0.0f;
+        cutoffDefault = 20000.0f;
+        resonanceDefault = 0.1f;
+        filterEnvAmountDefault = 0.0f;
+        rhythmRateDefault = 16.0f;
+        rhythmDepthDefault = 0.0f;
+        drumMasterLevelDefault = 1.0f;
     }
     else if constexpr (buildFlavor() == InstrumentFlavor::bassSynth)
     {
@@ -2191,6 +2732,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
     params.push_back (std::make_unique<juce::AudioParameterChoice> ("PRESET", "Preset", presetChoicesForFlavor(), presetDefault));
     params.push_back (std::make_unique<juce::AudioParameterChoice> ("OSCTYPE", "Osc Type", juce::StringArray { "Sine", "Saw", "Square", "Noise", "Sample" }, oscDefault));
     params.push_back (std::make_unique<juce::AudioParameterChoice> ("OSC2TYPE", "Osc 2 Type", juce::StringArray { "Sine", "Saw", "Square", "Noise", "Sample" }, osc2TypeDefault));
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+        params.push_back (std::make_unique<juce::AudioParameterChoice> ("OSC3TYPE", "Osc 3 Type", juce::StringArray { "Sine", "Saw", "Square", "Noise", "Sample" }, osc3TypeDefault));
     params.push_back (std::make_unique<juce::AudioParameterChoice> ("SAMPLEBANK", "Sample Bank", sampleBankChoices(), sampleBankDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("SAMPLESTART", "Sample Start", 0.0f, 0.95f, sampleStartDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("SAMPLEEND", "Sample End", 0.05f, 1.0f, sampleEndDefault));
@@ -2198,8 +2741,10 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
         params.push_back (std::make_unique<juce::AudioParameterFloat> ("MASTERLEVEL", "Master Level", 0.0f, 1.5f, masterLevelDefault));
     if constexpr (buildFlavor() == InstrumentFlavor::stringSynth)
         params.push_back (std::make_unique<juce::AudioParameterInt> ("POLYPHONY", "Polyphony", 1, voiceLimitForFlavor(), polyphonyDefault));
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+        params.push_back (std::make_unique<juce::AudioParameterBool> ("MONOENABLE", "Mono Enabled", false));
     params.push_back (std::make_unique<juce::AudioParameterInt> ("UNISON", "Unison", 1, maxUnisonForFlavor(), unisonDefault));
-    if constexpr (isDrumFlavor())
+    if constexpr (isSynthDrumFlavor())
     {
         params.push_back (std::make_unique<juce::AudioParameterFloat> ("DETUNE", "Detune", -6.0f, 6.0f, detuneDefault));
         params.push_back (std::make_unique<juce::AudioParameterFloat> ("FMAMOUNT", "FM Amount", 0.0f, 200.0f, fmDefault));
@@ -2226,12 +2771,30 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
                                                                             drumVoiceDecayDefaults[index]));
         }
     }
+    else if constexpr (buildFlavor() == InstrumentFlavor::vec1DrumPad)
+    {
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("DETUNE", "Detune", 0.0f, 1.0f, 0.0f));
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("FMAMOUNT", "FM Amount", 0.0f, 1.0f, 0.0f));
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("SYNC", "Sync", 0.0f, 1.0f, 0.0f));
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("OSCGATE", "Osc Note Length Gate", 0.1f, 2.4f, gateDefault));
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("DRUMMASTERLEVEL", "Drum Master Level", 0.0f, 1.5f, drumMasterLevelDefault));
+    }
     else
     {
         params.push_back (std::make_unique<juce::AudioParameterFloat> ("DETUNE", "Detune", 0.0f, 1.0f, detuneDefault));
         params.push_back (std::make_unique<juce::AudioParameterFloat> ("FMAMOUNT", "FM Amount", 0.0f, 1000.0f, fmDefault));
         params.push_back (std::make_unique<juce::AudioParameterFloat> ("SYNC", "Sync", 0.0f, 4.0f, syncDefault));
         params.push_back (std::make_unique<juce::AudioParameterFloat> ("OSCGATE", "Osc Note Length Gate", 0.01f, 8.0f, gateDefault));
+    }
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+    {
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("OSC1SEMITONE", "Osc 1 Semitone", -24.0f, 24.0f, osc1SemitoneDefault));
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("OSC1DETUNE", "Osc 1 Detune", -1.0f, 1.0f, osc1DetuneDefault));
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("OSC1PW", "Osc 1 Pulse Width", 0.05f, 0.95f, osc1PulseWidthDefault));
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("OSC2PW", "Osc 2 Pulse Width", 0.05f, 0.95f, osc2PulseWidthDefault));
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("OSC3SEMITONE", "Osc 3 Semitone", -24.0f, 24.0f, osc3SemitoneDefault));
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("OSC3DETUNE", "Osc 3 Detune", -1.0f, 1.0f, osc3DetuneDefault));
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("OSC3PW", "Osc 3 Pulse Width", 0.05f, 0.95f, osc3PulseWidthDefault));
     }
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("OSC2SEMITONE", "Osc 2 Semitone", -24.0f, 24.0f, osc2SemitoneDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("OSC2DETUNE", "Osc 2 Detune", -1.0f, 1.0f, osc2DetuneDefault));
@@ -2264,6 +2827,11 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
     else
         params.push_back (std::make_unique<juce::AudioParameterChoice> ("FILTERTYPE", "Filter Type", juce::StringArray { "LP", "BP", "HP", "Notch" }, filterTypeDefault));
     params.push_back (std::make_unique<juce::AudioParameterChoice> ("FILTER2TYPE", "Filter 2 Type", juce::StringArray { "LP", "BP", "HP", "Notch" }, filter2TypeDefault));
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+    {
+        params.push_back (std::make_unique<juce::AudioParameterBool> ("FILTER1ENABLE", "Filter 1 Enabled", true));
+        params.push_back (std::make_unique<juce::AudioParameterBool> ("FILTER2ENABLE", "Filter 2 Enabled", true));
+    }
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("CUTOFF", "Cutoff", 20.0f, 20000.0f, cutoffDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("CUTOFF2", "Cutoff 2", 20.0f, 20000.0f, cutoff2Default));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("RESONANCE", "Resonance", 0.1f, resonanceMax, resonanceDefault));
@@ -2272,16 +2840,24 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
 
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("LFO1RATE", "LFO1 Rate", 0.05f, 40.0f, lfo1RateDefault));
     params.push_back (std::make_unique<juce::AudioParameterChoice> ("LFO1SHAPE", "LFO1 Shape", juce::StringArray { "Sine", "Saw", "Square" }, lfo1ShapeDefault));
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+        params.push_back (std::make_unique<juce::AudioParameterBool> ("LFO1ENABLE", "LFO1 Enabled", true));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("LFO1PITCH", "LFO1 -> Pitch", 0.0f, 24.0f, lfo1PitchDefault));
 
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("LFO2RATE", "LFO2 Rate", 0.05f, 40.0f, lfo2RateDefault));
     params.push_back (std::make_unique<juce::AudioParameterChoice> ("LFO2SHAPE", "LFO2 Shape", juce::StringArray { "Sine", "Saw", "Square" }, lfo2ShapeDefault));
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+        params.push_back (std::make_unique<juce::AudioParameterBool> ("LFO2ENABLE", "LFO2 Enabled", true));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("LFO2FILTER", "LFO2 -> Filter", 0.0f, 1.0f, lfo2FilterDefault));
 
     params.push_back (std::make_unique<juce::AudioParameterChoice> ("ARPMODE", "Arp Mode", juce::StringArray { "Up", "Down", "UpDown", "Random" }, arpModeDefault));
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+        params.push_back (std::make_unique<juce::AudioParameterBool> ("ARPENABLE", "Arp Enabled", false));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("ARPRATE", "Arp Rate", 0.25f, 16.0f, arpRateDefault));
 
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("RHYTHMGATE_RATE", "Rhythm Gate Rate", 0.25f, 32.0f, rhythmRateDefault));
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+        params.push_back (std::make_unique<juce::AudioParameterBool> ("LFO3ENABLE", "LFO3 Enabled", true));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("RHYTHMGATE_DEPTH", "Rhythm Gate Depth", 0.0f, 1.0f, rhythmDepthDefault));
     params.push_back (std::make_unique<juce::AudioParameterChoice> ("FXTYPE", "FX Type", juce::StringArray { "Off", "Dist", "Phaser", "Chorus", "Flanger" }, fxTypeDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("FXMIX", "FX Mix", 0.0f, 1.0f, fxMixDefault));
@@ -2291,7 +2867,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("DELAYFEEDBACK", "Delay Feedback", 0.0f, 0.92f, delayFeedbackDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("REVERBMIX", "Reverb Mix", 0.0f, 1.0f, reverbMixDefault));
 
-    if constexpr (isDrumFlavor())
+    if constexpr (isSynthDrumFlavor())
     {
         for (size_t index = 0; index < drumVoiceLevelParamIds.size(); ++index)
         {
@@ -2299,6 +2875,22 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
                                                                             drumVoiceLevelNames[index],
                                                                             0.0f, 1.5f,
                                                                             drumVoiceLevelDefaults[index]));
+        }
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::vec1DrumPad)
+    {
+        for (int padIndex = 0; padIndex < vecPadCount; ++padIndex)
+        {
+            const auto padTitle = juce::String (vecPadTitles[static_cast<size_t> (padIndex)]);
+            params.push_back (std::make_unique<juce::AudioParameterFloat> (externalPadLevelParameterIdForIndex (padIndex),
+                                                                            padTitle + " Level",
+                                                                            0.0f, 1.5f,
+                                                                            1.0f));
+            params.push_back (std::make_unique<juce::AudioParameterInt> (externalPadSampleParameterIdForIndex (padIndex),
+                                                                          padTitle + " Sample",
+                                                                          0,
+                                                                          maxVecPadSampleChoices - 1,
+                                                                          0));
         }
     }
 
@@ -2338,7 +2930,14 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
     setParameterActual ("FILTERSLOPE", 0.0f);
     setParameterActual ("FILTER2SLOPE", 0.0f);
     if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+    {
         setParameterActual ("MASTERLEVEL", 1.0f);
+        setParameterActual ("MONOENABLE", 0.0f);
+        setParameterActual ("ARPENABLE", 0.0f);
+        setParameterActual ("LFO1ENABLE", 1.0f);
+        setParameterActual ("LFO2ENABLE", 1.0f);
+        setParameterActual ("LFO3ENABLE", 1.0f);
+    }
 
     if constexpr (buildFlavor() == InstrumentFlavor::bassSynth)
     {
@@ -3053,6 +3652,24 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
                 break;
         }
     }
+    else if constexpr (buildFlavor() == InstrumentFlavor::vec1DrumPad)
+    {
+        setParameterActual ("DRUMMASTERLEVEL", 1.0f);
+        setParameterActual ("DETUNE", 0.0f);
+        setParameterActual ("SYNC", 0.0f);
+        setParameterActual ("FMAMOUNT", 0.0f);
+        setParameterActual ("OSCGATE", 1.0f);
+        setParameterActual ("FILTERTYPE", 0.0f);
+        setParameterActual ("CUTOFF", 20000.0f);
+        setParameterActual ("RESONANCE", 0.1f);
+        setParameterActual ("FILTERENVAMOUNT", 0.0f);
+
+        for (int padIndex = 0; padIndex < vecPadCount; ++padIndex)
+        {
+            setParameterActual (externalPadLevelParameterIdForIndex (padIndex).toRawUTF8(), 1.0f);
+            setParameterActual (externalPadSampleParameterIdForIndex (padIndex).toRawUTF8(), 0.0f);
+        }
+    }
     else
     {
         switch (presetIndex)
@@ -3105,27 +3722,46 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
     }
 
     updateRenderParameters();
-    refreshSampleBank();
+    if constexpr (buildFlavor() != InstrumentFlavor::vec1DrumPad)
+        refreshSampleBank();
+    else
+        refreshExternalPadSamples();
     applyEnvelopeSettings();
 }
 
 void AdvancedVSTiAudioProcessor::parameterChanged (const juce::String& parameterID, float newValue)
 {
-    if (parameterID != "PRESET" || suppressPresetCallback)
+    if (parameterID == "PRESET" && ! suppressPresetCallback)
+    {
+        currentProgramIndex = juce::jlimit (0, juce::jmax (0, getNumPrograms() - 1), juce::roundToInt (newValue));
+        pendingPresetIndex.store (currentProgramIndex);
+        triggerAsyncUpdate();
         return;
+    }
 
-    currentProgramIndex = juce::jlimit (0, juce::jmax (0, getNumPrograms() - 1), juce::roundToInt (newValue));
-    pendingPresetIndex.store (currentProgramIndex);
-    triggerAsyncUpdate();
+    if constexpr (buildFlavor() == InstrumentFlavor::vec1DrumPad)
+    {
+        if (parameterID.startsWith ("VECPADSELECT_"))
+        {
+            pendingExternalPadReload.store (true);
+            triggerAsyncUpdate();
+        }
+    }
 }
 
 void AdvancedVSTiAudioProcessor::handleAsyncUpdate()
 {
     const auto presetIndex = pendingPresetIndex.exchange (-1);
-    if (presetIndex < 0)
-        return;
+    const auto shouldRefreshExternalPads = pendingExternalPadReload.exchange (false);
 
-    applyPresetByIndex (presetIndex);
+    if (presetIndex >= 0)
+        applyPresetByIndex (presetIndex);
+
+    if constexpr (buildFlavor() == InstrumentFlavor::vec1DrumPad)
+    {
+        if (presetIndex >= 0 || shouldRefreshExternalPads)
+            refreshExternalPadSamples();
+    }
 }
 
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
