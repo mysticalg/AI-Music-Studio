@@ -69,6 +69,9 @@ private:
         sample
     };
 
+    static constexpr int maxVoices = 256;
+    static constexpr int maxUnisonOscillators = 8;
+
     struct VoiceState
     {
         bool active = false;
@@ -84,6 +87,9 @@ private:
         float auxPhase = 0.0f;
         float toneState = 0.0f;
         float colourState = 0.0f;
+        std::array<float, maxUnisonOscillators> unisonPhases {};
+        std::array<float, maxUnisonOscillators> unisonSyncPhases {};
+        std::array<float, maxUnisonOscillators> unisonSamplePositions {};
 
         juce::ADSR ampEnv;
         juce::ADSR filterEnv;
@@ -92,6 +98,7 @@ private:
     struct RenderParameters
     {
         OscType oscType = OscType::sine;
+        int polyphony = 16;
         int unisonVoices = 1;
         int lfo1Shape = 0;
         int lfo2Shape = 0;
@@ -160,8 +167,6 @@ private:
         juce::ADSR::Parameters ampEnv;
         juce::ADSR::Parameters filterEnv;
     };
-
-    static constexpr int maxVoices = 16;
     std::array<VoiceState, maxVoices> voices;
     RenderParameters renderParams;
 
@@ -180,6 +185,8 @@ private:
     juce::dsp::StateVariableTPTFilter<float> rightFilter2Cascade;
     juce::dsp::Chorus<float> chorusLeft;
     juce::dsp::Chorus<float> chorusRight;
+    juce::dsp::Chorus<float> flangerLeft;
+    juce::dsp::Chorus<float> flangerRight;
     juce::dsp::Phaser<float> phaserLeft;
     juce::dsp::Phaser<float> phaserRight;
     juce::Reverb reverb;
@@ -239,7 +246,7 @@ private:
         if constexpr (buildFlavor() == InstrumentFlavor::drumMachine || buildFlavor() == InstrumentFlavor::drum808)
             return 8;
         if constexpr (buildFlavor() == InstrumentFlavor::stringSynth)
-            return 16;
+            return maxVoices;
         if constexpr (buildFlavor() == InstrumentFlavor::leadSynth)
             return 8;
         if constexpr (buildFlavor() == InstrumentFlavor::padSynth)
@@ -265,7 +272,7 @@ private:
                       || buildFlavor() == InstrumentFlavor::acid303)
             return 1;
         if constexpr (buildFlavor() == InstrumentFlavor::stringSynth)
-            return 2;
+            return maxUnisonOscillators;
         if constexpr (buildFlavor() == InstrumentFlavor::padSynth)
             return 2;
         if constexpr (buildFlavor() == InstrumentFlavor::leadSynth)
@@ -275,10 +282,12 @@ private:
         return 2;
     }
 
+    [[nodiscard]] int activeVoiceLimit() const noexcept;
     void handleMidiMessage (const juce::MidiMessage& message);
     float renderVoiceSample (VoiceState& voice);
     float renderDrumVoiceSample (VoiceState& voice);
     float oscSample (VoiceState& voice, float baseFreq, OscType type, float syncAmount);
+    float oscSampleForState (float& phase, float& syncPhase, float& samplePos, float baseFreq, OscType type, float syncAmount);
     float basicOscSample (float& phase, float frequency, OscType type);
     float fmOperator (VoiceState& voice, float baseFreq, float amount);
     float lfoValue (int shape, float phase) const;

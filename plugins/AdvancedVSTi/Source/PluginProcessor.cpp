@@ -384,6 +384,10 @@ void AdvancedVSTiAudioProcessor::prepareToPlay (double sampleRate, int samplesPe
     chorusRight.prepare (spec);
     chorusLeft.reset();
     chorusRight.reset();
+    flangerLeft.prepare (spec);
+    flangerRight.prepare (spec);
+    flangerLeft.reset();
+    flangerRight.reset();
     phaserLeft.prepare (spec);
     phaserRight.prepare (spec);
     phaserLeft.reset();
@@ -426,6 +430,8 @@ void AdvancedVSTiAudioProcessor::reset()
     rightFilter2Cascade.reset();
     chorusLeft.reset();
     chorusRight.reset();
+    flangerLeft.reset();
+    flangerRight.reset();
     phaserLeft.reset();
     phaserRight.reset();
     reverb.reset();
@@ -448,6 +454,9 @@ void AdvancedVSTiAudioProcessor::reset()
         voice.auxPhase = 0.0f;
         voice.toneState = 0.0f;
         voice.colourState = 0.0f;
+        voice.unisonPhases.fill (0.0f);
+        voice.unisonSyncPhases.fill (0.0f);
+        voice.unisonSamplePositions.fill (0.0f);
         voice.ampEnv.reset();
         voice.filterEnv.reset();
     }
@@ -467,7 +476,13 @@ juce::StringArray AdvancedVSTiAudioProcessor::presetChoicesForFlavor()
     if constexpr (buildFlavor() == InstrumentFlavor::bassSynth)
         return { "Sub Bass", "Saw Bass", "Square Bass", "Picked Bass" };
     if constexpr (buildFlavor() == InstrumentFlavor::stringSynth)
-        return { "Ensemble", "Soft Strings", "Synth Brass", "Warm Choir" };
+        return {
+            "Ensemble", "Soft Strings", "Synth Brass", "Warm Choir", "Cinema Swell", "Studio Section",
+            "Vintage Solina", "Octave Ribbon", "Silk Pad", "Muted Chamber", "Airy Tremolo", "Dark Legato",
+            "Glass Arcs", "Dream Cascade", "Wide Overture", "Rosin Lead", "Analog Sweep", "Halo Choir",
+            "Frozen Bow", "Pulse Ensemble", "Detuned Wash", "Ribbon Machine", "Golden Swell", "Velvet Brass",
+            "Aurora Choir", "Neon Strings", "Mono Cello", "Nordic Bloom", "Cathedral Pad", "Lush Motion"
+        };
     if constexpr (buildFlavor() == InstrumentFlavor::leadSynth)
         return { "Saw Lead", "Square Solo", "Soft Lead", "Brass Lead" };
     if constexpr (buildFlavor() == InstrumentFlavor::padSynth)
@@ -658,11 +673,19 @@ void AdvancedVSTiAudioProcessor::buildGeneratedSampleBank (int bankIndex)
         juce::FloatVectorOperations::multiply (dst, 0.92f / peak, numSamples);
 }
 
+int AdvancedVSTiAudioProcessor::activeVoiceLimit() const noexcept
+{
+    if constexpr (buildFlavor() == InstrumentFlavor::stringSynth)
+        return juce::jlimit (1, voiceLimitForFlavor(), renderParams.polyphony);
+
+    return voiceLimitForFlavor();
+}
+
 void AdvancedVSTiAudioProcessor::handleMidiMessage (const juce::MidiMessage& msg)
 {
     if (msg.isNoteOn())
     {
-        constexpr int polyphonyLimit = voiceLimitForFlavor();
+        const auto polyphonyLimit = activeVoiceLimit();
         if constexpr (isDrumFlavor())
         {
             const auto triggeredKind = drumKindForMidi (msg.getNoteNumber());
@@ -737,6 +760,9 @@ void AdvancedVSTiAudioProcessor::handleMidiMessage (const juce::MidiMessage& msg
         voice.auxPhase = 0.0f;
         voice.toneState = 0.0f;
         voice.colourState = 0.0f;
+        voice.unisonPhases.fill (0.0f);
+        voice.unisonSyncPhases.fill (0.0f);
+        voice.unisonSamplePositions.fill (0.0f);
         voice.ampEnv.noteOn();
         voice.filterEnv.noteOn();
 
@@ -781,18 +807,24 @@ float AdvancedVSTiAudioProcessor::fmOperator (VoiceState& voice, float baseFreq,
 
 float AdvancedVSTiAudioProcessor::oscSample (VoiceState& voice, float baseFreq, OscType type, float syncAmount)
 {
+    return oscSampleForState (voice.phase, voice.syncPhase, voice.samplePos, baseFreq, type, syncAmount);
+}
+
+float AdvancedVSTiAudioProcessor::oscSampleForState (float& phase, float& syncPhase, float& samplePos,
+                                                     float baseFreq, OscType type, float syncAmount)
+{
     auto increment = baseFreq / static_cast<float> (currentSampleRate);
 
-    voice.syncPhase = std::fmod (voice.syncPhase + increment * (1.0f + syncAmount), 1.0f);
-    if (voice.syncPhase < increment)
-        voice.phase = 0.0f;
+    syncPhase = std::fmod (syncPhase + increment * (1.0f + syncAmount), 1.0f);
+    if (syncPhase < increment)
+        phase = 0.0f;
 
-    voice.phase = std::fmod (voice.phase + increment, 1.0f);
+    phase = std::fmod (phase + increment, 1.0f);
 
     switch (type)
     {
-        case OscType::saw: return 2.0f * voice.phase - 1.0f;
-        case OscType::square: return voice.phase < 0.5f ? 1.0f : -1.0f;
+        case OscType::saw: return 2.0f * phase - 1.0f;
+        case OscType::square: return phase < 0.5f ? 1.0f : -1.0f;
         case OscType::noise: return random.nextFloat() * 2.0f - 1.0f;
         case OscType::sample:
         {
@@ -803,19 +835,19 @@ float AdvancedVSTiAudioProcessor::oscSample (VoiceState& voice, float baseFreq, 
             const auto totalSamples = loadedSample.getNumSamples();
             const auto loopStart = juce::jlimit (0, totalSamples - 1, juce::roundToInt (renderParams.sampleStart * static_cast<float> (totalSamples - 1)));
             const auto loopEnd = juce::jlimit (loopStart + 1, totalSamples, juce::roundToInt (renderParams.sampleEnd * static_cast<float> (totalSamples)));
-            if (voice.samplePos < static_cast<float> (loopStart) || voice.samplePos >= static_cast<float> (loopEnd))
-                voice.samplePos = static_cast<float> (loopStart);
-            const auto idx = juce::jlimit (loopStart, loopEnd - 1, static_cast<int> (voice.samplePos));
+            if (samplePos < static_cast<float> (loopStart) || samplePos >= static_cast<float> (loopEnd))
+                samplePos = static_cast<float> (loopStart);
+            const auto idx = juce::jlimit (loopStart, loopEnd - 1, static_cast<int> (samplePos));
             const auto sample = loadedSample.getSample (0, idx);
             const auto playbackRatio = juce::jlimit (0.125f, 8.0f, baseFreq / 261.6256f);
-            voice.samplePos += playbackRatio;
-            if (voice.samplePos >= static_cast<float> (loopEnd))
-                voice.samplePos = static_cast<float> (loopStart);
+            samplePos += playbackRatio;
+            if (samplePos >= static_cast<float> (loopEnd))
+                samplePos = static_cast<float> (loopStart);
             return sample;
         }
         case OscType::sine:
         default:
-            return std::sin (twoPi * voice.phase);
+            return std::sin (twoPi * phase);
     }
 }
 
@@ -1190,9 +1222,17 @@ float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice)
     for (int i = 0; i < params.unisonVoices; ++i)
     {
         const auto spread = (static_cast<float> (i) - (params.unisonVoices - 1) * 0.5f) * params.detune;
-        s += oscSample (voice, baseHz * std::pow (2.0f, spread / 12.0f) + fm, params.oscType, params.syncAmount);
+        s += oscSampleForState (voice.unisonPhases[static_cast<size_t> (i)],
+                                voice.unisonSyncPhases[static_cast<size_t> (i)],
+                                voice.unisonSamplePositions[static_cast<size_t> (i)],
+                                baseHz * std::pow (2.0f, spread / 12.0f) + fm,
+                                params.oscType,
+                                params.syncAmount);
     }
     s /= static_cast<float> (params.unisonVoices);
+    voice.phase = voice.unisonPhases[0];
+    voice.syncPhase = voice.unisonSyncPhases[0];
+    voice.samplePos = voice.unisonSamplePositions[0];
 
     if constexpr (buildFlavor() == InstrumentFlavor::bassSynth)
     {
@@ -1333,6 +1373,10 @@ int AdvancedVSTiAudioProcessor::getArpNote() const
 void AdvancedVSTiAudioProcessor::updateRenderParameters()
 {
     renderParams.oscType = static_cast<OscType> (paramIndex (apvts, "OSCTYPE"));
+    if constexpr (buildFlavor() == InstrumentFlavor::stringSynth)
+        renderParams.polyphony = juce::jlimit (1, voiceLimitForFlavor(), paramIndex (apvts, "POLYPHONY"));
+    else
+        renderParams.polyphony = voiceLimitForFlavor();
     renderParams.unisonVoices = juce::jlimit (1, maxUnisonForFlavor(), paramIndex (apvts, "UNISON"));
     renderParams.lfo1Shape = paramIndex (apvts, "LFO1SHAPE");
     renderParams.lfo2Shape = paramIndex (apvts, "LFO2SHAPE");
@@ -1475,6 +1519,15 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     chorusLeft.setFeedback (0.05f + renderParams.fxIntensity * 0.18f);
     chorusRight.setFeedback (0.04f + renderParams.fxIntensity * 0.18f);
 
+    flangerLeft.setRate (0.04f + renderParams.fxIntensity * 0.7f);
+    flangerRight.setRate (0.05f + renderParams.fxIntensity * 0.75f);
+    flangerLeft.setDepth (0.2f + renderParams.fxIntensity * 0.78f);
+    flangerRight.setDepth (0.22f + renderParams.fxIntensity * 0.74f);
+    flangerLeft.setCentreDelay (1.2f + renderParams.fxIntensity * 3.1f);
+    flangerRight.setCentreDelay (1.4f + renderParams.fxIntensity * 2.8f);
+    flangerLeft.setFeedback (0.08f + renderParams.fxIntensity * 0.42f);
+    flangerRight.setFeedback (0.08f + renderParams.fxIntensity * 0.42f);
+
     phaserLeft.setRate (0.08f + renderParams.fxIntensity * 1.3f);
     phaserRight.setRate (0.09f + renderParams.fxIntensity * 1.35f);
     phaserLeft.setDepth (0.15f + renderParams.fxIntensity * 0.72f);
@@ -1553,8 +1606,9 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
         currentFilterEnvPeak = 0.0f;
         float sum = 0.0f;
-        for (auto& voice : voices)
-            sum += renderVoiceSample (voice);
+        const auto voiceLimit = activeVoiceLimit();
+        for (int voiceIndex = 0; voiceIndex < voiceLimit; ++voiceIndex)
+            sum += renderVoiceSample (voices[static_cast<size_t> (voiceIndex)]);
 
         auto cutoff = renderParams.cutoff;
         cutoff += currentFilterEnvPeak * renderParams.filterEnvAmount * 10000.0f;
@@ -1610,10 +1664,11 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         hasMidi = midiIterator.getNextEvent (nextMidiMessage, nextMidiSample);
     }
 
-    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced || buildFlavor() == InstrumentFlavor::stringSynth)
     {
         applyAdvancedEffects (buffer);
-        buffer.applyGain (juce::jlimit (0.0f, 1.5f, renderParams.masterLevel));
+        if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+            buffer.applyGain (juce::jlimit (0.0f, 1.5f, renderParams.masterLevel));
     }
 }
 
@@ -1629,7 +1684,7 @@ void AdvancedVSTiAudioProcessor::applyAdvancedEffects (juce::AudioBuffer<float>&
 
     if (fxMix > 0.0001f)
     {
-        if (renderParams.fxType == 2 || renderParams.fxType == 3)
+        if (renderParams.fxType == 2 || renderParams.fxType == 3 || renderParams.fxType == 4)
         {
             juce::AudioBuffer<float> wetBuffer;
             wetBuffer.makeCopyOf (buffer, true);
@@ -1644,10 +1699,15 @@ void AdvancedVSTiAudioProcessor::applyAdvancedEffects (juce::AudioBuffer<float>&
                 phaserLeft.process (leftContext);
                 phaserRight.process (rightContext);
             }
-            else
+            else if (renderParams.fxType == 3)
             {
                 chorusLeft.process (leftContext);
                 chorusRight.process (rightContext);
+            }
+            else
+            {
+                flangerLeft.process (leftContext);
+                flangerRight.process (rightContext);
             }
 
             for (int sample = 0; sample < numSamples; ++sample)
@@ -1771,6 +1831,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
     std::vector<std::unique_ptr<juce::RangedAudioParameter>> params;
 
     int oscDefault = 0;
+    int polyphonyDefault = voiceLimitForFlavor();
     int unisonDefault = 1;
     float detuneDefault = 0.1f;
     float fmDefault = 0.0f;
@@ -1929,6 +1990,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
     else if constexpr (buildFlavor() == InstrumentFlavor::stringSynth)
     {
         oscDefault = 1;
+        polyphonyDefault = 16;
         unisonDefault = 2;
         detuneDefault = 0.035f;
         gateDefault = 8.0f;
@@ -1949,6 +2011,13 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
         lfo2RateDefault = 0.08f;
         lfo2FilterDefault = 0.0f;
         rhythmDepthDefault = 0.0f;
+        fxTypeDefault = 3;
+        fxMixDefault = 0.16f;
+        fxIntensityDefault = 0.24f;
+        delaySendDefault = 0.08f;
+        delayTimeDefault = 0.34f;
+        delayFeedbackDefault = 0.22f;
+        reverbMixDefault = 0.14f;
     }
     else if constexpr (buildFlavor() == InstrumentFlavor::leadSynth)
     {
@@ -2127,6 +2196,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("SAMPLEEND", "Sample End", 0.05f, 1.0f, sampleEndDefault));
     if constexpr (buildFlavor() == InstrumentFlavor::advanced)
         params.push_back (std::make_unique<juce::AudioParameterFloat> ("MASTERLEVEL", "Master Level", 0.0f, 1.5f, masterLevelDefault));
+    if constexpr (buildFlavor() == InstrumentFlavor::stringSynth)
+        params.push_back (std::make_unique<juce::AudioParameterInt> ("POLYPHONY", "Polyphony", 1, voiceLimitForFlavor(), polyphonyDefault));
     params.push_back (std::make_unique<juce::AudioParameterInt> ("UNISON", "Unison", 1, maxUnisonForFlavor(), unisonDefault));
     if constexpr (isDrumFlavor())
     {
@@ -2212,7 +2283,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
 
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("RHYTHMGATE_RATE", "Rhythm Gate Rate", 0.25f, 32.0f, rhythmRateDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("RHYTHMGATE_DEPTH", "Rhythm Gate Depth", 0.0f, 1.0f, rhythmDepthDefault));
-    params.push_back (std::make_unique<juce::AudioParameterChoice> ("FXTYPE", "FX Type", juce::StringArray { "Off", "Dist", "Phaser", "Chorus" }, fxTypeDefault));
+    params.push_back (std::make_unique<juce::AudioParameterChoice> ("FXTYPE", "FX Type", juce::StringArray { "Off", "Dist", "Phaser", "Chorus", "Flanger" }, fxTypeDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("FXMIX", "FX Mix", 0.0f, 1.0f, fxMixDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("FXINTENSITY", "FX Intensity", 0.0f, 1.0f, fxIntensityDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("DELAYSEND", "Delay Send", 0.0f, 1.0f, delaySendDefault));
@@ -2311,41 +2382,268 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
     }
     else if constexpr (buildFlavor() == InstrumentFlavor::stringSynth)
     {
+        auto applyStringSettings = [this] (std::initializer_list<std::pair<const char*, float>> settings)
+        {
+            for (const auto& setting : settings)
+                setParameterActual (setting.first, setting.second);
+        };
+
+        applyStringSettings ({
+            { "POLYPHONY", 16.0f },
+            { "OSCTYPE", 1.0f },
+            { "UNISON", 4.0f },
+            { "DETUNE", 0.035f },
+            { "OSCGATE", 8.0f },
+            { "FILTERTYPE", 0.0f },
+            { "CUTOFF", 3200.0f },
+            { "RESONANCE", 0.12f },
+            { "FILTERENVAMOUNT", 0.08f },
+            { "AMPATTACK", 0.3f },
+            { "AMPDECAY", 0.7f },
+            { "AMPSUSTAIN", 0.88f },
+            { "AMPRELEASE", 1.1f },
+            { "FILTATTACK", 0.12f },
+            { "FILTDECAY", 0.52f },
+            { "FILTSUSTAIN", 0.72f },
+            { "FILTRELEASE", 0.9f },
+            { "FXTYPE", 3.0f },
+            { "FXMIX", 0.16f },
+            { "FXINTENSITY", 0.24f },
+            { "DELAYSEND", 0.08f },
+            { "DELAYTIME", 0.34f },
+            { "DELAYFEEDBACK", 0.22f },
+            { "REVERBMIX", 0.14f },
+        });
+
         switch (presetIndex)
         {
             case 1:
-                setParameterActual ("OSCTYPE", 2.0f);
-                setParameterActual ("DETUNE", 0.025f);
-                setParameterActual ("CUTOFF", 2600.0f);
-                setParameterActual ("AMPATTACK", 0.42f);
-                setParameterActual ("AMPRELEASE", 1.4f);
+                applyStringSettings ({
+                    { "OSCTYPE", 2.0f }, { "UNISON", 4.0f }, { "DETUNE", 0.028f }, { "CUTOFF", 2500.0f },
+                    { "AMPATTACK", 0.48f }, { "AMPRELEASE", 1.5f }, { "FXMIX", 0.12f }, { "REVERBMIX", 0.22f },
+                });
                 break;
             case 2:
-                setParameterActual ("OSCTYPE", 1.0f);
-                setParameterActual ("DETUNE", 0.02f);
-                setParameterActual ("CUTOFF", 1800.0f);
-                setParameterActual ("FILTERENVAMOUNT", 0.22f);
-                setParameterActual ("AMPATTACK", 0.08f);
-                setParameterActual ("AMPDECAY", 0.35f);
-                setParameterActual ("AMPSUSTAIN", 0.62f);
-                setParameterActual ("AMPRELEASE", 0.34f);
+                applyStringSettings ({
+                    { "UNISON", 2.0f }, { "DETUNE", 0.018f }, { "OSCGATE", 2.2f }, { "CUTOFF", 1800.0f },
+                    { "RESONANCE", 0.18f }, { "FILTERENVAMOUNT", 0.24f }, { "AMPATTACK", 0.03f }, { "AMPDECAY", 0.26f },
+                    { "AMPSUSTAIN", 0.66f }, { "AMPRELEASE", 0.28f }, { "FILTATTACK", 0.001f }, { "FILTDECAY", 0.18f },
+                    { "FILTSUSTAIN", 0.16f }, { "FILTRELEASE", 0.1f }, { "FXTYPE", 1.0f }, { "FXMIX", 0.04f },
+                    { "FXINTENSITY", 0.12f }, { "DELAYSEND", 0.02f }, { "REVERBMIX", 0.06f },
+                });
                 break;
             case 3:
-                setParameterActual ("OSCTYPE", 2.0f);
-                setParameterActual ("DETUNE", 0.03f);
-                setParameterActual ("CUTOFF", 2200.0f);
-                setParameterActual ("AMPATTACK", 0.34f);
-                setParameterActual ("AMPRELEASE", 1.6f);
+                applyStringSettings ({
+                    { "OSCTYPE", 2.0f }, { "POLYPHONY", 24.0f }, { "UNISON", 4.0f }, { "DETUNE", 0.034f },
+                    { "CUTOFF", 2200.0f }, { "FILTERENVAMOUNT", 0.12f }, { "AMPATTACK", 0.36f }, { "AMPRELEASE", 1.9f },
+                    { "FXMIX", 0.18f }, { "FXINTENSITY", 0.28f }, { "REVERBMIX", 0.28f },
+                });
+                break;
+            case 4:
+                applyStringSettings ({
+                    { "POLYPHONY", 32.0f }, { "UNISON", 6.0f }, { "DETUNE", 0.06f }, { "CUTOFF", 4000.0f },
+                    { "FILTERENVAMOUNT", 0.18f }, { "AMPATTACK", 1.2f }, { "AMPRELEASE", 2.8f }, { "FXMIX", 0.24f },
+                    { "FXINTENSITY", 0.34f }, { "DELAYSEND", 0.14f }, { "DELAYTIME", 0.46f }, { "DELAYFEEDBACK", 0.32f },
+                    { "REVERBMIX", 0.24f },
+                });
+                break;
+            case 5:
+                applyStringSettings ({
+                    { "UNISON", 4.0f }, { "DETUNE", 0.032f }, { "CUTOFF", 3300.0f }, { "AMPATTACK", 0.22f },
+                    { "AMPDECAY", 0.52f }, { "AMPSUSTAIN", 0.82f }, { "AMPRELEASE", 0.9f }, { "FILTATTACK", 0.08f },
+                    { "FILTDECAY", 0.36f }, { "FILTSUSTAIN", 0.58f }, { "FILTRELEASE", 0.56f }, { "FXMIX", 0.08f },
+                    { "DELAYSEND", 0.04f }, { "REVERBMIX", 0.1f },
+                });
+                break;
+            case 6:
+                applyStringSettings ({
+                    { "UNISON", 6.0f }, { "DETUNE", 0.044f }, { "CUTOFF", 4100.0f }, { "AMPATTACK", 0.18f },
+                    { "AMPRELEASE", 1.2f }, { "FXMIX", 0.24f }, { "FXINTENSITY", 0.36f }, { "DELAYSEND", 0.05f },
+                    { "REVERBMIX", 0.18f },
+                });
+                break;
+            case 7:
+                applyStringSettings ({
+                    { "OSCTYPE", 2.0f }, { "UNISON", 2.0f }, { "DETUNE", 0.015f }, { "OSCGATE", 3.4f }, { "CUTOFF", 2600.0f },
+                    { "RESONANCE", 0.2f }, { "FILTERENVAMOUNT", 0.3f }, { "AMPATTACK", 0.08f }, { "AMPDECAY", 0.25f },
+                    { "AMPSUSTAIN", 0.7f }, { "AMPRELEASE", 0.35f }, { "FILTATTACK", 0.001f }, { "FILTDECAY", 0.22f },
+                    { "FILTSUSTAIN", 0.24f }, { "FILTRELEASE", 0.18f }, { "FXTYPE", 2.0f }, { "FXMIX", 0.14f },
+                    { "FXINTENSITY", 0.22f },
+                });
+                break;
+            case 8:
+                applyStringSettings ({
+                    { "POLYPHONY", 32.0f }, { "UNISON", 5.0f }, { "DETUNE", 0.052f }, { "CUTOFF", 3000.0f },
+                    { "FILTERENVAMOUNT", 0.1f }, { "AMPATTACK", 0.9f }, { "AMPRELEASE", 2.4f }, { "FXMIX", 0.18f },
+                    { "FXINTENSITY", 0.28f }, { "REVERBMIX", 0.24f },
+                });
+                break;
+            case 9:
+                applyStringSettings ({
+                    { "POLYPHONY", 12.0f }, { "UNISON", 2.0f }, { "DETUNE", 0.012f }, { "OSCGATE", 2.0f }, { "CUTOFF", 1400.0f },
+                    { "FILTERENVAMOUNT", 0.18f }, { "AMPATTACK", 0.02f }, { "AMPDECAY", 0.3f }, { "AMPSUSTAIN", 0.52f },
+                    { "AMPRELEASE", 0.38f }, { "FILTATTACK", 0.001f }, { "FILTDECAY", 0.18f }, { "FILTSUSTAIN", 0.18f },
+                    { "FILTRELEASE", 0.18f }, { "FXTYPE", 0.0f }, { "FXMIX", 0.0f }, { "DELAYSEND", 0.0f }, { "REVERBMIX", 0.08f },
+                });
+                break;
+            case 10:
+                applyStringSettings ({
+                    { "POLYPHONY", 24.0f }, { "UNISON", 4.0f }, { "DETUNE", 0.03f }, { "CUTOFF", 3600.0f },
+                    { "FILTERENVAMOUNT", 0.1f }, { "AMPATTACK", 0.24f }, { "AMPRELEASE", 1.2f }, { "FXTYPE", 2.0f },
+                    { "FXMIX", 0.2f }, { "FXINTENSITY", 0.4f }, { "REVERBMIX", 0.18f },
+                });
+                break;
+            case 11:
+                applyStringSettings ({
+                    { "POLYPHONY", 8.0f }, { "UNISON", 3.0f }, { "DETUNE", 0.02f }, { "CUTOFF", 1200.0f },
+                    { "RESONANCE", 0.24f }, { "FILTERENVAMOUNT", 0.06f }, { "AMPATTACK", 0.16f }, { "AMPRELEASE", 1.4f },
+                    { "FXTYPE", 0.0f }, { "FXMIX", 0.0f }, { "DELAYSEND", 0.0f }, { "REVERBMIX", 0.12f },
+                });
+                break;
+            case 12:
+                applyStringSettings ({
+                    { "UNISON", 4.0f }, { "DETUNE", 0.04f }, { "CUTOFF", 5200.0f }, { "FILTERENVAMOUNT", 0.28f },
+                    { "AMPATTACK", 0.35f }, { "AMPRELEASE", 1.6f }, { "FILTATTACK", 0.04f }, { "FILTDECAY", 0.7f },
+                    { "FILTSUSTAIN", 0.48f }, { "FILTRELEASE", 1.1f }, { "FXTYPE", 4.0f }, { "FXMIX", 0.18f },
+                    { "FXINTENSITY", 0.26f }, { "DELAYSEND", 0.08f }, { "REVERBMIX", 0.16f },
+                });
+                break;
+            case 13:
+                applyStringSettings ({
+                    { "POLYPHONY", 32.0f }, { "UNISON", 6.0f }, { "DETUNE", 0.065f }, { "CUTOFF", 4600.0f },
+                    { "AMPATTACK", 1.4f }, { "AMPRELEASE", 3.0f }, { "FXMIX", 0.28f }, { "FXINTENSITY", 0.36f },
+                    { "DELAYSEND", 0.18f }, { "DELAYTIME", 0.52f }, { "DELAYFEEDBACK", 0.4f }, { "REVERBMIX", 0.3f },
+                });
+                break;
+            case 14:
+                applyStringSettings ({
+                    { "POLYPHONY", 48.0f }, { "UNISON", 8.0f }, { "DETUNE", 0.08f }, { "CUTOFF", 3400.0f },
+                    { "FILTERENVAMOUNT", 0.14f }, { "AMPATTACK", 0.8f }, { "AMPRELEASE", 2.5f }, { "FXMIX", 0.2f },
+                    { "DELAYSEND", 0.1f }, { "REVERBMIX", 0.24f },
+                });
+                break;
+            case 15:
+                applyStringSettings ({
+                    { "POLYPHONY", 4.0f }, { "UNISON", 2.0f }, { "DETUNE", 0.01f }, { "OSCGATE", 2.8f }, { "CUTOFF", 2100.0f },
+                    { "RESONANCE", 0.22f }, { "FILTERENVAMOUNT", 0.32f }, { "AMPATTACK", 0.01f }, { "AMPDECAY", 0.18f },
+                    { "AMPSUSTAIN", 0.78f }, { "AMPRELEASE", 0.2f }, { "FILTATTACK", 0.001f }, { "FILTDECAY", 0.18f },
+                    { "FILTSUSTAIN", 0.2f }, { "FILTRELEASE", 0.1f }, { "FXTYPE", 1.0f }, { "FXMIX", 0.08f },
+                    { "FXINTENSITY", 0.18f }, { "DELAYSEND", 0.02f }, { "REVERBMIX", 0.04f },
+                });
+                break;
+            case 16:
+                applyStringSettings ({
+                    { "UNISON", 4.0f }, { "DETUNE", 0.045f }, { "CUTOFF", 1800.0f }, { "RESONANCE", 0.2f },
+                    { "FILTERENVAMOUNT", 0.4f }, { "AMPATTACK", 0.12f }, { "AMPRELEASE", 1.8f }, { "FILTATTACK", 0.3f },
+                    { "FILTDECAY", 1.6f }, { "FILTSUSTAIN", 0.12f }, { "FILTRELEASE", 1.2f }, { "FXTYPE", 2.0f },
+                    { "FXMIX", 0.16f }, { "FXINTENSITY", 0.42f }, { "DELAYSEND", 0.1f }, { "REVERBMIX", 0.16f },
+                });
+                break;
+            case 17:
+                applyStringSettings ({
+                    { "POLYPHONY", 24.0f }, { "UNISON", 5.0f }, { "DETUNE", 0.05f }, { "CUTOFF", 2400.0f },
+                    { "FILTERENVAMOUNT", 0.14f }, { "AMPATTACK", 0.55f }, { "AMPRELEASE", 2.2f }, { "FXMIX", 0.2f },
+                    { "FXINTENSITY", 0.3f }, { "DELAYSEND", 0.12f }, { "REVERBMIX", 0.34f },
+                });
+                break;
+            case 18:
+                applyStringSettings ({
+                    { "POLYPHONY", 12.0f }, { "UNISON", 4.0f }, { "DETUNE", 0.022f }, { "CUTOFF", 900.0f },
+                    { "RESONANCE", 0.3f }, { "FILTERENVAMOUNT", 0.05f }, { "AMPATTACK", 0.4f }, { "AMPDECAY", 0.8f },
+                    { "AMPSUSTAIN", 0.7f }, { "AMPRELEASE", 1.5f }, { "FILTATTACK", 0.6f }, { "FILTDECAY", 1.8f },
+                    { "FILTSUSTAIN", 0.4f }, { "FILTRELEASE", 1.4f }, { "FXTYPE", 4.0f }, { "FXMIX", 0.12f },
+                    { "FXINTENSITY", 0.18f }, { "REVERBMIX", 0.26f },
+                });
+                break;
+            case 19:
+                applyStringSettings ({
+                    { "UNISON", 4.0f }, { "DETUNE", 0.035f }, { "OSCGATE", 1.6f }, { "CUTOFF", 2000.0f },
+                    { "FILTERENVAMOUNT", 0.36f }, { "AMPATTACK", 0.01f }, { "AMPDECAY", 0.22f }, { "AMPSUSTAIN", 0.46f },
+                    { "AMPRELEASE", 0.18f }, { "FILTATTACK", 0.001f }, { "FILTDECAY", 0.16f }, { "FILTSUSTAIN", 0.14f },
+                    { "FILTRELEASE", 0.14f }, { "FXMIX", 0.1f }, { "DELAYSEND", 0.06f }, { "REVERBMIX", 0.08f },
+                });
+                break;
+            case 20:
+                applyStringSettings ({
+                    { "POLYPHONY", 32.0f }, { "UNISON", 8.0f }, { "DETUNE", 0.095f }, { "CUTOFF", 2800.0f },
+                    { "AMPATTACK", 0.7f }, { "AMPRELEASE", 2.7f }, { "FXMIX", 0.3f }, { "FXINTENSITY", 0.42f },
+                    { "DELAYSEND", 0.12f }, { "DELAYTIME", 0.38f }, { "DELAYFEEDBACK", 0.28f }, { "REVERBMIX", 0.25f },
+                });
+                break;
+            case 21:
+                applyStringSettings ({
+                    { "UNISON", 3.0f }, { "DETUNE", 0.026f }, { "OSCGATE", 3.2f }, { "CUTOFF", 3100.0f },
+                    { "FILTERENVAMOUNT", 0.22f }, { "AMPATTACK", 0.09f }, { "AMPDECAY", 0.42f }, { "AMPSUSTAIN", 0.74f },
+                    { "AMPRELEASE", 0.52f }, { "FXTYPE", 2.0f }, { "FXMIX", 0.22f }, { "FXINTENSITY", 0.28f },
+                    { "DELAYSEND", 0.08f }, { "REVERBMIX", 0.12f },
+                });
+                break;
+            case 22:
+                applyStringSettings ({
+                    { "POLYPHONY", 24.0f }, { "UNISON", 5.0f }, { "DETUNE", 0.048f }, { "CUTOFF", 3600.0f },
+                    { "FILTERENVAMOUNT", 0.18f }, { "AMPATTACK", 0.95f }, { "AMPRELEASE", 2.3f }, { "FXMIX", 0.18f },
+                    { "DELAYSEND", 0.15f }, { "DELAYTIME", 0.58f }, { "DELAYFEEDBACK", 0.36f }, { "REVERBMIX", 0.22f },
+                });
+                break;
+            case 23:
+                applyStringSettings ({
+                    { "POLYPHONY", 8.0f }, { "UNISON", 2.0f }, { "DETUNE", 0.018f }, { "OSCGATE", 2.4f }, { "CUTOFF", 1700.0f },
+                    { "RESONANCE", 0.19f }, { "FILTERENVAMOUNT", 0.3f }, { "AMPATTACK", 0.025f }, { "AMPDECAY", 0.22f },
+                    { "AMPSUSTAIN", 0.72f }, { "AMPRELEASE", 0.26f }, { "FILTATTACK", 0.001f }, { "FILTDECAY", 0.24f },
+                    { "FILTSUSTAIN", 0.24f }, { "FILTRELEASE", 0.12f }, { "FXTYPE", 1.0f }, { "FXMIX", 0.05f },
+                    { "FXINTENSITY", 0.12f }, { "REVERBMIX", 0.06f },
+                });
+                break;
+            case 24:
+                applyStringSettings ({
+                    { "POLYPHONY", 32.0f }, { "UNISON", 6.0f }, { "DETUNE", 0.058f }, { "CUTOFF", 2900.0f },
+                    { "FILTERENVAMOUNT", 0.16f }, { "AMPATTACK", 0.62f }, { "AMPRELEASE", 2.6f }, { "FXTYPE", 4.0f },
+                    { "FXMIX", 0.16f }, { "FXINTENSITY", 0.32f }, { "DELAYSEND", 0.16f }, { "DELAYTIME", 0.48f },
+                    { "DELAYFEEDBACK", 0.34f }, { "REVERBMIX", 0.32f },
+                });
+                break;
+            case 25:
+                applyStringSettings ({
+                    { "UNISON", 4.0f }, { "DETUNE", 0.03f }, { "CUTOFF", 4800.0f }, { "RESONANCE", 0.14f },
+                    { "FILTERENVAMOUNT", 0.2f }, { "AMPATTACK", 0.12f }, { "AMPDECAY", 0.45f }, { "AMPSUSTAIN", 0.82f },
+                    { "AMPRELEASE", 0.9f }, { "FXTYPE", 2.0f }, { "FXMIX", 0.14f }, { "FXINTENSITY", 0.35f },
+                    { "DELAYSEND", 0.1f }, { "REVERBMIX", 0.14f },
+                });
+                break;
+            case 26:
+                applyStringSettings ({
+                    { "POLYPHONY", 1.0f }, { "OSCTYPE", 2.0f }, { "UNISON", 1.0f }, { "DETUNE", 0.0f }, { "OSCGATE", 4.0f },
+                    { "CUTOFF", 950.0f }, { "RESONANCE", 0.24f }, { "FILTERENVAMOUNT", 0.18f }, { "AMPATTACK", 0.07f },
+                    { "AMPDECAY", 0.32f }, { "AMPSUSTAIN", 0.82f }, { "AMPRELEASE", 0.6f }, { "FILTATTACK", 0.03f },
+                    { "FILTDECAY", 0.5f }, { "FILTSUSTAIN", 0.4f }, { "FILTRELEASE", 0.6f }, { "FXTYPE", 0.0f },
+                    { "FXMIX", 0.0f }, { "DELAYSEND", 0.0f }, { "REVERBMIX", 0.1f },
+                });
+                break;
+            case 27:
+                applyStringSettings ({
+                    { "POLYPHONY", 20.0f }, { "UNISON", 4.0f }, { "DETUNE", 0.024f }, { "CUTOFF", 2300.0f },
+                    { "FILTERENVAMOUNT", 0.26f }, { "AMPATTACK", 0.4f }, { "AMPDECAY", 0.9f }, { "AMPSUSTAIN", 0.76f },
+                    { "AMPRELEASE", 1.7f }, { "FILTATTACK", 0.18f }, { "FILTDECAY", 1.4f }, { "FILTSUSTAIN", 0.22f },
+                    { "FILTRELEASE", 1.6f }, { "FXMIX", 0.12f }, { "DELAYSEND", 0.14f }, { "REVERBMIX", 0.28f },
+                });
+                break;
+            case 28:
+                applyStringSettings ({
+                    { "POLYPHONY", 48.0f }, { "UNISON", 6.0f }, { "DETUNE", 0.07f }, { "CUTOFF", 2600.0f },
+                    { "FILTERENVAMOUNT", 0.12f }, { "AMPATTACK", 1.6f }, { "AMPRELEASE", 3.6f }, { "FXMIX", 0.24f },
+                    { "FXINTENSITY", 0.2f }, { "DELAYSEND", 0.22f }, { "DELAYTIME", 0.72f }, { "DELAYFEEDBACK", 0.44f },
+                    { "REVERBMIX", 0.38f },
+                });
+                break;
+            case 29:
+                applyStringSettings ({
+                    { "POLYPHONY", 24.0f }, { "UNISON", 5.0f }, { "DETUNE", 0.055f }, { "CUTOFF", 3400.0f },
+                    { "FILTERENVAMOUNT", 0.2f }, { "AMPATTACK", 0.52f }, { "AMPRELEASE", 2.0f }, { "FXTYPE", 2.0f },
+                    { "FXMIX", 0.12f }, { "FXINTENSITY", 0.46f }, { "DELAYSEND", 0.12f }, { "DELAYTIME", 0.42f },
+                    { "DELAYFEEDBACK", 0.3f }, { "REVERBMIX", 0.2f },
+                });
                 break;
             default:
-                setParameterActual ("OSCTYPE", 1.0f);
-                setParameterActual ("DETUNE", 0.035f);
-                setParameterActual ("CUTOFF", 3200.0f);
-                setParameterActual ("FILTERENVAMOUNT", 0.08f);
-                setParameterActual ("AMPATTACK", 0.3f);
-                setParameterActual ("AMPDECAY", 0.7f);
-                setParameterActual ("AMPSUSTAIN", 0.88f);
-                setParameterActual ("AMPRELEASE", 1.1f);
                 break;
         }
     }

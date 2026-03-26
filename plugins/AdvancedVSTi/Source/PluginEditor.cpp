@@ -713,6 +713,15 @@ AdvancedVSTiAudioProcessorEditor::AdvancedVSTiAudioProcessorEditor (AdvancedVSTi
         maxWidth = 2800;
         maxHeight = 1800;
     }
+    else if (normalizedPluginName (audioProcessor).contains ("string"))
+    {
+        defaultWidth = 1380;
+        defaultHeight = 900;
+        minWidth = 1060;
+        minHeight = 760;
+        maxWidth = 2600;
+        maxHeight = 1800;
+    }
     else if (usesDrumPadLayout())
     {
         defaultWidth = isTribute909() ? 1120 : 1180;
@@ -947,7 +956,7 @@ std::vector<AdvancedVSTiAudioProcessorEditor::ChoiceSpec> AdvancedVSTiAudioProce
         specs.push_back ({ "FILTERSLOPE", "Filter 1 Slope", "Roll-off steepness", { "12 dB", "16 dB", "24 dB" }, { "12", "16", "24" }, true, 3 });
         specs.push_back ({ "FILTER2TYPE", "Filter 2 Mode", "Secondary response", { "LP", "BP", "HP", "Notch" }, { "LP", "BP", "HP", "NCH" }, true, 2 });
         specs.push_back ({ "FILTER2SLOPE", "Filter 2 Slope", "Secondary roll-off", { "12 dB", "16 dB", "24 dB" }, { "12", "16", "24" }, true, 3 });
-        specs.push_back ({ "FXTYPE", "Effects", "Insert algorithm", { "Off", "Dist", "Phaser", "Chorus" }, { "OFF", "DST", "PHA", "CHO" }, true, 2 });
+        specs.push_back ({ "FXTYPE", "Effects", "Insert algorithm", { "Off", "Dist", "Phaser", "Chorus", "Flanger" }, { "OFF", "DST", "PHA", "CHO", "FLA" }, true, 3 });
         specs.push_back ({ "LFO1SHAPE", "LFO 1 Shape", "Primary motion", { "Sine", "Saw", "Square" }, { "SIN", "SAW", "SQR" }, true, 3 });
         specs.push_back ({ "LFO2SHAPE", "LFO 2 Shape", "Secondary motion", { "Sine", "Saw", "Square" }, { "SIN", "SAW", "SQR" }, true, 3 });
         specs.push_back ({ "ARPMODE", "Arp Mode", "Pattern motion", { "Up", "Down", "UpDown", "Random" }, { "FWD", "REV", "ALT", "RND" }, true, 2 });
@@ -959,6 +968,15 @@ std::vector<AdvancedVSTiAudioProcessorEditor::ChoiceSpec> AdvancedVSTiAudioProce
         specs.push_back ({ "OSCTYPE", "Waveform", "Switch the acid core source", { "Sine", "Saw", "Square", "Noise", "Sample" }, {}, false, 0 });
         specs.push_back ({ "FILTERTYPE", "Filter Mode", "Tribute panel with modern filter options", { "LP", "BP", "HP", "Notch" }, {}, false, 0 });
         specs.push_back ({ "FILTERSLOPE", "Slope", "Acid roll-off steepness", { "12 dB", "16 dB", "24 dB" }, {}, false, 0 });
+        return specs;
+    }
+
+    if (name.contains ("string"))
+    {
+        specs.push_back ({ "OSCTYPE", "Oscillator", "Core ensemble source", { "Sine", "Saw", "Square", "Noise", "Sample" }, {}, false, 0 });
+        specs.push_back ({ "FILTERTYPE", "Filter", "Main timbre curve", { "LP", "BP", "HP", "Notch" }, {}, false, 0 });
+        specs.push_back ({ "FILTERSLOPE", "Slope", "Filter roll-off", { "12 dB", "16 dB", "24 dB" }, {}, false, 0 });
+        specs.push_back ({ "FXTYPE", "FX Type", "Insert color", { "Off", "Dist", "Phaser", "Chorus", "Flanger" }, {}, false, 0 });
         return specs;
     }
 
@@ -1151,7 +1169,31 @@ std::vector<AdvancedVSTiAudioProcessorEditor::KnobSpec> AdvancedVSTiAudioProcess
             { "AMPRELEASE", "Release", "Tail and sustain feel" },
         };
 
-    if (name.contains ("string") || name.contains ("pad"))
+    if (name.contains ("string"))
+        return {
+            { "POLYPHONY", "Poly", "Max active notes" },
+            { "UNISON", "Unison", "Voices per note" },
+            { "DETUNE", "Detune", "Unison spread" },
+            { "CUTOFF", "Cutoff", "Brightness and air" },
+            { "RESONANCE", "Res", "Filter focus" },
+            { "FILTERENVAMOUNT", "Env Amt", "Filter bloom depth" },
+            { "FILTATTACK", "Flt Att", "Filter rise" },
+            { "FILTDECAY", "Flt Dec", "Filter fall" },
+            { "FILTSUSTAIN", "Flt Sus", "Filter hold" },
+            { "FILTRELEASE", "Flt Rel", "Filter tail" },
+            { "AMPATTACK", "Amp Att", "Level rise" },
+            { "AMPDECAY", "Amp Dec", "Level fall" },
+            { "AMPSUSTAIN", "Amp Sus", "Level hold" },
+            { "AMPRELEASE", "Amp Rel", "Level tail" },
+            { "FXMIX", "FX Mix", "Insert blend" },
+            { "FXINTENSITY", "FX Int", "Insert depth" },
+            { "DELAYSEND", "Delay", "Echo send" },
+            { "DELAYTIME", "Dly Time", "Echo space" },
+            { "DELAYFEEDBACK", "Feedback", "Echo repeats" },
+            { "REVERBMIX", "Reverb", "Room blend" },
+        };
+
+    if (name.contains ("pad"))
         return {
             { "CUTOFF", "Cutoff", "Brightness and air" },
             { "AMPATTACK", "Attack", "Slow onset" },
@@ -1557,18 +1599,23 @@ void AdvancedVSTiAudioProcessorEditor::resized()
         for (auto* card : choiceCards)
             card->setScale (uiScale);
 
-        auto frame = getLocalBounds().reduced (s (20.0f));
-        auto hero = frame.removeFromTop (s (58.0f));
-        badgeLabel.setBounds (hero.removeFromTop (s (12.0f)));
-        titleLabel.setBounds (hero.removeFromTop (s (30.0f)));
-        subtitleLabel.setBounds (hero.removeFromTop (s (18.0f)));
+        // Match paint() coordinate system exactly
+        auto frame = getLocalBounds().reduced (s (12.0f));
+        auto hero = frame.removeFromTop (s (82.0f));
 
-        auto surface = frame;
-        auto stepStrip = surface.removeFromBottom (s (30.0f));
-        juce::ignoreUnused (stepStrip);
-        auto topControls = surface.removeFromTop (juce::jmax (s (210.0f), surface.getHeight() - s (74.0f)));
-        surface.removeFromTop (s (6.0f));
-        auto bottomDecor = surface;
+        // Paint draws "TR-909" and "RHYTHM COMPOSER" in top 38px of hero;
+        // place labels in the remaining hero space below that
+        auto labelArea = hero;
+        labelArea.removeFromTop (s (38.0f));
+        badgeLabel.setBounds ({});
+        titleLabel.setBounds (labelArea.removeFromTop (s (24.0f)).reduced (s (10.0f), 0));
+        subtitleLabel.setBounds (labelArea.reduced (s (10.0f), 0));
+
+        // Surface layout matching paint() exactly (step strip is purely decorative)
+        auto surface = frame.reduced (s (10.0f));
+        surface.removeFromTop (s (70.0f));
+        auto bottomDecor = surface.removeFromBottom (s (82.0f));
+        auto topControls = surface;
 
         auto leftRail = topControls.removeFromLeft (s (180.0f));
         topControls.removeFromLeft (s (6.0f));
@@ -1923,9 +1970,11 @@ void AdvancedVSTiAudioProcessorEditor::resized()
     }
 
     const int spacing = 14;
-    const int columnCount = area.getWidth() > 940 ? 4 : (area.getWidth() > 680 ? 3 : 2);
+    const int columnCount = area.getWidth() > 900 ? 5 : (area.getWidth() > 720 ? 4 : (area.getWidth() > 560 ? 3 : 2));
+    const int rowCount = juce::jmax (1, (knobCards.size() + columnCount - 1) / columnCount);
     const int cardWidth = (area.getWidth() - ((columnCount - 1) * spacing)) / columnCount;
-    const int cardHeight = 220;
+    const int computedCardHeight = rowCount > 0 ? (area.getHeight() - ((rowCount - 1) * spacing)) / rowCount : 220;
+    const int cardHeight = juce::jlimit (105, 220, computedCardHeight);
     int x = area.getX();
     int y = area.getY();
     int column = 0;
