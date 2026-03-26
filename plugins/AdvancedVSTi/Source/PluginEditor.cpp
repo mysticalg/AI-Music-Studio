@@ -1321,14 +1321,20 @@ void AdvancedVSTiAudioProcessorEditor::paint (juce::Graphics& g)
         g.setColour (theme.trim.withAlpha (0.8f));
         g.drawRoundedRectangle (frame, s (10.0f), juce::jmax (1.0f, s (1.0f)));
 
-        auto hero = frame.removeFromTop (s (82.0f));
-        auto titleStrip = hero.removeFromTop (s (38.0f));
+        auto hero = frame.removeFromTop (s (54.0f));
+        auto titleStrip = hero.removeFromTop (s (34.0f));
         g.setColour (theme.legend);
         g.setFont (juce::Font (28.0f * uiScale, juce::Font::bold));
-        g.drawFittedText ("TR-909", titleStrip.toNearestInt().removeFromLeft (si (220.0f)), juce::Justification::centredLeft, 1);
+        g.drawFittedText ("TR-909", titleStrip.toNearestInt().reduced (si (10.0f), 0).removeFromLeft (si (220.0f)), juce::Justification::centredLeft, 1);
         g.setColour (theme.panelEdge);
         g.setFont (juce::Font (14.0f * uiScale, juce::Font::bold));
-        g.drawFittedText ("RHYTHM COMPOSER", titleStrip.toNearestInt().removeFromRight (si (280.0f)), juce::Justification::centredRight, 1);
+        g.drawFittedText ("RHYTHM COMPOSER", titleStrip.toNearestInt().reduced (si (10.0f), 0).removeFromRight (si (280.0f)), juce::Justification::centredRight, 1);
+
+        g.setColour (theme.panelEdge.brighter (0.18f));
+        g.setFont (juce::Font (11.0f * uiScale, juce::Font::plain));
+        auto subtitleStrip = hero;
+        g.drawFittedText ("AI Drum Machine \u2013 909-style punch, clap and hats",
+                          subtitleStrip.toNearestInt().reduced (si (10.0f), 0), juce::Justification::centredLeft, 1);
 
         auto drawSection = [&] (juce::Rectangle<float> area, const juce::String& title)
         {
@@ -1347,29 +1353,32 @@ void AdvancedVSTiAudioProcessorEditor::paint (juce::Graphics& g)
             g.drawFittedText (title, titleBounds, juce::Justification::centredLeft, 1);
         };
 
-        auto surface = frame.reduced (s (10.0f));
-        surface.removeFromTop (s (70.0f));
-        auto bottomDecor = surface.removeFromBottom (s (82.0f));
+        auto surface = frame.reduced (s (8.0f));
+        surface.removeFromTop (s (6.0f));
+        auto stepArea = surface.removeFromBottom (s (32.0f));
+        surface.removeFromBottom (s (6.0f));
+        auto bottomDecor = surface.removeFromBottom (s (110.0f));
+        surface.removeFromBottom (s (6.0f));
         auto topControls = surface;
-        auto leftRail = topControls.removeFromLeft (s (180.0f));
-        topControls.removeFromLeft (s (6.0f));
+        auto leftRail = topControls.removeFromLeft (s (140.0f));
+        topControls.removeFromLeft (s (5.0f));
 
-        const float gap = s (6.0f);
-        const float ratioSum = 1.55f + 1.55f + 1.15f + 1.15f + 1.15f + 0.95f + 1.55f + 1.55f;
+        const float gap = s (5.0f);
+        const float ratioSum = 1.5f + 1.5f + 1.0f + 1.0f + 1.0f + 0.85f + 1.5f + 1.5f;
         const float unit = (topControls.getWidth() - gap * 7.0f) / ratioSum;
-        auto kickArea = topControls.removeFromLeft (unit * 1.55f);
+        auto kickArea = topControls.removeFromLeft (unit * 1.5f);
         topControls.removeFromLeft (gap);
-        auto snareArea = topControls.removeFromLeft (unit * 1.55f);
+        auto snareArea = topControls.removeFromLeft (unit * 1.5f);
         topControls.removeFromLeft (gap);
-        auto lowTomArea = topControls.removeFromLeft (unit * 1.15f);
+        auto lowTomArea = topControls.removeFromLeft (unit * 1.0f);
         topControls.removeFromLeft (gap);
-        auto midTomArea = topControls.removeFromLeft (unit * 1.15f);
+        auto midTomArea = topControls.removeFromLeft (unit * 1.0f);
         topControls.removeFromLeft (gap);
-        auto highTomArea = topControls.removeFromLeft (unit * 1.15f);
+        auto highTomArea = topControls.removeFromLeft (unit * 1.0f);
         topControls.removeFromLeft (gap);
-        auto rimClapArea = topControls.removeFromLeft (unit * 0.95f);
+        auto rimClapArea = topControls.removeFromLeft (unit * 0.85f);
         topControls.removeFromLeft (gap);
-        auto hatArea = topControls.removeFromLeft (unit * 1.55f);
+        auto hatArea = topControls.removeFromLeft (unit * 1.5f);
         topControls.removeFromLeft (gap);
         auto cymbalArea = topControls;
 
@@ -1382,11 +1391,14 @@ void AdvancedVSTiAudioProcessorEditor::paint (juce::Graphics& g)
         drawSection (rimClapArea, "RIM / CLAP");
         drawSection (hatArea, "HI HAT");
         drawSection (cymbalArea, "CYMBAL");
-        drawSection (bottomDecor.removeFromLeft (juce::jmin (s (290.0f), bottomDecor.getWidth() * 0.31f)), "PRESET / FILTER");
+
+        auto presetDecor = bottomDecor.removeFromLeft (juce::jmin (s (280.0f), bottomDecor.getWidth() * 0.28f));
+        bottomDecor.removeFromLeft (s (6.0f));
+        drawSection (presetDecor, "PRESET / FILTER");
         drawSection (bottomDecor, "PERCUSSION LEVELS");
 
-        auto stepStrip = frame.removeFromBottom (s (34.0f)).reduced (s (10.0f), s (5.0f));
-        const float buttonWidth = (stepStrip.getWidth() - 15.0f * s (5.0f)) / 16.0f;
+        auto stepStrip = stepArea.reduced (s (2.0f), s (3.0f));
+        const float buttonWidth = (stepStrip.getWidth() - 15.0f * s (4.0f)) / 16.0f;
         float stepX = stepStrip.getX();
         for (int index = 0; index < 16; ++index)
         {
@@ -1398,7 +1410,7 @@ void AdvancedVSTiAudioProcessorEditor::paint (juce::Graphics& g)
             g.setColour (theme.panelEdge);
             g.setFont (juce::Font (8.6f * uiScale, juce::Font::bold));
             g.drawFittedText (juce::String (index + 1), step.toNearestInt(), juce::Justification::centred, 1);
-            stepX += buttonWidth + s (5.0f);
+            stepX += buttonWidth + s (4.0f);
         }
         return;
     }
@@ -1601,47 +1613,49 @@ void AdvancedVSTiAudioProcessorEditor::resized()
 
         // Match paint() coordinate system exactly
         auto frame = getLocalBounds().reduced (s (12.0f));
-        auto hero = frame.removeFromTop (s (82.0f));
+        frame.removeFromTop (s (54.0f));
 
-        // Paint draws "TR-909" and "RHYTHM COMPOSER" in top 38px of hero;
-        // place labels in the remaining hero space below that
-        auto labelArea = hero;
-        labelArea.removeFromTop (s (38.0f));
+        // Paint draws all title text; hide labels
         badgeLabel.setBounds ({});
-        titleLabel.setBounds (labelArea.removeFromTop (s (24.0f)).reduced (s (10.0f), 0));
-        subtitleLabel.setBounds (labelArea.reduced (s (10.0f), 0));
+        titleLabel.setBounds ({});
+        subtitleLabel.setBounds ({});
 
-        // Surface layout matching paint() exactly (step strip is purely decorative)
-        auto surface = frame.reduced (s (10.0f));
-        surface.removeFromTop (s (70.0f));
-        auto bottomDecor = surface.removeFromBottom (s (82.0f));
+        // Surface layout matching paint() exactly
+        auto surface = frame.reduced (s (8.0f));
+        surface.removeFromTop (s (6.0f));
+        surface.removeFromBottom (s (32.0f));
+        surface.removeFromBottom (s (6.0f));
+        auto bottomDecor = surface.removeFromBottom (s (110.0f));
+        surface.removeFromBottom (s (6.0f));
         auto topControls = surface;
 
-        auto leftRail = topControls.removeFromLeft (s (180.0f));
-        topControls.removeFromLeft (s (6.0f));
+        auto leftRail = topControls.removeFromLeft (s (140.0f));
+        topControls.removeFromLeft (s (5.0f));
 
-        const int gap = s (6.0f);
-        const float ratioSum = 1.55f + 1.55f + 1.15f + 1.15f + 1.15f + 0.95f + 1.55f + 1.55f;
+        const int gap = s (5.0f);
+        const float ratioSum = 1.5f + 1.5f + 1.0f + 1.0f + 1.0f + 0.85f + 1.5f + 1.5f;
         const int unit = juce::roundToInt ((topControls.getWidth() - gap * 7) / ratioSum);
-        auto kickArea = topControls.removeFromLeft (juce::roundToInt (unit * 1.55f));
+        auto kickArea = topControls.removeFromLeft (juce::roundToInt (unit * 1.5f));
         topControls.removeFromLeft (gap);
-        auto snareArea = topControls.removeFromLeft (juce::roundToInt (unit * 1.55f));
+        auto snareArea = topControls.removeFromLeft (juce::roundToInt (unit * 1.5f));
         topControls.removeFromLeft (gap);
-        auto lowTomArea = topControls.removeFromLeft (juce::roundToInt (unit * 1.15f));
+        auto lowTomArea = topControls.removeFromLeft (juce::roundToInt (unit * 1.0f));
         topControls.removeFromLeft (gap);
-        auto midTomArea = topControls.removeFromLeft (juce::roundToInt (unit * 1.15f));
+        auto midTomArea = topControls.removeFromLeft (juce::roundToInt (unit * 1.0f));
         topControls.removeFromLeft (gap);
-        auto highTomArea = topControls.removeFromLeft (juce::roundToInt (unit * 1.15f));
+        auto highTomArea = topControls.removeFromLeft (juce::roundToInt (unit * 1.0f));
         topControls.removeFromLeft (gap);
-        auto rimClapArea = topControls.removeFromLeft (juce::roundToInt (unit * 0.95f));
+        auto rimClapArea = topControls.removeFromLeft (juce::roundToInt (unit * 0.85f));
         topControls.removeFromLeft (gap);
-        auto hatArea = topControls.removeFromLeft (juce::roundToInt (unit * 1.55f));
+        auto hatArea = topControls.removeFromLeft (juce::roundToInt (unit * 1.5f));
         topControls.removeFromLeft (gap);
         auto cymbalArea = topControls;
 
-        auto presetArea = bottomDecor.removeFromLeft (juce::jmin (s (290.0f), juce::roundToInt (bottomDecor.getWidth() * 0.31f)));
+        auto presetArea = bottomDecor.removeFromLeft (juce::jmin (s (280.0f), juce::roundToInt (bottomDecor.getWidth() * 0.28f)));
         bottomDecor.removeFromLeft (s (6.0f));
         auto extrasArea = bottomDecor;
+
+        const int maxCellH = s (120.0f);
 
         auto layoutGroup = [&] (juce::Rectangle<int> bounds, std::initializer_list<int> indices, int columns)
         {
@@ -1654,7 +1668,10 @@ void AdvancedVSTiAudioProcessorEditor::resized()
             const int spacing = s (3.0f);
             const int rows = (count + columns - 1) / columns;
             const int cellWidth = (inner.getWidth() - spacing * (columns - 1)) / columns;
-            const int cellHeight = (inner.getHeight() - spacing * (rows - 1)) / juce::jmax (1, rows);
+            const int rawCellH = (inner.getHeight() - spacing * (rows - 1)) / juce::jmax (1, rows);
+            const int cellHeight = juce::jmin (rawCellH, maxCellH);
+            const int totalHeight = cellHeight * rows + spacing * (rows - 1);
+            const int yOffset = (inner.getHeight() - totalHeight) / 2;
 
             int localIndex = 0;
             for (int knobIndex : indices)
@@ -1665,7 +1682,7 @@ void AdvancedVSTiAudioProcessorEditor::resized()
                 const int row = localIndex / columns;
                 const int column = localIndex % columns;
                 int x = inner.getX() + column * (cellWidth + spacing);
-                const int y = inner.getY() + row * (cellHeight + spacing);
+                const int y = inner.getY() + yOffset + row * (cellHeight + spacing);
                 int width = cellWidth;
 
                 const bool singleInLastRow = (count % columns) == 1 && row == rows - 1 && column == 0;
@@ -1691,13 +1708,14 @@ void AdvancedVSTiAudioProcessorEditor::resized()
         if (choiceCards.size() >= 1)
         {
             auto choices = presetArea.reduced (s (6.0f));
+            choices.removeFromTop (s (18.0f));
             const int spacing = s (6.0f);
-            const int cardHeight = (choices.getHeight() - spacing) / 2;
-            choiceCards[0]->setBounds (choices.removeFromTop (cardHeight));
-            if (choiceCards.size() >= 2)
+            const int cardHeight = juce::jmin ((choices.getHeight() - spacing) / juce::jmax (1, choiceCards.size()), s (36.0f));
+            for (int index = 0; index < choiceCards.size(); ++index)
             {
-                choices.removeFromTop (spacing);
-                choiceCards[1]->setBounds (choices.removeFromTop (cardHeight));
+                choiceCards[index]->setBounds (choices.removeFromTop (cardHeight));
+                if (index + 1 < choiceCards.size())
+                    choices.removeFromTop (spacing);
             }
         }
 
