@@ -4,12 +4,19 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version label for the build (e.g. v1.0.0-beta)"
+        required: false
+        default: "dev"
 
 permissions:
   contents: write
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || inputs.version || 'dev' }}
 
 jobs:
   windows-release:
@@ -32,7 +39,7 @@ jobs:
       - name: Package portable Windows build
         shell: pwsh
         run: |
-          $archiveOutput = ./scripts/build_windows_release.ps1 -RepoRoot $PWD -PythonExecutable "${{ env.pythonLocation }}\\python.exe" -ReleaseVersion "${{ github.ref_name }}" -SkipBundledVstBuild
+          $archiveOutput = ./scripts/build_windows_release.ps1 -RepoRoot $PWD -PythonExecutable "${{ env.pythonLocation }}\\python.exe" -ReleaseVersion "${{ env.RELEASE_VERSION }}" -SkipBundledVstBuild
           $archivePath = ($archiveOutput | Select-Object -Last 1).ToString().Trim()
           if (-not $archivePath) {
             throw "Packaging step did not return an archive path."
@@ -58,7 +65,7 @@ jobs:
       - name: Build Windows installer
         shell: pwsh
         run: |
-          $installerOutput = ./scripts/build_windows_installer.ps1 -RepoRoot $PWD -ReleaseVersion "${{ github.ref_name }}"
+          $installerOutput = ./scripts/build_windows_installer.ps1 -RepoRoot $PWD -ReleaseVersion "${{ env.RELEASE_VERSION }}"
           $installerPath = ($installerOutput | Select-Object -Last 1).ToString().Trim()
           if (-not $installerPath) {
             throw "Installer step did not return a path."
@@ -79,7 +86,7 @@ jobs:
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AI-Music-Studio-${{ github.ref_name }}-windows-x64
+          name: AI-Music-Studio-${{ env.RELEASE_VERSION }}-windows-x64
           path: |
             ${{ env.ARCHIVE_PATH }}
             ${{ env.CHECKSUM_PATH }}
@@ -118,7 +125,7 @@ jobs:
           archive_output=$(./scripts/build_macos_release.sh \
             --repo-root "$GITHUB_WORKSPACE" \
             --python "${{ env.pythonLocation }}/python" \
-            --release-version "${{ github.ref_name }}" \
+            --release-version "${{ env.RELEASE_VERSION }}" \
             --skip-bundled-vst-build)
           archive_path=$(echo "$archive_output" | tail -1 | tr -d '[:space:]')
           if [[ -z "$archive_path" ]] || [[ ! -f "$archive_path" ]]; then
@@ -136,13 +143,14 @@ jobs:
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AI-Music-Studio-${{ github.ref_name }}-macos-x64
+          name: AI-Music-Studio-${{ env.RELEASE_VERSION }}-macos-x64
           path: |
             ${{ env.ARCHIVE_PATH }}
             ${{ env.CHECKSUM_PATH }}
           if-no-files-found: error
 
   publish-release:
+    if: github.ref_type == 'tag'
     needs: [windows-release, macos-release]
     runs-on: ubuntu-latest
 
@@ -158,7 +166,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          tag="${{ github.ref_name }}"
+          tag="${{ env.RELEASE_VERSION }}"
           assets=()
           while IFS= read -r -d '' file; do
             assets+=("$file")
