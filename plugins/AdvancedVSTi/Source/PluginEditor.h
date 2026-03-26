@@ -206,6 +206,7 @@ private:
     juce::Label badgeLabel;
     juce::Label titleLabel;
     juce::Label subtitleLabel;
+    juce::Image backgroundImage;
     juce::OwnedArray<KnobCard> knobCards;
     juce::OwnedArray<ChoiceCard> choiceCards;
     juce::OwnedArray<DrumPad> drumPads;

@@ -55,6 +55,12 @@ endfunction()
 
 add_ai_music_vst3(AdvancedVSTi "AdvancedVSTi" AdvS 0 com.aimusicstudio.advancedvsti)
 add_ai_music_vst3(AIDrumMachine "AI Drum Machine" ADrm 1 com.aimusicstudio.aidrummachine)
+
+juce_add_binary_data(AIDrumMachineData
+    HEADER_NAME BinaryData.h
+    NAMESPACE BinaryData
+    SOURCES resources/tr9092.jpg)
+target_link_libraries(AIDrumMachine PRIVATE AIDrumMachineData)
 add_ai_music_vst3(AIBassSynth "AI Bass Synth" ABas 2 com.aimusicstudio.aibasssynth)
 add_ai_music_vst3(AIStringSynth "AI String Synth" AStr 3 com.aimusicstudio.aistringsynth)
 add_ai_music_vst3(AILeadSynth "AI Lead Synth" ALed 4 com.aimusicstudio.aileadsynth)

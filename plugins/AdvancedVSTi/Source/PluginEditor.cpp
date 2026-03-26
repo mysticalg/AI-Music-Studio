@@ -1,5 +1,10 @@
 #include "PluginEditor.h"
 
+#if __has_include("BinaryData.h")
+#include "BinaryData.h"
+#define AIMS_HAS_BINARY_DATA 1
+#endif
+
 namespace
 {
 juce::String normalizedPluginName (const AdvancedVSTiAudioProcessor& processor)
@@ -722,12 +727,21 @@ AdvancedVSTiAudioProcessorEditor::AdvancedVSTiAudioProcessorEditor (AdvancedVSTi
         maxWidth = 2600;
         maxHeight = 1800;
     }
+    else if (isTribute909())
+    {
+#ifdef AIMS_HAS_BINARY_DATA
+        backgroundImage = juce::ImageCache::getFromMemory (BinaryData::tr9092_jpg, BinaryData::tr9092_jpgSize);
+#endif
+        setResizable (false, false);
+        setSize (1120, 460);
+        return;
+    }
     else if (usesDrumPadLayout())
     {
-        defaultWidth = isTribute909() ? 1120 : 1180;
-        defaultHeight = isTribute909() ? 640 : 860;
-        minWidth = isTribute909() ? 940 : 960;
-        minHeight = isTribute909() ? 540 : 700;
+        defaultWidth = 1180;
+        defaultHeight = 860;
+        minWidth = 960;
+        minHeight = 700;
         maxWidth = 2400;
         maxHeight = 1800;
     }
@@ -1305,113 +1319,11 @@ void AdvancedVSTiAudioProcessorEditor::paint (juce::Graphics& g)
 
     if (isTribute909())
     {
-        const auto uiScale = juce::jlimit (0.72f, 1.45f, juce::jmin (getWidth() / 1120.0f, getHeight() / 640.0f));
-        const auto s = [uiScale] (float value) { return scaledFloat (value, uiScale); };
-        const auto si = [uiScale] (float value) { return scaledInt (value, uiScale); };
-        auto bounds = getLocalBounds().toFloat();
-        juce::ColourGradient faceplate (theme.faceplate.brighter (0.03f), bounds.getTopLeft(),
-                                        theme.faceplate.darker (0.08f), bounds.getBottomRight(), false);
-        g.setGradientFill (faceplate);
-        g.fillAll();
-
-        g.setColour (juce::Colours::white.withAlpha (0.38f));
-        g.drawRect (getLocalBounds().reduced (1), 1);
-
-        auto frame = bounds.reduced (s (12.0f));
-        g.setColour (theme.trim.withAlpha (0.8f));
-        g.drawRoundedRectangle (frame, s (10.0f), juce::jmax (1.0f, s (1.0f)));
-
-        auto hero = frame.removeFromTop (s (54.0f));
-        auto titleStrip = hero.removeFromTop (s (34.0f));
-        g.setColour (theme.legend);
-        g.setFont (juce::Font (28.0f * uiScale, juce::Font::bold));
-        g.drawFittedText ("TR-909", titleStrip.toNearestInt().reduced (si (10.0f), 0).removeFromLeft (si (220.0f)), juce::Justification::centredLeft, 1);
-        g.setColour (theme.panelEdge);
-        g.setFont (juce::Font (14.0f * uiScale, juce::Font::bold));
-        g.drawFittedText ("RHYTHM COMPOSER", titleStrip.toNearestInt().reduced (si (10.0f), 0).removeFromRight (si (280.0f)), juce::Justification::centredRight, 1);
-
-        g.setColour (theme.panelEdge.brighter (0.18f));
-        g.setFont (juce::Font (11.0f * uiScale, juce::Font::plain));
-        auto subtitleStrip = hero;
-        g.drawFittedText ("AI Drum Machine \u2013 909-style punch, clap and hats",
-                          subtitleStrip.toNearestInt().reduced (si (10.0f), 0), juce::Justification::centredLeft, 1);
-
-        auto drawSection = [&] (juce::Rectangle<float> area, const juce::String& title)
-        {
-            g.setColour (theme.faceplate.withAlpha (0.95f));
-            g.fillRoundedRectangle (area, s (7.0f));
-            g.setColour (theme.trim.withAlpha (0.9f));
-            g.drawRoundedRectangle (area, s (7.0f), juce::jmax (1.0f, s (1.0f)));
-            const auto titleBounds = area.toNearestInt().reduced (si (8.0f), si (2.0f)).removeFromTop (si (14.0f));
-            auto header = area.removeFromTop (s (18.0f));
-            g.setColour (theme.panelEdge);
-            g.fillRoundedRectangle (header, s (5.0f));
-            g.setColour (theme.accent.withAlpha (0.92f));
-            g.fillRect (header.removeFromBottom (s (2.0f)));
-            g.setColour (theme.legend);
-            g.setFont (juce::Font (8.2f * uiScale, juce::Font::bold));
-            g.drawFittedText (title, titleBounds, juce::Justification::centredLeft, 1);
-        };
-
-        auto surface = frame.reduced (s (8.0f));
-        surface.removeFromTop (s (6.0f));
-        auto stepArea = surface.removeFromBottom (s (32.0f));
-        surface.removeFromBottom (s (6.0f));
-        auto bottomDecor = surface.removeFromBottom (s (110.0f));
-        surface.removeFromBottom (s (6.0f));
-        auto topControls = surface;
-        auto leftRail = topControls.removeFromLeft (s (140.0f));
-        topControls.removeFromLeft (s (5.0f));
-
-        const float gap = s (5.0f);
-        const float ratioSum = 1.5f + 1.5f + 1.0f + 1.0f + 1.0f + 0.85f + 1.5f + 1.5f;
-        const float unit = (topControls.getWidth() - gap * 7.0f) / ratioSum;
-        auto kickArea = topControls.removeFromLeft (unit * 1.5f);
-        topControls.removeFromLeft (gap);
-        auto snareArea = topControls.removeFromLeft (unit * 1.5f);
-        topControls.removeFromLeft (gap);
-        auto lowTomArea = topControls.removeFromLeft (unit * 1.0f);
-        topControls.removeFromLeft (gap);
-        auto midTomArea = topControls.removeFromLeft (unit * 1.0f);
-        topControls.removeFromLeft (gap);
-        auto highTomArea = topControls.removeFromLeft (unit * 1.0f);
-        topControls.removeFromLeft (gap);
-        auto rimClapArea = topControls.removeFromLeft (unit * 0.85f);
-        topControls.removeFromLeft (gap);
-        auto hatArea = topControls.removeFromLeft (unit * 1.5f);
-        topControls.removeFromLeft (gap);
-        auto cymbalArea = topControls;
-
-        drawSection (leftRail, "MASTER");
-        drawSection (kickArea, "BASS DRUM");
-        drawSection (snareArea, "SNARE DRUM");
-        drawSection (lowTomArea, "LOW TOM");
-        drawSection (midTomArea, "MID TOM");
-        drawSection (highTomArea, "HI TOM");
-        drawSection (rimClapArea, "RIM / CLAP");
-        drawSection (hatArea, "HI HAT");
-        drawSection (cymbalArea, "CYMBAL");
-
-        auto presetDecor = bottomDecor.removeFromLeft (juce::jmin (s (280.0f), bottomDecor.getWidth() * 0.28f));
-        bottomDecor.removeFromLeft (s (6.0f));
-        drawSection (presetDecor, "PRESET / FILTER");
-        drawSection (bottomDecor, "PERCUSSION LEVELS");
-
-        auto stepStrip = stepArea.reduced (s (2.0f), s (3.0f));
-        const float buttonWidth = (stepStrip.getWidth() - 15.0f * s (4.0f)) / 16.0f;
-        float stepX = stepStrip.getX();
-        for (int index = 0; index < 16; ++index)
-        {
-            juce::Rectangle<float> step (stepX, stepStrip.getY(), buttonWidth, stepStrip.getHeight());
-            g.setColour (theme.faceplate.brighter (0.06f));
-            g.fillRoundedRectangle (step, s (4.0f));
-            g.setColour (theme.trim.withAlpha (0.9f));
-            g.drawRoundedRectangle (step, s (4.0f), juce::jmax (1.0f, s (1.0f)));
-            g.setColour (theme.panelEdge);
-            g.setFont (juce::Font (8.6f * uiScale, juce::Font::bold));
-            g.drawFittedText (juce::String (index + 1), step.toNearestInt(), juce::Justification::centred, 1);
-            stepX += buttonWidth + s (4.0f);
-        }
+        if (backgroundImage.isValid())
+            g.drawImage (backgroundImage, getLocalBounds().toFloat(),
+                         juce::RectanglePlacement::stretchToFit);
+        else
+            g.fillAll (theme.faceplate);
         return;
     }
 
@@ -1601,123 +1513,117 @@ void AdvancedVSTiAudioProcessorEditor::resized()
 
     if (isTribute909())
     {
-        const auto uiScale = juce::jlimit (0.72f, 1.45f, juce::jmin (getWidth() / 1120.0f, getHeight() / 640.0f));
-        const auto s = [uiScale] (float value) { return scaledInt (value, uiScale); };
-        badgeLabel.setFont (juce::Font (11.0f * uiScale, juce::Font::bold));
-        titleLabel.setFont (juce::Font (28.0f * uiScale, juce::Font::bold));
-        subtitleLabel.setFont (juce::Font (13.0f * uiScale, juce::Font::plain));
+        // Fixed 1120x460 layout with JPEG background – knobs overlaid at fixed positions
+        // matching the tr9092.jpg reference image.
+        //
+        // Knob indices (from buildKnobSpecs):
+        //   0-3   MASTER  (Accent, Volume, Tone, Noise)
+        //   4-7   BASS DRUM (Tune, Level, Attack, Decay)
+        //   8-11  SNARE (Tune, Level, Tone, Snappy)
+        //   12-14 LOW TOM (Tune, Level, Decay)
+        //   15-17 MID TOM (Tune, Level, Decay)
+        //   18-20 HI TOM (Tune, Level, Decay)
+        //   21-22 RIM, CLAP
+        //   23-26 HATS (CH Level, OH Level, CH Dec, OH Dec)
+        //   27-30 CYMBALS (Crash Lv, Ride Lv, Crash Tun, Ride Tun)
+        //   31-34 PERCUSSION (Cowbell, Clave, Maraca, Perc)
+
         for (auto* card : knobCards)
-            card->setScale (uiScale);
+            card->setScale (0.82f);
         for (auto* card : choiceCards)
-            card->setScale (uiScale);
+            card->setScale (0.82f);
 
-        // Match paint() coordinate system exactly
-        auto frame = getLocalBounds().reduced (s (12.0f));
-        frame.removeFromTop (s (54.0f));
-
-        // Paint draws all title text; hide labels
+        // Hide title labels – the image contains all the text
         badgeLabel.setBounds ({});
         titleLabel.setBounds ({});
         subtitleLabel.setBounds ({});
 
-        // Surface layout matching paint() exactly
-        auto surface = frame.reduced (s (8.0f));
-        surface.removeFromTop (s (6.0f));
-        surface.removeFromBottom (s (32.0f));
-        surface.removeFromBottom (s (6.0f));
-        auto bottomDecor = surface.removeFromBottom (s (110.0f));
-        surface.removeFromBottom (s (6.0f));
-        auto topControls = surface;
+        const int kw = 60;   // knob card width
+        const int kh = 78;   // knob card height
+        const int r1 = 62;   // top row y
+        const int r2 = 148;  // bottom row y
 
-        auto leftRail = topControls.removeFromLeft (s (140.0f));
-        topControls.removeFromLeft (s (5.0f));
-
-        const int gap = s (5.0f);
-        const float ratioSum = 1.5f + 1.5f + 1.0f + 1.0f + 1.0f + 0.85f + 1.5f + 1.5f;
-        const int unit = juce::roundToInt ((topControls.getWidth() - gap * 7) / ratioSum);
-        auto kickArea = topControls.removeFromLeft (juce::roundToInt (unit * 1.5f));
-        topControls.removeFromLeft (gap);
-        auto snareArea = topControls.removeFromLeft (juce::roundToInt (unit * 1.5f));
-        topControls.removeFromLeft (gap);
-        auto lowTomArea = topControls.removeFromLeft (juce::roundToInt (unit * 1.0f));
-        topControls.removeFromLeft (gap);
-        auto midTomArea = topControls.removeFromLeft (juce::roundToInt (unit * 1.0f));
-        topControls.removeFromLeft (gap);
-        auto highTomArea = topControls.removeFromLeft (juce::roundToInt (unit * 1.0f));
-        topControls.removeFromLeft (gap);
-        auto rimClapArea = topControls.removeFromLeft (juce::roundToInt (unit * 0.85f));
-        topControls.removeFromLeft (gap);
-        auto hatArea = topControls.removeFromLeft (juce::roundToInt (unit * 1.5f));
-        topControls.removeFromLeft (gap);
-        auto cymbalArea = topControls;
-
-        auto presetArea = bottomDecor.removeFromLeft (juce::jmin (s (280.0f), juce::roundToInt (bottomDecor.getWidth() * 0.28f)));
-        bottomDecor.removeFromLeft (s (6.0f));
-        auto extrasArea = bottomDecor;
-
-        const int maxCellH = s (120.0f);
-
-        auto layoutGroup = [&] (juce::Rectangle<int> bounds, std::initializer_list<int> indices, int columns)
+        // Helper to place a knob by index
+        auto place = [&] (int index, int x, int y, int w = 0, int h = 0)
         {
-            auto inner = bounds.reduced (s (4.0f));
-            inner.removeFromTop (s (18.0f));
-            const int count = static_cast<int> (indices.size());
-            if (count <= 0 || columns <= 0)
-                return;
-
-            const int spacing = s (3.0f);
-            const int rows = (count + columns - 1) / columns;
-            const int cellWidth = (inner.getWidth() - spacing * (columns - 1)) / columns;
-            const int rawCellH = (inner.getHeight() - spacing * (rows - 1)) / juce::jmax (1, rows);
-            const int cellHeight = juce::jmin (rawCellH, maxCellH);
-            const int totalHeight = cellHeight * rows + spacing * (rows - 1);
-            const int yOffset = (inner.getHeight() - totalHeight) / 2;
-
-            int localIndex = 0;
-            for (int knobIndex : indices)
-            {
-                if (! juce::isPositiveAndBelow (knobIndex, knobCards.size()))
-                    continue;
-
-                const int row = localIndex / columns;
-                const int column = localIndex % columns;
-                int x = inner.getX() + column * (cellWidth + spacing);
-                const int y = inner.getY() + yOffset + row * (cellHeight + spacing);
-                int width = cellWidth;
-
-                const bool singleInLastRow = (count % columns) == 1 && row == rows - 1 && column == 0;
-                if (singleInLastRow)
-                    x = inner.getX() + (inner.getWidth() - cellWidth) / 2;
-
-                knobCards[knobIndex]->setBounds (x, y, width, cellHeight);
-                ++localIndex;
-            }
+            if (juce::isPositiveAndBelow (index, knobCards.size()))
+                knobCards[index]->setBounds (x, y, w > 0 ? w : kw, h > 0 ? h : kh);
         };
 
-        layoutGroup (leftRail, { 0, 1, 2, 3 }, 2);
-        layoutGroup (kickArea, { 4, 5, 6, 7 }, 2);
-        layoutGroup (snareArea, { 8, 9, 10, 11 }, 2);
-        layoutGroup (lowTomArea, { 12, 13, 14 }, 2);
-        layoutGroup (midTomArea, { 15, 16, 17 }, 2);
-        layoutGroup (highTomArea, { 18, 19, 20 }, 2);
-        layoutGroup (rimClapArea, { 21, 22 }, 2);
-        layoutGroup (hatArea, { 23, 24, 25, 26 }, 2);
-        layoutGroup (cymbalArea, { 27, 28, 29, 30 }, 2);
-        layoutGroup (extrasArea, { 31, 32, 33, 34 }, 4);
+        // --- TOTAL ACCENT / MASTER section (indices 0-3) ---
+        // In the image: leftmost area, labelled "TOTAL ACCENT"
+        // Map: 0=Accent, 1=Volume, 2=Tone, 3=Noise
+        place (0, 18,  r1);       // Accent (top-left)
+        place (1, 78,  r1);       // Volume
+        place (2, 18,  r2);       // Tone
+        place (3, 78,  r2);       // Noise
 
+        // --- BASS DRUM (indices 4-7) ---
+        // Image: TUNE, LEVEL top row; ATTACK, DECAY bottom row
+        place (4,  155, r1);      // Tune
+        place (5,  215, r1);      // Level
+        place (6,  155, r2);      // Attack
+        place (7,  215, r2);      // Decay
+
+        // --- SNARE DRUM (indices 8-11) ---
+        // Image: TUNE, LEVEL top; TONE, SNAPPY bottom
+        place (8,  295, r1);      // Tune
+        place (9,  355, r1);      // Level
+        place (10, 295, r2);      // Tone
+        place (11, 355, r2);      // Snappy
+
+        // --- LOW TOM (indices 12-14) ---
+        // Image: TUNE, LEVEL top; DECAY bottom (centred)
+        place (12, 430, r1);      // Tune
+        place (13, 490, r1);      // Level
+        place (14, 460, r2);      // Decay (centred)
+
+        // --- MID TOM (indices 15-17) ---
+        place (15, 555, r1);      // Tune
+        place (16, 615, r1);      // Level
+        place (17, 585, r2);      // Decay
+
+        // --- HI TOM (indices 18-20) ---
+        place (18, 680, r1);      // Tune
+        place (19, 740, r1);      // Level
+        place (20, 710, r2);      // Decay
+
+        // --- RIM (index 21), CLAP (index 22) ---
+        // Image: single knob each, side by side
+        place (21, 808, r1);      // Rim level
+        place (22, 808, r2);      // Clap level
+
+        // --- HI HAT (indices 23-26) ---
+        // Image: CH Level, OH Level top; CH Decay, OH Decay bottom
+        place (23, 875, r1);      // CH Level
+        place (24, 935, r1);      // OH Level
+        place (25, 875, r2);      // CH Decay
+        place (26, 935, r2);      // OH Decay
+
+        // --- CYMBAL (indices 27-30) ---
+        // Image: Crash, Ride top; Crash Tune, Ride Tune bottom
+        place (27, 1000, r1);     // Crash Lv
+        place (28, 1055, r1);     // Ride Lv
+        place (29, 1000, r2);     // Crash Tun
+        place (30, 1055, r2);     // Ride Tun
+
+        // --- PERCUSSION LEVELS (indices 31-34) ---
+        // Bottom-right area of the image, below the main knob section
+        // Image shows VOLUME and SHUFFLE knobs in the centre-right
+        // Place these in a row in the lower-centre area
+        const int pr = 290;       // percussion row y
+        const int pw = 64;
+        place (31, 580, pr, pw, kh);   // Cowbell
+        place (32, 650, pr, pw, kh);   // Clave
+        place (33, 720, pr, pw, kh);   // Maraca
+        place (34, 790, pr, pw, kh);   // Perc
+
+        // --- Choice cards (Tone Filter, Slope) ---
+        // Place in the lower-left area near the preset/pattern display
         if (choiceCards.size() >= 1)
-        {
-            auto choices = presetArea.reduced (s (6.0f));
-            choices.removeFromTop (s (18.0f));
-            const int spacing = s (6.0f);
-            const int cardHeight = juce::jmin ((choices.getHeight() - spacing) / juce::jmax (1, choiceCards.size()), s (36.0f));
-            for (int index = 0; index < choiceCards.size(); ++index)
-            {
-                choiceCards[index]->setBounds (choices.removeFromTop (cardHeight));
-                if (index + 1 < choiceCards.size())
-                    choices.removeFromTop (spacing);
-            }
-        }
+            choiceCards[0]->setBounds (300, 280, 130, 42);
+        if (choiceCards.size() >= 2)
+            choiceCards[1]->setBounds (300, 326, 130, 42);
 
         for (auto* pad : drumPads)
             pad->setBounds ({});
