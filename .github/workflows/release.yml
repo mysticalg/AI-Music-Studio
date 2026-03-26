@@ -1,4 +1,4 @@
-name: Build Windows Release
+name: Build Release
 
 on:
   push:
@@ -87,15 +87,90 @@ jobs:
             ${{ env.INSTALLER_CHECKSUM_PATH }}
           if-no-files-found: error
 
+  macos-release:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Build bundled VST3 instruments
+        run: |
+          git clone --depth 1 https://github.com/juce-framework/JUCE.git JUCE
+          cmake -S plugins/AdvancedVSTi -B plugins/AdvancedVSTi/build-macos \
+                -DJUCE_DIR="${GITHUB_WORKSPACE}/JUCE" \
+                -DCMAKE_BUILD_TYPE=Release
+          cmake --build plugins/AdvancedVSTi/build-macos --config Release
+
+          mkdir -p vsti
+          find plugins/AdvancedVSTi/build-macos -type d -name "*.vst3" -print0 \
+            | while IFS= read -r -d '' plugin; do
+                cp -R "$plugin" vsti/
+              done
+
+      - name: Package portable macOS build
+        run: |
+          archive_output=$(./scripts/build_macos_release.sh \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --python "${{ env.pythonLocation }}/python" \
+            --release-version "${{ github.ref_name }}" \
+            --skip-bundled-vst-build)
+          archive_path=$(echo "$archive_output" | tail -1 | tr -d '[:space:]')
+          if [[ -z "$archive_path" ]] || [[ ! -f "$archive_path" ]]; then
+            echo "Packaging step did not produce a valid archive: $archive_path" >&2
+            exit 1
+          fi
+          echo "ARCHIVE_PATH=$archive_path" >> "$GITHUB_ENV"
+
+      - name: Create SHA256 checksum
+        run: |
+          checksum_path="${ARCHIVE_PATH}.sha256"
+          shasum -a 256 "$ARCHIVE_PATH" | awk '{print $1 "  " FILENAME}' FILENAME="$(basename "$ARCHIVE_PATH")" > "$checksum_path"
+          echo "CHECKSUM_PATH=$checksum_path" >> "$GITHUB_ENV"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AI-Music-Studio-${{ github.ref_name }}-macos-x64
+          path: |
+            ${{ env.ARCHIVE_PATH }}
+            ${{ env.CHECKSUM_PATH }}
+          if-no-files-found: error
+
+  publish-release:
+    needs: [windows-release, macos-release]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
       - name: Publish GitHub release
-        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          $tag = "${{ github.ref_name }}"
-          gh release view $tag --json tagName *> $null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $env:ARCHIVE_PATH $env:CHECKSUM_PATH $env:INSTALLER_PATH $env:INSTALLER_CHECKSUM_PATH --clobber
-          } else {
-            gh release create $tag $env:ARCHIVE_PATH $env:CHECKSUM_PATH $env:INSTALLER_PATH $env:INSTALLER_CHECKSUM_PATH --title "AI Music Studio $tag" --generate-notes
-          }
+          tag="${{ github.ref_name }}"
+          assets=()
+          while IFS= read -r -d '' file; do
+            assets+=("$file")
+          done < <(find release-assets -type f -print0)
+
+          if [ ${#assets[@]} -eq 0 ]; then
+            echo "No release assets found" >&2
+            exit 1
+          fi
+
+          if gh release view "$tag" --json tagName > /dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --clobber
+          else
+            gh release create "$tag" "${assets[@]}" --title "AI Music Studio $tag" --generate-notes
+          fi
