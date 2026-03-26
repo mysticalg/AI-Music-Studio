@@ -1106,12 +1106,16 @@ class AIClient:
     LEGACY_AUTH_PATHS = [Path('.ai_auth.json'), Path('.openai_auth.json')]
     PROVIDER_OPENAI = 'openai'
     PROVIDER_OLLAMA = 'ollama'
+    DEFAULT_REQUEST_TIMEOUT_SECONDS = 120
+    MIN_REQUEST_TIMEOUT_SECONDS = 15
+    MAX_REQUEST_TIMEOUT_SECONDS = 1800
 
     def __init__(self) -> None:
         self.provider = self.PROVIDER_OPENAI
         self.remote_model = str(OPENAI_MODEL or 'gpt-5-codex').strip()
         self.ollama_base_url = self._normalize_ollama_base_url(OLLAMA_BASE_URL)
         self.ollama_model = ''
+        self.request_timeout_seconds = self.DEFAULT_REQUEST_TIMEOUT_SECONDS
         self.api_key = os.getenv("OPENAI_API_KEY", "")
         self.oauth_access_token = ""
         self.oauth_refresh_token = ""
@@ -1132,6 +1136,14 @@ class AIClient:
             raw = 'http://127.0.0.1:11434'
         return raw.rstrip('/')
 
+    @classmethod
+    def _normalize_request_timeout_seconds(cls, timeout_seconds: object) -> int:
+        try:
+            value = int(timeout_seconds)
+        except Exception:
+            value = cls.DEFAULT_REQUEST_TIMEOUT_SECONDS
+        return int(clamp(value, cls.MIN_REQUEST_TIMEOUT_SECONDS, cls.MAX_REQUEST_TIMEOUT_SECONDS))
+
     def apply_settings(
         self,
         *,
@@ -1139,6 +1151,7 @@ class AIClient:
         remote_model: object | None = None,
         ollama_base_url: object | None = None,
         ollama_model: object | None = None,
+        request_timeout_seconds: object | None = None,
     ) -> None:
         if provider is not None:
             self.provider = self._normalize_provider(provider)
@@ -1149,6 +1162,8 @@ class AIClient:
             self.ollama_base_url = self._normalize_ollama_base_url(ollama_base_url)
         if ollama_model is not None:
             self.ollama_model = str(ollama_model or '').strip()
+        if request_timeout_seconds is not None:
+            self.request_timeout_seconds = self._normalize_request_timeout_seconds(request_timeout_seconds)
 
     def _load_saved_auth(self) -> None:
         search_paths = [self.AUTH_PATH, *self.LEGACY_AUTH_PATHS]
@@ -1214,6 +1229,9 @@ class AIClient:
         self.ollama_base_url = self._normalize_ollama_base_url(base_url)
         if model is not None:
             self.ollama_model = str(model or '').strip()
+
+    def set_request_timeout_seconds(self, timeout_seconds: object) -> None:
+        self.request_timeout_seconds = self._normalize_request_timeout_seconds(timeout_seconds)
 
     def set_api_key(self, api_key: str) -> None:
         self.api_key = api_key.strip()
@@ -1291,7 +1309,7 @@ class AIClient:
             payload=payload,
             headers={"Authorization": self._authorization_header()},
             method='POST',
-            timeout=60,
+            timeout=self.request_timeout_seconds,
             error_prefix='OpenAI',
         )
         text = str(result.get("output_text", "") or '').strip()
@@ -1352,7 +1370,7 @@ class AIClient:
             self._ollama_endpoint('api/chat'),
             payload=payload,
             method='POST',
-            timeout=120,
+            timeout=self.request_timeout_seconds,
             error_prefix='Ollama',
         )
         message = result.get('message', {})
@@ -5402,7 +5420,15 @@ class AISettingsDialog(QtWidgets.QDialog):
         self.provider_combo = QtWidgets.QComboBox()
         self.provider_combo.addItem('Remote OpenAI', AIClient.PROVIDER_OPENAI)
         self.provider_combo.addItem('Local Ollama', AIClient.PROVIDER_OLLAMA)
+        self.request_timeout_spin = QtWidgets.QSpinBox()
+        self.request_timeout_spin.setRange(
+            AIClient.MIN_REQUEST_TIMEOUT_SECONDS,
+            AIClient.MAX_REQUEST_TIMEOUT_SECONDS,
+        )
+        self.request_timeout_spin.setSingleStep(15)
+        self.request_timeout_spin.setSuffix(' sec')
         provider_form.addRow('Mode', self.provider_combo)
+        provider_form.addRow('Response timeout', self.request_timeout_spin)
         layout.addWidget(provider_group)
 
         remote_group = QtWidgets.QGroupBox('Remote OpenAI')
@@ -5459,6 +5485,7 @@ class AISettingsDialog(QtWidgets.QDialog):
         self._ollama_model_names: list[str] = []
 
         self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
+        self.request_timeout_spin.valueChanged.connect(self._on_request_timeout_changed)
         self.remote_model_combo.currentTextChanged.connect(self._on_remote_model_changed)
         if self.remote_model_combo.lineEdit() is not None:
             self.remote_model_combo.lineEdit().editingFinished.connect(self._commit_remote_model)
@@ -5494,11 +5521,17 @@ class AISettingsDialog(QtWidgets.QDialog):
         index = self.provider_combo.findData(client.provider)
         self.provider_combo.setCurrentIndex(index if index >= 0 else 0)
         del blocker
+        timeout_blocker = QtCore.QSignalBlocker(self.request_timeout_spin)
+        self.request_timeout_spin.setValue(int(client.request_timeout_seconds))
+        del timeout_blocker
 
         self._set_editable_combo_items(self.remote_model_combo, client.remote_model_choices(), client.remote_model)
         self.ollama_base_url_input.setText(client.ollama_base_url)
 
-        status_lines = [client.auth_status()]
+        status_lines = [
+            client.auth_status(),
+            f'Current response timeout: {int(client.request_timeout_seconds)} sec',
+        ]
         if refresh_ollama_models:
             try:
                 self._ollama_model_names = client.available_ollama_models(client.ollama_base_url)
@@ -5542,6 +5575,12 @@ class AISettingsDialog(QtWidgets.QDialog):
             return
         main_window.set_ai_provider(self.provider_combo.currentData())
         self.refresh_from_mainwindow(refresh_ollama_models=False)
+
+    def _on_request_timeout_changed(self, value: int) -> None:
+        main_window = self._main_window()
+        if main_window is None:
+            return
+        main_window.set_ai_request_timeout_seconds(int(value), save=True)
 
     def _commit_remote_model(self) -> None:
         main_window = self._main_window()
@@ -5942,6 +5981,81 @@ class AudioSettingsDialog(QtWidgets.QDialog):
         self.refresh_from_mainwindow(refresh_controls=False)
 
 
+class AIComposeDialog(QtWidgets.QDialog):
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget | None = None,
+        *,
+        default_prompt: str = '',
+        default_bars: int = 8,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle('AI Composition Prompt')
+        self.resize(620, 340)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        prompt_label = QtWidgets.QLabel('Describe the song/arrangement:')
+        layout.addWidget(prompt_label)
+
+        self.prompt_input = QtWidgets.QPlainTextEdit()
+        self.prompt_input.setPlaceholderText(
+            'Example:\n'
+            'Warm lo-fi beat with soft keys, subtle bass, and a simple melody.\n'
+            'Build over 8 bars and keep the rhythm relaxed.'
+        )
+        self.prompt_input.setTabChangesFocus(True)
+        self.prompt_input.setMinimumHeight(170)
+        self.prompt_input.setPlainText(str(default_prompt or ''))
+        layout.addWidget(self.prompt_input, 1)
+
+        bars_row = QtWidgets.QFormLayout()
+        bars_row.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.bars_input = QtWidgets.QSpinBox()
+        self.bars_input.setRange(1, 256)
+        self.bars_input.setValue(max(1, min(256, int(default_bars or 8))))
+        bars_row.addRow('Song length (bars):', self.bars_input)
+        layout.addLayout(bars_row)
+
+        hint_label = QtWidgets.QLabel('Press Ctrl+Enter to start the composition in the background.')
+        hint_label.setStyleSheet('color: #9fb1c4; font-size: 11px;')
+        hint_label.setWordWrap(True)
+        layout.addWidget(hint_label)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        ok_button = buttons.button(QtWidgets.QDialogButtonBox.StandardButton.Ok)
+        if ok_button is not None:
+            ok_button.setText('Generate')
+        buttons.accepted.connect(self._accept_if_valid)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._submit_shortcuts: list[QtGui.QShortcut] = []
+        for sequence in ('Ctrl+Return', 'Ctrl+Enter'):
+            shortcut = QtGui.QShortcut(QtGui.QKeySequence(sequence), self)
+            shortcut.activated.connect(self._accept_if_valid)
+            self._submit_shortcuts.append(shortcut)
+
+        QtCore.QTimer.singleShot(0, self.prompt_input.setFocus)
+
+    def prompt_text(self) -> str:
+        return self.prompt_input.toPlainText()
+
+    def bars(self) -> int:
+        return int(self.bars_input.value())
+
+    def _accept_if_valid(self) -> None:
+        if not self.prompt_text().strip():
+            QtWidgets.QApplication.beep()
+            self.prompt_input.setFocus(QtCore.Qt.FocusReason.ShortcutFocusReason)
+            return
+        self.accept()
+
+
 class FloatingPanelWindow(QtWidgets.QMainWindow):
     visibilityChanged = QtCore.Signal(bool)
 
@@ -6180,6 +6294,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._note_editor_inner_sizes = [640, 160]
         self._tools_window_visible = True
         self._tools_window_geometry_b64 = ''
+        self._samples_window_visible = True
+        self._samples_window_geometry_b64 = ''
         self._mixer_window_visible = True
         self._mixer_window_geometry_b64 = ''
         self._transport_window_visible = True
@@ -6209,6 +6325,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._native_output_async_warm_thread: threading.Thread | None = None
         self._native_output_async_warm_token = 0
         self._native_output_async_warm_signature: tuple[object, ...] | None = None
+        self._ai_compose_results: queue.SimpleQueue = queue.SimpleQueue()
+        self._ai_compose_thread: threading.Thread | None = None
+        self._ai_compose_request_token = 0
+        self._ai_compose_busy = False
+        self._ai_compose_default_bars = 8
+        self._ai_compose_default_prompt = ''
         self._pending_playback_start_tick: int | None = None
         self._native_output_queued_frames = 0
         self._native_output_underruns = 0
@@ -6365,6 +6487,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._native_output_async_warm_poll_timer = QtCore.QTimer(self)
         self._native_output_async_warm_poll_timer.setInterval(40)
         self._native_output_async_warm_poll_timer.timeout.connect(self._poll_async_native_output_bridge_warm)
+        self._ai_compose_poll_timer = QtCore.QTimer(self)
+        self._ai_compose_poll_timer.setInterval(40)
+        self._ai_compose_poll_timer.timeout.connect(self._poll_ai_compose_results)
         self._pending_playback_start_retry_timer = QtCore.QTimer(self)
         self._pending_playback_start_retry_timer.setSingleShot(True)
         self._pending_playback_start_retry_timer.setInterval(40)
@@ -6472,37 +6597,18 @@ class MainWindow(QtWidgets.QMainWindow):
         add_track_btn = QtWidgets.QPushButton("+ Track (Sample/Instrument)")
         add_track_btn.clicked.connect(self.add_track)
 
-        import_btn = QtWidgets.QPushButton("Import MIDI + AI Instrument Render")
-        import_btn.clicked.connect(self.import_midi)
-        render_btn = QtWidgets.QPushButton("Render AI Audio Stems")
-        render_btn.clicked.connect(self.render_all_tracks)
         import_sample_btn = QtWidgets.QPushButton("Import Sample (WAV/MP3)")
         import_sample_btn.clicked.connect(self.import_sample)
         place_sample_btn = QtWidgets.QPushButton("Place Selected Sample On Timeline")
         place_sample_btn.clicked.connect(self.place_selected_sample)
-        ai_btn = QtWidgets.QPushButton("AI Compose")
-        ai_btn.clicked.connect(self.compose_with_ai)
-
-        
+        self.ai_compose_btn = QtWidgets.QPushButton("AI Compose")
+        self.ai_compose_btn.clicked.connect(self.compose_with_ai)
         left_panel = QtWidgets.QWidget()
         left_layout = QtWidgets.QVBoxLayout(left_panel)
         left_layout.addWidget(QtWidgets.QLabel("Tracks"))
         left_layout.addWidget(self.track_list)
         left_layout.addWidget(add_track_btn)
-        left_layout.addWidget(QtWidgets.QLabel("Quantize / Note Length"))
-        quantize_row = QtWidgets.QHBoxLayout()
-        quantize_row.addWidget(self.quantize_box)
-        quantize_row.addWidget(self.note_length_lock_btn)
-        quantize_row.addWidget(self.note_length_box)
-        quantize_row.addWidget(self.quantize_snap_btn)
-        left_layout.addLayout(quantize_row)
-        left_layout.addWidget(import_btn)
-        left_layout.addWidget(render_btn)
-        left_layout.addWidget(QtWidgets.QLabel("Samples Toolbox"))
-        left_layout.addWidget(self.sample_library)
-        left_layout.addWidget(import_sample_btn)
-        left_layout.addWidget(place_sample_btn)
-        left_layout.addWidget(ai_btn)
+        left_layout.addWidget(self.ai_compose_btn)
         left_layout.addStretch()
 
         right_tabs = QtWidgets.QTabWidget()
@@ -6523,11 +6629,42 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mixer_window.resize(1100, 500)
         self.mixer_window.visibilityChanged.connect(self._on_mixer_window_visibility_changed)
 
+        samples_root = QtWidgets.QWidget()
+        samples_layout = QtWidgets.QVBoxLayout(samples_root)
+        samples_layout.setContentsMargins(12, 12, 12, 12)
+        samples_layout.setSpacing(8)
+        samples_hint = QtWidgets.QLabel('Browse imported sample folders, then place the selected file onto the timeline.')
+        samples_hint.setWordWrap(True)
+        samples_hint.setStyleSheet('color: #9fb1c4; font-size: 11px;')
+        samples_layout.addWidget(samples_hint)
+        samples_layout.addWidget(self.sample_library, 1)
+        samples_layout.addWidget(import_sample_btn)
+        samples_layout.addWidget(place_sample_btn)
+        self.samples_window = FloatingPanelWindow('Samples', self)
+        self.samples_window.setCentralWidget(samples_root)
+        self.samples_window.resize(420, 560)
+        self.samples_window.visibilityChanged.connect(self._on_samples_window_visibility_changed)
+
         note_editor = QtWidgets.QWidget()
         note_editor.setMinimumHeight(0)
         note_editor_layout = QtWidgets.QVBoxLayout(note_editor)
         note_editor_layout.setContentsMargins(0, 0, 0, 0)
-        note_editor_layout.setSpacing(0)
+        note_editor_layout.setSpacing(6)
+
+        quantize_controls = QtWidgets.QWidget()
+        quantize_controls_layout = QtWidgets.QVBoxLayout(quantize_controls)
+        quantize_controls_layout.setContentsMargins(0, 0, 0, 0)
+        quantize_controls_layout.setSpacing(6)
+        quantize_controls_layout.addWidget(QtWidgets.QLabel("Quantize / Note Length"))
+        quantize_row = QtWidgets.QHBoxLayout()
+        quantize_row.setContentsMargins(0, 0, 0, 0)
+        quantize_row.setSpacing(8)
+        quantize_row.addWidget(self.quantize_box)
+        quantize_row.addWidget(self.note_length_lock_btn)
+        quantize_row.addWidget(self.note_length_box)
+        quantize_row.addWidget(self.quantize_snap_btn)
+        quantize_controls_layout.addLayout(quantize_row)
+        note_editor_layout.addWidget(quantize_controls)
 
         velocity_panel = QtWidgets.QWidget()
         velocity_panel.setMinimumHeight(0)
@@ -6561,6 +6698,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.splitter_main = splitter_main
 
         self.setCentralWidget(splitter_main)
+        self._ai_compose_status_label = QtWidgets.QLabel('')
+        self._ai_compose_status_label.setStyleSheet('color: #9fb1c4; font-weight: 600;')
+        self._ai_compose_status_label.hide()
+        self.statusBar().addPermanentWidget(self._ai_compose_status_label)
         self._setup_menus()
         self._setup_floating_transport()
         self._setup_virtual_piano_window()
@@ -6570,6 +6711,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_sample_library()
         self.scan_sample_paths()
         self._apply_tools_window_preferences()
+        self._apply_samples_window_preferences()
         self._apply_mixer_window_preferences()
         self._update_window_title()
 
@@ -6661,6 +6803,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.show_panels_window_action.setChecked(self._tools_window_visible)
         self.show_panels_window_action.toggled.connect(self.toggle_tools_window)
         windows_menu.addAction(self.show_panels_window_action)
+        self.show_samples_window_action = QtGui.QAction('Show Samples Window', self)
+        self.show_samples_window_action.setCheckable(True)
+        self.show_samples_window_action.setChecked(self._samples_window_visible)
+        self.show_samples_window_action.toggled.connect(self.toggle_samples_window)
+        windows_menu.addAction(self.show_samples_window_action)
         self.show_mixer_window_action = QtGui.QAction('Show Mixer Window', self)
         self.show_mixer_window_action.setCheckable(True)
         self.show_mixer_window_action.setChecked(self._mixer_window_visible)
@@ -7234,6 +7381,19 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if hasattr(self, 'note_length_box'):
             self.note_length_box.setEnabled(not locked)
+            self.note_length_box.setStyleSheet(
+                """
+                QComboBox:disabled {
+                    color: #728194;
+                    background-color: #232a33;
+                    border: 1px solid #3f4a58;
+                }
+                QComboBox::drop-down:disabled {
+                    background-color: #1d232b;
+                    border-left: 1px solid #3f4a58;
+                }
+                """
+            )
 
     def _apply_note_length_choice(self, div: int, triplet: bool, *, update_combo: bool = True) -> None:
         div = max(1, int(div))
@@ -14873,6 +15033,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self._save_preferences()
         self.refresh_ai_status()
 
+    def set_ai_request_timeout_seconds(self, timeout_seconds: object, *, save: bool = True) -> None:
+        self.ai_client.set_request_timeout_seconds(timeout_seconds)
+        if save:
+            self._save_preferences()
+        self.refresh_ai_status()
+        self.statusBar().showMessage(f'AI response timeout set to {int(self.ai_client.request_timeout_seconds)} sec')
+
     def set_audio_output_device(self, device_id: str) -> None:
         requested = str(device_id or '').strip()
         normalized = ''
@@ -19028,6 +19195,8 @@ class MainWindow(QtWidgets.QMainWindow):
         note_editor_sizes = payload.get('note_editor_inner_sizes', self._note_editor_inner_sizes)
         self._tools_window_visible = bool(payload.get('tools_window_visible', True))
         self._tools_window_geometry_b64 = str(payload.get('tools_window_geometry_b64', '') or '')
+        self._samples_window_visible = bool(payload.get('samples_window_visible', True))
+        self._samples_window_geometry_b64 = str(payload.get('samples_window_geometry_b64', '') or '')
         self._mixer_window_visible = bool(payload.get('mixer_window_visible', True))
         self._mixer_window_geometry_b64 = str(payload.get('mixer_window_geometry_b64', '') or '')
         self._transport_window_visible = True
@@ -19068,6 +19237,7 @@ class MainWindow(QtWidgets.QMainWindow):
             remote_model=payload.get('ai_remote_model', self.ai_client.remote_model),
             ollama_base_url=payload.get('ai_ollama_base_url', self.ai_client.ollama_base_url),
             ollama_model=payload.get('ai_ollama_model', self.ai_client.ollama_model),
+            request_timeout_seconds=payload.get('ai_request_timeout_seconds', self.ai_client.request_timeout_seconds),
         )
         self.selected_audio_output_name = str(payload.get('selected_audio_output_name', '') or '').strip()
         self.selected_audio_output_id = str(payload.get('selected_audio_output_id', '') or '')
@@ -19177,6 +19347,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if hasattr(self, 'tools_window'):
             self._tools_window_visible = self.tools_window.isVisible()
             self._tools_window_geometry_b64 = bytes(self.tools_window.saveGeometry().toBase64()).decode('ascii')
+        if hasattr(self, 'samples_window'):
+            self._samples_window_visible = self.samples_window.isVisible()
+            self._samples_window_geometry_b64 = bytes(self.samples_window.saveGeometry().toBase64()).decode('ascii')
         if hasattr(self, 'mixer_window'):
             self._mixer_window_visible = self.mixer_window.isVisible()
             self._mixer_window_geometry_b64 = bytes(self.mixer_window.saveGeometry().toBase64()).decode('ascii')
@@ -19210,6 +19383,7 @@ class MainWindow(QtWidgets.QMainWindow):
             'ai_remote_model': self.ai_client.remote_model,
             'ai_ollama_base_url': self.ai_client.ollama_base_url,
             'ai_ollama_model': self.ai_client.ollama_model,
+            'ai_request_timeout_seconds': self.ai_client.request_timeout_seconds,
             'selected_audio_output_name': self.selected_audio_output_name,
             'selected_audio_output_id': '',
             'selected_audio_sample_rate': self.selected_audio_sample_rate,
@@ -19226,6 +19400,8 @@ class MainWindow(QtWidgets.QMainWindow):
             'note_editor_inner_sizes': self._note_editor_inner_sizes,
             'tools_window_visible': self._tools_window_visible,
             'tools_window_geometry_b64': self._tools_window_geometry_b64,
+            'samples_window_visible': self._samples_window_visible,
+            'samples_window_geometry_b64': self._samples_window_geometry_b64,
             'mixer_window_visible': self._mixer_window_visible,
             'mixer_window_geometry_b64': self._mixer_window_geometry_b64,
             'transport_window_visible': self._transport_window_visible,
@@ -19693,6 +19869,28 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.tools_window.hide()
 
+    def _apply_samples_window_preferences(self) -> None:
+        if not hasattr(self, 'samples_window'):
+            return
+        if self._samples_window_geometry_b64:
+            try:
+                geometry = QtCore.QByteArray.fromBase64(self._samples_window_geometry_b64.encode('ascii'))
+                if not geometry.isEmpty():
+                    self.samples_window.restoreGeometry(geometry)
+            except Exception:
+                pass
+        else:
+            self._position_samples_window_default()
+        if hasattr(self, 'show_samples_window_action'):
+            self.show_samples_window_action.blockSignals(True)
+            self.show_samples_window_action.setChecked(self._samples_window_visible)
+            self.show_samples_window_action.blockSignals(False)
+        if self._samples_window_visible:
+            self.samples_window.show()
+            self.samples_window.raise_()
+        else:
+            self.samples_window.hide()
+
     def _apply_mixer_window_preferences(self) -> None:
         if not hasattr(self, 'mixer_window'):
             return
@@ -19770,6 +19968,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.show_panels_window_action.blockSignals(False)
         self._save_preferences()
 
+    def _on_samples_window_visibility_changed(self, visible: bool) -> None:
+        self._samples_window_visible = bool(visible)
+        if hasattr(self, 'show_samples_window_action'):
+            self.show_samples_window_action.blockSignals(True)
+            self.show_samples_window_action.setChecked(self._samples_window_visible)
+            self.show_samples_window_action.blockSignals(False)
+        self._save_preferences()
+
     def _on_mixer_window_visibility_changed(self, visible: bool) -> None:
         self._mixer_window_visible = bool(visible)
         if hasattr(self, 'show_mixer_window_action'):
@@ -19805,6 +20011,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tools_window.activateWindow()
         else:
             self.tools_window.hide()
+
+    def toggle_samples_window(self, checked: bool) -> None:
+        self._samples_window_visible = bool(checked)
+        if not hasattr(self, 'samples_window'):
+            return
+        if checked:
+            self.samples_window.show()
+            self.samples_window.raise_()
+            self.samples_window.activateWindow()
+        else:
+            self.samples_window.hide()
 
     def toggle_mixer_window(self, checked: bool) -> None:
         self._mixer_window_visible = bool(checked)
@@ -19891,6 +20108,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tools_window.raise_()
             self._tools_window_visible = True
 
+        if hasattr(self, 'samples_window'):
+            sample_width = min(460, max(320, available.width() // 4))
+            sample_height = min(560, max(400, available.height() // 2))
+            sample_x = available.x() + max(0, available.width() - sample_width - spacing)
+            sample_y = available.y() + max(available.height() - sample_height - spacing, spacing + 120)
+            self.samples_window.setGeometry(sample_x, sample_y, sample_width, sample_height)
+            self.samples_window.show()
+            self.samples_window.raise_()
+            self._samples_window_visible = True
+
         if hasattr(self, 'mixer_window'):
             mixer_width = min(available.width() - 120, max(980, (available.width() * 3) // 5))
             mixer_height = min(available.height() - 220, max(420, available.height() // 2))
@@ -19916,6 +20143,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.show_panels_window_action.blockSignals(True)
             self.show_panels_window_action.setChecked(True)
             self.show_panels_window_action.blockSignals(False)
+        if hasattr(self, 'show_samples_window_action'):
+            self.show_samples_window_action.blockSignals(True)
+            self.show_samples_window_action.setChecked(True)
+            self.show_samples_window_action.blockSignals(False)
         if hasattr(self, 'show_mixer_window_action'):
             self.show_mixer_window_action.blockSignals(True)
             self.show_mixer_window_action.setChecked(True)
@@ -19951,6 +20182,20 @@ class MainWindow(QtWidgets.QMainWindow):
         height = min(available.height() - 160, max(480, (available.height() * 2) // 5))
         self._center_widget_on_screen(self.tools_window, width=width, height=height)
         self.tools_window.move(available.x() + max(0, available.width() - width - 24), available.y() + 120)
+
+    def _position_samples_window_default(self) -> None:
+        if not hasattr(self, 'samples_window'):
+            return
+        available = self._screen_available_geometry()
+        if available is None:
+            return
+        width = min(440, max(320, available.width() // 4))
+        height = min(560, max(400, available.height() // 2))
+        self._center_widget_on_screen(self.samples_window, width=width, height=height)
+        self.samples_window.move(
+            available.x() + max(0, available.width() - width - 24),
+            available.y() + max(available.height() - height - 28, 140),
+        )
 
     def _position_mixer_window_default(self) -> None:
         if not hasattr(self, 'mixer_window'):
@@ -20542,6 +20787,11 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
         try:
+            if hasattr(self, '_ai_compose_poll_timer'):
+                self._ai_compose_poll_timer.stop()
+        except Exception:
+            pass
+        try:
             self._stop_realtime_audio_sink()
         except Exception:
             _APP_LOGGER.exception("Failed to stop realtime audio sink during shutdown")
@@ -20603,21 +20853,102 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
         super().closeEvent(event)
 
-    def compose_with_ai(self) -> None:
-        prompt, ok = QtWidgets.QInputDialog.getText(self, "AI Composition Prompt", "Describe the song/arrangement:")
-        if not ok or not prompt.strip():
-            return
-        bars, ok = QtWidgets.QInputDialog.getInt(self, "Bars", "Song length (bars):", 8, 1, 256)
-        if not ok:
-            return
+    def _prompt_for_ai_composition(self) -> tuple[str, int] | None:
+        dialog = AIComposeDialog(
+            self,
+            default_prompt=self._ai_compose_default_prompt,
+            default_bars=self._ai_compose_default_bars,
+        )
+        self._center_widget_on_screen(dialog, width=620, height=360)
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return None
+        prompt = dialog.prompt_text().strip()
+        if not prompt:
+            return None
+        bars = int(dialog.bars())
+        self._ai_compose_default_prompt = prompt
+        self._ai_compose_default_bars = bars
+        return prompt, bars
 
-        self.statusBar().showMessage(f"Requesting AI composition via {self.ai_client.auth_status()}...")
-        try:
-            result = self.composer.compose(prompt=prompt.strip(), bars=bars, bpm=self.project.bpm)
-            self._apply_ai_result(result)
-        except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "AI composition failed", str(exc))
-            self.statusBar().showMessage("AI composition failed")
+    def _set_ai_compose_busy(self, busy: bool, detail: str = '') -> None:
+        self._ai_compose_busy = bool(busy)
+        if hasattr(self, 'ai_compose_btn') and self.ai_compose_btn is not None:
+            self.ai_compose_btn.setEnabled(not self._ai_compose_busy)
+        if not hasattr(self, '_ai_compose_status_label') or self._ai_compose_status_label is None:
+            return
+        if self._ai_compose_busy:
+            status_text = str(detail or 'AI processing...')
+            self._ai_compose_status_label.setText(status_text)
+            self._ai_compose_status_label.show()
+        else:
+            self._ai_compose_status_label.clear()
+            self._ai_compose_status_label.hide()
+
+    def _poll_ai_compose_results(self) -> None:
+        drained = False
+        while True:
+            try:
+                result = self._ai_compose_results.get_nowait()
+            except queue.Empty:
+                break
+            drained = True
+            kind = str(result[0] or '')
+            token = int(result[1])
+            current_token = int(getattr(self, '_ai_compose_request_token', 0) or 0)
+            if token != current_token:
+                continue
+            if kind == 'success':
+                try:
+                    self._apply_ai_result(result[2])
+                except Exception as exc:
+                    QtWidgets.QMessageBox.critical(self, 'AI composition failed', str(exc))
+                    self.statusBar().showMessage('AI composition failed')
+                finally:
+                    self._set_ai_compose_busy(False)
+            elif kind == 'error':
+                QtWidgets.QMessageBox.critical(self, 'AI composition failed', str(result[2]))
+                self.statusBar().showMessage('AI composition failed')
+                self._set_ai_compose_busy(False)
+
+        current_thread = getattr(self, '_ai_compose_thread', None)
+        if drained and (current_thread is None or not current_thread.is_alive()):
+            self._ai_compose_thread = None
+        if (
+            hasattr(self, '_ai_compose_poll_timer')
+            and not bool(getattr(self, '_ai_compose_busy', False))
+            and (current_thread is None or not current_thread.is_alive())
+        ):
+            self._ai_compose_poll_timer.stop()
+
+    def compose_with_ai(self) -> None:
+        if bool(getattr(self, '_ai_compose_busy', False)):
+            self.statusBar().showMessage('AI composition is already processing in the background...')
+            return
+        request = self._prompt_for_ai_composition()
+        if request is None:
+            return
+        prompt, bars = request
+        token = int(getattr(self, '_ai_compose_request_token', 0) or 0) + 1
+        self._ai_compose_request_token = token
+
+        def worker() -> None:
+            try:
+                result = self.composer.compose(prompt=prompt, bars=bars, bpm=self.project.bpm)
+                self._ai_compose_results.put(('success', token, result))
+            except Exception as exc:
+                self._ai_compose_results.put(('error', token, str(exc)))
+
+        self._set_ai_compose_busy(True, 'AI processing...')
+        self.statusBar().showMessage(
+            f"AI processing composition via {self.ai_client.auth_status()} in the background..."
+        )
+        self._ai_compose_thread = threading.Thread(
+            target=worker,
+            name='ai-compose-worker',
+            daemon=True,
+        )
+        self._ai_compose_thread.start()
+        self._ai_compose_poll_timer.start()
 
     def _apply_ai_result(self, result: dict) -> None:
         tracks = result.get("tracks", [])
