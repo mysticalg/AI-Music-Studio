@@ -2009,6 +2009,26 @@ private:
         setResponseField(response, "parameter_names", juce::var(parameterNames));
         setResponseField(response, "plugin_parameters", juce::var(parameters));
         setResponseField(response, "editor_open", editorWindow != nullptr);
+
+        // Detect plugin state changes that don't fire audioProcessorChanged
+        // by checksumming the actual state blob on each status poll.
+        // Only check when editor is open to avoid false positives from
+        // plugins that embed playback-related data in their state.
+        if (pluginInstance != nullptr && editorWindow != nullptr)
+        {
+            juce::MemoryBlock stateBlock;
+            pluginInstance->getStateInformation(stateBlock);
+            uint64_t checksum = 0xcbf29ce484222325ULL; // FNV-1a offset basis
+            for (size_t i = 0; i < stateBlock.getSize(); ++i)
+            {
+                checksum ^= static_cast<uint64_t>(static_cast<const uint8_t*>(stateBlock.getData())[i]);
+                checksum *= 0x100000001b3ULL; // FNV-1a prime
+            }
+            if (checksum != lastPluginStateChecksum && lastPluginStateChecksum != 0)
+                pluginStateGeneration.fetch_add(1, std::memory_order_relaxed);
+            lastPluginStateChecksum = checksum;
+        }
+
         setResponseField(response, "state_generation", pluginStateGeneration.load(std::memory_order_relaxed));
         setResponseField(response, "sample_rate", currentSampleRate);
         setResponseField(response, "buffer_size", currentBlockSize);
@@ -3217,6 +3237,8 @@ private:
             pluginInstance = std::move(instance);
             pluginInstance->disableNonMainBuses();
             pluginInstance->addListener(this);
+            lastPluginStateChecksum = 0;
+            pluginStateGeneration.store(0, std::memory_order_relaxed);
         }
 
         pathEditor.setText(pluginFile.getFullPathName(), juce::dontSendNotification);
@@ -5751,7 +5773,8 @@ private:
     double currentSampleRate = 44100.0;
     int currentBlockSize = 512;
     float pluginOutputPeakLevel = 0.0f;
-    std::atomic<int> pluginStateGeneration { 0 };
+    mutable std::atomic<int> pluginStateGeneration { 0 };
+    mutable uint64_t lastPluginStateChecksum { 0 };
 
     // Pre-allocated scratch buffers for realtime audio callback (avoid heap allocs)
     std::vector<float> deinterleaveLeft;
