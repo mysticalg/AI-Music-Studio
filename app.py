@@ -10779,6 +10779,12 @@ class MainWindow(QtWidgets.QMainWindow):
         # the user can continue tweaking parameters.  The existing parameter-
         # polling mechanism will sync changes to the active playback engine.
         editor_visible_rows: set[int] = set()
+        for row in list(getattr(self, '_track_native_vst_host_bridges', {}).keys()):
+            try:
+                if self._native_vst_host_editor_visible(int(row)):
+                    editor_visible_rows.add(int(row))
+            except Exception:
+                pass
         for row, dialog in getattr(self, '_track_vsti_windows', {}).items():
             try:
                 if dialog is not None and dialog.isVisible():
