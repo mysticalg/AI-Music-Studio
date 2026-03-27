@@ -239,7 +239,8 @@ private:
 class HostComponent final : public juce::Component,
                             private juce::Button::Listener,
                             private juce::ComboBox::Listener,
-                            private juce::AudioIODeviceCallback
+                            private juce::AudioIODeviceCallback,
+                            private juce::AudioProcessorListener
 {
 public:
     HostComponent(juce::PropertiesFile& settings,
@@ -2008,6 +2009,7 @@ private:
         setResponseField(response, "parameter_names", juce::var(parameterNames));
         setResponseField(response, "plugin_parameters", juce::var(parameters));
         setResponseField(response, "editor_open", editorWindow != nullptr);
+        setResponseField(response, "state_generation", pluginStateGeneration.load(std::memory_order_relaxed));
         setResponseField(response, "sample_rate", currentSampleRate);
         setResponseField(response, "buffer_size", currentBlockSize);
         setResponseField(response, "rendered_sample_frames", static_cast<double>(renderedSampleFrames.load()));
@@ -2372,6 +2374,13 @@ private:
         loadButton.setEnabled(true);
         unloadButton.setEnabled(loaded);
         editorButton.setEnabled(loaded);
+    }
+
+    // AudioProcessorListener — detect preset / state changes in the main plugin.
+    void audioProcessorParameterChanged(juce::AudioProcessor*, int, float) override {}
+    void audioProcessorChanged(juce::AudioProcessor*, const juce::AudioProcessorListener::ChangeDetails&) override
+    {
+        pluginStateGeneration.fetch_add(1, std::memory_order_relaxed);
     }
 
     void buttonClicked(juce::Button* button) override
@@ -3207,6 +3216,7 @@ private:
             pluginDescription = description;
             pluginInstance = std::move(instance);
             pluginInstance->disableNonMainBuses();
+            pluginInstance->addListener(this);
         }
 
         pathEditor.setText(pluginFile.getFullPathName(), juce::dontSendNotification);
@@ -3223,7 +3233,10 @@ private:
         {
             juce::ScopedLock lock(pluginLock);
             if (pluginInstance != nullptr)
+            {
+                pluginInstance->removeListener(this);
                 pluginInstance->suspendProcessing(true);
+            }
         }
         releasePluginResources();
         {
@@ -5738,6 +5751,7 @@ private:
     double currentSampleRate = 44100.0;
     int currentBlockSize = 512;
     float pluginOutputPeakLevel = 0.0f;
+    std::atomic<int> pluginStateGeneration { 0 };
 
     // Pre-allocated scratch buffers for realtime audio callback (avoid heap allocs)
     std::vector<float> deinterleaveLeft;
