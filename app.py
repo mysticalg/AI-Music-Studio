@@ -10774,28 +10774,28 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
         self._release_live_midi_host()
-        # Remember which rows had visible VSTi editor windows so we can
-        # reopen them after playback stops.  Preserve any already-pending
-        # rows from a prior suspend that hasn't been flushed yet.
-        visible_window_rows: set[int] = set(getattr(self, '_track_vsti_windows_pending_reopen', set()))
+        # Determine which rows have a visible VSTi editor window.  We keep
+        # those bridges (and their editor windows) alive during playback so
+        # the user can continue tweaking parameters.  The existing parameter-
+        # polling mechanism will sync changes to the active playback engine.
+        editor_visible_rows: set[int] = set()
         for row, dialog in getattr(self, '_track_vsti_windows', {}).items():
             try:
                 if dialog is not None and dialog.isVisible():
-                    visible_window_rows.add(int(row))
+                    editor_visible_rows.add(int(row))
             except Exception:
                 pass
-        self._track_vsti_windows_pending_reopen = visible_window_rows
         # Flush latest parameter / state data from every open editor bridge
-        # *before* we tear them down, so the saved state reflects any
-        # preset changes or knob tweaks the user made.
+        # so the playback engine starts with the most recent values.
         self._flush_native_vst_editor_state_rows()
         open_rows = (
             {int(row) for row in getattr(self, '_track_vsti_windows', {}).keys()}
             | {int(row) for row in getattr(self, '_track_native_vst_host_bridges', {}).keys()}
         )
         for row in sorted(open_rows, reverse=True):
-            # Close the editor window but leave the bridge alive so that
-            # _stop_native_vst_host_bridge can capture the full plugin state.
+            if int(row) in editor_visible_rows:
+                # Keep the bridge and editor window alive during playback.
+                continue
             self._close_track_vsti_window(int(row), teardown_host=False, suppress_finished_reload=True)
             self._stop_native_vst_host_bridge(int(row), capture_state=True)
 
