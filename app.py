@@ -16553,6 +16553,15 @@ class MainWindow(QtWidgets.QMainWindow):
                             track.rack_vsti,
                         )
 
+        # The native audio engine doesn't support reloading state for a
+        # single track mid-playback, so schedule a transport reprepare
+        # which will restart the engine with the updated state file.
+        if self._native_audio_engine_active():
+            track_index = self._track_index_for_object(track) if track is not None else int(row)
+            engine_rows = list(getattr(self, '_native_audio_engine_track_rows', []) or [])
+            if int(track_index) in engine_rows:
+                self._schedule_transport_reprepare(reason='VSTi preset change', delay_ms=150)
+
     def _sync_track_native_vst_editor_bridge_state(
         self,
         row: int,
