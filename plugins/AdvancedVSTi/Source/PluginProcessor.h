@@ -57,6 +57,9 @@ public:
     [[nodiscard]] ExternalPadState getExternalPadState (int padIndex) const;
     void stepExternalPadSample (int padIndex, int delta);
     [[nodiscard]] juce::String externalPadLevelParameterId (int padIndex) const;
+    [[nodiscard]] juce::String externalPadSustainParameterId (int padIndex) const;
+    [[nodiscard]] juce::String externalPadReleaseParameterId (int padIndex) const;
+    [[nodiscard]] juce::MidiKeyboardState& getKeyboardState() noexcept { return keyboardState; }
 
     juce::AudioProcessorValueTreeState apvts;
 
@@ -77,7 +80,7 @@ private:
     };
 
     static constexpr int drumVoiceLevelCount = 15;
-    static constexpr int vecPadCount = 16;
+    static constexpr int vecPadCount = 23;
 
     enum class OscType
     {
@@ -85,7 +88,56 @@ private:
         saw,
         square,
         noise,
-        sample
+        sample,
+        hypersaw,
+        wavetableFormant,
+        wavetableComplex,
+        wavetableMetal,
+        wavetableVocal
+    };
+
+    enum class MatrixSource
+    {
+        off = 0,
+        lfo1,
+        lfo2,
+        lfo3,
+        filterEnv,
+        ampEnv,
+        velocity,
+        note,
+        random
+    };
+
+    enum class MatrixDestination
+    {
+        off = 0,
+        osc1Pitch,
+        osc23Pitch,
+        pulseWidth,
+        resonance,
+        filterGain,
+        cutoff1,
+        cutoff2,
+        shape,
+        fmAmount,
+        panorama,
+        assign,
+        ampLevel,
+        filterBalance,
+        oscVolume,
+        subOscVolume,
+        noiseVolume,
+        fxMix,
+        fxIntensity,
+        delaySend,
+        delayTime,
+        delayFeedback,
+        reverbMix,
+        reverbTime,
+        lowEqGain,
+        midEqGain,
+        highEqGain
     };
 
     struct ExternalSampleData;
@@ -119,6 +171,40 @@ private:
         juce::ADSR filterEnv;
     };
 
+    struct ModMatrixTarget
+    {
+        int destination = static_cast<int> (MatrixDestination::off);
+        float amount = 0.0f;
+    };
+
+    struct ModMatrixSlot
+    {
+        int source = static_cast<int> (MatrixSource::off);
+        std::array<ModMatrixTarget, 3> targets {};
+    };
+
+    struct SampleModulationSums
+    {
+        float filterEnvPeak = 0.0f;
+        float ampEnvPeak = 0.0f;
+        float cutoff1 = 0.0f;
+        float cutoff2 = 0.0f;
+        float resonance = 0.0f;
+        float filterBalance = 0.0f;
+        float panorama = 0.0f;
+        float fxMix = 0.0f;
+        float fxIntensity = 0.0f;
+        float delaySend = 0.0f;
+        float delayTime = 0.0f;
+        float delayFeedback = 0.0f;
+        float reverbMix = 0.0f;
+        float reverbTime = 0.0f;
+        float lowEqGain = 0.0f;
+        float midEqGain = 0.0f;
+        float highEqGain = 0.0f;
+        int activeVoices = 0;
+    };
+
     struct RenderParameters
     {
         OscType oscType = OscType::sine;
@@ -126,11 +212,15 @@ private:
         int unisonVoices = 1;
         int lfo1Shape = 0;
         int lfo2Shape = 0;
+        int lfo3Shape = 0;
         int arpMode = 0;
         bool arpEnabled = false;
         bool lfo1Enabled = true;
         bool lfo2Enabled = true;
         bool lfo3Enabled = true;
+        bool lfo1EnvMode = false;
+        bool lfo2EnvMode = false;
+        bool lfo3EnvMode = true;
         bool filter1Enabled = true;
         bool filter2Enabled = true;
         int filterType = 0;
@@ -168,11 +258,20 @@ private:
         float filterEnvAmount = 0.5f;
         float filterBalance = 0.0f;
         float lfo1Rate = 2.0f;
+        float lfo1Amount = 0.0f;
+        int lfo1Destination = 0;
+        int lfo1AssignDestination = static_cast<int> (MatrixDestination::off);
         float lfo1Pitch = 0.0f;
         float lfo2Rate = 3.0f;
+        float lfo2Amount = 0.0f;
+        int lfo2Destination = 5;
+        int lfo2AssignDestination = static_cast<int> (MatrixDestination::off);
         float lfo2Filter = 0.0f;
         float arpRate = 4.0f;
         float rhythmGateRate = 8.0f;
+        float lfo3Amount = 0.0f;
+        int lfo3Destination = 10;
+        int lfo3AssignDestination = static_cast<int> (MatrixDestination::ampLevel);
         float rhythmGateDepth = 0.0f;
         float fxMix = 0.0f;
         float fxIntensity = 0.0f;
@@ -180,6 +279,18 @@ private:
         float delayTimeSec = 0.32f;
         float delayFeedback = 0.25f;
         float reverbMix = 0.0f;
+        float reverbTime = 0.45f;
+        float reverbDamping = 0.45f;
+        float lowEqGainDb = 0.0f;
+        float lowEqFreq = 220.0f;
+        float lowEqQ = 0.8f;
+        float midEqGainDb = 0.0f;
+        float midEqFreq = 1400.0f;
+        float midEqQ = 1.1f;
+        float highEqGainDb = 0.0f;
+        float highEqFreq = 5000.0f;
+        float highEqQ = 0.8f;
+        std::array<ModMatrixSlot, 6> modulationMatrix {};
         float drumMasterLevel = 1.0f;
         float drumKickAttack = 0.5f;
         float drumSnareTone = 0.5f;
@@ -202,12 +313,24 @@ private:
             1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
             1.0f, 1.0f, 1.0f, 1.0f, 1.0f
         };
-        std::array<float, vecPadCount> externalPadLevels {
-            1.0f, 1.0f, 1.0f, 1.0f,
-            1.0f, 1.0f, 1.0f, 1.0f,
-            1.0f, 1.0f, 1.0f, 1.0f,
-            1.0f, 1.0f, 1.0f, 1.0f
-        };
+        std::array<float, vecPadCount> externalPadLevels = []
+        {
+            std::array<float, vecPadCount> values {};
+            values.fill (1.0f);
+            return values;
+        }();
+        std::array<float, vecPadCount> externalPadSustainTimes = []
+        {
+            std::array<float, vecPadCount> values {};
+            values.fill (120.0f);
+            return values;
+        }();
+        std::array<float, vecPadCount> externalPadReleaseTimes = []
+        {
+            std::array<float, vecPadCount> values {};
+            values.fill (0.2f);
+            return values;
+        }();
 
         juce::ADSR::Parameters ampEnv;
         juce::ADSR::Parameters filterEnv;
@@ -247,12 +370,12 @@ private:
     juce::AudioFormatManager audioFormatManager;
     std::vector<ExternalPadDefinition> externalPads;
     std::array<std::shared_ptr<const ExternalSampleData>, vecPadCount> externalPadSamples {};
-    std::array<int, vecPadCount> loadedExternalPadIndices {
-        -1, -1, -1, -1,
-        -1, -1, -1, -1,
-        -1, -1, -1, -1,
-        -1, -1, -1, -1
-    };
+    std::array<int, vecPadCount> loadedExternalPadIndices = []
+    {
+        std::array<int, vecPadCount> values {};
+        values.fill (-1);
+        return values;
+    }();
 
     juce::dsp::StateVariableTPTFilter<float> leftFilter;
     juce::dsp::StateVariableTPTFilter<float> rightFilter;
@@ -268,6 +391,12 @@ private:
     juce::dsp::Chorus<float> flangerRight;
     juce::dsp::Phaser<float> phaserLeft;
     juce::dsp::Phaser<float> phaserRight;
+    juce::dsp::IIR::Filter<float> lowEqLeft;
+    juce::dsp::IIR::Filter<float> lowEqRight;
+    juce::dsp::IIR::Filter<float> midEqLeft;
+    juce::dsp::IIR::Filter<float> midEqRight;
+    juce::dsp::IIR::Filter<float> highEqLeft;
+    juce::dsp::IIR::Filter<float> highEqRight;
     juce::Reverb reverb;
     juce::AudioBuffer<float> delayBuffer;
     int delayWritePosition = 0;
@@ -275,8 +404,10 @@ private:
 
     float lfo1Phase = 0.0f;
     float lfo2Phase = 0.0f;
+    float lfo3Phase = 0.0f;
     int arpStep = 0;
     juce::Array<int> heldNotes;
+    juce::MidiKeyboardState keyboardState;
     std::atomic<int> pendingPresetIndex { -1 };
     std::atomic<bool> pendingExternalPadReload { false };
     int currentProgramIndex = 0;
@@ -376,12 +507,14 @@ private:
 
     [[nodiscard]] int activeVoiceLimit() const noexcept;
     void handleMidiMessage (const juce::MidiMessage& message);
-    float renderVoiceSample (VoiceState& voice);
+    float renderVoiceSample (VoiceState& voice, SampleModulationSums& sampleModSums);
     float renderDrumVoiceSample (VoiceState& voice);
     float renderExternalPadVoiceSample (VoiceState& voice);
     float oscSample (VoiceState& voice, float baseFreq, OscType type, float syncAmount, float pulseWidth);
     float oscSampleForState (float& phase, float& syncPhase, float& samplePos, float baseFreq, OscType type, float syncAmount, float pulseWidth);
     float basicOscSample (float& phase, float frequency, OscType type, float pulseWidth);
+    float wavetableOscSample (float& phase, float frequency, float shape, int variant);
+    float hypersawSample (float phase, float shape) const;
     float fmOperator (VoiceState& voice, float baseFreq, float amount);
     float lfoValue (int shape, float phase) const;
     void refreshSampleBank();
@@ -394,6 +527,8 @@ private:
     [[nodiscard]] int externalPadIndexForMidi (int midiNote) const noexcept;
     [[nodiscard]] static juce::String externalPadSampleParameterIdForIndex (int padIndex);
     [[nodiscard]] static juce::String externalPadLevelParameterIdForIndex (int padIndex);
+    [[nodiscard]] static juce::String externalPadSustainParameterIdForIndex (int padIndex);
+    [[nodiscard]] static juce::String externalPadReleaseParameterIdForIndex (int padIndex);
     void applyAdvancedEffects (juce::AudioBuffer<float>& buffer);
 
     void updateRenderParameters();

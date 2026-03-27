@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <JuceHeader.h>
 #include "PluginProcessor.h"
 
@@ -165,21 +166,28 @@ private:
         void setSampleInfo (const juce::String& presetText, const juce::String& sampleText);
         void setStepperVisible (bool shouldShowStepper);
         void setStepperEnabled (bool canStepLeft, bool canStepRight);
+        void setEnvelopeControlsVisible (bool shouldShowEnvelopeControls);
 
         std::function<void()> onPreviewRequested;
         std::function<void()> onStepLeftRequested;
         std::function<void()> onStepRightRequested;
         PreviewSlider slider;
+        PreviewSlider sustainSlider;
+        PreviewSlider releaseSlider;
 
     private:
         juce::Label titleLabel;
         juce::Label noteLabel;
         juce::Label presetLabel;
         juce::Label sampleLabel;
+        juce::Label levelLabel;
+        juce::Label sustainLabel;
+        juce::Label releaseLabel;
         juce::TextButton leftButton { "<" };
         juce::TextButton rightButton { ">" };
         AccentLookAndFeel& lookAndFeel;
         bool showStepper = false;
+        bool showEnvelopeControls = false;
 
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (DrumPad)
     };
@@ -207,7 +215,9 @@ private:
 
     struct DrumPadSpec
     {
-        juce::String paramId;
+        juce::String levelParamId;
+        juce::String sustainParamId;
+        juce::String releaseParamId;
         juce::String title;
         juce::String note;
         int midiNote = 36;
@@ -223,6 +233,26 @@ private:
     [[nodiscard]] bool usesDrumPadLayout() const noexcept;
     void syncExternalPadDisplays();
     void updateVirusOscillatorBindings();
+    void updateVirusModulatorBindings();
+    void refreshVirusValueKnobBindings();
+    void refreshVirusMatrixMenuOsd();
+    void refreshVirusLfoMenuOsd();
+    void refreshVirusOscMenuOsd();
+    void refreshVirusFilterMenuOsd();
+    void refreshVirusFxMenuOsd (bool lowerSection);
+    void refreshVirusArpMenuOsd();
+    void refreshVirusPresetOsd();
+    void clearVirusLfoMenu (bool clearOsd = false);
+    void showVirusOsdMessage (const juce::String& title,
+                              const juce::String& value,
+                              const juce::String& detail = {},
+                              bool pinned = false,
+                              double lifetimeMs = 2200.0);
+    void showVirusOsdForParam (const juce::String& paramId,
+                               const juce::String& titleOverride = {},
+                               const juce::String& detail = {},
+                               bool pinned = false,
+                               double lifetimeMs = 2200.0);
     void syncVirusPanelButtons();
     void buildVirusPanelButtons();
     LedToggleButton* addVirusPanelButton (const juce::String& key, const juce::String& text, const juce::String& tooltip, bool latching = true);
@@ -243,16 +273,35 @@ private:
     juce::OwnedArray<LedToggleButton> virusPanelButtons;
     std::vector<juce::String> virusPanelButtonKeys;
     std::unique_ptr<LedToggleButton> virusBackgroundToggle;
+    std::unique_ptr<LedToggleButton> virusKeyboardToggle;
+    std::unique_ptr<juce::MidiKeyboardComponent> virusKeyboard;
     juce::Image virusTemplateImage;
     juce::Image backgroundImage;
     bool virusShowBackground = true;
+    bool virusKeyboardVisible = false;
     int virusMatrixSlotIndex = 0;
+    int virusMatrixTargetIndex = 0;
     int virusModulatorIndex = 0;
     int virusOscillatorIndex = 0;
     int virusFilterEditIndex = 0;
     int virusUpperFxLegendIndex = 0;
     int virusLowerFxLegendIndex = 0;
     int virusPanelModeIndex = 2;
+    std::array<int, 3> virusModLeftTargetIndices { 0, 2, 4 };
+    std::array<int, 3> virusModRightTargetIndices { -1, -1, -1 };
+    juce::String virusOsdTitle;
+    juce::String virusOsdValue;
+    juce::String virusOsdDetail;
+    double virusOsdUntilMs = 0.0;
+    bool virusOsdPinned = false;
+    int virusActiveLfoMenu = -1;
+    int virusActiveMatrixMenu = -1;
+    int virusActiveOscMenu = -1;
+    int virusActiveFilterMenu = -1;
+    int virusActiveFxMenu = -1;
+    bool virusActivePresetMenu = false;
+    bool virusActiveArpMenu = false;
+    bool virusShiftMode = false;
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>> sliderAttachments;
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment>> comboAttachments;
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment>> buttonAttachments;

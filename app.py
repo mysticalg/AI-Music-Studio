@@ -337,6 +337,23 @@ _CURRENT_SESSION_FAULT_PATH: Path | None = None
 _LAST_CRASH_REPORT_PATH: Path | None = None
 
 
+def load_app_version_string() -> str:
+    candidates = [APP_ROOT_DIR / "VERSION.txt"]
+    if not getattr(sys, "frozen", False):
+        candidates.append(Path(__file__).resolve().parent / "dist" / APP_NAME / "VERSION.txt")
+    for candidate in candidates:
+        try:
+            raw = candidate.read_text(encoding="utf-8").strip()
+        except Exception:
+            continue
+        if raw:
+            return raw
+    return f"v0.{PROJECT_FILE_VERSION}.0-dev"
+
+
+APP_VERSION = load_app_version_string()
+
+
 def _qt_message_mode_name(mode) -> str:
     mapping = {
         QtCore.QtMsgType.QtDebugMsg: "QT_DEBUG",
@@ -611,6 +628,108 @@ def load_startup_preferences() -> dict:
     except Exception:
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+class StartupSplash(QtWidgets.QWidget):
+    def __init__(self, version_text: str, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        flags = (
+            QtCore.Qt.WindowType.FramelessWindowHint
+            | QtCore.Qt.WindowType.SplashScreen
+            | QtCore.Qt.WindowType.WindowStaysOnTopHint
+        )
+        self.setWindowFlags(flags)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setObjectName("startupSplash")
+        self.setFixedSize(520, 260)
+
+        outer_layout = QtWidgets.QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+
+        panel = QtWidgets.QFrame(self)
+        panel.setObjectName("startupSplashPanel")
+        panel_layout = QtWidgets.QVBoxLayout(panel)
+        panel_layout.setContentsMargins(30, 28, 30, 26)
+        panel_layout.setSpacing(10)
+
+        title_label = QtWidgets.QLabel("AI Studio", panel)
+        title_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignHCenter)
+        title_label.setStyleSheet("font-size: 30px; font-weight: 700; color: #f5f7fb; letter-spacing: 0.5px;")
+        panel_layout.addWidget(title_label)
+
+        version_label = QtWidgets.QLabel(f"Version {version_text}", panel)
+        version_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignHCenter)
+        version_label.setStyleSheet("font-size: 13px; color: #aeb8c6;")
+        panel_layout.addWidget(version_label)
+
+        creator_label = QtWidgets.QLabel("Created by metalsoft David R Hook 2026 March", panel)
+        creator_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignHCenter)
+        creator_label.setStyleSheet("font-size: 12px; color: #8b97a8;")
+        panel_layout.addWidget(creator_label)
+
+        panel_layout.addSpacing(10)
+
+        self.message_label = QtWidgets.QLabel("Loading AI Studio...", panel)
+        self.message_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignHCenter)
+        self.message_label.setStyleSheet("font-size: 14px; color: #dce4ef;")
+        panel_layout.addWidget(self.message_label)
+
+        self.progress_bar = QtWidgets.QProgressBar(panel)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("%p%")
+        self.progress_bar.setFixedHeight(18)
+        panel_layout.addWidget(self.progress_bar)
+
+        outer_layout.addWidget(panel)
+
+        shadow = QtWidgets.QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(32)
+        shadow.setOffset(0, 10)
+        shadow.setColor(QtGui.QColor(0, 0, 0, 150))
+        panel.setGraphicsEffect(shadow)
+
+        self.setStyleSheet(
+            """
+            QWidget#startupSplash {
+                background: transparent;
+            }
+            QFrame#startupSplashPanel {
+                background-color: rgba(21, 25, 31, 242);
+                border: 1px solid rgba(124, 146, 176, 110);
+                border-radius: 18px;
+            }
+            QProgressBar {
+                border: 1px solid rgba(124, 146, 176, 120);
+                border-radius: 9px;
+                background: rgba(10, 13, 18, 210);
+                color: #f5f7fb;
+                font-size: 11px;
+                text-align: center;
+            }
+            QProgressBar::chunk {
+                border-radius: 8px;
+                background-color: #58a8ff;
+            }
+            """
+        )
+
+    def center_on_primary_screen(self) -> None:
+        screen = QtGui.QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        geometry = screen.availableGeometry()
+        self.move(geometry.center() - self.rect().center())
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        self.center_on_primary_screen()
+
+    def set_progress(self, value: int, message: str) -> None:
+        self.progress_bar.setValue(max(0, min(100, int(value))))
+        self.message_label.setText(str(message))
+        QtWidgets.QApplication.processEvents()
 
 
 def native_vst_host_runtime_hint() -> str:
@@ -6273,6 +6392,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.vsti_plugin_metadata: dict[str, list[str]] = {}
         self.vsti_description_cache: dict[str, tuple[str, bool, bool, str, bool, str]] = {}
         self.vsti_bus_metadata: dict[str, dict[str, list[dict[str, object]]]] = {}
+        self._vsti_mtime_state: dict[str, int] = {}
         self.vsti_directory = BUNDLED_VSTI_DIR
         self.user_vsti_directory = USER_VSTI_DIR
         self.user_vsti_directory.mkdir(parents=True, exist_ok=True)
@@ -9066,13 +9186,15 @@ class MainWindow(QtWidgets.QMainWindow):
         direct_plugin: tuple[int, TrackState, VSTInstrument] | None = None,
     ) -> tuple[object, ...]:
         direct_entry = direct_plugin[2] if direct_plugin is not None else None
+        direct_plugin_path = self._normalized_vsti_path(str(direct_entry.path)) if direct_entry is not None else ''
         audio_device_type, audio_output_device_name = self._effective_native_audio_device_request()
         return (
             max(1, int(self._native_vst_host_target_sample_rate())),
             max(64, int(self._native_vst_host_target_buffer_size())),
             str(audio_device_type or '').strip(),
             str(audio_output_device_name or '').strip(),
-            self._normalized_vsti_path(str(direct_entry.path)) if direct_entry is not None else '',
+            direct_plugin_path,
+            self._vsti_plugin_mtime_ns(Path(direct_plugin_path)) if direct_plugin_path else 0,
         )
 
     def _native_output_bridge_matches_signature(
@@ -9088,6 +9210,7 @@ class MainWindow(QtWidgets.QMainWindow):
         audio_device_type = str(signature[2] or '').strip()
         audio_output_device_name = str(signature[3] or '').strip()
         plugin_path = self._normalized_vsti_path(str(signature[4] or ''))
+        plugin_mtime_ns = int(signature[5] or 0) if len(signature) > 5 else 0
         actual_plugin_path = self._normalized_vsti_path(str(getattr(target, 'plugin_path', '') or ''))
         return (
             int(getattr(target, 'requested_sample_rate', getattr(target, 'sample_rate', 0)) or 0) == sample_rate
@@ -9097,6 +9220,7 @@ class MainWindow(QtWidgets.QMainWindow):
             and str(getattr(target, 'requested_audio_output_device_name', getattr(target, 'audio_output_device_name', '')) or '').strip().casefold()
             == audio_output_device_name.casefold()
             and actual_plugin_path == plugin_path
+            and int(getattr(target, '_aims_loaded_plugin_mtime_ns', 0) or 0) == plugin_mtime_ns
         )
 
     def _native_output_bridge_matches_audio_signature(
@@ -11635,6 +11759,7 @@ class MainWindow(QtWidgets.QMainWindow):
         plugin_path = self._normalized_vsti_path(str(getattr(entry, 'path', '') or ''))
         if not plugin_path:
             return False
+        plugin_mtime_ns = int(self._vsti_plugin_mtime_ns(Path(plugin_path)))
         try:
             bridge.command('panic')
             status = bridge.command('load', path=plugin_path)
@@ -11653,6 +11778,7 @@ class MainWindow(QtWidgets.QMainWindow):
         bridge.audio_output_device_name = str(status.get('audio_device_name') or getattr(bridge, 'audio_output_device_name', '') or '')
         setattr(bridge, '_aims_rack_name', str(entry.name))
         setattr(bridge, '_aims_supports_set_parameters', True)
+        setattr(bridge, '_aims_loaded_plugin_mtime_ns', plugin_mtime_ns)
         self._discard_pending_native_vst_bridge_parameter_updates(bridge)
 
         state_path, state_mtime_ns = self._native_vst_host_state_signature(track, entry)
@@ -15729,6 +15855,41 @@ class MainWindow(QtWidgets.QMainWindow):
                 added += 1
         return added
 
+    def _refresh_changed_vsti_cache_entries(self, paths: list[str]) -> int:
+        changed = 0
+        current_state: dict[str, int] = {}
+        for raw_path in paths:
+            normalized = self._canonical_vsti_path(raw_path)
+            if not normalized or not self._is_valid_vsti_plugin_path(normalized):
+                continue
+            current_mtime = int(self._vsti_plugin_mtime_ns(Path(normalized)))
+            current_state[normalized] = current_mtime
+            previous_mtime = int(self._vsti_mtime_state.get(normalized, 0) or 0)
+            if previous_mtime == current_mtime and current_mtime > 0:
+                continue
+
+            self.vsti_description_cache.pop(normalized, None)
+            self.vsti_plugin_metadata.pop(normalized, None)
+            self.vsti_bus_metadata.pop(normalized, None)
+
+            for entry in self.project.vsti_rack:
+                if self._canonical_vsti_path(entry.path) != normalized:
+                    continue
+                name, is_instrument, is_effect, category, host_supported, host_error = self._describe_plugin_path(normalized)
+                entry.name = self._default_vsti_display_name(normalized, name)
+                entry.plugin_name = entry.name
+                entry.path = normalized
+                entry.is_instrument = bool(is_instrument)
+                entry.is_effect = bool(is_effect)
+                entry.category = str(category or '')
+                entry.host_supported = bool(host_supported)
+                entry.host_error = str(host_error or '')
+                changed += 1
+                break
+
+        self._vsti_mtime_state = current_state
+        return changed
+
     def _dedupe_and_filter_vsti_state(self) -> None:
         unique_paths: list[str] = []
         seen_paths: set[str] = set()
@@ -17865,6 +18026,31 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:
             return 0
 
+    @staticmethod
+    def _vsti_plugin_mtime_ns(path: Path | str) -> int:
+        try:
+            plugin_path = Path(path)
+        except Exception:
+            return 0
+        if not plugin_path.exists():
+            return 0
+        if plugin_path.is_dir() and plugin_path.suffix.lower() == '.vst3':
+            mtimes = [MainWindow._path_mtime_ns(plugin_path)]
+            contents_dir = plugin_path / 'Contents'
+            preferred_dirs = [contents_dir / 'x86_64-win', contents_dir / 'Resources']
+            for folder in preferred_dirs:
+                if not folder.exists():
+                    continue
+                for child in folder.rglob('*'):
+                    if child.is_file():
+                        mtimes.append(MainWindow._path_mtime_ns(child))
+            if len(mtimes) == 1:
+                for child in plugin_path.rglob('*'):
+                    if child.is_file():
+                        mtimes.append(MainWindow._path_mtime_ns(child))
+            return max(mtimes) if mtimes else 0
+        return MainWindow._path_mtime_ns(plugin_path)
+
     def _track_audio_cache_key(self, track: TrackState, idx: int) -> str:
         instrument_entry = self._native_instrument_entry_for_track(track)
         effective_state_path = self._effective_vsti_state_path(track, instrument_entry)
@@ -17890,6 +18076,7 @@ class MainWindow(QtWidgets.QMainWindow):
             'instrument_mode': track.instrument_mode,
             'rack_vsti': track.rack_vsti,
             'rack_vsti_path': instrument_entry.path if instrument_entry else '',
+            'rack_vsti_mtime_ns': self._vsti_plugin_mtime_ns(Path(instrument_entry.path)) if instrument_entry else 0,
             'midi_program': -1 if uses_rack_vsti_instrument else int(track.midi_program),
             'synth_profile': track.synth_profile,
             'volume': round(float(track.volume), 6),
@@ -18045,6 +18232,7 @@ class MainWindow(QtWidgets.QMainWindow):
         desired_sample_rate = self._native_vst_host_target_sample_rate()
         desired_buffer_size = self._native_vst_host_target_buffer_size()
         desired_audio_device_type, desired_audio_output_device_name = self._effective_native_audio_device_request()
+        desired_plugin_mtime_ns = int(self._vsti_plugin_mtime_ns(Path(entry.path)))
         desired_state_path, desired_state_mtime_ns = self._native_vst_host_state_signature(track, entry)
         desired_bus_signature = self._native_vst_host_bus_payload_signature(self._native_vst_host_bus_payload(track, entry))
         existing = self._track_native_vst_host_bridges.get(row)
@@ -18059,6 +18247,7 @@ class MainWindow(QtWidgets.QMainWindow):
         ).strip()
         existing_state_path = str(getattr(existing, '_aims_loaded_state_path', '') or '')
         existing_state_mtime_ns = int(getattr(existing, '_aims_loaded_state_mtime_ns', 0) or 0)
+        existing_plugin_mtime_ns = int(getattr(existing, '_aims_loaded_plugin_mtime_ns', 0) or 0)
         existing_bus_signature = getattr(existing, '_aims_bus_routing_signature', None)
         if existing is not None and self._native_vst_host_bridge_alive(row):
             try:
@@ -18073,6 +18262,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     self._stop_native_vst_host_bridge(row)
                     existing = None
                 elif existing_audio_output_device_name.casefold() != desired_audio_output_device_name.casefold():
+                    self._stop_native_vst_host_bridge(row)
+                    existing = None
+                elif existing_plugin_mtime_ns != desired_plugin_mtime_ns:
                     self._stop_native_vst_host_bridge(row)
                     existing = None
                 elif existing_state_path != desired_state_path or existing_state_mtime_ns != desired_state_mtime_ns:
@@ -18126,6 +18318,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 setattr(bridge, '_aims_rack_name', str(entry.name))
                 bridge.requested_audio_device_type = desired_audio_device_type
                 bridge.requested_audio_output_device_name = desired_audio_output_device_name
+                setattr(bridge, '_aims_loaded_plugin_mtime_ns', desired_plugin_mtime_ns)
                 bridge.start()
                 self._prime_native_vst_host_bridge_state(bridge, track, entry)
                 ok, status = self._configure_native_vst_host_bridge_buses(bridge, track, entry)
@@ -19231,6 +19424,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.project.vsti_paths = [p for p in payload.get('vsti_paths', []) if isinstance(p, str)]
         self.project.vsti_folder_paths = [p for p in payload.get('vsti_folder_paths', []) if isinstance(p, str)]
+        raw_vsti_mtime_state = payload.get('vsti_mtime_state', {})
+        if isinstance(raw_vsti_mtime_state, dict):
+            cleaned_vsti_mtime_state: dict[str, int] = {}
+            for raw_path, raw_mtime in raw_vsti_mtime_state.items():
+                if not isinstance(raw_path, str):
+                    continue
+                try:
+                    cleaned_vsti_mtime_state[self._canonical_vsti_path(raw_path)] = max(0, int(raw_mtime))
+                except Exception:
+                    continue
+            self._vsti_mtime_state = cleaned_vsti_mtime_state
         self.project.sample_paths = [p for p in payload.get('sample_paths', []) if isinstance(p, str)]
         self.ai_client.apply_settings(
             provider=payload.get('ai_provider', self.ai_client.provider),
@@ -19364,6 +19568,11 @@ class MainWindow(QtWidgets.QMainWindow):
         payload = {
             'vsti_paths': self.project.vsti_paths,
             'vsti_folder_paths': self.project.vsti_folder_paths,
+            'vsti_mtime_state': {
+                str(path): int(mtime)
+                for path, mtime in sorted(self._vsti_mtime_state.items())
+                if str(path)
+            },
             'vsti_rack_paths': [v.path for v in self.project.vsti_rack],
             'vsti_rack_state': [
                 {
@@ -19415,7 +19624,22 @@ class MainWindow(QtWidgets.QMainWindow):
         APP_PREFS_PATH.write_text(json.dumps(payload, indent=2))
 
     def _sync_bundled_vsti_directory(self) -> None:
-        discovered_roots = [folder for folder in (self.vsti_directory, self.user_vsti_directory) if folder.exists()]
+        discovered_roots: list[Path] = []
+        seen_roots: set[str] = set()
+        candidate_roots = [self.vsti_directory, self.user_vsti_directory]
+        candidate_roots.extend(Path(path) for path in self.project.vsti_folder_paths if isinstance(path, str))
+        for folder in candidate_roots:
+            try:
+                resolved = folder.expanduser().resolve()
+            except Exception:
+                continue
+            if not resolved.exists() or not resolved.is_dir():
+                continue
+            key = str(resolved)
+            if key in seen_roots:
+                continue
+            seen_roots.add(key)
+            discovered_roots.append(resolved)
         if not discovered_roots:
             return
 
@@ -19431,6 +19655,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not bundled_paths:
             return
 
+        changed_plugins = self._refresh_changed_vsti_cache_entries(bundled_paths)
         changed = False
         for path in bundled_paths:
             if path not in self.project.vsti_paths:
@@ -19445,7 +19670,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.project.vsti_paths != original_paths
             or [(v.name, v.path, v.plugin_name) for v in self.project.vsti_rack] != original_rack_snapshot
         )
-        if changed or added_to_rack or cleaned:
+        if changed or added_to_rack or cleaned or changed_plugins:
             self._save_preferences()
 
     def _preferred_vsti_browser_directory(self) -> Path:
@@ -19546,6 +19771,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.vsti_description_cache.pop(plugin_path, None)
                 self.vsti_plugin_metadata.pop(plugin_path, None)
                 self.vsti_bus_metadata.pop(plugin_path, None)
+                self._vsti_mtime_state.pop(plugin_path, None)
         self._dedupe_and_filter_vsti_state()
         if save:
             self._save_preferences()
@@ -22731,9 +22957,19 @@ def main() -> int:
     palette.setColor(QtGui.QPalette.ColorRole.ButtonText, QtGui.QColor(220, 220, 220))
     app.setPalette(palette)
 
+    splash = StartupSplash(APP_VERSION)
+    splash.set_progress(12, "Loading AI Studio...")
+    splash.show()
+    splash.raise_()
+    app.processEvents()
+
+    splash.set_progress(46, "Preparing audio and plugin systems...")
     window = MainWindow()
+    splash.set_progress(82, "Building the studio workspace...")
     app.aboutToQuit.connect(window._shutdown_runtime_resources)
     window.show()
+    splash.set_progress(100, "Ready")
+    QtCore.QTimer.singleShot(350, splash.close)
     return app.exec()
 
 

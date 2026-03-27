@@ -73,6 +73,174 @@ constexpr int kVirusKnobHeight = 62;
 constexpr int kVirusChoiceHeight = 22;
 constexpr int kVirusToggleSize = 16;
 constexpr int kVirusSquareButtonSize = 33;
+constexpr int kVirusKeyboardExtraHeight = 72;
+
+const std::array<juce::String, 5> kVirusModLeftTargetLabels { "OSC 1", "OSC 2/3", "PW", "RESO", "FLT GAIN" };
+const std::array<juce::String, 6> kVirusModRightTargetLabels { "CUTOFF 1", "CUTOFF 2", "SHAPE", "FM AMT", "PAN", "ASSIGN" };
+const std::array<juce::String, 11> kVirusModDestinationLabels {
+    "OSC 1", "OSC 2/3", "PW", "RESO", "FLT GAIN",
+    "CUTOFF 1", "CUTOFF 2", "SHAPE", "FM AMT", "PAN", "ASSIGN"
+};
+const std::array<juce::String, 5> kVirusUpperFxLabels { "DELAY", "REVERB", "LOW EQ", "MID EQ", "HIGH EQ" };
+const std::array<juce::String, 5> kVirusLowerFxLabels { "DISTORTION", "CHARACTER", "CHORUS", "PHASER", "OTHERS" };
+
+juce::String virusLfoEnableParamId (int index)
+{
+    switch (juce::jlimit (0, 2, index))
+    {
+        case 1: return "LFO2ENABLE";
+        case 2: return "LFO3ENABLE";
+        default: return "LFO1ENABLE";
+    }
+}
+
+juce::String virusLfoShapeParamId (int index)
+{
+    switch (juce::jlimit (0, 2, index))
+    {
+        case 1: return "LFO2SHAPE";
+        case 2: return "LFO3SHAPE";
+        default: return "LFO1SHAPE";
+    }
+}
+
+juce::String virusLfoEnvModeParamId (int index)
+{
+    switch (juce::jlimit (0, 2, index))
+    {
+        case 1: return "LFO2ENVMODE";
+        case 2: return "LFO3ENVMODE";
+        default: return "LFO1ENVMODE";
+    }
+}
+
+juce::String virusLfoRateParamId (int index)
+{
+    switch (juce::jlimit (0, 2, index))
+    {
+        case 1: return "LFO2RATE";
+        case 2: return "RHYTHMGATE_RATE";
+        default: return "LFO1RATE";
+    }
+}
+
+juce::String virusLfoAmountParamId (int index)
+{
+    switch (juce::jlimit (0, 2, index))
+    {
+        case 1: return "LFO2AMOUNT";
+        case 2: return "LFO3AMOUNT";
+        default: return "LFO1AMOUNT";
+    }
+}
+
+juce::String virusLfoDestinationParamId (int index)
+{
+    switch (juce::jlimit (0, 2, index))
+    {
+        case 1: return "LFO2DEST";
+        case 2: return "LFO3DEST";
+        default: return "LFO1DEST";
+    }
+}
+
+juce::String virusLfoAssignDestinationParamId (int index)
+{
+    switch (juce::jlimit (0, 2, index))
+    {
+        case 1: return "LFO2ASSIGNDEST";
+        case 2: return "LFO3ASSIGNDEST";
+        default: return "LFO1ASSIGNDEST";
+    }
+}
+
+juce::String virusMatrixSourceParamId (int slotIndex)
+{
+    return "MATRIX" + juce::String (juce::jlimit (0, 5, slotIndex) + 1) + "SOURCE";
+}
+
+juce::String virusMatrixAmountParamId (int slotIndex, int targetIndex)
+{
+    return "MATRIX" + juce::String (juce::jlimit (0, 5, slotIndex) + 1)
+           + "AMOUNT" + juce::String (juce::jlimit (0, 2, targetIndex) + 1);
+}
+
+juce::String virusMatrixDestinationParamId (int slotIndex, int targetIndex)
+{
+    return "MATRIX" + juce::String (juce::jlimit (0, 5, slotIndex) + 1)
+           + "DEST" + juce::String (juce::jlimit (0, 2, targetIndex) + 1);
+}
+
+int virusCombinedDestinationIndex (const std::array<int, 3>& leftIndices,
+                                   const std::array<int, 3>& rightIndices,
+                                   int lfoIndex)
+{
+    const auto clampedIndex = juce::jlimit (0, 2, lfoIndex);
+    const auto left = leftIndices[static_cast<size_t> (clampedIndex)];
+    if (left >= 0)
+        return juce::jlimit (0, static_cast<int> (kVirusModLeftTargetLabels.size()) - 1, left);
+
+    const auto right = rightIndices[static_cast<size_t> (clampedIndex)];
+    if (right >= 0)
+        return static_cast<int> (kVirusModLeftTargetLabels.size())
+               + juce::jlimit (0, static_cast<int> (kVirusModRightTargetLabels.size()) - 1, right);
+
+    return 0;
+}
+
+void setVirusCombinedDestinationIndex (std::array<int, 3>& leftIndices,
+                                       std::array<int, 3>& rightIndices,
+                                       int lfoIndex,
+                                       int destinationIndex)
+{
+    const auto clampedLfo = juce::jlimit (0, 2, lfoIndex);
+    const auto clampedDestination = juce::jlimit (0, static_cast<int> (kVirusModDestinationLabels.size()) - 1, destinationIndex);
+
+    if (clampedDestination < static_cast<int> (kVirusModLeftTargetLabels.size()))
+    {
+        leftIndices[static_cast<size_t> (clampedLfo)] = clampedDestination;
+        rightIndices[static_cast<size_t> (clampedLfo)] = -1;
+    }
+    else
+    {
+        leftIndices[static_cast<size_t> (clampedLfo)] = -1;
+        rightIndices[static_cast<size_t> (clampedLfo)]
+            = clampedDestination - static_cast<int> (kVirusModLeftTargetLabels.size());
+    }
+}
+
+juce::String parameterValueText (juce::AudioProcessorValueTreeState& apvts, const juce::String& paramId)
+{
+    if (auto* parameter = dynamic_cast<juce::RangedAudioParameter*> (apvts.getParameter (paramId)))
+    {
+        if (auto* choice = dynamic_cast<juce::AudioParameterChoice*> (parameter))
+        {
+            const auto choiceIndex = juce::jlimit (0, choice->choices.size() - 1, choice->getIndex());
+            return choice->choices[choiceIndex];
+        }
+
+        if (auto* toggle = dynamic_cast<juce::AudioParameterBool*> (parameter))
+            return toggle->get() ? "ON" : "OFF";
+
+        auto text = parameter->getCurrentValueAsText();
+        if (text.isEmpty())
+            text = parameter->getText (parameter->getValue(), 24);
+        return text;
+    }
+
+    return "--";
+}
+
+void setParameterActualValue (juce::AudioProcessorValueTreeState& apvts, const juce::String& paramId, float actualValue)
+{
+    if (auto* parameter = dynamic_cast<juce::RangedAudioParameter*> (apvts.getParameter (paramId)))
+    {
+        const auto legalValue = parameter->getNormalisableRange().snapToLegalValue (actualValue);
+        parameter->beginChangeGesture();
+        parameter->setValueNotifyingHost (parameter->convertTo0to1 (legalValue));
+        parameter->endChangeGesture();
+    }
+}
 
 struct VirusLegend
 {
@@ -175,15 +343,15 @@ VirusLegend virusButtonLegend (const juce::String& key)
 std::array<VirusGroupChrome, 9> virusGroupChrome()
 {
     return {{
-        { "MATRIX",             {  90.0f,  61.0f,  80.0f, 161.0f }, { 103.0f,  49.0f,  57.0f, 14.0f } },
-        { "MODULATORS",         { 171.0f,  61.0f, 220.0f, 161.0f }, { 183.0f,  49.0f,  88.0f, 14.0f } },
-        { "OSCILLATORS",        { 392.0f,  61.0f, 281.0f, 161.0f }, { 404.0f,  49.0f,  96.0f, 14.0f } },
-        { "MIXER",              { 690.0f,  61.0f,  64.0f, 364.0f }, { 696.0f,  49.0f,  52.0f, 14.0f } },
-        { "FILTERS",            { 770.0f,  61.0f, 271.0f, 161.0f }, { 783.0f,  49.0f,  60.0f, 14.0f } },
-        { "FILTER ENVELOPE",    { 770.0f, 239.0f, 270.0f,  85.0f }, { 782.0f, 227.0f, 104.0f, 14.0f } },
-        { "AMPLIFIER ENVELOPE", { 770.0f, 335.0f, 270.0f,  85.0f }, { 782.0f, 323.0f, 126.0f, 14.0f } },
+        { "MATRIX",             {  90.0f,  61.0f,  80.0f, 158.0f }, { 103.0f,  49.0f,  57.0f, 14.0f } },
+        { "MODULATORS",         { 171.0f,  61.0f, 220.0f, 158.0f }, { 183.0f,  49.0f,  88.0f, 14.0f } },
+        { "OSCILLATORS",        { 392.0f,  61.0f, 281.0f, 158.0f }, { 404.0f,  49.0f,  96.0f, 14.0f } },
+        { "MIXER",              { 690.0f,  61.0f,  64.0f, 358.0f }, { 696.0f,  49.0f,  52.0f, 14.0f } },
+        { "FILTERS",            { 770.0f,  61.0f, 271.0f, 158.0f }, { 783.0f,  49.0f,  60.0f, 14.0f } },
+        { "FILTER ENVELOPE",    { 770.0f, 239.0f, 270.0f,  80.0f }, { 782.0f, 227.0f, 104.0f, 14.0f } },
+        { "AMPLIFIER ENVELOPE", { 770.0f, 335.0f, 270.0f,  80.0f }, { 782.0f, 323.0f, 126.0f, 14.0f } },
         { "EFFECTS",            {   8.0f, 239.0f, 300.0f, 172.0f }, {  19.0f, 227.0f,  60.0f, 14.0f } },
-        { "ARP",                {   7.0f, 146.0f,  83.0f,  76.0f }, {  15.0f, 134.0f,  28.0f, 14.0f } }
+        { "ARP",                {   7.0f, 146.0f,  83.0f,  73.0f }, {  15.0f, 134.0f,  28.0f, 14.0f } }
     }};
 }
 } // namespace
@@ -498,31 +666,28 @@ void AdvancedVSTiAudioProcessorEditor::AccentLookAndFeel::drawRotarySlider (
                                        theme.knobBody.darker (0.55f), bounds.getCentreX(), bounds.getBottom(), false);
         g.setGradientFill (knobFill);
         g.fillEllipse (bounds);
-        g.setColour (juce::Colours::white.withAlpha (0.22f));
-        g.drawEllipse (bounds.reduced (1.0f), 1.0f);
+        g.setColour (juce::Colours::white.withAlpha (0.26f));
+        g.drawEllipse (bounds.reduced (1.0f), 3.0f);
         g.setColour (theme.trim.withAlpha (0.9f));
-        g.drawEllipse (bounds, 1.3f);
+        g.drawEllipse (bounds, 1.5f);
 
-        for (int index = 0; index < 21; ++index)
+        const float dotRingRadius = (radius * 1.06f) + 6.0f;
+        for (int index = 0; index < 29; ++index)
         {
-            const auto proportion = static_cast<float> (index) / 20.0f;
+            const auto proportion = static_cast<float> (index) / 28.0f;
             const auto tickAngle = rotaryStartAngle + (proportion * (rotaryEndAngle - rotaryStartAngle));
-            const auto innerPoint = centre.getPointOnCircumference (radius * 0.84f, tickAngle);
-            const auto outerPoint = centre.getPointOnCircumference (radius * 1.08f, tickAngle);
-            g.setColour ((index % 5 == 0) ? theme.legend.withAlpha (0.72f) : theme.trim.withAlpha (0.6f));
-            g.drawLine ({ innerPoint, outerPoint }, index % 5 == 0 ? 1.3f : 0.9f);
+            const auto dotCentre = centre.getPointOnCircumference (dotRingRadius, tickAngle);
+            const auto dotRadius = index % 7 == 0 ? radius * 0.065f : radius * 0.052f;
+            const auto dotBounds = juce::Rectangle<float> (dotRadius * 2.0f, dotRadius * 2.0f).withCentre (dotCentre);
+            g.setColour ((index % 7 == 0) ? theme.legend.withAlpha (0.88f) : theme.trim.withAlpha (0.74f));
+            g.fillEllipse (dotBounds);
         }
 
+        const float indicatorLength = (radius * 0.76f) + 1.0f;
         juce::Path indicator;
-        indicator.addRoundedRectangle (-1.9f, -radius * 0.74f, 3.8f, radius * 0.4f, 1.9f);
-        g.setColour (theme.knobCap.isTransparent() ? theme.text : theme.knobCap);
+        indicator.addRoundedRectangle (-2.05f, -indicatorLength, 4.1f, indicatorLength, 1.0f);
+        g.setColour ((theme.knobCap.isTransparent() ? theme.text : theme.knobCap).brighter (0.14f));
         g.fillPath (indicator, juce::AffineTransform::rotation (angle).translated (centre.x, centre.y));
-
-        const auto capRadius = radius * 0.22f;
-        g.setColour (theme.faceplate.brighter (0.2f));
-        g.fillEllipse (juce::Rectangle<float> (capRadius * 2.0f, capRadius * 2.0f).withCentre (centre));
-        g.setColour (juce::Colours::black.withAlpha (0.35f));
-        g.drawEllipse (juce::Rectangle<float> (capRadius * 2.0f, capRadius * 2.0f).withCentre (centre), 1.0f);
         return;
     }
 
@@ -930,9 +1095,34 @@ AdvancedVSTiAudioProcessorEditor::DrumPad::DrumPad (
     const juce::String& noteText)
     : lookAndFeel (lf)
 {
+    const bool compactVecPad = lf.theme.vecPadMachine;
+    auto configurePadSlider = [this, compactVecPad, &lf] (PreviewSlider& targetSlider, const juce::String& tooltip)
+    {
+        targetSlider.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
+        targetSlider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, compactVecPad ? 42 : (lf.theme.tribute909 ? 52 : 58), compactVecPad ? 16 : 20);
+        targetSlider.setLookAndFeel (&lookAndFeel);
+        targetSlider.setColour (juce::Slider::textBoxTextColourId, lf.theme.text);
+        targetSlider.setColour (juce::Slider::textBoxBackgroundColourId, lf.theme.tribute909 ? lf.theme.faceplate.brighter (0.08f) : lf.theme.panel.brighter (0.08f));
+        targetSlider.setColour (juce::Slider::textBoxOutlineColourId, lf.theme.tribute909 ? lf.theme.trim : lf.theme.panelEdge);
+        targetSlider.setColour (juce::Slider::textBoxHighlightColourId, lf.theme.accent.withAlpha (0.16f));
+        targetSlider.setMouseDragSensitivity (compactVecPad ? 190 : 160);
+        targetSlider.setTooltip (tooltip);
+        addAndMakeVisible (targetSlider);
+    };
+    auto configureFooterLabel = [this, compactVecPad, &lf] (juce::Label& label, const juce::String& text)
+    {
+        label.setText (text, juce::dontSendNotification);
+        label.setJustificationType (juce::Justification::centred);
+        label.setFont (juce::Font (juce::FontOptions { compactVecPad ? 8.0f : 8.8f, juce::Font::bold }));
+        label.setColour (juce::Label::textColourId, lf.theme.hint.brighter (0.4f));
+        label.setInterceptsMouseClicks (false, false);
+        label.setVisible (false);
+        addAndMakeVisible (label);
+    };
+
     titleLabel.setText (titleText, juce::dontSendNotification);
     titleLabel.setJustificationType (juce::Justification::centred);
-    titleLabel.setFont (juce::Font (juce::FontOptions { lf.theme.tribute909 ? 12.0f : 13.0f, juce::Font::bold }));
+    titleLabel.setFont (juce::Font (juce::FontOptions { compactVecPad ? 11.5f : (lf.theme.tribute909 ? 12.0f : 13.0f), juce::Font::bold }));
     titleLabel.setColour (juce::Label::textColourId, lf.theme.tribute909 ? lf.theme.legend : lf.theme.text);
     titleLabel.setMinimumHorizontalScale (0.7f);
     titleLabel.setInterceptsMouseClicks (false, false);
@@ -940,35 +1130,34 @@ AdvancedVSTiAudioProcessorEditor::DrumPad::DrumPad (
 
     noteLabel.setText (noteText, juce::dontSendNotification);
     noteLabel.setJustificationType (juce::Justification::centred);
-    noteLabel.setFont (juce::Font (juce::FontOptions { lf.theme.tribute909 ? 9.5f : 10.5f, juce::Font::plain }));
+    noteLabel.setFont (juce::Font (juce::FontOptions { compactVecPad ? 8.8f : (lf.theme.tribute909 ? 9.5f : 10.5f), juce::Font::plain }));
     noteLabel.setColour (juce::Label::textColourId, lf.theme.tribute909 ? lf.theme.panelEdge.darker (0.42f) : lf.theme.hint);
     noteLabel.setInterceptsMouseClicks (false, false);
     addAndMakeVisible (noteLabel);
 
     presetLabel.setJustificationType (juce::Justification::centred);
-    presetLabel.setFont (juce::Font (juce::FontOptions { lf.theme.vecPadMachine ? 9.5f : 9.0f, juce::Font::bold }));
+    presetLabel.setFont (juce::Font (juce::FontOptions { compactVecPad ? 8.3f : 9.0f, juce::Font::bold }));
     presetLabel.setColour (juce::Label::textColourId, lf.theme.accent.brighter (0.25f));
     presetLabel.setInterceptsMouseClicks (false, false);
     presetLabel.setVisible (false);
     addAndMakeVisible (presetLabel);
 
     sampleLabel.setJustificationType (juce::Justification::centred);
-    sampleLabel.setFont (juce::Font (juce::FontOptions { lf.theme.vecPadMachine ? 12.5f : 10.5f, juce::Font::bold }));
+    sampleLabel.setFont (juce::Font (juce::FontOptions { compactVecPad ? 10.8f : 10.5f, juce::Font::bold }));
     sampleLabel.setColour (juce::Label::textColourId, lf.theme.text);
-    sampleLabel.setMinimumHorizontalScale (0.66f);
+    sampleLabel.setMinimumHorizontalScale (compactVecPad ? 0.58f : 0.66f);
     sampleLabel.setInterceptsMouseClicks (false, false);
     sampleLabel.setVisible (false);
     addAndMakeVisible (sampleLabel);
 
-    slider.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
-    slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, lf.theme.tribute909 ? 52 : 58, 20);
-    slider.setLookAndFeel (&lookAndFeel);
-    slider.setColour (juce::Slider::textBoxTextColourId, lf.theme.text);
-    slider.setColour (juce::Slider::textBoxBackgroundColourId, lf.theme.tribute909 ? lf.theme.faceplate.brighter (0.08f) : lf.theme.panel.brighter (0.08f));
-    slider.setColour (juce::Slider::textBoxOutlineColourId, lf.theme.tribute909 ? lf.theme.trim : lf.theme.panelEdge);
-    slider.setColour (juce::Slider::textBoxHighlightColourId, lf.theme.accent.withAlpha (0.16f));
-    slider.setMouseDragSensitivity (160);
-    addAndMakeVisible (slider);
+    configurePadSlider (slider, compactVecPad ? "Click to audition, drag to set level" : "Drag to set level");
+    configurePadSlider (sustainSlider, "Click to audition, drag to set sustain time");
+    configurePadSlider (releaseSlider, "Click to audition, drag to set release time");
+    sustainSlider.setVisible (false);
+    releaseSlider.setVisible (false);
+    configureFooterLabel (levelLabel, "LVL");
+    configureFooterLabel (sustainLabel, "SUS");
+    configureFooterLabel (releaseLabel, "REL");
 
     auto configureButton = [this] (juce::TextButton& button)
     {
@@ -1032,7 +1221,7 @@ void AdvancedVSTiAudioProcessorEditor::DrumPad::paint (juce::Graphics& g)
         g.setColour (lookAndFeel.theme.panelEdge.withAlpha (0.9f));
         g.drawRoundedRectangle (shell, 16.0f, 1.2f);
 
-        auto padFace = shell.reduced (12.0f, 14.0f).withTrimmedTop (34.0f).withTrimmedBottom (58.0f);
+        auto padFace = shell.reduced (10.0f, 12.0f).withTrimmedTop (30.0f).withTrimmedBottom (showEnvelopeControls ? 82.0f : 50.0f);
         juce::ColourGradient faceFill (lookAndFeel.theme.panel.brighter (0.24f), padFace.getTopLeft(),
                                        lookAndFeel.theme.panel.darker (0.28f), padFace.getBottomRight(), false);
         g.setGradientFill (faceFill);
@@ -1084,23 +1273,66 @@ void AdvancedVSTiAudioProcessorEditor::DrumPad::setStepperEnabled (bool canStepL
     rightButton.setEnabled (canStepRight);
 }
 
+void AdvancedVSTiAudioProcessorEditor::DrumPad::setEnvelopeControlsVisible (bool shouldShowEnvelopeControls)
+{
+    showEnvelopeControls = shouldShowEnvelopeControls;
+    sustainSlider.setVisible (shouldShowEnvelopeControls);
+    releaseSlider.setVisible (shouldShowEnvelopeControls);
+    levelLabel.setVisible (shouldShowEnvelopeControls);
+    sustainLabel.setVisible (shouldShowEnvelopeControls);
+    releaseLabel.setVisible (shouldShowEnvelopeControls);
+    resized();
+}
+
 void AdvancedVSTiAudioProcessorEditor::DrumPad::resized()
 {
-    auto area = getLocalBounds().reduced (lookAndFeel.theme.tribute909 ? 8 : 12);
-    titleLabel.setBounds (area.removeFromTop (lookAndFeel.theme.tribute909 ? 18 : 20));
-    noteLabel.setBounds (area.removeFromTop (lookAndFeel.theme.tribute909 ? 12 : 16));
+    const bool compactVecPad = lookAndFeel.theme.vecPadMachine;
+    auto area = getLocalBounds().reduced (lookAndFeel.theme.tribute909 ? 8 : (compactVecPad ? 8 : 12));
+    titleLabel.setBounds (area.removeFromTop (lookAndFeel.theme.tribute909 ? 18 : (compactVecPad ? 18 : 20)));
+    noteLabel.setBounds (area.removeFromTop (lookAndFeel.theme.tribute909 ? 12 : (compactVecPad ? 12 : 16)));
 
     if (showStepper)
     {
-        area.removeFromTop (4);
-        presetLabel.setBounds (area.removeFromTop (14));
-        sampleLabel.setBounds (area.removeFromTop (24));
-        auto footer = area.removeFromBottom (54);
-        auto buttonArea = footer.removeFromLeft (64);
-        leftButton.setBounds (buttonArea.removeFromLeft (28));
-        buttonArea.removeFromLeft (8);
-        rightButton.setBounds (buttonArea.removeFromLeft (28));
-        slider.setBounds (footer.removeFromRight (70).reduced (0, 2));
+        area.removeFromTop (compactVecPad ? 2 : 4);
+        presetLabel.setBounds (area.removeFromTop (compactVecPad ? 12 : 14));
+        sampleLabel.setBounds (area.removeFromTop (compactVecPad ? 18 : 24));
+        auto footer = area.removeFromBottom (showEnvelopeControls ? (compactVecPad ? 86 : 96) : (compactVecPad ? 46 : 54));
+
+        if (showEnvelopeControls)
+        {
+            auto stepperRow = footer.removeFromTop (compactVecPad ? 18 : 22);
+            auto buttonArea = juce::Rectangle<int> (compactVecPad ? 52 : 64, stepperRow.getHeight()).withCentre (stepperRow.getCentre());
+            leftButton.setBounds (buttonArea.removeFromLeft (compactVecPad ? 22 : 28));
+            buttonArea.removeFromLeft (compactVecPad ? 6 : 8);
+            rightButton.setBounds (buttonArea.removeFromLeft (compactVecPad ? 22 : 28));
+
+            footer.removeFromTop (compactVecPad ? 10 : 12);
+            auto sliderArea = footer.reduced (compactVecPad ? 0 : 2, 0);
+            const int spacing = compactVecPad ? 4 : 6;
+            const int sliderWidth = (sliderArea.getWidth() - (spacing * 2)) / 3;
+            auto layoutSliderWithLabel = [] (juce::Rectangle<int> bounds, juce::Label& label, PreviewSlider& targetSlider)
+            {
+                auto labelBounds = bounds.removeFromTop (10);
+                label.setBounds (labelBounds);
+                targetSlider.setBounds (bounds);
+            };
+
+            auto levelArea = sliderArea.removeFromLeft (sliderWidth);
+            layoutSliderWithLabel (levelArea, levelLabel, slider);
+            sliderArea.removeFromLeft (spacing);
+            auto sustainArea = sliderArea.removeFromLeft (sliderWidth);
+            layoutSliderWithLabel (sustainArea, sustainLabel, sustainSlider);
+            sliderArea.removeFromLeft (spacing);
+            layoutSliderWithLabel (sliderArea, releaseLabel, releaseSlider);
+        }
+        else
+        {
+            auto buttonArea = footer.removeFromLeft (compactVecPad ? 52 : 64);
+            leftButton.setBounds (buttonArea.removeFromLeft (compactVecPad ? 22 : 28));
+            buttonArea.removeFromLeft (compactVecPad ? 6 : 8);
+            rightButton.setBounds (buttonArea.removeFromLeft (compactVecPad ? 22 : 28));
+            slider.setBounds (footer.removeFromRight (compactVecPad ? 60 : 70).reduced (0, compactVecPad ? 1 : 2));
+        }
         return;
     }
 
@@ -1108,8 +1340,13 @@ void AdvancedVSTiAudioProcessorEditor::DrumPad::resized()
     sampleLabel.setBounds ({});
     leftButton.setBounds ({});
     rightButton.setBounds ({});
-    area.removeFromTop (lookAndFeel.theme.tribute909 ? 0 : 2);
-    slider.setBounds (area.reduced (lookAndFeel.theme.tribute909 ? 2 : 6, 0));
+    levelLabel.setBounds ({});
+    sustainLabel.setBounds ({});
+    releaseLabel.setBounds ({});
+    sustainSlider.setBounds ({});
+    releaseSlider.setBounds ({});
+    area.removeFromTop (lookAndFeel.theme.tribute909 ? 0 : (compactVecPad ? 1 : 2));
+    slider.setBounds (area.reduced (lookAndFeel.theme.tribute909 ? 2 : (compactVecPad ? 4 : 6), 0));
 }
 
 AdvancedVSTiAudioProcessorEditor::AdvancedVSTiAudioProcessorEditor (AdvancedVSTiAudioProcessor& p)
@@ -1216,6 +1453,10 @@ AdvancedVSTiAudioProcessorEditor::AdvancedVSTiAudioProcessorEditor (AdvancedVSTi
 
 void AdvancedVSTiAudioProcessorEditor::buildEditor()
 {
+    const auto choiceSpecs = buildChoiceSpecs();
+    const auto knobSpecs = buildKnobSpecs();
+    const auto drumPadSpecs = buildDrumPadSpecs();
+
     badgeLabel.setText (isTribute303() ? "ACID BASS LINE EMULATOR TRIBUTE"
                                        : (isTribute909() ? "RHYTHM COMPOSER TRIBUTE"
                                                          : (isTributeVirus() ? "ACCESS-STYLE MAIN SYNTH" : audioProcessor.getName())),
@@ -1246,16 +1487,26 @@ void AdvancedVSTiAudioProcessorEditor::buildEditor()
         subtitleLabel.setVisible (false);
     }
 
-    for (const auto& spec : buildChoiceSpecs())
+    for (const auto& spec : choiceSpecs)
     {
         auto* card = choiceCards.add (new ChoiceCard (theme, spec));
         for (int index = 0; index < spec.values.size(); ++index)
             card->combo.addItem (spec.values[index], index + 1);
         comboAttachments.push_back (std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (audioProcessor.apvts, spec.paramId, card->combo));
+        if (isTributeVirus())
+        {
+            const auto priorOnChange = card->combo.onChange;
+            card->combo.onChange = [this, priorOnChange, paramId = spec.paramId, title = spec.title]
+            {
+                if (priorOnChange != nullptr)
+                    priorOnChange();
+                showVirusOsdForParam (paramId, title);
+            };
+        }
         addAndMakeVisible (card);
     }
 
-    for (const auto& spec : buildKnobSpecs())
+    for (const auto& spec : knobSpecs)
     {
         auto* card = knobCards.add (new KnobCard (lookAndFeel, spec.title, spec.hint,
                                                   usesDrumPadLayout() || isTributeVirus(),
@@ -1268,6 +1519,13 @@ void AdvancedVSTiAudioProcessorEditor::buildEditor()
             };
         }
         sliderAttachments.push_back (std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (audioProcessor.apvts, spec.paramId, card->slider));
+        if (isTributeVirus())
+        {
+            card->slider.onValueChange = [this, paramId = spec.paramId, title = spec.title, hint = spec.hint]
+            {
+                showVirusOsdForParam (paramId, title, hint);
+            };
+        }
         if (spec.toggleParamId.isNotEmpty())
         {
             if (auto* toggleButton = card->getToggleButton())
@@ -1279,7 +1537,7 @@ void AdvancedVSTiAudioProcessorEditor::buildEditor()
     if (usesDrumPadLayout() && ! isTribute909())
     {
         int padIndex = 0;
-        for (const auto& spec : buildDrumPadSpecs())
+        for (const auto& spec : drumPadSpecs)
         {
             auto* pad = drumPads.add (new DrumPad (lookAndFeel, spec.title, spec.note));
             pad->onPreviewRequested = [this, midiNote = spec.midiNote]
@@ -1287,9 +1545,12 @@ void AdvancedVSTiAudioProcessorEditor::buildEditor()
                 audioProcessor.previewDrumPad (midiNote);
             };
             pad->slider.onPreviewRequested = pad->onPreviewRequested;
+            pad->sustainSlider.onPreviewRequested = pad->onPreviewRequested;
+            pad->releaseSlider.onPreviewRequested = pad->onPreviewRequested;
             if (audioProcessor.isVec1DrumPadFlavor())
             {
                 pad->setStepperVisible (true);
+                pad->setEnvelopeControlsVisible (true);
                 pad->onStepLeftRequested = [this, padIndex, midiNote = spec.midiNote]
                 {
                     audioProcessor.stepExternalPadSample (padIndex, -1);
@@ -1303,7 +1564,16 @@ void AdvancedVSTiAudioProcessorEditor::buildEditor()
                     syncExternalPadDisplays();
                 };
             }
-            sliderAttachments.push_back (std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (audioProcessor.apvts, spec.paramId, pad->slider));
+            else
+            {
+                pad->setEnvelopeControlsVisible (false);
+            }
+
+            sliderAttachments.push_back (std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (audioProcessor.apvts, spec.levelParamId, pad->slider));
+            if (spec.sustainParamId.isNotEmpty())
+                sliderAttachments.push_back (std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (audioProcessor.apvts, spec.sustainParamId, pad->sustainSlider));
+            if (spec.releaseParamId.isNotEmpty())
+                sliderAttachments.push_back (std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (audioProcessor.apvts, spec.releaseParamId, pad->releaseSlider));
             addAndMakeVisible (pad);
             ++padIndex;
         }
@@ -1333,8 +1603,51 @@ void AdvancedVSTiAudioProcessorEditor::buildEditor()
             addAndMakeVisible (*virusBackgroundToggle);
         }
 
+        if (virusKeyboardToggle == nullptr)
+        {
+            virusKeyboardToggle = std::make_unique<LedToggleButton> (theme, "KB", true);
+            virusKeyboardToggle->setScale (0.82f);
+            virusKeyboardToggle->setTooltip ("Show or hide the preview keyboard");
+            virusKeyboardToggle->onClick = [this]
+            {
+                if (virusKeyboardToggle != nullptr)
+                {
+                    virusKeyboardVisible = virusKeyboardToggle->getToggleState();
+                    if (virusKeyboard != nullptr)
+                        virusKeyboard->setVisible (virusKeyboardVisible);
+                    setResizeLimits (kVirusTemplateWidth,
+                                     kVirusTemplateHeight + (virusKeyboardVisible ? kVirusKeyboardExtraHeight : 0),
+                                     kVirusTemplateWidth,
+                                     kVirusTemplateHeight + (virusKeyboardVisible ? kVirusKeyboardExtraHeight : 0));
+                    setSize (kVirusTemplateWidth, kVirusTemplateHeight + (virusKeyboardVisible ? kVirusKeyboardExtraHeight : 0));
+                    resized();
+                    repaint();
+                }
+            };
+            addAndMakeVisible (*virusKeyboardToggle);
+        }
+
+        if (virusKeyboard == nullptr)
+        {
+            virusKeyboard = std::make_unique<juce::MidiKeyboardComponent> (audioProcessor.getKeyboardState(),
+                                                                           juce::MidiKeyboardComponent::horizontalKeyboard);
+            virusKeyboard->setKeyWidth (18.0f);
+            virusKeyboard->setAvailableRange (24, 96);
+            virusKeyboard->setWantsKeyboardFocus (false);
+            virusKeyboard->setScrollButtonsVisible (false);
+            virusKeyboard->setColour (juce::MidiKeyboardComponent::whiteNoteColourId, juce::Colour::fromRGB (232, 236, 242));
+            virusKeyboard->setColour (juce::MidiKeyboardComponent::blackNoteColourId, juce::Colour::fromRGB (34, 38, 44));
+            virusKeyboard->setColour (juce::MidiKeyboardComponent::keySeparatorLineColourId, juce::Colour::fromRGB (92, 102, 118));
+            virusKeyboard->setColour (juce::MidiKeyboardComponent::mouseOverKeyOverlayColourId, theme.accent.withAlpha (0.22f));
+            virusKeyboard->setColour (juce::MidiKeyboardComponent::keyDownOverlayColourId, theme.accent.withAlpha (0.52f));
+            addAndMakeVisible (*virusKeyboard);
+        }
+
         virusBackgroundToggle->setToggleState (virusShowBackground, juce::dontSendNotification);
+        virusKeyboardToggle->setToggleState (virusKeyboardVisible, juce::dontSendNotification);
         virusBackgroundToggle->setVisible (virusTemplateImage.isValid());
+        virusKeyboardToggle->setVisible (true);
+        virusKeyboard->setVisible (virusKeyboardVisible);
     }
 }
 
@@ -1362,7 +1675,19 @@ bool AdvancedVSTiAudioProcessorEditor::usesDrumPadLayout() const noexcept
 void AdvancedVSTiAudioProcessorEditor::timerCallback()
 {
     if (isTributeVirus())
+    {
         syncVirusPanelButtons();
+        if (! virusOsdPinned
+            && virusOsdUntilMs > 0.0
+            && juce::Time::getMillisecondCounterHiRes() > virusOsdUntilMs)
+        {
+            virusOsdUntilMs = 0.0;
+            virusOsdTitle.clear();
+            virusOsdValue.clear();
+            virusOsdDetail.clear();
+            repaint();
+        }
+    }
 
     if (audioProcessor.isVec1DrumPadFlavor())
         syncExternalPadDisplays();
@@ -1380,6 +1705,640 @@ void AdvancedVSTiAudioProcessorEditor::syncExternalPadDisplays()
         drumPads[index]->setSampleInfo (state.preset, state.sample);
         drumPads[index]->setStepperEnabled (state.canStepLeft, state.canStepRight);
     }
+}
+
+void AdvancedVSTiAudioProcessorEditor::showVirusOsdMessage (const juce::String& title,
+                                                            const juce::String& value,
+                                                            const juce::String& detail,
+                                                            bool pinned,
+                                                            double lifetimeMs)
+{
+    if (! isTributeVirus())
+        return;
+
+    virusOsdTitle = title;
+    virusOsdValue = value;
+    virusOsdDetail = detail;
+    virusOsdPinned = pinned;
+    virusOsdUntilMs = juce::Time::getMillisecondCounterHiRes() + lifetimeMs;
+    repaint();
+}
+
+void AdvancedVSTiAudioProcessorEditor::showVirusOsdForParam (const juce::String& paramId,
+                                                             const juce::String& titleOverride,
+                                                             const juce::String& detail,
+                                                             bool pinned,
+                                                             double lifetimeMs)
+{
+    if (! isTributeVirus())
+        return;
+
+    if (paramId == "PRESET")
+    {
+        virusActivePresetMenu = true;
+        refreshVirusValueKnobBindings();
+        refreshVirusPresetOsd();
+        return;
+    }
+
+    if (auto* parameter = dynamic_cast<juce::RangedAudioParameter*> (audioProcessor.apvts.getParameter (paramId)))
+    {
+        juce::String valueText;
+        if (auto* choice = dynamic_cast<juce::AudioParameterChoice*> (parameter))
+        {
+            const auto choiceIndex = juce::jlimit (0, choice->choices.size() - 1, choice->getIndex());
+            valueText = choice->choices[choiceIndex];
+        }
+        else if (auto* toggle = dynamic_cast<juce::AudioParameterBool*> (parameter))
+        {
+            valueText = toggle->get() ? "ON" : "OFF";
+        }
+        else
+        {
+            valueText = parameter->getCurrentValueAsText();
+            if (valueText.isEmpty())
+                valueText = parameter->getText (parameter->getValue(), 24);
+        }
+
+        const auto title = titleOverride.isNotEmpty() ? titleOverride : parameter->getName (36);
+        showVirusOsdMessage (title, valueText, detail, pinned, lifetimeMs);
+    }
+}
+
+void AdvancedVSTiAudioProcessorEditor::refreshVirusMatrixMenuOsd()
+{
+    if (! isTributeVirus())
+        return;
+
+    const auto slotIndex = juce::jlimit (0, 5, virusActiveMatrixMenu >= 0 ? virusActiveMatrixMenu : virusMatrixSlotIndex);
+    const auto targetIndex = juce::jlimit (0, 2, virusMatrixTargetIndex);
+
+    const auto value = "SRC "
+                       + parameterValueText (audioProcessor.apvts, virusMatrixSourceParamId (slotIndex))
+                       + "   AMT "
+                       + parameterValueText (audioProcessor.apvts, virusMatrixAmountParamId (slotIndex, targetIndex))
+                       + "   DEST "
+                       + parameterValueText (audioProcessor.apvts, virusMatrixDestinationParamId (slotIndex, targetIndex));
+
+    showVirusOsdMessage ("MATRIX SLOT " + juce::String (slotIndex + 1),
+                         value,
+                         "V1 SOURCE   V2 AMOUNT   V3 DEST   DESTINATION selects row "
+                             + juce::String (targetIndex + 1),
+                         true,
+                         60000.0);
+}
+
+void AdvancedVSTiAudioProcessorEditor::refreshVirusLfoMenuOsd()
+{
+    if (! isTributeVirus())
+        return;
+
+    const auto lfoIndex = juce::jlimit (0, 2, virusActiveLfoMenu >= 0 ? virusActiveLfoMenu : virusModulatorIndex);
+
+    juce::String amountText = "0";
+    juce::String rateText = "0";
+    auto destinationText = parameterValueText (audioProcessor.apvts, virusLfoDestinationParamId (lfoIndex));
+    bool envMode = false;
+    if (auto* amountParam = dynamic_cast<juce::RangedAudioParameter*> (audioProcessor.apvts.getParameter (virusLfoAmountParamId (lfoIndex))))
+    {
+        amountText = amountParam->getCurrentValueAsText();
+        if (amountText.isEmpty())
+            amountText = amountParam->getText (amountParam->getValue(), 24);
+    }
+    if (auto* rateParam = dynamic_cast<juce::RangedAudioParameter*> (audioProcessor.apvts.getParameter (virusLfoRateParamId (lfoIndex))))
+    {
+        rateText = rateParam->getCurrentValueAsText();
+        if (rateText.isEmpty())
+            rateText = rateParam->getText (rateParam->getValue(), 24);
+    }
+    if (auto* envModeParam = dynamic_cast<juce::AudioParameterBool*> (audioProcessor.apvts.getParameter (virusLfoEnvModeParamId (lfoIndex))))
+        envMode = envModeParam->get();
+    if (destinationText.equalsIgnoreCase ("ASSIGN"))
+        destinationText = parameterValueText (audioProcessor.apvts, virusLfoAssignDestinationParamId (lfoIndex));
+
+    const auto value = juce::String ("AMT ")
+                       + amountText
+                       + "   RATE "
+                       + rateText
+                       + "   DEST "
+                       + destinationText;
+    const auto detail = juce::String ("V1 AMOUNT   V2 RATE   V3 DESTINATION   ENV ")
+                        + (envMode ? "NOTE" : "FREE");
+
+    showVirusOsdMessage ("LFO " + juce::String (lfoIndex + 1), value, detail, true, 60000.0);
+}
+
+void AdvancedVSTiAudioProcessorEditor::refreshVirusOscMenuOsd()
+{
+    if (! isTributeVirus())
+        return;
+
+    const auto oscIndex = juce::jlimit (0, 2, virusActiveOscMenu >= 0 ? virusActiveOscMenu : virusOscillatorIndex);
+
+    auto oscWaveParamId = [oscIndex] () -> juce::String
+    {
+        switch (oscIndex)
+        {
+            case 1: return "OSC2TYPE";
+            case 2: return "OSC3TYPE";
+            default: return "OSCTYPE";
+        }
+    }();
+
+    auto oscShapeParamId = [oscIndex] () -> juce::String
+    {
+        switch (oscIndex)
+        {
+            case 1: return "OSC2PW";
+            case 2: return "OSC3PW";
+            default: return "OSC1PW";
+        }
+    }();
+
+    auto oscSemiParamId = [oscIndex] () -> juce::String
+    {
+        switch (oscIndex)
+        {
+            case 1: return "OSC2SEMITONE";
+            case 2: return "OSC3SEMITONE";
+            default: return "OSC1SEMITONE";
+        }
+    }();
+
+    const auto value = "WAVE "
+                       + parameterValueText (audioProcessor.apvts, oscWaveParamId)
+                       + "   SHAPE "
+                       + parameterValueText (audioProcessor.apvts, oscShapeParamId)
+                       + "   SEMI "
+                       + parameterValueText (audioProcessor.apvts, oscSemiParamId);
+
+    showVirusOsdMessage ("OSC " + juce::String (oscIndex + 1),
+                         value,
+                         "V1 WAVE   V2 SHAPE / PW   V3 SEMITONE",
+                         true,
+                         60000.0);
+}
+
+void AdvancedVSTiAudioProcessorEditor::refreshVirusFilterMenuOsd()
+{
+    if (! isTributeVirus())
+        return;
+
+    const auto pageIndex = juce::jlimit (0, 2, virusActiveFilterMenu >= 0 ? virusActiveFilterMenu : virusFilterEditIndex);
+
+    if (pageIndex < 2)
+    {
+        const auto typeParamId = pageIndex == 0 ? "FILTERTYPE" : "FILTER2TYPE";
+        const auto slopeParamId = pageIndex == 0 ? "FILTERSLOPE" : "FILTER2SLOPE";
+        const auto enableParamId = pageIndex == 0 ? "FILTER1ENABLE" : "FILTER2ENABLE";
+        const auto value = "TYPE "
+                           + parameterValueText (audioProcessor.apvts, typeParamId)
+                           + "   SLOPE "
+                           + parameterValueText (audioProcessor.apvts, slopeParamId)
+                           + "   ENABLE "
+                           + parameterValueText (audioProcessor.apvts, enableParamId);
+
+        showVirusOsdMessage ("FILTER " + juce::String (pageIndex + 1),
+                             value,
+                             "V1 TYPE   V2 SLOPE   V3 ENABLE",
+                             true,
+                             60000.0);
+        return;
+    }
+
+    const auto value = "BAL "
+                       + parameterValueText (audioProcessor.apvts, "FILTERBALANCE")
+                       + "   ENV "
+                       + parameterValueText (audioProcessor.apvts, "FILTERENVAMOUNT")
+                       + "   CUT2 "
+                       + parameterValueText (audioProcessor.apvts, "CUTOFF2");
+
+    showVirusOsdMessage ("FILTER COMMON",
+                         value,
+                         "V1 BALANCE   V2 ENV AMT   V3 CUTOFF 2",
+                         true,
+                         60000.0);
+}
+
+void AdvancedVSTiAudioProcessorEditor::refreshVirusFxMenuOsd (bool lowerSection)
+{
+    if (! isTributeVirus())
+        return;
+
+    if (lowerSection)
+    {
+        const auto effectIndex = juce::jlimit (0, static_cast<int> (kVirusLowerFxLabels.size()) - 1, virusLowerFxLegendIndex);
+        const auto value = "TYPE "
+                           + parameterValueText (audioProcessor.apvts, "FXTYPE")
+                           + "   MIX "
+                           + parameterValueText (audioProcessor.apvts, "FXMIX")
+                           + "   INT "
+                           + parameterValueText (audioProcessor.apvts, "FXINTENSITY");
+
+        showVirusOsdMessage (kVirusLowerFxLabels[static_cast<size_t> (effectIndex)],
+                             value,
+                             "V1 TYPE   V2 MIX   V3 INTENSITY",
+                             true,
+                             60000.0);
+        return;
+    }
+
+    const auto effectIndex = juce::jlimit (0, static_cast<int> (kVirusUpperFxLabels.size()) - 1, virusUpperFxLegendIndex);
+    const auto effectLabel = kVirusUpperFxLabels[static_cast<size_t> (effectIndex)];
+
+    if (effectIndex == 0)
+    {
+        const auto value = "SEND "
+                           + parameterValueText (audioProcessor.apvts, "DELAYSEND")
+                           + "   TIME "
+                           + parameterValueText (audioProcessor.apvts, "DELAYTIME")
+                           + "   FEEDBACK "
+                           + parameterValueText (audioProcessor.apvts, "DELAYFEEDBACK");
+        showVirusOsdMessage (effectLabel,
+                             value,
+                             "V1 SEND   V2 TIME   V3 FEEDBACK",
+                             true,
+                             60000.0);
+        return;
+    }
+
+    if (effectIndex == 1)
+    {
+        const auto value = "MIX "
+                           + parameterValueText (audioProcessor.apvts, "REVERBMIX")
+                           + "   TIME "
+                           + parameterValueText (audioProcessor.apvts, "REVERBTIME")
+                           + "   DAMP "
+                           + parameterValueText (audioProcessor.apvts, "REVERBDAMP");
+        showVirusOsdMessage (effectLabel,
+                             value,
+                             "V1 MIX   V2 TIME   V3 DAMP",
+                             true,
+                             60000.0);
+        return;
+    }
+
+    if (effectIndex == 2)
+    {
+        const auto value = "GAIN "
+                           + parameterValueText (audioProcessor.apvts, "LOWEQGAIN")
+                           + "   FREQ "
+                           + parameterValueText (audioProcessor.apvts, "LOWEQFREQ")
+                           + "   Q "
+                           + parameterValueText (audioProcessor.apvts, "LOWEQQ");
+        showVirusOsdMessage (effectLabel, value, "V1 GAIN   V2 FREQ   V3 Q", true, 60000.0);
+        return;
+    }
+
+    if (effectIndex == 3)
+    {
+        const auto value = "GAIN "
+                           + parameterValueText (audioProcessor.apvts, "MIDEQGAIN")
+                           + "   FREQ "
+                           + parameterValueText (audioProcessor.apvts, "MIDEQFREQ")
+                           + "   Q "
+                           + parameterValueText (audioProcessor.apvts, "MIDEQQ");
+        showVirusOsdMessage (effectLabel, value, "V1 GAIN   V2 FREQ   V3 Q", true, 60000.0);
+        return;
+    }
+
+    const auto value = "GAIN "
+                       + parameterValueText (audioProcessor.apvts, "HIGHEQGAIN")
+                       + "   FREQ "
+                       + parameterValueText (audioProcessor.apvts, "HIGHEQFREQ")
+                       + "   Q "
+                       + parameterValueText (audioProcessor.apvts, "HIGHEQQ");
+    showVirusOsdMessage (effectLabel, value, "V1 GAIN   V2 FREQ   V3 Q", true, 60000.0);
+}
+
+void AdvancedVSTiAudioProcessorEditor::refreshVirusArpMenuOsd()
+{
+    if (! isTributeVirus())
+        return;
+
+    const auto value = "ON "
+                       + parameterValueText (audioProcessor.apvts, "ARPENABLE")
+                       + "   MODE "
+                       + parameterValueText (audioProcessor.apvts, "ARPMODE")
+                       + "   RATE "
+                       + parameterValueText (audioProcessor.apvts, "ARPRATE");
+
+    showVirusOsdMessage ("ARPEGGIATOR",
+                         value,
+                         "V1 ON / OFF   V2 MODE   V3 RATE",
+                         true,
+                         60000.0);
+}
+
+void AdvancedVSTiAudioProcessorEditor::refreshVirusPresetOsd()
+{
+    if (! isTributeVirus())
+        return;
+
+    const auto presetIndex = audioProcessor.getCurrentProgram();
+    auto presetName = audioProcessor.getProgramName (presetIndex);
+    if (presetName.isEmpty())
+        presetName = "Init Preset";
+
+    showVirusOsdMessage (virusPanelModeIndex == 1 ? "MULTI" : "SINGLE",
+                         presetName,
+                         "PRESET "
+                             + juce::String (presetIndex + 1).paddedLeft ('0', 3)
+                             + " / "
+                             + juce::String (juce::jmax (1, audioProcessor.getNumPrograms())).paddedLeft ('0', 3)
+                             + "   VALUE 1-3 / PART < >",
+                         true,
+                         60000.0);
+}
+
+void AdvancedVSTiAudioProcessorEditor::clearVirusLfoMenu (bool clearOsd)
+{
+    virusActiveMatrixMenu = -1;
+    virusActiveLfoMenu = -1;
+    virusActiveOscMenu = -1;
+    virusActiveFilterMenu = -1;
+    virusActiveFxMenu = -1;
+    virusActivePresetMenu = false;
+    virusActiveArpMenu = false;
+    virusOsdPinned = false;
+    refreshVirusValueKnobBindings();
+
+    if (clearOsd)
+    {
+        virusOsdUntilMs = 0.0;
+        virusOsdTitle.clear();
+        virusOsdValue.clear();
+        virusOsdDetail.clear();
+        repaint();
+    }
+}
+
+void AdvancedVSTiAudioProcessorEditor::refreshVirusValueKnobBindings()
+{
+    if (! isTributeVirus() || knobCards.size() <= 32 || sliderAttachments.size() <= 32)
+        return;
+
+    auto rangedParameter = [this] (const juce::String& paramId) -> juce::RangedAudioParameter*
+    {
+        return dynamic_cast<juce::RangedAudioParameter*> (audioProcessor.apvts.getParameter (paramId));
+    };
+
+    auto bindParamKnob = [this, rangedParameter] (int knobIndex,
+                                                  const juce::String& paramId,
+                                                  const juce::String& title,
+                                                  const juce::String& hint)
+    {
+        if (! juce::isPositiveAndBelow (knobIndex, knobCards.size()) || ! juce::isPositiveAndBelow (knobIndex, static_cast<int> (sliderAttachments.size())))
+            return;
+
+        if (auto* parameter = rangedParameter (paramId))
+            knobCards[knobIndex]->slider.setValue (parameter->convertFrom0to1 (parameter->getValue()), juce::dontSendNotification);
+
+        sliderAttachments[static_cast<size_t> (knobIndex)] =
+            std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (audioProcessor.apvts,
+                                                                                     paramId,
+                                                                                     knobCards[knobIndex]->slider);
+        knobCards[knobIndex]->slider.setTooltip (buildControlTooltip (title, hint));
+        knobCards[knobIndex]->slider.onValueChange = [this, paramId, title, hint]
+        {
+            showVirusOsdForParam (paramId, title, hint);
+        };
+    };
+
+    auto bindMenuKnob = [this] (int knobIndex,
+                                double minValue,
+                                double maxValue,
+                                double interval,
+                                double currentValue,
+                                const juce::String& tooltip,
+                                std::function<void (double)> onChange)
+    {
+        if (! juce::isPositiveAndBelow (knobIndex, knobCards.size()) || ! juce::isPositiveAndBelow (knobIndex, static_cast<int> (sliderAttachments.size())))
+            return;
+
+        sliderAttachments[static_cast<size_t> (knobIndex)].reset();
+        auto& slider = knobCards[knobIndex]->slider;
+        slider.onValueChange = nullptr;
+        slider.setRange (minValue, maxValue, interval);
+        slider.setValue (currentValue, juce::dontSendNotification);
+        slider.setTooltip (tooltip);
+        slider.onValueChange = [safeThis = juce::Component::SafePointer<AdvancedVSTiAudioProcessorEditor> (this),
+                                knobIndex,
+                                onChange = std::move (onChange)]() mutable
+        {
+            if (safeThis == nullptr || onChange == nullptr)
+                return;
+
+            onChange (safeThis->knobCards[knobIndex]->slider.getValue());
+        };
+    };
+
+    if (virusActiveMatrixMenu >= 0)
+    {
+        const auto slotIndex = juce::jlimit (0, 5, virusActiveMatrixMenu);
+        const auto targetIndex = juce::jlimit (0, 2, virusMatrixTargetIndex);
+
+        bindParamKnob (30, virusMatrixSourceParamId (slotIndex), "Value 1", "Selected matrix source");
+        bindParamKnob (31, virusMatrixAmountParamId (slotIndex, targetIndex), "Value 2", "Selected matrix amount");
+        bindParamKnob (32, virusMatrixDestinationParamId (slotIndex, targetIndex), "Value 3", "Selected matrix destination");
+
+        knobCards[30]->slider.onValueChange = [this] { refreshVirusMatrixMenuOsd(); };
+        knobCards[31]->slider.onValueChange = [this] { refreshVirusMatrixMenuOsd(); };
+        knobCards[32]->slider.onValueChange = [this] { refreshVirusMatrixMenuOsd(); };
+        return;
+    }
+
+    if (virusActiveLfoMenu >= 0)
+    {
+        const auto lfoIndex = juce::jlimit (0, 2, virusActiveLfoMenu);
+        const auto amountParamId = virusLfoAmountParamId (lfoIndex);
+        const auto rateParamId = virusLfoRateParamId (lfoIndex);
+
+        double amountStart = 0.0;
+        double amountEnd = 1.0;
+        double amountInterval = 0.0;
+        double amountValue = 0.0;
+        if (auto* amountParam = dynamic_cast<juce::RangedAudioParameter*> (audioProcessor.apvts.getParameter (amountParamId)))
+        {
+            const auto range = amountParam->getNormalisableRange();
+            amountStart = range.start;
+            amountEnd = range.end;
+            amountInterval = range.interval;
+            amountValue = amountParam->convertFrom0to1 (amountParam->getValue());
+        }
+
+        double rateStart = 0.0;
+        double rateEnd = 1.0;
+        double rateInterval = 0.0;
+        double rateValue = 0.0;
+        if (auto* rateParam = dynamic_cast<juce::RangedAudioParameter*> (audioProcessor.apvts.getParameter (rateParamId)))
+        {
+            const auto range = rateParam->getNormalisableRange();
+            rateStart = range.start;
+            rateEnd = range.end;
+            rateInterval = range.interval;
+            rateValue = rateParam->convertFrom0to1 (rateParam->getValue());
+        }
+
+        double destinationValue = 0.0;
+        if (auto* destinationParam = dynamic_cast<juce::AudioParameterChoice*> (audioProcessor.apvts.getParameter (virusLfoDestinationParamId (lfoIndex))))
+            destinationValue = static_cast<double> (destinationParam->getIndex());
+
+        bindMenuKnob (30, amountStart, amountEnd, amountInterval, amountValue,
+                      buildControlTooltip ("Value 1", "Set LFO " + juce::String (lfoIndex + 1) + " amount"),
+                      [this, lfoIndex] (double rawValue)
+                      {
+                          setParameterActualValue (audioProcessor.apvts, virusLfoAmountParamId (lfoIndex), static_cast<float> (rawValue));
+                          setParameterActualValue (audioProcessor.apvts, virusLfoEnableParamId (lfoIndex), std::abs (rawValue) > 0.0001 ? 1.0f : 0.0f);
+                          syncVirusPanelButtons();
+                          refreshVirusLfoMenuOsd();
+                      });
+
+        bindMenuKnob (31, rateStart, rateEnd, rateInterval, rateValue,
+                      buildControlTooltip ("Value 2", "Set LFO " + juce::String (lfoIndex + 1) + " rate"),
+                      [this, lfoIndex] (double rawValue)
+                      {
+                          setParameterActualValue (audioProcessor.apvts, virusLfoRateParamId (lfoIndex), static_cast<float> (rawValue));
+                          refreshVirusLfoMenuOsd();
+                      });
+
+        bindMenuKnob (32, 0.0, static_cast<double> (kVirusModDestinationLabels.size() - 1), 1.0,
+                      destinationValue,
+                      buildControlTooltip ("Value 3", "Cycle LFO " + juce::String (lfoIndex + 1) + " destination"),
+                      [this, lfoIndex] (double rawValue)
+                      {
+                          setParameterActualValue (audioProcessor.apvts,
+                                                   virusLfoDestinationParamId (lfoIndex),
+                                                   static_cast<float> (juce::roundToInt (rawValue)));
+                          syncVirusPanelButtons();
+                          refreshVirusLfoMenuOsd();
+                          repaint();
+                      });
+        return;
+    }
+
+    if (virusActiveOscMenu >= 0)
+    {
+        const auto oscIndex = juce::jlimit (0, 2, virusActiveOscMenu);
+        const auto waveParamId = oscIndex == 0 ? "OSCTYPE" : (oscIndex == 1 ? "OSC2TYPE" : "OSC3TYPE");
+        const auto shapeParamId = oscIndex == 0 ? "OSC1PW" : (oscIndex == 1 ? "OSC2PW" : "OSC3PW");
+        const auto semiParamId = oscIndex == 0 ? "OSC1SEMITONE" : (oscIndex == 1 ? "OSC2SEMITONE" : "OSC3SEMITONE");
+
+        bindParamKnob (30, waveParamId, "Value 1", "Selected oscillator wave");
+        bindParamKnob (31, shapeParamId, "Value 2", "Selected oscillator shape / pulse width");
+        bindParamKnob (32, semiParamId, "Value 3", "Selected oscillator semitone");
+
+        knobCards[30]->slider.onValueChange = [this] { refreshVirusOscMenuOsd(); };
+        knobCards[31]->slider.onValueChange = [this] { refreshVirusOscMenuOsd(); };
+        knobCards[32]->slider.onValueChange = [this] { refreshVirusOscMenuOsd(); };
+        return;
+    }
+
+    if (virusActiveFilterMenu >= 0)
+    {
+        const auto filterPage = juce::jlimit (0, 2, virusActiveFilterMenu);
+        if (filterPage < 2)
+        {
+            const auto typeParamId = filterPage == 0 ? "FILTERTYPE" : "FILTER2TYPE";
+            const auto slopeParamId = filterPage == 0 ? "FILTERSLOPE" : "FILTER2SLOPE";
+            const auto enableParamId = filterPage == 0 ? "FILTER1ENABLE" : "FILTER2ENABLE";
+
+            bindParamKnob (30, typeParamId, "Value 1", "Filter mode");
+            bindParamKnob (31, slopeParamId, "Value 2", "Filter slope");
+            bindParamKnob (32, enableParamId, "Value 3", "Filter enabled");
+
+            knobCards[30]->slider.onValueChange = [this] { syncVirusPanelButtons(); refreshVirusFilterMenuOsd(); };
+            knobCards[31]->slider.onValueChange = [this] { syncVirusPanelButtons(); refreshVirusFilterMenuOsd(); };
+            knobCards[32]->slider.onValueChange = [this] { syncVirusPanelButtons(); refreshVirusFilterMenuOsd(); };
+            return;
+        }
+
+        bindParamKnob (30, "FILTERBALANCE", "Value 1", "Filter balance");
+        bindParamKnob (31, "FILTERENVAMOUNT", "Value 2", "Filter envelope amount");
+        bindParamKnob (32, "CUTOFF2", "Value 3", "Filter 2 cutoff offset");
+
+        knobCards[30]->slider.onValueChange = [this] { refreshVirusFilterMenuOsd(); };
+        knobCards[31]->slider.onValueChange = [this] { refreshVirusFilterMenuOsd(); };
+        knobCards[32]->slider.onValueChange = [this] { refreshVirusFilterMenuOsd(); };
+        return;
+    }
+
+    if (virusActiveFxMenu >= 0)
+    {
+        if (virusActiveFxMenu == 0)
+        {
+            switch (juce::jlimit (0, 4, virusUpperFxLegendIndex))
+            {
+                case 0:
+                    bindParamKnob (30, "DELAYSEND", "Value 1", "Delay send");
+                    bindParamKnob (31, "DELAYTIME", "Value 2", "Delay time");
+                    bindParamKnob (32, "DELAYFEEDBACK", "Value 3", "Delay feedback");
+                    break;
+                case 1:
+                    bindParamKnob (30, "REVERBMIX", "Value 1", "Reverb mix");
+                    bindParamKnob (31, "REVERBTIME", "Value 2", "Reverb time");
+                    bindParamKnob (32, "REVERBDAMP", "Value 3", "Reverb damping");
+                    break;
+                case 2:
+                    bindParamKnob (30, "LOWEQGAIN", "Value 1", "Low EQ gain");
+                    bindParamKnob (31, "LOWEQFREQ", "Value 2", "Low EQ frequency");
+                    bindParamKnob (32, "LOWEQQ", "Value 3", "Low EQ Q");
+                    break;
+                case 3:
+                    bindParamKnob (30, "MIDEQGAIN", "Value 1", "Mid EQ gain");
+                    bindParamKnob (31, "MIDEQFREQ", "Value 2", "Mid EQ frequency");
+                    bindParamKnob (32, "MIDEQQ", "Value 3", "Mid EQ Q");
+                    break;
+                default:
+                    bindParamKnob (30, "HIGHEQGAIN", "Value 1", "High EQ gain");
+                    bindParamKnob (31, "HIGHEQFREQ", "Value 2", "High EQ frequency");
+                    bindParamKnob (32, "HIGHEQQ", "Value 3", "High EQ Q");
+                    break;
+            }
+
+            knobCards[30]->slider.onValueChange = [this] { refreshVirusFxMenuOsd (false); };
+            knobCards[31]->slider.onValueChange = [this] { refreshVirusFxMenuOsd (false); };
+            knobCards[32]->slider.onValueChange = [this] { refreshVirusFxMenuOsd (false); };
+            return;
+        }
+
+        bindParamKnob (30, "FXTYPE", "Value 1", "Lower effect type");
+        bindParamKnob (31, "FXMIX", "Value 2", "Lower effect mix");
+        bindParamKnob (32, "FXINTENSITY", "Value 3", "Lower effect intensity");
+
+        knobCards[30]->slider.onValueChange = [this] { syncVirusPanelButtons(); refreshVirusFxMenuOsd (true); };
+        knobCards[31]->slider.onValueChange = [this] { refreshVirusFxMenuOsd (true); };
+        knobCards[32]->slider.onValueChange = [this] { refreshVirusFxMenuOsd (true); };
+        return;
+    }
+
+    if (virusActiveArpMenu)
+    {
+        bindParamKnob (30, "ARPENABLE", "Value 1", "Arpeggiator on / off");
+        bindParamKnob (31, "ARPMODE", "Value 2", "Arpeggiator mode");
+        bindParamKnob (32, "ARPRATE", "Value 3", "Arpeggiator rate");
+
+        knobCards[30]->slider.onValueChange = [this] { syncVirusPanelButtons(); refreshVirusArpMenuOsd(); };
+        knobCards[31]->slider.onValueChange = [this] { refreshVirusArpMenuOsd(); };
+        knobCards[32]->slider.onValueChange = [this] { refreshVirusArpMenuOsd(); };
+        return;
+    }
+
+    if (virusActivePresetMenu)
+    {
+        bindParamKnob (30, "PRESET", "Value 1", "Preset");
+        bindParamKnob (31, "PRESET", "Value 2", "Preset");
+        bindParamKnob (32, "PRESET", "Value 3", "Preset");
+
+        knobCards[30]->slider.onValueChange = [this] { refreshVirusPresetOsd(); };
+        knobCards[31]->slider.onValueChange = [this] { refreshVirusPresetOsd(); };
+        knobCards[32]->slider.onValueChange = [this] { refreshVirusPresetOsd(); };
+        return;
+    }
+
+    bindParamKnob (30, "ARPRATE", "Value 1", "Arp rate");
+    bindParamKnob (31, "RHYTHMGATE_RATE", "Value 2", "Rhythm gate rate");
+    bindParamKnob (32, "RHYTHMGATE_DEPTH", "Value 3", "Rhythm gate depth");
 }
 
 void AdvancedVSTiAudioProcessorEditor::syncVirusPanelButtons()
@@ -1446,17 +2405,37 @@ void AdvancedVSTiAudioProcessorEditor::syncVirusPanelButtons()
             button->setToggleState (virusMatrixSlotIndex == index, juce::dontSendNotification);
 
     const std::array<const char*, 3> modKeys { "modLfo1", "modLfo2", "modLfo3" };
-    const std::array<const char*, 3> modEnableParamIds { "LFO1ENABLE", "LFO2ENABLE", "LFO3ENABLE" };
     for (int index = 0; index < static_cast<int> (modKeys.size()); ++index)
-    {
         if (auto* button = findVirusPanelButton (modKeys[static_cast<size_t> (index)]))
+            button->setToggleState (virusModulatorIndex == index, juce::dontSendNotification);
+
+    const auto selectedShapeParamId = [this] () -> juce::String
+    {
+        switch (virusModulatorIndex)
         {
-            bool enabled = true;
-            if (auto* parameter = rangedParameter (modEnableParamIds[static_cast<size_t> (index)]))
-                enabled = parameter->getValue() >= 0.5f;
-            button->setToggleState (enabled, juce::dontSendNotification);
+            case 1: return "LFO2SHAPE";
+            case 2: return "LFO3SHAPE";
+            default: return "LFO1SHAPE";
         }
-    }
+    }();
+
+    const auto selectedEnvModeParamId = [this] () -> juce::String
+    {
+        switch (virusModulatorIndex)
+        {
+            case 1: return "LFO2ENVMODE";
+            case 2: return "LFO3ENVMODE";
+            default: return "LFO1ENVMODE";
+        }
+    }();
+
+    if (auto* button = findVirusPanelButton ("modEnvMode"))
+        if (auto* parameter = rangedParameter (selectedEnvModeParamId))
+            button->setToggleState (parameter->getValue() >= 0.5f, juce::dontSendNotification);
+
+    if (auto* button = findVirusPanelButton ("modShape"))
+        if (auto* parameter = dynamic_cast<juce::AudioParameterChoice*> (rangedParameter (selectedShapeParamId)))
+            button->setToggleState (parameter->getIndex() != 0, juce::dontSendNotification);
 
     const std::array<const char*, 3> oscKeys { "oscLed1", "oscLed2", "oscLed3" };
     for (int index = 0; index < static_cast<int> (oscKeys.size()); ++index)
@@ -1468,23 +2447,39 @@ void AdvancedVSTiAudioProcessorEditor::syncVirusPanelButtons()
         if (auto* button = findVirusPanelButton (upperFxKeys[static_cast<size_t> (index)]))
             button->setToggleState (virusUpperFxLegendIndex == index, juce::dontSendNotification);
 
+    if (auto* parameter = dynamic_cast<juce::AudioParameterChoice*> (rangedParameter ("FXTYPE")))
+    {
+        const auto fxIndex = juce::jlimit (0, parameter->choices.size() - 1, parameter->getIndex());
+        if (fxIndex == 1) virusLowerFxLegendIndex = 0;
+        else if (fxIndex == 2) virusLowerFxLegendIndex = 1;
+        else if (fxIndex == 3) virusLowerFxLegendIndex = 2;
+        else if (fxIndex == 4) virusLowerFxLegendIndex = 3;
+        else if (fxIndex >= 5) virusLowerFxLegendIndex = 4;
+    }
+
     const std::array<const char*, 5> lowerFxKeys { "fxDistortion", "fxCharacter", "fxChorus", "fxPhaser", "fxOthers" };
     for (int index = 0; index < static_cast<int> (lowerFxKeys.size()); ++index)
         if (auto* button = findVirusPanelButton (lowerFxKeys[static_cast<size_t> (index)]))
             button->setToggleState (virusLowerFxLegendIndex == index, juce::dontSendNotification);
 
-    const std::array<const char*, 3> panelModeKeys { "part", "multi", "single" };
+    if (auto* button = findVirusPanelButton ("displayShift"))
+        button->setToggleState (virusShiftMode, juce::dontSendNotification);
+
+    const std::array<const char*, 2> panelModeKeys { "multi", "single" };
     for (int index = 0; index < static_cast<int> (panelModeKeys.size()); ++index)
         if (auto* button = findVirusPanelButton (panelModeKeys[static_cast<size_t> (index)]))
-            button->setToggleState (virusPanelModeIndex == index, juce::dontSendNotification);
-    if (auto* button = findVirusPanelButton ("partLeft"))
-        button->setToggleState (virusPanelModeIndex == 0, juce::dontSendNotification);
+            button->setToggleState (virusPanelModeIndex == index + 1, juce::dontSendNotification);
 }
 
 void AdvancedVSTiAudioProcessorEditor::updateVirusOscillatorBindings()
 {
     if (! isTributeVirus() || sliderAttachments.size() <= 16 || knobCards.size() <= 16)
         return;
+
+    auto rangedParameter = [this] (const juce::String& paramId) -> juce::RangedAudioParameter*
+    {
+        return dynamic_cast<juce::RangedAudioParameter*> (audioProcessor.apvts.getParameter (paramId));
+    };
 
     const std::array<std::array<const char*, 4>, 3> paramIds {{
         {{ "OSCTYPE",  "OSC1PW", "OSC1SEMITONE", "OSC1DETUNE" }},
@@ -1518,12 +2513,48 @@ void AdvancedVSTiAudioProcessorEditor::updateVirusOscillatorBindings()
     for (int localIndex = 0; localIndex < static_cast<int> (knobIndices.size()); ++localIndex)
     {
         const auto knobIndex = knobIndices[static_cast<size_t> (localIndex)];
+        const auto paramId = juce::String (paramIds[static_cast<size_t> (oscIndex)][static_cast<size_t> (localIndex)]);
+        if (auto* parameter = rangedParameter (paramId))
+            knobCards[knobIndex]->slider.setValue (parameter->convertFrom0to1 (parameter->getValue()), juce::dontSendNotification);
+
         sliderAttachments[static_cast<size_t> (knobIndex)] =
             std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (audioProcessor.apvts,
-                                                                                     paramIds[static_cast<size_t> (oscIndex)][static_cast<size_t> (localIndex)],
+                                                                                     paramId,
                                                                                      knobCards[knobIndex]->slider);
         knobCards[knobIndex]->slider.setTooltip (tooltips[static_cast<size_t> (oscIndex)][static_cast<size_t> (localIndex)]);
     }
+}
+
+void AdvancedVSTiAudioProcessorEditor::updateVirusModulatorBindings()
+{
+    if (! isTributeVirus() || sliderAttachments.size() <= 3 || knobCards.size() <= 3)
+        return;
+
+    auto rangedParameter = [this] (const juce::String& paramId) -> juce::RangedAudioParameter*
+    {
+        return dynamic_cast<juce::RangedAudioParameter*> (audioProcessor.apvts.getParameter (paramId));
+    };
+
+    const auto lfoIndex = juce::jlimit (0, 2, virusModulatorIndex);
+    const auto rateParamId = virusLfoRateParamId (lfoIndex);
+
+    if (auto* parameter = rangedParameter (rateParamId))
+        knobCards[3]->slider.setValue (parameter->convertFrom0to1 (parameter->getValue()), juce::dontSendNotification);
+
+    sliderAttachments[3] =
+        std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (audioProcessor.apvts,
+                                                                                 rateParamId,
+                                                                                 knobCards[3]->slider);
+    knobCards[3]->slider.setTooltip (buildControlTooltip ("LFO " + juce::String (lfoIndex + 1) + " Rate",
+                                                          "Speed for the selected LFO"));
+    knobCards[3]->slider.onValueChange = [this, lfoIndex]
+    {
+        showVirusOsdForParam (virusLfoRateParamId (lfoIndex),
+                              "LFO " + juce::String (lfoIndex + 1) + " Rate",
+                              "Selected LFO speed");
+        if (virusActiveLfoMenu >= 0)
+            refreshVirusLfoMenuOsd();
+    };
 }
 
 AdvancedVSTiAudioProcessorEditor::LedToggleButton* AdvancedVSTiAudioProcessorEditor::addVirusPanelButton (
@@ -1577,15 +2608,15 @@ void AdvancedVSTiAudioProcessorEditor::buildVirusPanelButtons()
     addPanelButton ("matrixSlot4", "Select matrix slot 4");
     addPanelButton ("matrixSlot5", "Select matrix slot 5");
     addPanelButton ("matrixSlot6", "Select matrix slot 6");
-    addPanelButton ("modLfo1", "LFO 1 enabled indicator");
-    addPanelButton ("modLfo2", "LFO 2 enabled indicator");
-    addPanelButton ("modLfo3", "LFO 3 enabled indicator");
+    addPanelButton ("modLfo1", "LFO 1 focus indicator");
+    addPanelButton ("modLfo2", "LFO 2 focus indicator");
+    addPanelButton ("modLfo3", "LFO 3 focus indicator");
     addMomentaryButton ("modEdit", "EDIT: cycle the active modulation source focus");
-    addMomentaryButton ("modEnvMode", "ENV MODE: step the selected motion mode");
+    addMomentaryButton ("modEnvMode", "ENV MODE: toggle note-triggered motion for the selected LFO");
     addMomentaryButton ("modShape", "SHAPE: cycle the waveform for the selected LFO");
-    addPanelButton ("modSelect", "SELECT: toggle LFO 1 enabled and edit that source");
-    addPanelButton ("modAssign", "SELECT: toggle LFO 2 enabled and edit that source");
-    addPanelButton ("modSelectRight", "SELECT: toggle LFO 3 enabled and edit that source");
+    addMomentaryButton ("modSelect", "SELECT: focus LFO 1, then cycle its destination LED");
+    addMomentaryButton ("modAssign", "SELECT: focus LFO 2, then cycle its destination LED");
+    addMomentaryButton ("modSelectRight", "SELECT: focus LFO 3, then cycle its destination LED");
     addPanelButton ("oscLed1", "Editing oscillator 1");
     addPanelButton ("oscLed2", "Editing oscillator 2");
     addPanelButton ("oscLed3", "Editing oscillator 3");
@@ -1613,14 +2644,14 @@ void AdvancedVSTiAudioProcessorEditor::buildVirusPanelButtons()
     addMomentaryButton ("transposeUp", "Transpose up one octave");
     addMomentaryButton ("displayExit", "Previous preset");
     addMomentaryButton ("displayTap", "Next preset");
-    addMomentaryButton ("displayEdit", "Previous oscillator 1 wave");
-    addMomentaryButton ("displayConfig", "Next oscillator 1 wave");
-    addMomentaryButton ("displayStore", "Previous insert effect");
-    addMomentaryButton ("displayUndo", "Next insert effect");
-    addMomentaryButton ("displayShift", "Previous arp mode");
+    addMomentaryButton ("displayEdit", "EDIT: open oscillator page   SHIFT+EDIT: multi edit");
+    addMomentaryButton ("displayConfig", "CONFIG: configuration page   SHIFT+CONFIG: remote page");
+    addMomentaryButton ("displayStore", "STORE: save / step storage page   SHIFT+STORE: random patch");
+    addMomentaryButton ("displayUndo", "UNDO: last edit   SHIFT+UNDO: help");
+    addPanelButton ("displayShift", "SHIFT: latch secondary red legends");
     addMomentaryButton ("displaySearch", "Next arp mode");
-    addPanelButton ("partLeft", "Select part panel mode");
-    addPanelButton ("part", "Select part panel mode");
+    addMomentaryButton ("partLeft", "Previous preset");
+    addMomentaryButton ("part", "Next preset");
     addPanelButton ("multi", "Select multi panel mode");
     addPanelButton ("single", "Select single panel mode");
     addMomentaryButton ("parameters", "Previous part / multi / single panel mode");
@@ -1648,12 +2679,16 @@ void AdvancedVSTiAudioProcessorEditor::buildVirusPanelButtons()
         return dynamic_cast<juce::RangedAudioParameter*> (audioProcessor.apvts.getParameter (paramId));
     };
 
-    auto commitActualValue = [] (juce::RangedAudioParameter& parameter, float actualValue)
+    auto commitActualValue = [this] (juce::RangedAudioParameter& parameter, float actualValue)
     {
         const auto legalValue = parameter.getNormalisableRange().snapToLegalValue (actualValue);
         parameter.beginChangeGesture();
         parameter.setValueNotifyingHost (parameter.convertTo0to1 (legalValue));
         parameter.endChangeGesture();
+        if (auto* parameterWithId = dynamic_cast<juce::AudioProcessorParameterWithID*> (&parameter))
+            showVirusOsdForParam (parameterWithId->paramID, parameter.getName (36));
+        else
+            showVirusOsdMessage (parameter.getName (36), parameter.getCurrentValueAsText());
     };
 
     auto stepChoiceParameter = [rangedParameter, commitActualValue] (const juce::String& paramId, int delta)
@@ -1720,6 +2755,26 @@ void AdvancedVSTiAudioProcessorEditor::buildVirusPanelButtons()
         }
     };
 
+    auto bindShiftAwareMomentaryAction = [this, flashMomentary] (const juce::String& key,
+                                                                 std::function<void()> primaryAction,
+                                                                 std::function<void()> shiftedAction)
+    {
+        if (auto* button = findVirusPanelButton (key))
+        {
+            button->onClick = [this, button, flashMomentary,
+                               primaryAction = std::move (primaryAction),
+                               shiftedAction = std::move (shiftedAction)]
+            {
+                if (virusShiftMode && shiftedAction != nullptr)
+                    shiftedAction();
+                else if (primaryAction != nullptr)
+                    primaryAction();
+
+                flashMomentary (button);
+            };
+        }
+    };
+
     auto setIndicatorOnly = [this] (const juce::String& key)
     {
         if (auto* button = findVirusPanelButton (key))
@@ -1737,50 +2792,227 @@ void AdvancedVSTiAudioProcessorEditor::buildVirusPanelButtons()
             button->setVirusTopLedVisible (true);
     };
 
+    auto setShiftMode = [this] (bool enabled, const juce::String& detail = {})
+    {
+        virusShiftMode = enabled;
+        syncVirusPanelButtons();
+        showVirusOsdMessage ("SHIFT",
+                             enabled ? "ON" : "OFF",
+                             detail.isNotEmpty() ? detail
+                                                 : (enabled ? "Secondary red legends active"
+                                                            : "Primary functions active"),
+                             false,
+                             2000.0);
+        repaint();
+    };
+
     auto selectMatrixSlot = [this] (int index)
     {
+        clearVirusLfoMenu();
         virusMatrixSlotIndex = juce::jlimit (0, 5, index);
+        virusActiveMatrixMenu = virusMatrixSlotIndex;
+        refreshVirusValueKnobBindings();
         syncVirusPanelButtons();
+        refreshVirusMatrixMenuOsd();
     };
 
     auto selectModulator = [this] (int index)
     {
+        virusActiveMatrixMenu = -1;
         virusModulatorIndex = juce::jlimit (0, 2, index);
+        updateVirusModulatorBindings();
         syncVirusPanelButtons();
+        showVirusOsdMessage ("MODULATOR", "LFO " + juce::String (virusModulatorIndex + 1), "Selected");
+        repaint();
+    };
+
+    auto focusOrCycleModulator = [this, selectModulator] (int index)
+    {
+        const auto clampedIndex = juce::jlimit (0, 2, index);
+        if (virusModulatorIndex != clampedIndex)
+            selectModulator (clampedIndex);
+
+        else
+        {
+            if (auto* destinationParam = dynamic_cast<juce::AudioParameterChoice*> (audioProcessor.apvts.getParameter (virusLfoDestinationParamId (clampedIndex))))
+            {
+                const auto nextDestination = (destinationParam->getIndex() + 1) % destinationParam->choices.size();
+                setParameterActualValue (audioProcessor.apvts,
+                                         virusLfoDestinationParamId (clampedIndex),
+                                         static_cast<float> (nextDestination));
+            }
+            syncVirusPanelButtons();
+        }
+
+        virusActiveLfoMenu = clampedIndex;
+        refreshVirusValueKnobBindings();
+        refreshVirusLfoMenuOsd();
+        repaint();
     };
 
     auto selectOscillator = [this] (int index)
     {
+        const bool keepOscMenuOpen = virusActiveOscMenu >= 0;
+        clearVirusLfoMenu();
         virusOscillatorIndex = juce::jlimit (0, 2, index);
         updateVirusOscillatorBindings();
         syncVirusPanelButtons();
+        if (keepOscMenuOpen)
+        {
+            virusActiveOscMenu = virusOscillatorIndex;
+            refreshVirusValueKnobBindings();
+            refreshVirusOscMenuOsd();
+        }
+        else
+        {
+            showVirusOsdMessage ("OSCILLATOR", "OSC " + juce::String (virusOscillatorIndex + 1), "Edit focus");
+        }
         repaint();
     };
 
     auto selectUpperFxTarget = [this] (int index)
     {
+        const bool keepFxMenuOpen = virusActiveFxMenu == 0;
+        clearVirusLfoMenu();
         virusUpperFxLegendIndex = juce::jlimit (0, 4, index);
         syncVirusPanelButtons();
+        if (keepFxMenuOpen)
+        {
+            virusActiveFxMenu = 0;
+            refreshVirusValueKnobBindings();
+            refreshVirusFxMenuOsd (false);
+        }
+        else
+        {
+            showVirusOsdMessage ("UPPER FX",
+                                 kVirusUpperFxLabels[static_cast<size_t> (virusUpperFxLegendIndex)],
+                                 "SELECT cycles focus   EDIT opens page");
+        }
     };
 
     auto selectLowerFxTarget = [this, setChoiceParameter] (int index)
     {
+        const bool keepFxMenuOpen = virusActiveFxMenu == 1;
+        clearVirusLfoMenu();
         virusLowerFxLegendIndex = juce::jlimit (0, 4, index);
         switch (virusLowerFxLegendIndex)
         {
             case 0: setChoiceParameter ("FXTYPE", 1); break;
+            case 1: setChoiceParameter ("FXTYPE", 2); break;
             case 2: setChoiceParameter ("FXTYPE", 3); break;
-            case 3: setChoiceParameter ("FXTYPE", 2); break;
-            case 4: setChoiceParameter ("FXTYPE", 4); break;
+            case 3: setChoiceParameter ("FXTYPE", 4); break;
+            case 4: setChoiceParameter ("FXTYPE", 5); break;
             default: break;
         }
         syncVirusPanelButtons();
+        if (keepFxMenuOpen)
+        {
+            virusActiveFxMenu = 1;
+            refreshVirusValueKnobBindings();
+            refreshVirusFxMenuOsd (true);
+        }
+        else
+        {
+            showVirusOsdMessage ("LOWER FX",
+                                 kVirusLowerFxLabels[static_cast<size_t> (virusLowerFxLegendIndex)],
+                                 "SELECT cycles focus   EDIT opens page");
+        }
     };
 
     auto selectPanelMode = [this] (int index)
     {
+        clearVirusLfoMenu();
         virusPanelModeIndex = juce::jlimit (0, 2, index);
         syncVirusPanelButtons();
+    };
+
+    auto openOscMenu = [this]
+    {
+        clearVirusLfoMenu();
+        virusActiveOscMenu = juce::jlimit (0, 2, virusOscillatorIndex);
+        refreshVirusValueKnobBindings();
+        refreshVirusOscMenuOsd();
+        repaint();
+    };
+
+    auto openFilterMenu = [this]
+    {
+        const auto nextPage = virusActiveFilterMenu >= 0 ? (virusActiveFilterMenu + 1) % 3
+                                                         : juce::jlimit (0, 1, virusFilterEditIndex);
+        clearVirusLfoMenu();
+        virusActiveFilterMenu = nextPage;
+        refreshVirusValueKnobBindings();
+        syncVirusPanelButtons();
+        refreshVirusFilterMenuOsd();
+        repaint();
+    };
+
+    auto openFxMenu = [this] (bool lowerSection)
+    {
+        clearVirusLfoMenu();
+        virusActiveFxMenu = lowerSection ? 1 : 0;
+        refreshVirusValueKnobBindings();
+        refreshVirusFxMenuOsd (lowerSection);
+        repaint();
+    };
+
+    auto openArpMenu = [this]
+    {
+        clearVirusLfoMenu();
+        virusActiveArpMenu = true;
+        refreshVirusValueKnobBindings();
+        refreshVirusArpMenuOsd();
+        repaint();
+    };
+
+    auto showShiftHelp = [this]
+    {
+        showVirusOsdMessage ("HELP",
+                             "SHIFT + STORE RANDOM   SHIFT + EDIT MULTI EDIT",
+                             "SHIFT + CONFIG REMOTE   SHIFT latches secondary legends",
+                             true,
+                             6000.0);
+    };
+
+    auto randomPreset = [rangedParameter, commitActualValue, this]
+    {
+        if (auto* parameter = dynamic_cast<juce::AudioParameterChoice*> (rangedParameter ("PRESET")))
+        {
+            const int choiceCount = parameter->choices.size();
+            if (choiceCount <= 0)
+                return;
+
+            int nextIndex = juce::Random::getSystemRandom().nextInt (choiceCount);
+            if (choiceCount > 1 && nextIndex == parameter->getIndex())
+                nextIndex = (nextIndex + 1) % choiceCount;
+
+            commitActualValue (*parameter, static_cast<float> (nextIndex));
+            showVirusOsdMessage ("RANDOM PATCH",
+                                 parameter->choices[nextIndex],
+                                 "SHIFT+STORE",
+                                 false,
+                                 2400.0);
+        }
+    };
+
+    auto openMultiEdit = [this, selectPanelMode]
+    {
+        clearVirusLfoMenu();
+        selectPanelMode (1);
+        showVirusOsdMessage ("MULTI EDIT",
+                             "Panel focus: MULTI",
+                             "SHIFT+EDIT",
+                             true,
+                             3000.0);
+    };
+
+    auto openRemotePage = [this]
+    {
+        showVirusOsdMessage ("REMOTE",
+                             "Not yet modelled",
+                             "SHIFT+CONFIG",
+                             true,
+                             2600.0);
     };
 
     auto selectedOscillatorWaveParamId = [this] () -> juce::String
@@ -1805,27 +3037,30 @@ void AdvancedVSTiAudioProcessorEditor::buildVirusPanelButtons()
 
     auto selectedDepthParamId = [this] () -> juce::String
     {
-        switch (virusModulatorIndex)
-        {
-            case 0: return "LFO1PITCH";
-            case 1: return "LFO2FILTER";
-            default: return "RHYTHMGATE_DEPTH";
-        }
+        return virusLfoAmountParamId (virusModulatorIndex);
     };
 
-    auto stepSelectedShape = [this, stepChoiceParameter]
+    auto selectedModulatorShapeParamId = [this] () -> juce::String { return virusLfoShapeParamId (virusModulatorIndex); };
+
+    auto selectedModulatorEnvModeParamId = [this] () -> juce::String { return virusLfoEnvModeParamId (virusModulatorIndex); };
+
+    auto stepSelectedShape = [this, stepChoiceParameter, selectedModulatorShapeParamId]
     {
-        switch (virusModulatorIndex)
-        {
-            case 0: stepChoiceParameter ("LFO1SHAPE", 1); break;
-            case 1: stepChoiceParameter ("LFO2SHAPE", 1); break;
-            default: stepChoiceParameter ("ARPMODE", 1); break;
-        }
+        stepChoiceParameter (selectedModulatorShapeParamId(), 1);
+        virusActiveLfoMenu = juce::jlimit (0, 2, virusModulatorIndex);
+        refreshVirusValueKnobBindings();
+        syncVirusPanelButtons();
+        refreshVirusLfoMenuOsd();
+        repaint();
     };
 
-    auto stepPreset = [stepChoiceParameter] (int delta)
+    auto stepPreset = [this, stepChoiceParameter] (int delta)
     {
+        clearVirusLfoMenu();
+        virusActivePresetMenu = true;
         stepChoiceParameter ("PRESET", delta);
+        refreshVirusValueKnobBindings();
+        refreshVirusPresetOsd();
     };
 
     auto stepActiveFilterSlope = [this, stepChoiceParameter]
@@ -1835,8 +3070,16 @@ void AdvancedVSTiAudioProcessorEditor::buildVirusPanelButtons()
 
     auto toggleActiveFilterFocus = [this]
     {
+        const bool keepFilterMenuOpen = virusActiveFilterMenu >= 0;
+        clearVirusLfoMenu();
         virusFilterEditIndex = 1 - virusFilterEditIndex;
         syncVirusPanelButtons();
+        if (keepFilterMenuOpen)
+        {
+            virusActiveFilterMenu = virusFilterEditIndex;
+            refreshVirusValueKnobBindings();
+            refreshVirusFilterMenuOsd();
+        }
     };
 
     auto adjustUpperFxTarget = [this, nudgeParameter] (float direction)
@@ -1862,60 +3105,123 @@ void AdvancedVSTiAudioProcessorEditor::buildVirusPanelButtons()
         buttonAttachments.push_back (std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (audioProcessor.apvts, "SYNCENABLE", *button));
     if (auto* button = findVirusPanelButton ("fmMode"))
         buttonAttachments.push_back (std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (audioProcessor.apvts, "FMENABLE", *button));
-    if (auto* button = findVirusPanelButton ("modSelect"))
-        buttonAttachments.push_back (std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (audioProcessor.apvts, "LFO1ENABLE", *button));
-    if (auto* button = findVirusPanelButton ("modAssign"))
-        buttonAttachments.push_back (std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (audioProcessor.apvts, "LFO2ENABLE", *button));
-    if (auto* button = findVirusPanelButton ("modSelectRight"))
-        buttonAttachments.push_back (std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (audioProcessor.apvts, "LFO3ENABLE", *button));
-
-    bindMomentaryAction ("arpEdit", [stepChoiceParameter] { stepChoiceParameter ("ARPMODE", 1); });
-    bindMomentaryAction ("matrixDest", [selectedDepthParamId, nudgeParameter] { nudgeParameter (selectedDepthParamId(), -0.08f); });
-    bindMomentaryAction ("matrixSource", [this, selectModulator] { selectModulator ((virusModulatorIndex + 1) % 3); });
+    bindMomentaryAction ("arpEdit", [openArpMenu] { openArpMenu(); });
+    bindMomentaryAction ("matrixDest", [this]
+    {
+        virusMatrixTargetIndex = (virusMatrixTargetIndex + 1) % 3;
+        virusActiveMatrixMenu = virusMatrixSlotIndex;
+        refreshVirusValueKnobBindings();
+        syncVirusPanelButtons();
+        refreshVirusMatrixMenuOsd();
+        repaint();
+    });
+    bindMomentaryAction ("matrixSource", [this]
+    {
+        if (auto* parameter = dynamic_cast<juce::AudioParameterChoice*> (audioProcessor.apvts.getParameter (virusMatrixSourceParamId (virusMatrixSlotIndex))))
+        {
+            const auto nextSource = (parameter->getIndex() + 1) % parameter->choices.size();
+            setParameterActualValue (audioProcessor.apvts, virusMatrixSourceParamId (virusMatrixSlotIndex), static_cast<float> (nextSource));
+        }
+        virusActiveMatrixMenu = virusMatrixSlotIndex;
+        refreshVirusValueKnobBindings();
+        syncVirusPanelButtons();
+        refreshVirusMatrixMenuOsd();
+        repaint();
+    });
     bindMomentaryAction ("matrixSelect", [this, selectMatrixSlot] { selectMatrixSlot ((virusMatrixSlotIndex + 1) % 6); });
     bindMomentaryAction ("modEdit", [this, selectModulator] { selectModulator ((virusModulatorIndex + 1) % 3); });
-    bindMomentaryAction ("modEnvMode", [this, stepChoiceParameter]
+    if (auto* button = findVirusPanelButton ("modEnvMode"))
     {
-        if (virusModulatorIndex == 2)
-            stepChoiceParameter ("ARPMODE", 1);
-        else
-            stepChoiceParameter (virusModulatorIndex == 0 ? "LFO1SHAPE" : "LFO2SHAPE", -1);
-    });
+        button->onClick = [this, rangedParameter, selectedModulatorEnvModeParamId]
+        {
+            if (auto* parameter = rangedParameter (selectedModulatorEnvModeParamId()))
+            {
+                const bool nextState = ! (parameter->getValue() >= 0.5f);
+                parameter->beginChangeGesture();
+                parameter->setValueNotifyingHost (nextState ? 1.0f : 0.0f);
+                parameter->endChangeGesture();
+            }
+
+            virusActiveLfoMenu = juce::jlimit (0, 2, virusModulatorIndex);
+            updateVirusModulatorBindings();
+            refreshVirusValueKnobBindings();
+            syncVirusPanelButtons();
+            refreshVirusLfoMenuOsd();
+            repaint();
+        };
+    }
     bindMomentaryAction ("modShape", [stepSelectedShape] { stepSelectedShape(); });
     if (auto* button = findVirusPanelButton ("modSelect"))
-        button->onClick = [this, selectModulator] { selectModulator (0); };
+        button->onClick = [focusOrCycleModulator] { focusOrCycleModulator (0); };
     if (auto* button = findVirusPanelButton ("modAssign"))
-        button->onClick = [this, selectModulator] { selectModulator (1); };
+        button->onClick = [focusOrCycleModulator] { focusOrCycleModulator (1); };
     if (auto* button = findVirusPanelButton ("modSelectRight"))
-        button->onClick = [this, selectModulator] { selectModulator (2); };
+        button->onClick = [focusOrCycleModulator] { focusOrCycleModulator (2); };
     bindMomentaryAction ("oscSelect", [this, selectOscillator] { selectOscillator ((virusOscillatorIndex + 1) % 3); });
-    bindMomentaryAction ("oscEdit", [selectedOscillatorWaveParamId, stepChoiceParameter] { stepChoiceParameter (selectedOscillatorWaveParamId(), 1); });
+    bindMomentaryAction ("oscEdit", [openOscMenu] { openOscMenu(); });
     bindMomentaryAction ("fxSelectA", [this, selectUpperFxTarget] { selectUpperFxTarget ((virusUpperFxLegendIndex + 1) % 5); });
-    bindMomentaryAction ("fxEditA", [adjustUpperFxTarget] { adjustUpperFxTarget (1.0f); });
+    bindMomentaryAction ("fxEditA", [openFxMenu] { openFxMenu (false); });
     bindMomentaryAction ("fxSelectB", [this, selectLowerFxTarget] { selectLowerFxTarget ((virusLowerFxLegendIndex + 1) % 5); });
-    bindMomentaryAction ("fxEditB", [nudgeParameter] { nudgeParameter ("FXINTENSITY", 0.08f); });
+    bindMomentaryAction ("fxEditB", [openFxMenu] { openFxMenu (true); });
     bindMomentaryAction ("transposeDown", [selectedOscillatorSemitoneParamId, nudgeParameter] { nudgeParameter (selectedOscillatorSemitoneParamId(), -12.0f); });
     bindMomentaryAction ("transposeUp", [selectedOscillatorSemitoneParamId, nudgeParameter] { nudgeParameter (selectedOscillatorSemitoneParamId(), 12.0f); });
     bindMomentaryAction ("displayExit", [stepPreset] { stepPreset (-1); });
     bindMomentaryAction ("displayTap", [stepPreset] { stepPreset (1); });
-    bindMomentaryAction ("displayEdit", [selectedOscillatorWaveParamId, stepChoiceParameter] { stepChoiceParameter (selectedOscillatorWaveParamId(), -1); });
-    bindMomentaryAction ("displayConfig", [selectedOscillatorWaveParamId, stepChoiceParameter] { stepChoiceParameter (selectedOscillatorWaveParamId(), 1); });
-    bindMomentaryAction ("displayStore", [stepChoiceParameter] { stepChoiceParameter ("FXTYPE", -1); });
-    bindMomentaryAction ("displayUndo", [stepChoiceParameter] { stepChoiceParameter ("FXTYPE", 1); });
-    bindMomentaryAction ("displayShift", [stepChoiceParameter] { stepChoiceParameter ("ARPMODE", -1); });
+    bindShiftAwareMomentaryAction ("displayEdit",
+                                   [openOscMenu] { openOscMenu(); },
+                                   [openMultiEdit] { openMultiEdit(); });
+    bindShiftAwareMomentaryAction ("displayConfig",
+                                   [this]
+                                   {
+                                       clearVirusLfoMenu();
+                                       showVirusOsdMessage ("CONFIG",
+                                                            "Global configuration",
+                                                            "Primary function",
+                                                            true,
+                                                            2600.0);
+                                   },
+                                   [openRemotePage] { openRemotePage(); });
+    bindShiftAwareMomentaryAction ("displayStore",
+                                   [stepPreset] { stepPreset (-1); },
+                                   [randomPreset] { randomPreset(); });
+    bindShiftAwareMomentaryAction ("displayUndo",
+                                   [this]
+                                   {
+                                       clearVirusLfoMenu();
+                                       showVirusOsdMessage ("UNDO",
+                                                            "Previous edit / preset",
+                                                            "Primary function",
+                                                            false,
+                                                            2000.0);
+                                   },
+                                   [showShiftHelp] { showShiftHelp(); });
+    if (auto* button = findVirusPanelButton ("displayShift"))
+    {
+        button->onClick = [this, button, setShiftMode]
+        {
+            setShiftMode (button->getToggleState());
+        };
+    }
     bindMomentaryAction ("displaySearch", [stepChoiceParameter] { stepChoiceParameter ("ARPMODE", 1); });
     bindMomentaryAction ("parameters", [this, selectPanelMode] { selectPanelMode ((virusPanelModeIndex + 2) % 3); });
     bindMomentaryAction ("parametersNext", [this, selectPanelMode] { selectPanelMode ((virusPanelModeIndex + 1) % 3); });
     bindMomentaryAction ("valueProgram", [stepPreset] { stepPreset (-1); });
     bindMomentaryAction ("valueProgramNext", [stepPreset] { stepPreset (1); });
-    bindMomentaryAction ("filterEdit", [toggleActiveFilterFocus] { toggleActiveFilterFocus(); });
+    bindMomentaryAction ("filterEdit", [openFilterMenu] { openFilterMenu(); });
     bindMomentaryAction ("filterMode", [this, stepChoiceParameter]
     {
+        const bool keepFilterMenuOpen = virusActiveFilterMenu >= 0;
+        clearVirusLfoMenu();
         virusFilterEditIndex = 1;
         stepChoiceParameter ("FILTER2TYPE", 1);
         syncVirusPanelButtons();
+        if (keepFilterMenuOpen)
+        {
+            virusActiveFilterMenu = 1;
+            refreshVirusValueKnobBindings();
+            refreshVirusFilterMenuOsd();
+        }
     });
-    bindMomentaryAction ("filterSelect", [stepActiveFilterSlope] { stepActiveFilterSlope(); });
 
     const std::array<const char*, 6> matrixSlotKeys { "matrixSlot1", "matrixSlot2", "matrixSlot3", "matrixSlot4", "matrixSlot5", "matrixSlot6" };
     for (const auto* key : matrixSlotKeys)
@@ -1948,28 +3254,40 @@ void AdvancedVSTiAudioProcessorEditor::buildVirusPanelButtons()
     for (const auto* key : filterActiveKeys)
         setIndicatorOnly (key);
 
-    const std::array<const char*, 11> topLedButtons {
+    const std::array<const char*, 15> topLedButtons {
         "arpEdit", "arpOn",
+        "modEdit", "modEnvMode", "modShape",
         "oscSelect", "oscEdit", "osc3On",
         "mono", "syncPanel",
-        "displayEdit", "displayConfig",
+        "displayEdit", "displayConfig", "displayShift",
         "transposeDown", "transposeUp"
     };
     for (const auto* key : topLedButtons)
         setTopLedVisible (key);
 
-    const std::array<const char*, 4> panelModeKeys { "partLeft", "part", "multi", "single" };
+    const std::array<const char*, 2> panelModeKeys { "multi", "single" };
     for (int index = 0; index < static_cast<int> (panelModeKeys.size()); ++index)
         if (auto* button = findVirusPanelButton (panelModeKeys[static_cast<size_t> (index)]))
-            button->onClick = [selectPanelMode, index] { selectPanelMode (index <= 1 ? 0 : index - 1); };
+            button->onClick = [selectPanelMode, index] { selectPanelMode (index + 1); };
+
+    bindMomentaryAction ("partLeft", [stepPreset] { stepPreset (-1); });
+    bindMomentaryAction ("part", [stepPreset] { stepPreset (1); });
 
     if (auto* button = findVirusPanelButton ("filter1Focus"))
     {
         button->onClick = [this, stepChoiceParameter]
         {
+            const bool keepFilterMenuOpen = virusActiveFilterMenu >= 0;
+            clearVirusLfoMenu();
             virusFilterEditIndex = 0;
             stepChoiceParameter ("FILTERTYPE", 1);
             syncVirusPanelButtons();
+            if (keepFilterMenuOpen)
+            {
+                virusActiveFilterMenu = 0;
+                refreshVirusValueKnobBindings();
+                refreshVirusFilterMenuOsd();
+            }
         };
     }
 
@@ -1977,6 +3295,8 @@ void AdvancedVSTiAudioProcessorEditor::buildVirusPanelButtons()
     {
         button->onClick = [this, button, rangedParameter]
         {
+            const bool keepFilterMenuOpen = virusActiveFilterMenu >= 0;
+            clearVirusLfoMenu();
             virusFilterEditIndex = 0;
             if (auto* parameter = rangedParameter ("FILTER1ENABLE"))
             {
@@ -1985,6 +3305,12 @@ void AdvancedVSTiAudioProcessorEditor::buildVirusPanelButtons()
                 parameter->endChangeGesture();
             }
             syncVirusPanelButtons();
+            if (keepFilterMenuOpen)
+            {
+                virusActiveFilterMenu = 0;
+                refreshVirusValueKnobBindings();
+                refreshVirusFilterMenuOsd();
+            }
         };
     }
 
@@ -1992,6 +3318,8 @@ void AdvancedVSTiAudioProcessorEditor::buildVirusPanelButtons()
     {
         button->onClick = [this, button, rangedParameter]
         {
+            const bool keepFilterMenuOpen = virusActiveFilterMenu >= 0;
+            clearVirusLfoMenu();
             virusFilterEditIndex = 1;
             if (auto* parameter = rangedParameter ("FILTER2ENABLE"))
             {
@@ -2000,9 +3328,17 @@ void AdvancedVSTiAudioProcessorEditor::buildVirusPanelButtons()
                 parameter->endChangeGesture();
             }
             syncVirusPanelButtons();
+            if (keepFilterMenuOpen)
+            {
+                virusActiveFilterMenu = 1;
+                refreshVirusValueKnobBindings();
+                refreshVirusFilterMenuOsd();
+            }
         };
     }
 
+    updateVirusModulatorBindings();
+    refreshVirusValueKnobBindings();
     syncVirusPanelButtons();
 }
 
@@ -2148,15 +3484,15 @@ std::vector<AdvancedVSTiAudioProcessorEditor::ChoiceSpec> AdvancedVSTiAudioProce
 
     if (isTributeVirus())
     {
-        specs.push_back ({ "OSCTYPE", "Osc 1 Wave", "Primary waveform", { "Sine", "Saw", "Square", "Noise", "Sample" }, { "SIN", "SAW", "SQR", "NOI", "SMP" }, true, 5 });
-        specs.push_back ({ "OSC2TYPE", "Osc 2 Wave", "Secondary waveform", { "Sine", "Saw", "Square", "Noise", "Sample" }, { "SIN", "SAW", "SQR", "NOI", "SMP" }, true, 5 });
+        specs.push_back ({ "OSCTYPE", "Osc 1 Wave", "Primary waveform", { "Sine", "Saw", "Square", "Noise", "Sample", "HyperSaw", "WT Formant", "WT Complex", "WT Metal", "WT Vocal" }, { "SIN", "SAW", "SQR", "NOI", "SMP", "HYP", "WTF", "WTC", "WTM", "WTV" }, true, 5 });
+        specs.push_back ({ "OSC2TYPE", "Osc 2 Wave", "Secondary waveform", { "Sine", "Saw", "Square", "Noise", "Sample", "HyperSaw", "WT Formant", "WT Complex", "WT Metal", "WT Vocal" }, { "SIN", "SAW", "SQR", "NOI", "SMP", "HYP", "WTF", "WTC", "WTM", "WTV" }, true, 5 });
         specs.push_back ({ "FILTERTYPE", "Filter 1 Mode", "Main response", { "LP", "BP", "HP", "Notch" }, { "LP", "BP", "HP", "NCH" }, true, 2 });
         specs.push_back ({ "FILTERSLOPE", "Filter 1 Slope", "Roll-off steepness", { "12 dB", "16 dB", "24 dB" }, { "12", "16", "24" }, true, 3 });
         specs.push_back ({ "FILTER2TYPE", "Filter 2 Mode", "Secondary response", { "LP", "BP", "HP", "Notch" }, { "LP", "BP", "HP", "NCH" }, true, 2 });
         specs.push_back ({ "FILTER2SLOPE", "Filter 2 Slope", "Secondary roll-off", { "12 dB", "16 dB", "24 dB" }, { "12", "16", "24" }, true, 3 });
-        specs.push_back ({ "FXTYPE", "Effects", "Insert algorithm", { "Off", "Dist", "Phaser", "Chorus", "Flanger" }, { "OFF", "DST", "PHA", "CHO", "FLA" }, true, 3 });
-        specs.push_back ({ "LFO1SHAPE", "LFO 1 Shape", "Primary motion", { "Sine", "Saw", "Square" }, { "SIN", "SAW", "SQR" }, true, 3 });
-        specs.push_back ({ "LFO2SHAPE", "LFO 2 Shape", "Secondary motion", { "Sine", "Saw", "Square" }, { "SIN", "SAW", "SQR" }, true, 3 });
+        specs.push_back ({ "FXTYPE", "Effects", "Insert algorithm", { "Off", "Distortion", "Character", "Chorus", "Phaser", "Flanger", "Ring Mod", "Freq Shift" }, { "OFF", "DST", "CHR", "CHO", "PHA", "FLA", "RNG", "FSH" }, true, 3 });
+        specs.push_back ({ "LFO1SHAPE", "LFO 1 Shape", "Primary motion", { "Sine", "Triangle", "Saw", "Noise", "Square" }, { "SIN", "TRI", "SAW", "NOI", "SQR" }, true, 3 });
+        specs.push_back ({ "LFO2SHAPE", "LFO 2 Shape", "Secondary motion", { "Sine", "Triangle", "Saw", "Noise", "Square" }, { "SIN", "TRI", "SAW", "NOI", "SQR" }, true, 3 });
         specs.push_back ({ "ARPMODE", "Arp Mode", "Pattern motion", { "Up", "Down", "UpDown", "Random" }, { "FWD", "REV", "ALT", "RND" }, true, 2 });
         return specs;
     }
@@ -2174,7 +3510,7 @@ std::vector<AdvancedVSTiAudioProcessorEditor::ChoiceSpec> AdvancedVSTiAudioProce
         specs.push_back ({ "OSCTYPE", "Oscillator", "Core ensemble source", { "Sine", "Saw", "Square", "Noise", "Sample" }, {}, false, 0 });
         specs.push_back ({ "FILTERTYPE", "Filter", "Main timbre curve", { "LP", "BP", "HP", "Notch" }, {}, false, 0 });
         specs.push_back ({ "FILTERSLOPE", "Slope", "Filter roll-off", { "12 dB", "16 dB", "24 dB" }, {}, false, 0 });
-        specs.push_back ({ "FXTYPE", "FX Type", "Insert color", { "Off", "Dist", "Phaser", "Chorus", "Flanger" }, {}, false, 0 });
+        specs.push_back ({ "FXTYPE", "FX Type", "Insert color", { "Off", "Distortion", "Character", "Chorus", "Phaser", "Flanger", "Ring Mod", "Freq Shift" }, {}, false, 0 });
         return specs;
     }
 
@@ -2434,6 +3770,23 @@ std::vector<AdvancedVSTiAudioProcessorEditor::KnobSpec> AdvancedVSTiAudioProcess
 
 std::vector<AdvancedVSTiAudioProcessorEditor::DrumPadSpec> AdvancedVSTiAudioProcessorEditor::buildDrumPadSpecs() const
 {
+    auto makePadSpec = [] (juce::String levelParamId,
+                           juce::String sustainParamId,
+                           juce::String releaseParamId,
+                           juce::String title,
+                           juce::String note,
+                           int midiNote)
+    {
+        DrumPadSpec spec;
+        spec.levelParamId = std::move (levelParamId);
+        spec.sustainParamId = std::move (sustainParamId);
+        spec.releaseParamId = std::move (releaseParamId);
+        spec.title = std::move (title);
+        spec.note = std::move (note);
+        spec.midiNote = midiNote;
+        return spec;
+    };
+
     if (audioProcessor.isVec1DrumPadFlavor())
     {
         std::vector<DrumPadSpec> specs;
@@ -2441,33 +3794,34 @@ std::vector<AdvancedVSTiAudioProcessorEditor::DrumPadSpec> AdvancedVSTiAudioProc
         for (int padIndex = 0; padIndex < audioProcessor.externalPadCount(); ++padIndex)
         {
             const auto state = audioProcessor.getExternalPadState (padIndex);
-            specs.push_back ({
-                audioProcessor.externalPadLevelParameterId (padIndex),
-                state.title,
-                state.note,
-                state.midiNote
-            });
+            specs.push_back (makePadSpec (audioProcessor.externalPadLevelParameterId (padIndex),
+                                          audioProcessor.externalPadSustainParameterId (padIndex),
+                                          audioProcessor.externalPadReleaseParameterId (padIndex),
+                                          state.title,
+                                          state.note,
+                                          state.midiNote));
         }
         return specs;
     }
 
-    return {
-        { "DRUMLEVEL_KICK", "Bass Drum", "C1", 36 },
-        { "DRUMLEVEL_RIM", "Rim Shot", "C#1", 37 },
-        { "DRUMLEVEL_SNARE", "Snare", "D1", 38 },
-        { "DRUMLEVEL_CLAP", "Clap", "D#1", 39 },
-        { "DRUMLEVEL_CLOSED_HAT", "Closed Hat", "E1", 40 },
-        { "DRUMLEVEL_OPEN_HAT", "Open Hat", "F1", 41 },
-        { "DRUMLEVEL_LOW_TOM", "Low Tom", "F#1", 42 },
-        { "DRUMLEVEL_MID_TOM", "Mid Tom", "G1", 43 },
-        { "DRUMLEVEL_HIGH_TOM", "High Tom", "G#1", 44 },
-        { "DRUMLEVEL_CRASH", "Crash", "A1", 45 },
-        { "DRUMLEVEL_RIDE", "Ride", "A#1", 46 },
-        { "DRUMLEVEL_COWBELL", "Cowbell", "B1", 47 },
-        { "DRUMLEVEL_CLAVE", "Clave", "C2", 48 },
-        { "DRUMLEVEL_MARACA", "Maraca", "C#2", 49 },
-        { "DRUMLEVEL_PERC", "Perc", "D2", 50 },
-    };
+    std::vector<DrumPadSpec> specs;
+    specs.reserve (15);
+    specs.push_back (makePadSpec ("DRUMLEVEL_KICK", {}, {}, "Bass Drum", "C1", 36));
+    specs.push_back (makePadSpec ("DRUMLEVEL_RIM", {}, {}, "Rim Shot", "C#1", 37));
+    specs.push_back (makePadSpec ("DRUMLEVEL_SNARE", {}, {}, "Snare", "D1", 38));
+    specs.push_back (makePadSpec ("DRUMLEVEL_CLAP", {}, {}, "Clap", "D#1", 39));
+    specs.push_back (makePadSpec ("DRUMLEVEL_CLOSED_HAT", {}, {}, "Closed Hat", "E1", 40));
+    specs.push_back (makePadSpec ("DRUMLEVEL_OPEN_HAT", {}, {}, "Open Hat", "F1", 41));
+    specs.push_back (makePadSpec ("DRUMLEVEL_LOW_TOM", {}, {}, "Low Tom", "F#1", 42));
+    specs.push_back (makePadSpec ("DRUMLEVEL_MID_TOM", {}, {}, "Mid Tom", "G1", 43));
+    specs.push_back (makePadSpec ("DRUMLEVEL_HIGH_TOM", {}, {}, "High Tom", "G#1", 44));
+    specs.push_back (makePadSpec ("DRUMLEVEL_CRASH", {}, {}, "Crash", "A1", 45));
+    specs.push_back (makePadSpec ("DRUMLEVEL_RIDE", {}, {}, "Ride", "A#1", 46));
+    specs.push_back (makePadSpec ("DRUMLEVEL_COWBELL", {}, {}, "Cowbell", "B1", 47));
+    specs.push_back (makePadSpec ("DRUMLEVEL_CLAVE", {}, {}, "Clave", "C2", 48));
+    specs.push_back (makePadSpec ("DRUMLEVEL_MARACA", {}, {}, "Maraca", "C#2", 49));
+    specs.push_back (makePadSpec ("DRUMLEVEL_PERC", {}, {}, "Perc", "D2", 50));
+    return specs;
 }
 
 void AdvancedVSTiAudioProcessorEditor::paint (juce::Graphics& g)
@@ -2632,12 +3986,22 @@ void AdvancedVSTiAudioProcessorEditor::paint (juce::Graphics& g)
         const auto showBackground = virusShowBackground && virusTemplateImage.isValid();
         const auto uiScale = juce::jlimit (0.9f, 1.2f, juce::jmin (getWidth() / static_cast<float> (kVirusTemplateWidth),
                                                                    getHeight() / static_cast<float> (kVirusTemplateHeight)));
+        const int surfaceHeight = juce::jmin (getHeight(), juce::roundToInt (kVirusTemplateHeight * uiScale));
 
         if (showBackground)
         {
-            g.drawImageWithin (virusTemplateImage, 0, 0, getWidth(), getHeight(), juce::RectanglePlacement::stretchToFit);
+            g.drawImageWithin (virusTemplateImage, 0, 0, getWidth(), surfaceHeight, juce::RectanglePlacement::stretchToFit);
             g.setColour (juce::Colours::black.withAlpha (0.03f));
-            g.fillRect (getLocalBounds());
+            g.fillRect (juce::Rectangle<int> (0, 0, getWidth(), surfaceHeight));
+            if (getHeight() > surfaceHeight)
+            {
+                juce::ColourGradient keyboardArea (juce::Colour::fromRGB (66, 69, 74), 0.0f, static_cast<float> (surfaceHeight),
+                                                   juce::Colour::fromRGB (44, 46, 50), 0.0f, static_cast<float> (getHeight()), false);
+                g.setGradientFill (keyboardArea);
+                g.fillRect (0, surfaceHeight, getWidth(), getHeight() - surfaceHeight);
+                g.setColour (juce::Colours::white.withAlpha (0.14f));
+                g.drawLine (0.0f, static_cast<float> (surfaceHeight), static_cast<float> (getWidth()), static_cast<float> (surfaceHeight), 1.0f);
+            }
         }
         else
         {
@@ -2660,21 +4024,23 @@ void AdvancedVSTiAudioProcessorEditor::paint (juce::Graphics& g)
             for (const auto& group : virusGroupChrome())
             {
                 auto frame = scaledRect (group.frame);
-                auto tab = scaledRect (group.tab);
+                auto tab = scaledRect (group.tab).translated (0.0f, -scaledFloat (3.0f, uiScale));
+                const auto frameCorner = scaledFloat (4.0f, uiScale);
+                const auto frameOutline = juce::jmax (1.0f, scaledFloat (1.0f, uiScale));
 
                 g.setColour (juce::Colour::fromRGBA (24, 28, 34, 168));
-                g.fillRoundedRectangle (frame, scaledFloat (4.0f, uiScale));
+                g.fillRoundedRectangle (frame, frameCorner);
                 g.setColour (juce::Colours::white.withAlpha (0.55f));
-                g.drawRoundedRectangle (frame, scaledFloat (4.0f, uiScale), juce::jmax (1.0f, scaledFloat (1.0f, uiScale)));
+                g.drawRoundedRectangle (frame, frameCorner, frameOutline);
 
-                g.setColour (juce::Colour::fromRGBA (18, 21, 26, 236));
-                g.fillRoundedRectangle (tab, scaledFloat (2.0f, uiScale));
-                g.setColour (juce::Colours::white.withAlpha (0.7f));
-                g.drawRoundedRectangle (tab, scaledFloat (2.0f, uiScale), juce::jmax (1.0f, scaledFloat (0.8f, uiScale)));
+                g.setColour (juce::Colour::fromRGB (239, 241, 244).withAlpha (0.98f));
+                g.setColour (juce::Colours::white.withAlpha (0.8f));
+                g.fillRect (tab);
+                g.drawRect (tab.toNearestInt(), juce::roundToInt (juce::jmax (1.0f, scaledFloat (1.0f, uiScale))));
 
                 auto textBounds = tab.toNearestInt().reduced (scaledInt (5.0f, uiScale), 0);
                 g.setFont (juce::Font (juce::FontOptions { 6.2f * uiScale, juce::Font::bold }));
-                g.setColour (juce::Colour::fromRGB (238, 241, 245));
+                g.setColour (juce::Colour::fromRGB (18, 20, 24));
                 g.drawFittedText (group.title, textBounds, juce::Justification::centredLeft, 1);
             }
         }
@@ -2863,7 +4229,45 @@ void AdvancedVSTiAudioProcessorEditor::paintOverChildren (juce::Graphics& g)
 
     for (int index = 0; index < knobCards.size(); ++index)
     {
-        const auto legend = virusKnobLegend (index);
+        auto legend = virusKnobLegend (index);
+        if (showBackground)
+        {
+            switch (index)
+            {
+                case 7:
+                case 15:
+                case 8:
+                case 16:
+                case 9:
+                    legend.yOffset += 3;
+                    break;
+
+                case 3:
+                    legend.yOffset += 3;
+                    break;
+
+                case 17:
+                case 18:
+                case 19:
+                case 21:
+                    legend.yOffset += 4;
+                    break;
+
+                case 13:
+                case 10:
+                case 20:
+                    legend.yOffset += 5;
+                    break;
+
+                case 22:
+                case 26:
+                    legend.yOffset += 1;
+                    break;
+
+                default:
+                    break;
+            }
+        }
         if (! legend.primary.isEmpty() && ! knobCards[index]->getBounds().isEmpty())
         {
             auto anchor = knobCards[index]->getBounds();
@@ -2900,13 +4304,13 @@ void AdvancedVSTiAudioProcessorEditor::paintOverChildren (juce::Graphics& g)
     drawGroupLegend ({ "valueProgram", "valueProgramNext" }, { "VALUE", "PROGRAM", false, 18, 1 });
     drawGroupLegend ({ "filter2Focus", "filterSelect" }, { "SELECT", {}, false, 22, 1 });
 
-    drawLabelAboveButton ("modLfo1", "LFO 1", scaledInt (30.0f, uiScale), scaledInt (-12.0f, uiScale));
-    drawLabelAboveButton ("modLfo2", "LFO 2", scaledInt (30.0f, uiScale), scaledInt (-12.0f, uiScale));
-    drawLabelAboveButton ("modLfo3", "LFO 3", scaledInt (30.0f, uiScale), scaledInt (-12.0f, uiScale));
+    drawLabelAboveButton ("modLfo1", "LFO 1", scaledInt (30.0f, uiScale), scaledInt (10.0f, uiScale));
+    drawLabelAboveButton ("modLfo2", "LFO 2", scaledInt (30.0f, uiScale), scaledInt (10.0f, uiScale));
+    drawLabelAboveButton ("modLfo3", "LFO 3", scaledInt (30.0f, uiScale), scaledInt (10.0f, uiScale));
 
-    drawLabelRightOfButton ("oscLed1", "OSC 1", scaledInt (3.0f, uiScale), scaledInt (28.0f, uiScale));
-    drawLabelRightOfButton ("oscLed2", "OSC 2", scaledInt (3.0f, uiScale), scaledInt (28.0f, uiScale));
-    drawLabelRightOfButton ("oscLed3", "OSC 3", scaledInt (3.0f, uiScale), scaledInt (28.0f, uiScale));
+    drawLabelRightOfButton ("oscLed1", "OSC 1", scaledInt (1.0f, uiScale), scaledInt (28.0f, uiScale));
+    drawLabelRightOfButton ("oscLed2", "OSC 2", scaledInt (1.0f, uiScale), scaledInt (28.0f, uiScale));
+    drawLabelRightOfButton ("oscLed3", "OSC 3", scaledInt (1.0f, uiScale), scaledInt (28.0f, uiScale));
 
     drawLabelRightOfButton ("fxDelay", "DELAY", scaledInt (-4.0f, uiScale), scaledInt (20.0f, uiScale), 5.2f);
     drawLabelRightOfButton ("fxReverb", "REVERB", scaledInt (-4.0f, uiScale), scaledInt (26.0f, uiScale), 5.2f);
@@ -2914,11 +4318,11 @@ void AdvancedVSTiAudioProcessorEditor::paintOverChildren (juce::Graphics& g)
     drawLabelRightOfButton ("fxMidEq", "MID-EQ", scaledInt (-4.0f, uiScale), scaledInt (24.0f, uiScale), 5.2f);
     drawLabelRightOfButton ("fxHighEq", "HIGH-EQ", scaledInt (-4.0f, uiScale), scaledInt (28.0f, uiScale), 5.2f);
 
-    drawLabelRightOfButton ("fxDistortion", "DISTORTION", scaledInt (1.0f, uiScale), scaledInt (38.0f, uiScale), 6.2f);
-    drawLabelRightOfButton ("fxCharacter", "CHARACTER", scaledInt (1.0f, uiScale), scaledInt (38.0f, uiScale), 6.2f);
-    drawLabelRightOfButton ("fxChorus", "CHORUS", scaledInt (1.0f, uiScale), scaledInt (28.0f, uiScale), 6.2f);
-    drawLabelRightOfButton ("fxPhaser", "PHASER", scaledInt (1.0f, uiScale), scaledInt (28.0f, uiScale), 6.2f);
-    drawLabelRightOfButton ("fxOthers", "OTHERS", scaledInt (1.0f, uiScale), scaledInt (28.0f, uiScale), 6.2f);
+    drawLabelRightOfButton ("fxDistortion", "DISTORTION", scaledInt (-2.0f, uiScale), scaledInt (38.0f, uiScale), 6.2f);
+    drawLabelRightOfButton ("fxCharacter", "CHARACTER", scaledInt (-2.0f, uiScale), scaledInt (38.0f, uiScale), 6.2f);
+    drawLabelRightOfButton ("fxChorus", "CHORUS", scaledInt (-2.0f, uiScale), scaledInt (28.0f, uiScale), 6.2f);
+    drawLabelRightOfButton ("fxPhaser", "PHASER", scaledInt (-2.0f, uiScale), scaledInt (28.0f, uiScale), 6.2f);
+    drawLabelRightOfButton ("fxOthers", "OTHERS", scaledInt (-2.0f, uiScale), scaledInt (28.0f, uiScale), 6.2f);
 
     if (auto* filter1Led = findVirusPanelButton ("filter1ActiveLed"))
         if (auto* filter1Button = findVirusPanelButton ("filter2Focus"))
@@ -2989,37 +4393,38 @@ void AdvancedVSTiAudioProcessorEditor::paintOverChildren (juce::Graphics& g)
 
         const std::array<juce::String, 5> modLeftLabels { "OSC 1", "OSC 2/3", "PW", "RESO", "FLT GAIN" };
         const std::array<juce::String, 6> modRightLabels { "CUTOFF 1", "CUTOFF 2", "SHAPE", "FM AMT", "PAN", "ASSIGN" };
-        const std::array<int, 3> activeLeftRows { 0, 2, 4 };
-        const std::array<int, 3> activeRightRows { 0, 1, 5 };
+        int currentLfoDestination = 0;
+        if (auto* destinationParam = dynamic_cast<juce::AudioParameterChoice*> (audioProcessor.apvts.getParameter (virusLfoDestinationParamId (juce::jlimit (0, 2, virusModulatorIndex)))))
+            currentLfoDestination = juce::jlimit (0, destinationParam->choices.size() - 1, destinationParam->getIndex());
 
         for (int index = 0; index < static_cast<int> (modLeftLabels.size()); ++index)
         {
-            const float y = 140.0f + static_cast<float> (index * 12);
-            drawLedDot (218.0f, y + 4.0f, index == activeLeftRows[static_cast<size_t> (juce::jlimit (0, 2, virusModulatorIndex))]);
-            drawFixedLabel (225.0f, y, 40.0f, modLeftLabels[static_cast<size_t> (index)]);
+            const float y = 142.0f + static_cast<float> (index * 12);
+            drawLedDot (222.0f, y + 4.0f, currentLfoDestination == index);
+            drawFixedLabel (227.0f, y, 40.0f, modLeftLabels[static_cast<size_t> (index)]);
         }
 
         for (int index = 0; index < static_cast<int> (modRightLabels.size()); ++index)
         {
             const float y = 140.0f + static_cast<float> (index * 12);
-            drawLedDot (300.0f, y + 4.0f, index == activeRightRows[static_cast<size_t> (juce::jlimit (0, 2, virusModulatorIndex))]);
+            drawLedDot (300.0f, y + 4.0f, currentLfoDestination == static_cast<int> (modLeftLabels.size()) + index);
             drawFixedLabel (307.0f, y, 42.0f, modRightLabels[static_cast<size_t> (index)]);
         }
 
         auto selectedShapeIndex = -1;
-        if (virusModulatorIndex == 0 || virusModulatorIndex == 1)
-            if (auto* parameter = dynamic_cast<juce::AudioParameterChoice*> (audioProcessor.apvts.getParameter (virusModulatorIndex == 0 ? "LFO1SHAPE" : "LFO2SHAPE")))
-                selectedShapeIndex = juce::jlimit (0, static_cast<int> (parameter->choices.size()) - 1, parameter->getIndex());
+        const auto selectedShapeParamId = virusModulatorIndex == 0 ? "LFO1SHAPE"
+                                        : virusModulatorIndex == 1 ? "LFO2SHAPE"
+                                                                   : "LFO3SHAPE";
+        if (auto* parameter = dynamic_cast<juce::AudioParameterChoice*> (audioProcessor.apvts.getParameter (selectedShapeParamId)))
+            selectedShapeIndex = juce::jlimit (0, static_cast<int> (parameter->choices.size()) - 1, parameter->getIndex());
 
-        const std::array<juce::String, 4> shapeSymbols { "~", "/", "<", "[]" };
+        const std::array<juce::String, 5> shapeSymbols { "~", "/\\", "/|", "X", "[ ]" };
         for (int index = 0; index < static_cast<int> (shapeSymbols.size()); ++index)
         {
             const float y = 83.0f + static_cast<float> (index * 13);
-            const bool active = (selectedShapeIndex == 0 && index == 0)
-                                || (selectedShapeIndex == 1 && index == 1)
-                                || (selectedShapeIndex == 2 && index == 3);
-            drawLedDot (303.0f, y + 4.0f, active);
-            drawFixedLabel (311.0f, y - 6.0f, 18.0f, shapeSymbols[static_cast<size_t> (index)]);
+            const bool active = selectedShapeIndex == index;
+            drawLedDot (303.0f, y - 4.0f, active);
+            drawFixedLabel (311.0f, y - 6.0f, 22.0f, shapeSymbols[static_cast<size_t> (index)]);
         }
     }
 
@@ -3046,6 +4451,84 @@ void AdvancedVSTiAudioProcessorEditor::paintOverChildren (juce::Graphics& g)
                                                              juce::jmax (scaledInt (16.0f, uiScale), rightBounds.getX() - leftBounds.getRight() - scaledInt (4.0f, uiScale)),
                                                              leftBounds.getHeight() + scaledInt (2.0f, uiScale));
                     drawInlineIndicatorLabel (labelBounds, label, juce::Justification::centred, 6.2f, primaryColour);
+                }
+            }
+        }
+    }
+
+    if (choiceCards.size() > 0
+        && choiceCards[0] != nullptr)
+    {
+        const auto nowMs = juce::Time::getMillisecondCounterHiRes();
+        const bool transientOsdActive = virusOsdPinned || virusOsdUntilMs > nowMs;
+        juce::String displayTitle = virusOsdTitle;
+        juce::String displayValue = virusOsdValue;
+        juce::String displayDetail = virusOsdDetail;
+
+        if (! transientOsdActive || displayValue.isEmpty())
+        {
+            const auto presetIndex = audioProcessor.getCurrentProgram();
+            displayTitle = virusPanelModeIndex == 1 ? "MULTI" : "SINGLE";
+            displayValue = audioProcessor.getProgramName (presetIndex);
+            if (displayValue.isEmpty())
+                displayValue = "Init Preset";
+            displayDetail = "PRESET "
+                            + juce::String (presetIndex + 1).paddedLeft ('0', 3)
+                            + " / "
+                            + juce::String (juce::jmax (1, audioProcessor.getNumPrograms())).paddedLeft ('0', 3)
+                            + "   PART < >";
+        }
+
+        auto baseBounds = choiceCards[0]->getBounds();
+        if (! baseBounds.isEmpty() && ! displayValue.isEmpty())
+        {
+            auto osdBounds = baseBounds.getIntersection (getLocalBounds().reduced (2));
+
+            if (! osdBounds.isEmpty())
+            {
+                auto bezelBounds = osdBounds.toFloat();
+                const auto bezelCorner = scaledFloat (6.0f, uiScale);
+                g.setColour (juce::Colour::fromRGB (43, 47, 52).withAlpha (showBackground ? 0.94f : 0.98f));
+                g.fillRoundedRectangle (bezelBounds, bezelCorner);
+                g.setColour (juce::Colour::fromRGB (12, 14, 18).withAlpha (0.85f));
+                g.drawRoundedRectangle (bezelBounds, bezelCorner, scaledFloat (1.2f, uiScale));
+
+                auto lcdBounds = bezelBounds.reduced (scaledFloat (5.0f, uiScale), scaledFloat (4.0f, uiScale));
+                juce::ColourGradient lcdFill (juce::Colour::fromRGB (230, 233, 235), lcdBounds.getCentreX(), lcdBounds.getY(),
+                                              juce::Colour::fromRGB (198, 204, 207), lcdBounds.getCentreX(), lcdBounds.getBottom(), false);
+                g.setGradientFill (lcdFill);
+                g.fillRoundedRectangle (lcdBounds, scaledFloat (2.5f, uiScale));
+                g.setColour (juce::Colour::fromRGB (88, 94, 100).withAlpha (0.95f));
+                g.drawRoundedRectangle (lcdBounds, scaledFloat (2.5f, uiScale), scaledFloat (1.0f, uiScale));
+
+                for (float y = lcdBounds.getY() + scaledFloat (3.0f, uiScale); y < lcdBounds.getBottom(); y += scaledFloat (3.4f, uiScale))
+                {
+                    g.setColour (juce::Colour::fromRGB (248, 249, 250).withAlpha (0.08f));
+                    g.drawLine (lcdBounds.getX() + scaledFloat (2.0f, uiScale), y,
+                                lcdBounds.getRight() - scaledFloat (2.0f, uiScale), y,
+                                scaledFloat (0.45f, uiScale));
+                }
+
+                auto textArea = lcdBounds.toNearestInt().reduced (scaledInt (7.0f, uiScale), scaledInt (4.0f, uiScale));
+                auto header = textArea.removeFromTop (scaledInt (9.0f, uiScale));
+                auto detailBounds = textArea.removeFromBottom (scaledInt (10.0f, uiScale));
+                auto valueBounds = textArea;
+
+                g.setColour (juce::Colour::fromRGB (52, 58, 62));
+                g.setFont (juce::Font (juce::FontOptions { 5.2f * uiScale, juce::Font::bold }));
+                g.drawFittedText (displayTitle, header, juce::Justification::centredLeft, 1);
+                g.drawFittedText ("LCD", header.removeFromRight (scaledInt (26.0f, uiScale)), juce::Justification::centredRight, 1);
+
+                const float valueFontSize = displayValue.length() > 18 ? 9.0f : 12.8f;
+                g.setFont (juce::Font (juce::FontOptions { valueFontSize * uiScale, juce::Font::bold }));
+                g.setColour (juce::Colour::fromRGB (66, 69, 72));
+                g.drawFittedText (displayValue, valueBounds, juce::Justification::centredLeft, 1);
+
+                if (displayDetail.isNotEmpty())
+                {
+                    g.setFont (juce::Font (juce::FontOptions { 5.5f * uiScale, juce::Font::plain }));
+                    g.setColour (juce::Colour::fromRGB (74, 78, 82));
+                    g.drawFittedText (displayDetail, detailBounds, juce::Justification::centredLeft, 1);
                 }
             }
         }
@@ -3290,6 +4773,11 @@ void AdvancedVSTiAudioProcessorEditor::resized()
             virusBackgroundToggle->setScale (0.82f);
             virusBackgroundToggle->setBounds (8, 8, 28, 16);
         }
+        if (virusKeyboardToggle != nullptr)
+        {
+            virusKeyboardToggle->setScale (0.82f);
+            virusKeyboardToggle->setBounds (40, 8, 28, 16);
+        }
 
         badgeLabel.setBounds ({});
         titleLabel.setBounds ({});
@@ -3375,63 +4863,71 @@ void AdvancedVSTiAudioProcessorEditor::resized()
         placeKnobByCentre (0, 40, 98);
         placeKnobByCentre (3, 354, 99);
 
-        placeKnobByCentre (7, 430, 98);
+        placeKnobByCentre (7, 428, 98);
         placeKnobByCentre (15, 498, 98);
         placeKnobByCentre (8, 566, 98);
-        placeKnobByCentre (16, 630, 98);
-        placeKnobByCentre (13, 630, 176);
+        placeKnobByCentre (16, 639, 98);
+        placeKnobByCentre (13, 639, 176);
 
         placeKnobByCentre (9, 722, 98);
-        placeKnobByCentre (10, 722, 176);
-        placeKnobByCentre (12, 722, 282);
-        placeKnobByCentre (11, 722, 378);
+        placeKnobByCentre (10, 722, 177);
+        placeKnobByCentre (12, 722, 287);
 
-        placeKnobByCentre (17, 804, 97);
-        placeKnobByCentre (18, 868, 98);
-        placeKnobByCentre (19, 931, 97);
+        placeKnobByCentre (17, 798, 97);
+        placeKnobByCentre (18, 865, 98);
+        placeKnobByCentre (19, 928, 97);
         placeKnobByCentre (21, 995, 97);
-        placeKnobByCentre (20, 804, 177);
-        placeKnobRow ({ 22, 23, 24, 25 }, 782, 251, 12);
-        placeKnobRow ({ 26, 27, 28, 29 }, 782, 347, 12);
+        placeKnobByCentre (20, 798, 177);
+        placeKnobByCentre (22, 799, 278);
+        placeKnobByCentre (23, 863, 278);
+        placeKnobByCentre (24, 929, 278);
+        placeKnobByCentre (25, 992, 278);
 
-        placeChoice (0, { 401, 255, 184, kVirusChoiceHeight });
-        layoutGrid ({ 402, 349, 210, kVirusKnobHeight }, { 30, 31, 32 }, 3, 20, 0);
-        placeKnobByCentre (35, 134, 289);
-        placeKnobByCentre (36, 193, 289);
-        placeKnobByCentre (37, 254, 288);
-        placeKnobByCentre (33, 131, 377);
-        placeKnobByCentre (34, 190, 377);
-        placeKnobByCentre (11, 722, 375);
-        placeKnobRow ({ 26, 27, 28, 29 }, 782, 344, 12);
+        if (juce::isPositiveAndBelow (0, choiceCards.size()))
+        {
+            choiceCards[0]->setBounds ({ 392, 247, 216, 58 });
+            choiceCards[0]->setVisible (false);
+        }
+        layoutGrid ({ 393, 349, 210, kVirusKnobHeight }, { 30, 31, 32 }, 3, 20, 0);
+        placeKnobByCentre (35, 122, 288);
+        placeKnobByCentre (36, 192, 288);
+        placeKnobByCentre (37, 259, 287);
+        placeKnobByCentre (33, 121, 375);
+        placeKnobByCentre (34, 190, 375);
+        placeKnobByCentre (11, 722, 373);
+        placeKnobByCentre (26, 799, 371);
+        placeKnobByCentre (27, 863, 371);
+        placeKnobByCentre (28, 929, 371);
+        placeKnobByCentre (29, 992, 371);
 
-        placeVirusPanelButton ("arpEdit", { 25, 156, kVirusSquareButtonSize, 45 });
-        placeVirusPanelButton ("arpOn", { 54, 156, kVirusSquareButtonSize, 45 });
+        placeVirusPanelButton ("arpEdit", { 25, 153, kVirusSquareButtonSize, 45 });
+        placeVirusPanelButton ("arpOn", { 54, 153, kVirusSquareButtonSize, 45 });
         placeVirusPanelButton ("matrixDest", { 101, 87, kVirusSquareButtonSize, kVirusSquareButtonSize });
         placeVirusPanelButton ("matrixSource", { 131, 87, kVirusSquareButtonSize, kVirusSquareButtonSize });
         placeVirusPanelButton ("matrixSelect", { 101, 163, kVirusSquareButtonSize, kVirusSquareButtonSize });
-        placeVirusPanelButton ("matrixSlot1", { 131, 138, 14, 10 });
-        placeVirusPanelButton ("matrixSlot2", { 131, 149, 14, 10 });
-        placeVirusPanelButton ("matrixSlot3", { 131, 160, 14, 10 });
-        placeVirusPanelButton ("matrixSlot4", { 131, 171, 14, 10 });
-        placeVirusPanelButton ("matrixSlot5", { 131, 182, 14, 10 });
-        placeVirusPanelButton ("matrixSlot6", { 131, 193, 14, 10 });
-        placeVirusPanelButton ("modLfo1", { 187, 152, 20, 12 });
-        placeVirusPanelButton ("modLfo2", { 262, 152, 20, 12 });
-        placeVirusPanelButton ("modLfo3", { 347, 152, 20, 12 });
-        placeVirusPanelButton ("modEdit", { 177, 87, kVirusSquareButtonSize, kVirusSquareButtonSize });
-        placeVirusPanelButton ("modEnvMode", { 210, 87, kVirusSquareButtonSize, kVirusSquareButtonSize });
-        placeVirusPanelButton ("modShape", { 260, 87, kVirusSquareButtonSize, kVirusSquareButtonSize });
+        placeVirusPanelButton ("matrixSlot1", { 133, 140, 14, 10 });
+        placeVirusPanelButton ("matrixSlot2", { 133, 151, 14, 10 });
+        placeVirusPanelButton ("matrixSlot3", { 133, 162, 14, 10 });
+        placeVirusPanelButton ("matrixSlot4", { 133, 173, 14, 10 });
+        placeVirusPanelButton ("matrixSlot5", { 133, 184, 14, 10 });
+        placeVirusPanelButton ("matrixSlot6", { 133, 195, 14, 10 });
+        placeVirusPanelButton ("modLfo1", { 187, 149, 20, 12 });
+        placeVirusPanelButton ("modLfo2", { 262, 149, 20, 12 });
+        placeVirusPanelButton ("modLfo3", { 347, 150, 20, 12 });
+        placeVirusPanelButton ("modEdit", { 181, 75, kVirusSquareButtonSize, 45 });
+        placeVirusPanelButton ("modEnvMode", { 210, 75, kVirusSquareButtonSize, 45 });
+        placeVirusPanelButton ("modShape", { 260, 75, kVirusSquareButtonSize, 45 });
         placeVirusPanelButton ("modSelect", { 183, 164, kVirusSquareButtonSize, kVirusSquareButtonSize });
         placeVirusPanelButton ("modAssign", { 260, 164, kVirusSquareButtonSize, kVirusSquareButtonSize });
-        placeVirusPanelButton ("modSelectRight", { 345, 164, kVirusSquareButtonSize, kVirusSquareButtonSize });
-        placeVirusPanelButton ("oscLed1", { 412, 136, 16, 10 });
-        placeVirusPanelButton ("oscLed2", { 443, 136, 16, 10 });
-        placeVirusPanelButton ("oscLed3", { 474, 136, 16, 10 });
-        placeVirusPanelButton ("oscSelect", { 401, 152, kVirusSquareButtonSize, 45 });
-        placeVirusPanelButton ("oscEdit", { 431, 152, kVirusSquareButtonSize, 45 });
-        placeVirusPanelButton ("osc3On", { 461, 152, kVirusSquareButtonSize, 45 });
-        placeVirusPanelButton ("mono", { 542, 152, kVirusSquareButtonSize, 45 });
-        placeVirusPanelButton ("syncPanel", { 572, 152, kVirusSquareButtonSize, 45 });
+        placeVirusPanelButton ("modSelectRight", { 341, 164, kVirusSquareButtonSize, kVirusSquareButtonSize });
+        placeVirusPanelButton ("oscLed1", { 406, 141, 16, 10 });
+        placeVirusPanelButton ("oscLed2", { 437, 141, 16, 10 });
+        placeVirusPanelButton ("oscLed3", { 468, 141, 16, 10 });
+        placeVirusPanelButton ("oscSelect", { 398, 152, kVirusSquareButtonSize, 45 });
+        placeVirusPanelButton ("oscEdit", { 427, 152, kVirusSquareButtonSize, 45 });
+        placeVirusPanelButton ("osc3On", { 459, 152, kVirusSquareButtonSize, 45 });
+        placeVirusPanelButton ("mono", { 540, 152, kVirusSquareButtonSize, 45 });
+        placeVirusPanelButton ("syncPanel", { 570, 152, kVirusSquareButtonSize, 45 });
         placeVirusPanelButton ("fxSelectA", { 25, 271, kVirusSquareButtonSize, kVirusSquareButtonSize });
         placeVirusPanelButton ("fxEditA", { 58, 271, kVirusSquareButtonSize, kVirusSquareButtonSize });
         placeVirusPanelButton ("fxSelectB", { 26, 357, kVirusSquareButtonSize, kVirusSquareButtonSize });
@@ -3446,16 +4942,16 @@ void AdvancedVSTiAudioProcessorEditor::resized()
         placeVirusPanelButton ("fxChorus", { 132, 325, 24, 14 });
         placeVirusPanelButton ("fxPhaser", { 186, 325, 24, 14 });
         placeVirusPanelButton ("fxOthers", { 240, 325, 24, 14 });
-        placeVirusPanelButton ("transposeDown", { 230, 346, kVirusSquareButtonSize, 45 });
-        placeVirusPanelButton ("transposeUp", { 263, 346, kVirusSquareButtonSize, 45 });
-        placeVirusPanelButton ("displayExit", { 315, 225, kVirusSquareButtonSize, kVirusSquareButtonSize });
-        placeVirusPanelButton ("displayTap", { 345, 225, kVirusSquareButtonSize, kVirusSquareButtonSize });
-        placeVirusPanelButton ("displayEdit", { 315, 268, kVirusSquareButtonSize, 45 });
-        placeVirusPanelButton ("displayConfig", { 345, 268, kVirusSquareButtonSize, 45 });
-        placeVirusPanelButton ("displayStore", { 315, 322, kVirusSquareButtonSize, kVirusSquareButtonSize });
-        placeVirusPanelButton ("displayUndo", { 345, 322, kVirusSquareButtonSize, kVirusSquareButtonSize });
-        placeVirusPanelButton ("displayShift", { 315, 367, kVirusSquareButtonSize, kVirusSquareButtonSize });
-        placeVirusPanelButton ("displaySearch", { 345, 367, kVirusSquareButtonSize, kVirusSquareButtonSize });
+        placeVirusPanelButton ("transposeDown", { 232, 354, kVirusSquareButtonSize, 45 });
+        placeVirusPanelButton ("transposeUp", { 263, 354, kVirusSquareButtonSize, 45 });
+        placeVirusPanelButton ("displayExit", { 312, 225, kVirusSquareButtonSize, kVirusSquareButtonSize });
+        placeVirusPanelButton ("displayTap", { 342, 225, kVirusSquareButtonSize, kVirusSquareButtonSize });
+        placeVirusPanelButton ("displayEdit", { 312, 266, kVirusSquareButtonSize, 45 });
+        placeVirusPanelButton ("displayConfig", { 342, 266, kVirusSquareButtonSize, 45 });
+        placeVirusPanelButton ("displayStore", { 312, 322, kVirusSquareButtonSize, kVirusSquareButtonSize });
+        placeVirusPanelButton ("displayUndo", { 342, 322, kVirusSquareButtonSize, kVirusSquareButtonSize });
+        placeVirusPanelButton ("displayShift", { 312, 367, kVirusSquareButtonSize, kVirusSquareButtonSize });
+        placeVirusPanelButton ("displaySearch", { 342, 367, kVirusSquareButtonSize, kVirusSquareButtonSize });
         placeVirusPanelButton ("partLeft", { 617, 226, kVirusSquareButtonSize, kVirusSquareButtonSize });
         placeVirusPanelButton ("part", { 647, 226, kVirusSquareButtonSize, kVirusSquareButtonSize });
         placeVirusPanelButton ("multi", { 617, 275, kVirusSquareButtonSize, kVirusSquareButtonSize });
@@ -3467,8 +4963,8 @@ void AdvancedVSTiAudioProcessorEditor::resized()
         placeVirusPanelButton ("filterEdit", { 832, 164, kVirusSquareButtonSize, kVirusSquareButtonSize });
         placeVirusPanelButton ("filter1Focus", { 861, 164, kVirusSquareButtonSize, kVirusSquareButtonSize });
         placeVirusPanelButton ("filterMode", { 931, 164, kVirusSquareButtonSize, kVirusSquareButtonSize });
-        placeVirusPanelButton ("filter2Focus", { 968, 164, kVirusSquareButtonSize, kVirusSquareButtonSize });
-        placeVirusPanelButton ("filterSelect", { 998, 164, kVirusSquareButtonSize, kVirusSquareButtonSize });
+        placeVirusPanelButton ("filter2Focus", { 963, 164, kVirusSquareButtonSize, kVirusSquareButtonSize });
+        placeVirusPanelButton ("filterSelect", { 993, 164, kVirusSquareButtonSize, kVirusSquareButtonSize });
         placeVirusPanelButton ("filter1ActiveLed", { 960, 152, 12, 10 });
         placeVirusPanelButton ("filter2ActiveLed", { 990, 152, 12, 10 });
         placeVirusPanelButton ("filter1ModeLp", { 893, 146, 12, 10 });
@@ -3480,6 +4976,14 @@ void AdvancedVSTiAudioProcessorEditor::resized()
         placeVirusPanelButton ("filter2ModeBp", { 918, 174, 12, 10 });
         placeVirusPanelButton ("filter2ModeBs", { 918, 188, 12, 10 });
 
+        if (virusKeyboard != nullptr)
+        {
+            if (virusKeyboardVisible)
+                virusKeyboard->setBounds (12, kVirusTemplateHeight + 8, getWidth() - 24, kVirusKeyboardExtraHeight - 18);
+            else
+                virusKeyboard->setBounds ({});
+        }
+
         for (auto* pad : drumPads)
             pad->setBounds ({});
         return;
@@ -3487,26 +4991,33 @@ void AdvancedVSTiAudioProcessorEditor::resized()
 
     if (virusBackgroundToggle != nullptr)
         virusBackgroundToggle->setBounds ({});
+    if (virusKeyboardToggle != nullptr)
+        virusKeyboardToggle->setBounds ({});
+    if (virusKeyboard != nullptr)
+        virusKeyboard->setBounds ({});
 
     if (usesDrumPadLayout())
     {
-        const auto uiScale = juce::jlimit (0.8f, 1.4f, juce::jmin (getWidth() / 1180.0f, getHeight() / 860.0f));
-        badgeLabel.setFont (juce::Font (11.0f * uiScale, juce::Font::bold));
-        titleLabel.setFont (juce::Font (28.0f * uiScale, juce::Font::bold));
-        subtitleLabel.setFont (juce::Font (13.0f * uiScale, juce::Font::plain));
+        const bool vecPadLayout = audioProcessor.isVec1DrumPadFlavor();
+        const auto uiScale = vecPadLayout
+                                 ? juce::jlimit (0.72f, 1.15f, juce::jmin (getWidth() / 1280.0f, getHeight() / 900.0f))
+                                 : juce::jlimit (0.8f, 1.4f, juce::jmin (getWidth() / 1180.0f, getHeight() / 860.0f));
+        badgeLabel.setFont (juce::Font ((vecPadLayout ? 10.0f : 11.0f) * uiScale, juce::Font::bold));
+        titleLabel.setFont (juce::Font ((vecPadLayout ? 24.0f : 28.0f) * uiScale, juce::Font::bold));
+        subtitleLabel.setFont (juce::Font ((vecPadLayout ? 11.5f : 13.0f) * uiScale, juce::Font::plain));
         for (auto* card : knobCards)
             card->setScale (uiScale);
         for (auto* card : choiceCards)
             card->setScale (uiScale);
 
-        auto area = getLocalBounds().reduced (isTribute909() ? 26 : 22);
-        auto hero = area.removeFromTop (isTribute909() ? 88 : 96);
+        auto area = getLocalBounds().reduced (isTribute909() ? 26 : (vecPadLayout ? 18 : 22));
+        auto hero = area.removeFromTop (isTribute909() ? 88 : (vecPadLayout ? 82 : 96));
         badgeLabel.setBounds (hero.removeFromTop (18));
-        titleLabel.setBounds (hero.removeFromTop (isTribute909() ? 40 : 36));
-        subtitleLabel.setBounds (hero.removeFromTop (36));
-        area.removeFromTop (audioProcessor.isVec1DrumPadFlavor() ? 6 : (isTribute909() ? 18 : 10));
+        titleLabel.setBounds (hero.removeFromTop (isTribute909() ? 40 : (vecPadLayout ? 32 : 36)));
+        subtitleLabel.setBounds (hero.removeFromTop (vecPadLayout ? 28 : 36));
+        area.removeFromTop (vecPadLayout ? 4 : (isTribute909() ? 18 : 10));
 
-        if (! audioProcessor.isVec1DrumPadFlavor())
+        if (! vecPadLayout)
         {
             auto controlBand = area.removeFromTop (isTribute909() ? 164 : 204);
             if (! choiceCards.isEmpty())
@@ -3540,11 +5051,12 @@ void AdvancedVSTiAudioProcessorEditor::resized()
         }
 
         auto padArea = area;
-        const int spacing = isTribute909() ? 10 : 14;
-        const int columns = isTribute909() ? 5 : 4;
-        const int rows = isTribute909() ? 3 : 4;
-        const int padWidth = (padArea.getWidth() - ((columns - 1) * spacing)) / columns;
-        const int padHeight = (padArea.getHeight() - ((rows - 1) * spacing)) / rows;
+        const int spacing = vecPadLayout ? 10 : (isTribute909() ? 10 : 14);
+        const int columns = vecPadLayout ? 5 : (isTribute909() ? 5 : 4);
+        const int rows = vecPadLayout ? juce::jmax (1, (drumPads.size() + columns - 1) / columns)
+                                      : (isTribute909() ? 3 : 4);
+        const int padWidth = juce::jmax (80, (padArea.getWidth() - ((columns - 1) * spacing)) / columns);
+        const int padHeight = juce::jmax (116, (padArea.getHeight() - ((rows - 1) * spacing)) / rows);
 
         int x = padArea.getX();
         int y = padArea.getY();
