@@ -60,6 +60,10 @@ public:
     [[nodiscard]] juce::String externalPadSustainParameterId (int padIndex) const;
     [[nodiscard]] juce::String externalPadReleaseParameterId (int padIndex) const;
     [[nodiscard]] juce::MidiKeyboardState& getKeyboardState() noexcept { return keyboardState; }
+    [[nodiscard]] bool toggleArpHold();
+    [[nodiscard]] bool isArpHoldEnabled() const noexcept;
+    void panicAllNotes();
+    void auditionPresetNote (int midiNote = 60, float velocity = 0.9f, int durationMs = 420);
 
     juce::AudioProcessorValueTreeState apvts;
 
@@ -137,7 +141,21 @@ private:
         reverbTime,
         lowEqGain,
         midEqGain,
-        highEqGain
+        highEqGain,
+        reverbDamping,
+        lowEqFreq,
+        lowEqQ,
+        midEqFreq,
+        midEqQ,
+        highEqFreq,
+        highEqQ,
+        masterLevel,
+        detune,
+        syncAmount,
+        gateLength,
+        filterEnvAmount,
+        osc2Mix,
+        ringModAmount
     };
 
     struct ExternalSampleData;
@@ -199,9 +217,18 @@ private:
         float delayFeedback = 0.0f;
         float reverbMix = 0.0f;
         float reverbTime = 0.0f;
+        float reverbDamping = 0.0f;
         float lowEqGain = 0.0f;
+        float lowEqFreq = 0.0f;
+        float lowEqQ = 0.0f;
         float midEqGain = 0.0f;
+        float midEqFreq = 0.0f;
+        float midEqQ = 0.0f;
         float highEqGain = 0.0f;
+        float highEqFreq = 0.0f;
+        float highEqQ = 0.0f;
+        float masterLevel = 0.0f;
+        float filterEnvAmount = 0.0f;
         int activeVoices = 0;
     };
 
@@ -410,8 +437,16 @@ private:
     juce::MidiKeyboardState keyboardState;
     std::atomic<int> pendingPresetIndex { -1 };
     std::atomic<bool> pendingExternalPadReload { false };
+    std::atomic<bool> arpHoldEnabled { false };
+    std::atomic<bool> pendingReleaseHeldNotes { false };
+    std::atomic<bool> pendingPanicAllNotes { false };
+    std::atomic<int> pendingAuditionNote { -1 };
+    std::atomic<int> pendingAuditionVelocity { 114 };
+    std::atomic<int> pendingAuditionDurationMs { 420 };
     int currentProgramIndex = 0;
     bool suppressPresetCallback = false;
+    int activeAuditionNote = -1;
+    int auditionSamplesRemaining = 0;
     juce::SpinLock pendingPreviewMidiLock;
     juce::MidiBuffer pendingPreviewMidi;
 
@@ -533,6 +568,7 @@ private:
 
     void updateRenderParameters();
     void applyEnvelopeSettings();
+    void applyPendingUiActions (juce::MidiBuffer& midiMessages, int blockSamples);
     void advanceArpIfNeeded();
     int getArpNote() const;
     void applyPresetByIndex (int presetIndex);

@@ -172,7 +172,8 @@ figcaption {
 .shot-grid,
 .guide-grid,
 .release-grid,
-.note-grid {
+.note-grid,
+.feature-split {
   display: grid;
   gap: 18px;
 }
@@ -201,10 +202,49 @@ figcaption {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+.feature-split,
+.manual-step {
+  grid-template-columns: minmax(0, 1.1fr) minmax(280px, 0.9fr);
+  align-items: start;
+}
+
 .guide-card,
 .note-card,
 .release-card {
   padding: 20px;
+}
+
+.feature-copy,
+.manual-copy {
+  border: 1px solid var(--line);
+  border-radius: 24px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+  padding: 20px;
+}
+
+.feature-list,
+.manual-list {
+  margin: 0;
+  padding-left: 20px;
+  color: var(--muted);
+  line-height: 1.7;
+}
+
+.manual-tip {
+  margin-bottom: 0;
+  padding: 14px 16px;
+  border-radius: 16px;
+  border: 1px solid rgba(89, 196, 255, 0.18);
+  background: rgba(89, 196, 255, 0.08);
+}
+
+.manual-hero {
+  grid-template-columns: minmax(0, 1.35fr) minmax(280px, 0.8fr);
+}
+
+.manual-media {
+  margin: 0;
 }
 
 .release-grid {
@@ -228,7 +268,9 @@ a {
   .shot-grid,
   .guide-grid,
   .release-grid,
-  .note-grid {
+  .note-grid,
+  .feature-split,
+  .manual-step {
     grid-template-columns: 1fr;
   }
 

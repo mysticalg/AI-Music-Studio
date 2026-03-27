@@ -84,6 +84,52 @@ const std::array<juce::String, 11> kVirusModDestinationLabels {
 const std::array<juce::String, 5> kVirusUpperFxLabels { "DELAY", "REVERB", "LOW EQ", "MID EQ", "HIGH EQ" };
 const std::array<juce::String, 5> kVirusLowerFxLabels { "DISTORTION", "CHARACTER", "CHORUS", "PHASER", "OTHERS" };
 
+struct VirusPresetDisplayInfo
+{
+    juce::String bankLabel;
+    juce::String slotLabel;
+    juce::String categoryCode;
+    juce::String descriptorA;
+    juce::String descriptorB;
+    juce::String descriptorC;
+};
+
+VirusPresetDisplayInfo virusPresetDisplayInfo (const juce::String& presetName, int presetIndex, int totalPrograms)
+{
+    const auto normalized = presetName.toLowerCase();
+    const auto bankLetter = static_cast<juce_wchar> ('A' + juce::jlimit (0, 25, presetIndex / 128));
+    juce::ignoreUnused (totalPrograms);
+
+    VirusPresetDisplayInfo info;
+    info.bankLabel = "RAM-" + juce::String::charToString (bankLetter);
+    info.slotLabel = juce::String ((presetIndex % 128) + 1).paddedLeft ('0', 3);
+
+    if (normalized.contains ("pad"))
+        return { info.bankLabel, info.slotLabel, "PAD", "ATMOS", "WARM", "WIDE" };
+    if (normalized.contains ("lead"))
+        return { info.bankLabel, info.slotLabel, "LEAD", "SOLO", "EDGE", "FOCUS" };
+    if (normalized.contains ("bass"))
+        return { info.bankLabel, info.slotLabel, "BASS", "SUB", "PUNCH", "DRIVE" };
+    if (normalized.contains ("arp") || normalized.contains ("seq"))
+        return { info.bankLabel, info.slotLabel, "SEQ", "MOTION", "RHYTHM", "STEP" };
+    if (normalized.contains ("sweep") || normalized.contains ("ufo"))
+        return { info.bankLabel, info.slotLabel, "FX", "SWEEP", "SPACE", "MOTION" };
+    if (normalized.contains ("pluck") || normalized.contains ("zipp"))
+        return { info.bankLabel, info.slotLabel, "PLUCK", "ATTACK", "BRIGHT", "SHORT" };
+    if (normalized.contains ("square"))
+        return { info.bankLabel, info.slotLabel, "CLASSIC", "SQUARE", "BRIGHT", "VINTAGE" };
+    if (normalized.contains ("saw"))
+        return { info.bankLabel, info.slotLabel, "CLASSIC", "SAW", "BRIGHT", "STACK" };
+    if (normalized.contains ("fm"))
+        return { info.bankLabel, info.slotLabel, "DIGI", "FM", "GLASS", "METAL" };
+    if (normalized.contains ("poly"))
+        return { info.bankLabel, info.slotLabel, "POLY", "STACK", "GLOSS", "WIDE" };
+    if (normalized.contains ("mono"))
+        return { info.bankLabel, info.slotLabel, "MONO", "FOCUS", "DRIVE", "LEGATO" };
+
+    return { info.bankLabel, info.slotLabel, "SYNTH", "CUSTOM", "VIRUS", "USER" };
+}
+
 juce::String virusLfoEnableParamId (int index)
 {
     switch (juce::jlimit (0, 2, index))
@@ -685,7 +731,7 @@ void AdvancedVSTiAudioProcessorEditor::AccentLookAndFeel::drawRotarySlider (
 
         const float indicatorLength = (radius * 0.76f) + 1.0f;
         juce::Path indicator;
-        indicator.addRoundedRectangle (-2.05f, -indicatorLength, 4.1f, indicatorLength, 1.0f);
+        indicator.addRoundedRectangle (-1.05f, -indicatorLength, 2.1f, indicatorLength, 1.0f);
         g.setColour ((theme.knobCap.isTransparent() ? theme.text : theme.knobCap).brighter (0.14f));
         g.fillPath (indicator, juce::AffineTransform::rotation (angle).translated (centre.x, centre.y));
         return;
@@ -2039,14 +2085,11 @@ void AdvancedVSTiAudioProcessorEditor::refreshVirusPresetOsd()
     auto presetName = audioProcessor.getProgramName (presetIndex);
     if (presetName.isEmpty())
         presetName = "Init Preset";
+    const auto presetInfo = virusPresetDisplayInfo (presetName, presetIndex, audioProcessor.getNumPrograms());
 
     showVirusOsdMessage (virusPanelModeIndex == 1 ? "MULTI" : "SINGLE",
                          presetName,
-                         "PRESET "
-                             + juce::String (presetIndex + 1).paddedLeft ('0', 3)
-                             + " / "
-                             + juce::String (juce::jmax (1, audioProcessor.getNumPrograms())).paddedLeft ('0', 3)
-                             + "   VALUE 1-3 / PART < >",
+                         presetInfo.descriptorA + "|" + presetInfo.descriptorB + "|" + presetInfo.descriptorC,
                          true,
                          60000.0);
 }
@@ -2351,9 +2394,15 @@ void AdvancedVSTiAudioProcessorEditor::syncVirusPanelButtons()
         return dynamic_cast<juce::RangedAudioParameter*> (audioProcessor.apvts.getParameter (paramId));
     };
 
-    if (auto* parameter = rangedParameter ("ARPENABLE"))
-        if (auto* button = findVirusPanelButton ("arpOn"))
-            button->setToggleState (parameter->getValue() >= 0.5f, juce::dontSendNotification);
+    if (auto* button = findVirusPanelButton ("arpOn"))
+    {
+        bool enabled = audioProcessor.isArpHoldEnabled();
+        if (! virusShiftMode)
+            if (auto* parameter = rangedParameter ("ARPENABLE"))
+                enabled = parameter->getValue() >= 0.5f;
+
+        button->setToggleState (enabled, juce::dontSendNotification);
+    }
 
     if (auto* parameter = rangedParameter ("MONOENABLE"))
         if (auto* button = findVirusPanelButton ("mono"))
@@ -2597,8 +2646,8 @@ void AdvancedVSTiAudioProcessorEditor::buildVirusPanelButtons()
         return addPanelButton (key, tooltip, false);
     };
 
-    addMomentaryButton ("arpEdit", "Cycle arp mode");
-    addPanelButton ("arpOn", "Enable arp playback");
+    addMomentaryButton ("arpEdit", "ARP EDIT: open the arpeggiator page");
+    addPanelButton ("arpOn", "ARP ON: enable arp playback   SHIFT+ARP ON: hold");
     addMomentaryButton ("matrixDest", "Decrease the selected modulation depth");
     addMomentaryButton ("matrixSource", "Cycle the modulation source focus");
     addMomentaryButton ("matrixSelect", "Cycle the matrix slot LED");
@@ -2623,7 +2672,7 @@ void AdvancedVSTiAudioProcessorEditor::buildVirusPanelButtons()
     addMomentaryButton ("oscSelect", "SELECT: cycle the active oscillator edit focus");
     addMomentaryButton ("oscEdit", "EDIT: step the waveform for the selected oscillator");
     addPanelButton ("osc3On", "Enable oscillator 3 / sub osc");
-    addPanelButton ("mono", "Enable mono voice mode");
+    addPanelButton ("mono", "MONO: enable mono voice mode   SHIFT+MONO: panic");
     addPanelButton ("syncPanel", "Enable oscillator sync");
     addPanelButton ("fmMode", "Enable FM");
     addMomentaryButton ("fxSelectA", "Decrease the selected upper FX target");
@@ -2649,7 +2698,7 @@ void AdvancedVSTiAudioProcessorEditor::buildVirusPanelButtons()
     addMomentaryButton ("displayStore", "STORE: save / step storage page   SHIFT+STORE: random patch");
     addMomentaryButton ("displayUndo", "UNDO: last edit   SHIFT+UNDO: help");
     addPanelButton ("displayShift", "SHIFT: latch secondary red legends");
-    addMomentaryButton ("displaySearch", "Next arp mode");
+    addMomentaryButton ("displaySearch", "SEARCH: preset browser   SHIFT+SEARCH: audition current preset");
     addMomentaryButton ("partLeft", "Previous preset");
     addMomentaryButton ("part", "Next preset");
     addPanelButton ("multi", "Select multi panel mode");
@@ -2726,6 +2775,25 @@ void AdvancedVSTiAudioProcessorEditor::buildVirusPanelButtons()
             const auto nextValue = range.snapToLegalValue (juce::jlimit (range.start, range.end, currentValue + delta));
             commitActualValue (*parameter, nextValue);
         }
+    };
+
+    auto toggleBoolParameter = [rangedParameter, commitActualValue] (const juce::String& paramId)
+    {
+        if (auto* parameter = dynamic_cast<juce::AudioParameterBool*> (rangedParameter (paramId)))
+        {
+            const bool nextState = ! parameter->get();
+            commitActualValue (*parameter, nextState ? 1.0f : 0.0f);
+            return nextState;
+        }
+
+        if (auto* parameter = rangedParameter (paramId))
+        {
+            const bool nextState = parameter->getValue() < 0.5f;
+            commitActualValue (*parameter, nextState ? 1.0f : 0.0f);
+            return nextState;
+        }
+
+        return false;
     };
 
     auto flashMomentary = [] (LedToggleButton* button)
@@ -2965,11 +3033,30 @@ void AdvancedVSTiAudioProcessorEditor::buildVirusPanelButtons()
         repaint();
     };
 
+    auto openSearchPage = [this]
+    {
+        clearVirusLfoMenu();
+        virusActivePresetMenu = true;
+        refreshVirusValueKnobBindings();
+        refreshVirusPresetOsd();
+        repaint();
+    };
+
+    auto auditionCurrentPreset = [this]
+    {
+        audioProcessor.auditionPresetNote();
+        showVirusOsdMessage ("AUDITION",
+                             audioProcessor.getProgramName (audioProcessor.getCurrentProgram()),
+                             "SHIFT+SEARCH   Preview note C4",
+                             false,
+                             1800.0);
+    };
+
     auto showShiftHelp = [this]
     {
         showVirusOsdMessage ("HELP",
-                             "SHIFT + STORE RANDOM   SHIFT + EDIT MULTI EDIT",
-                             "SHIFT + CONFIG REMOTE   SHIFT latches secondary legends",
+                             "SHIFT+ARP HOLD   SHIFT+MONO PANIC   SHIFT+STORE RANDOM",
+                             "SHIFT+EDIT MULTI EDIT   SHIFT+CONFIG REMOTE   SHIFT+SEARCH AUDITION",
                              true,
                              6000.0);
     };
@@ -3094,18 +3181,63 @@ void AdvancedVSTiAudioProcessorEditor::buildVirusPanelButtons()
         }
     };
 
-    if (auto* button = findVirusPanelButton ("arpOn"))
-        buttonAttachments.push_back (std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (audioProcessor.apvts, "ARPENABLE", *button));
-
     if (auto* button = findVirusPanelButton ("osc3On"))
         buttonAttachments.push_back (std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (audioProcessor.apvts, "OSC3ENABLE", *button));
-    if (auto* button = findVirusPanelButton ("mono"))
-        buttonAttachments.push_back (std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (audioProcessor.apvts, "MONOENABLE", *button));
     if (auto* button = findVirusPanelButton ("syncPanel"))
         buttonAttachments.push_back (std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (audioProcessor.apvts, "SYNCENABLE", *button));
     if (auto* button = findVirusPanelButton ("fmMode"))
         buttonAttachments.push_back (std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (audioProcessor.apvts, "FMENABLE", *button));
     bindMomentaryAction ("arpEdit", [openArpMenu] { openArpMenu(); });
+    if (auto* button = findVirusPanelButton ("arpOn"))
+    {
+        button->setClickingTogglesState (false);
+        button->onClick = [this, toggleBoolParameter]
+        {
+            if (virusShiftMode)
+            {
+                const bool enabled = audioProcessor.toggleArpHold();
+                syncVirusPanelButtons();
+                showVirusOsdMessage ("ARP HOLD",
+                                     enabled ? "ON" : "OFF",
+                                     enabled ? "SHIFT+ARP ON   Latch held notes while arp runs"
+                                             : "SHIFT+ARP ON   Release held arp notes",
+                                     false,
+                                     2200.0);
+            }
+            else
+            {
+                toggleBoolParameter ("ARPENABLE");
+                syncVirusPanelButtons();
+            }
+
+            repaint();
+        };
+    }
+
+    if (auto* button = findVirusPanelButton ("mono"))
+    {
+        button->setClickingTogglesState (false);
+        button->onClick = [this, toggleBoolParameter]
+        {
+            if (virusShiftMode)
+            {
+                audioProcessor.panicAllNotes();
+                showVirusOsdMessage ("PANIC",
+                                     "ALL NOTES OFF",
+                                     "SHIFT+MONO",
+                                     false,
+                                     1800.0);
+            }
+            else
+            {
+                toggleBoolParameter ("MONOENABLE");
+                syncVirusPanelButtons();
+            }
+
+            repaint();
+        };
+    }
+
     bindMomentaryAction ("matrixDest", [this]
     {
         virusMatrixTargetIndex = (virusMatrixTargetIndex + 1) % 3;
@@ -3202,7 +3334,9 @@ void AdvancedVSTiAudioProcessorEditor::buildVirusPanelButtons()
             setShiftMode (button->getToggleState());
         };
     }
-    bindMomentaryAction ("displaySearch", [stepChoiceParameter] { stepChoiceParameter ("ARPMODE", 1); });
+    bindShiftAwareMomentaryAction ("displaySearch",
+                                   [openSearchPage] { openSearchPage(); },
+                                   [auditionCurrentPreset] { auditionCurrentPreset(); });
     bindMomentaryAction ("parameters", [this, selectPanelMode] { selectPanelMode ((virusPanelModeIndex + 2) % 3); });
     bindMomentaryAction ("parametersNext", [this, selectPanelMode] { selectPanelMode ((virusPanelModeIndex + 1) % 3); });
     bindMomentaryAction ("valueProgram", [stepPreset] { stepPreset (-1); });
@@ -4464,19 +4598,30 @@ void AdvancedVSTiAudioProcessorEditor::paintOverChildren (juce::Graphics& g)
         juce::String displayTitle = virusOsdTitle;
         juce::String displayValue = virusOsdValue;
         juce::String displayDetail = virusOsdDetail;
+        juce::String displayHeaderCenter;
+        juce::String displayHeaderRight = "LCD";
+        bool usePresetLayout = false;
+        int presetIndex = audioProcessor.getCurrentProgram();
+        int totalPrograms = audioProcessor.getNumPrograms();
 
         if (! transientOsdActive || displayValue.isEmpty())
         {
-            const auto presetIndex = audioProcessor.getCurrentProgram();
             displayTitle = virusPanelModeIndex == 1 ? "MULTI" : "SINGLE";
             displayValue = audioProcessor.getProgramName (presetIndex);
             if (displayValue.isEmpty())
                 displayValue = "Init Preset";
-            displayDetail = "PRESET "
-                            + juce::String (presetIndex + 1).paddedLeft ('0', 3)
-                            + " / "
-                            + juce::String (juce::jmax (1, audioProcessor.getNumPrograms())).paddedLeft ('0', 3)
-                            + "   PART < >";
+            const auto presetInfo = virusPresetDisplayInfo (displayValue, presetIndex, totalPrograms);
+            displayHeaderCenter = "CAT:" + presetInfo.categoryCode;
+            displayHeaderRight = presetInfo.bankLabel + " " + presetInfo.slotLabel;
+            displayDetail = presetInfo.descriptorA + "|" + presetInfo.descriptorB + "|" + presetInfo.descriptorC;
+            usePresetLayout = true;
+        }
+        else if (displayTitle == "SINGLE" || displayTitle == "MULTI")
+        {
+            const auto presetInfo = virusPresetDisplayInfo (displayValue, presetIndex, totalPrograms);
+            displayHeaderCenter = "CAT:" + presetInfo.categoryCode;
+            displayHeaderRight = presetInfo.bankLabel + " " + presetInfo.slotLabel;
+            usePresetLayout = true;
         }
 
         auto baseBounds = choiceCards[0]->getBounds();
@@ -4516,8 +4661,19 @@ void AdvancedVSTiAudioProcessorEditor::paintOverChildren (juce::Graphics& g)
 
                 g.setColour (juce::Colour::fromRGB (52, 58, 62));
                 g.setFont (juce::Font (juce::FontOptions { 5.2f * uiScale, juce::Font::bold }));
-                g.drawFittedText (displayTitle, header, juce::Justification::centredLeft, 1);
-                g.drawFittedText ("LCD", header.removeFromRight (scaledInt (26.0f, uiScale)), juce::Justification::centredRight, 1);
+                if (usePresetLayout)
+                {
+                    auto leftHeader = header.removeFromLeft (scaledInt (32.0f, uiScale));
+                    auto rightHeader = header.removeFromRight (scaledInt (34.0f, uiScale));
+                    g.drawFittedText (displayTitle, leftHeader, juce::Justification::centredLeft, 1);
+                    g.drawFittedText (displayHeaderCenter, header, juce::Justification::centred, 1);
+                    g.drawFittedText (displayHeaderRight, rightHeader, juce::Justification::centredRight, 1);
+                }
+                else
+                {
+                    g.drawFittedText (displayTitle, header, juce::Justification::centredLeft, 1);
+                    g.drawFittedText (displayHeaderRight, header.removeFromRight (scaledInt (26.0f, uiScale)), juce::Justification::centredRight, 1);
+                }
 
                 const float valueFontSize = displayValue.length() > 18 ? 9.0f : 12.8f;
                 g.setFont (juce::Font (juce::FontOptions { valueFontSize * uiScale, juce::Font::bold }));
@@ -4528,7 +4684,22 @@ void AdvancedVSTiAudioProcessorEditor::paintOverChildren (juce::Graphics& g)
                 {
                     g.setFont (juce::Font (juce::FontOptions { 5.5f * uiScale, juce::Font::plain }));
                     g.setColour (juce::Colour::fromRGB (74, 78, 82));
-                    g.drawFittedText (displayDetail, detailBounds, juce::Justification::centredLeft, 1);
+                    if (usePresetLayout && displayDetail.containsChar ('|'))
+                    {
+                        auto detailParts = juce::StringArray::fromTokens (displayDetail, "|", "");
+                        while (detailParts.size() < 3)
+                            detailParts.add ({});
+
+                        auto leftThird = detailBounds.removeFromLeft (detailBounds.getWidth() / 3);
+                        auto middleThird = detailBounds.removeFromLeft (detailBounds.getWidth() / 2);
+                        g.drawFittedText (detailParts[0], leftThird, juce::Justification::centredLeft, 1);
+                        g.drawFittedText (detailParts[1], middleThird, juce::Justification::centred, 1);
+                        g.drawFittedText (detailParts[2], detailBounds, juce::Justification::centredRight, 1);
+                    }
+                    else
+                    {
+                        g.drawFittedText (displayDetail, detailBounds, juce::Justification::centredLeft, 1);
+                    }
                 }
             }
         }
@@ -4885,7 +5056,7 @@ void AdvancedVSTiAudioProcessorEditor::resized()
 
         if (juce::isPositiveAndBelow (0, choiceCards.size()))
         {
-            choiceCards[0]->setBounds ({ 392, 247, 216, 58 });
+            choiceCards[0]->setBounds ({ 385, 244, 228, 63 });
             choiceCards[0]->setVisible (false);
         }
         layoutGrid ({ 393, 349, 210, kVirusKnobHeight }, { 30, 31, 32 }, 3, 20, 0);

@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Virus Synth User Manual</title>
+    <meta
+      name="description"
+      content="Step-by-step user manual for the bundled Virus Synth in AI Music Studio, including screenshots, preset browsing, OSD workflow, oscillator editing, filters, FX, modulation, and shift functions."
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="hero manual-hero">
+        <div class="hero-copy">
+          <p class="eyebrow">Bundled VST3 manual</p>
+          <h1>Virus Synth</h1>
+          <p class="lede">
+            This guide walks through the current Virus TI-inspired workflow in AI Music Studio:
+            loading the synth, browsing presets, using the LCD / OSD pages, editing oscillators,
+            filters, FX, modulation, and the shift layer.
+          </p>
+          <div class="hero-actions">
+            <a class="button button-primary" href="index.html">Back to project overview</a>
+            <a class="button button-secondary" href="https://github.com/mysticalg/AI-Music-Studio/blob/main/README.md">Open README on GitHub</a>
+          </div>
+        </div>
+        <div class="hero-card">
+          <div class="hero-card-title">What is covered</div>
+          <ol>
+            <li>Load Virus Synth on a track</li>
+            <li>Browse presets from the LCD</li>
+            <li>Edit oscillators and shared controls</li>
+            <li>Use LFO, matrix, filter, and FX OSD pages</li>
+            <li>Use shift functions and the preview keyboard</li>
+          </ol>
+        </div>
+      </header>
+
+      <main>
+        <section class="section">
+          <div class="section-heading">
+            <p class="eyebrow">Overview</p>
+            <h2>Editor layout</h2>
+          </div>
+          <figure class="shot shot-wide">
+            <img src="assets/screenshots/virus/virus-synth-overview.png" alt="Virus Synth editor overview" />
+            <figcaption>
+              The Virus Synth editor combines a TI-style faceplate, hardware-style LED/button layout,
+              an LCD / OSD display in the center, lower value knobs, part buttons for preset stepping,
+              and optional background plus preview-keyboard toggles in the top-left.
+            </figcaption>
+          </figure>
+        </section>
+
+        <section class="section">
+          <div class="section-heading">
+            <p class="eyebrow">Step 1</p>
+            <h2>Load Virus Synth on a track</h2>
+          </div>
+          <div class="manual-step">
+            <figure class="shot manual-media">
+              <img src="assets/screenshots/instrument-panel.png" alt="Instrument rack panel with bundled VST options" />
+              <figcaption>Choose a track, switch the instrument type to VSTI Rack, then select Virus Synth from the rack list.</figcaption>
+            </figure>
+            <div class="manual-copy">
+              <ol class="manual-list">
+                <li>Create or select a MIDI track.</li>
+                <li>Open <strong>Panels &gt; Instruments and FX</strong>.</li>
+                <li>Set the track instrument to <strong>VSTI Rack</strong>.</li>
+                <li>Select <strong>Virus Synth</strong>.</li>
+                <li>Open the plugin editor window.</li>
+              </ol>
+              <p class="manual-tip">
+                If the rack list does not show the plugin, restart the app so it rescans the bundled <code>vsti</code> folder on startup.
+              </p>
+            </div>
+          </div>
+        </section>
+
+        <section class="section">
+          <div class="section-heading">
+            <p class="eyebrow">Step 2</p>
+            <h2>Browse presets from the LCD / OSD</h2>
+          </div>
+          <div class="manual-step">
+            <figure class="shot manual-media">
+              <img src="assets/screenshots/virus/virus-synth-lcd.png" alt="Virus Synth LCD showing preset information" />
+              <figcaption>The LCD shows the current program name plus TI-style bank, slot, and category-style fields.</figcaption>
+            </figure>
+            <div class="manual-copy">
+              <ol class="manual-list">
+                <li>Use the two <strong>PART</strong> buttons beside the LCD to step backward or forward through presets.</li>
+                <li>You can also use the lower-right <strong>VALUE PROGRAM - / +</strong> buttons.</li>
+                <li>When the preset page is active, the bottom <strong>VALUE 1 / 2 / 3</strong> knobs can browse programs too.</li>
+                <li>The LCD stays pinned on the preset page while you browse, so it does not fall back to a generic parameter readout.</li>
+              </ol>
+              <p class="manual-tip">
+                The LCD header uses a TI-style format: <strong>SINGLE</strong> / <strong>MULTI</strong> on the left,
+                a <strong>CAT:</strong> field in the middle, and the <strong>RAM bank + slot</strong> on the right.
+              </p>
+            </div>
+          </div>
+        </section>
+
+        <section class="section">
+          <div class="section-heading">
+            <p class="eyebrow">Step 3</p>
+            <h2>Edit oscillators and shared top-row controls</h2>
+          </div>
+          <div class="manual-step">
+            <figure class="shot manual-media">
+              <img src="assets/screenshots/virus/virus-synth-overview.png" alt="Virus Synth oscillator area" />
+              <figcaption>The oscillator section uses a shared top row. The selected oscillator determines what those controls edit.</figcaption>
+            </figure>
+            <div class="manual-copy">
+              <ol class="manual-list">
+                <li>Press <strong>OSC SELECT</strong> to cycle the edit focus across <strong>OSC 1</strong>, <strong>OSC 2</strong>, and <strong>OSC 3</strong>.</li>
+                <li>The LED strip above the oscillator buttons shows which oscillator is active.</li>
+                <li>Use the top-row knobs for <strong>Wave</strong>, <strong>Wave Select / PW</strong>, <strong>Semitone</strong>, and <strong>Detune 2/3</strong>.</li>
+                <li>Use <strong>FM Amount</strong> below that row for the shared FM depth control.</li>
+                <li>Press <strong>OSC EDIT</strong> to pin an oscillator page on the LCD and edit it from the three bottom value knobs.</li>
+              </ol>
+            </div>
+          </div>
+        </section>
+
+        <section class="section">
+          <div class="section-heading">
+            <p class="eyebrow">Step 4</p>
+            <h2>Use the modulation OSD workflow</h2>
+          </div>
+          <div class="manual-step">
+            <figure class="shot manual-media">
+              <img src="assets/screenshots/virus/virus-synth-modulators.png" alt="Virus Synth modulation area with LFO controls" />
+              <figcaption>LFOs use the LCD / OSD workflow instead of dedicated target buttons for every value.</figcaption>
+            </figure>
+            <div class="manual-copy">
+              <ol class="manual-list">
+                <li>Press an <strong>LFO SELECT</strong> button once to focus that LFO.</li>
+                <li>Repeated clicks on the same <strong>SELECT</strong> button cycle its visible destination LEDs.</li>
+                <li>Use the dedicated <strong>RATE</strong> knob for the selected LFO speed.</li>
+                <li>Press <strong>ENV MODE</strong> to toggle between free-running and note-triggered behavior for the selected LFO.</li>
+                <li>Press <strong>SHAPE</strong> to cycle the LFO wave shape.</li>
+                <li>On the pinned LCD page, the lower value knobs edit:
+                  <strong>VALUE 1 = amount</strong>,
+                  <strong>VALUE 2 = rate</strong>,
+                  <strong>VALUE 3 = destination</strong>.
+                </li>
+              </ol>
+              <p class="manual-tip">
+                In the current workflow, the destination LEDs mirror the selected LFO destination shown on the LCD, while an amount of zero effectively turns the modulation off.
+              </p>
+            </div>
+          </div>
+        </section>
+
+        <section class="section">
+          <div class="section-heading">
+            <p class="eyebrow">Step 5</p>
+            <h2>Edit filters, FX, and matrix pages</h2>
+          </div>
+          <div class="manual-step">
+            <figure class="shot manual-media">
+              <img src="assets/screenshots/virus/virus-synth-filters-fx.png" alt="Virus Synth filter and effects section" />
+              <figcaption>Filter and FX sections both feed the LCD / OSD, where the value knobs become page-specific editors.</figcaption>
+            </figure>
+            <div class="manual-copy">
+              <ol class="manual-list">
+                <li>Press <strong>FILTER EDIT</strong> to cycle the filter pages:
+                  <strong>Filter 1</strong>, <strong>Filter 2</strong>, then <strong>Filter Common</strong>.
+                </li>
+                <li>Use <strong>FLT 1</strong> and <strong>FLT 2</strong> with the LEDs to manage filter modes and active routing.</li>
+                <li>Press <strong>FX SELECT</strong> to move the focused effect row.</li>
+                <li>Press <strong>FX EDIT</strong> to pin the selected upper or lower FX page on the LCD.</li>
+                <li>The upper row currently exposes <strong>Delay</strong>, <strong>Reverb</strong>, and the three-band EQ pages with real DSP backing their values.</li>
+                <li>The matrix page uses the bottom value knobs for <strong>source</strong>, <strong>amount</strong>, and <strong>destination</strong> on the selected row.</li>
+              </ol>
+            </div>
+          </div>
+        </section>
+
+        <section class="section">
+          <div class="section-heading">
+            <p class="eyebrow">Step 6</p>
+            <h2>Use SHIFT, BG, and KB</h2>
+          </div>
+          <div class="note-grid">
+            <div class="note-card">
+              <h3>SHIFT layer</h3>
+              <p>Click <strong>SHIFT</strong> once to latch the red secondary layer. The LED above it confirms that shifted functions are active.</p>
+            </div>
+            <div class="note-card">
+              <h3>Shifted actions</h3>
+              <p><strong>SHIFT + ARP ON</strong> holds the arp, <strong>SHIFT + MONO</strong> sends panic, <strong>SHIFT + STORE</strong> randomizes the preset, and <strong>SHIFT + SEARCH</strong> auditions the current program.</p>
+            </div>
+            <div class="note-card">
+              <h3>BG and KB</h3>
+              <p>Use <strong>BG</strong> to switch between the faceplate view and the schematic overlay. Use <strong>KB</strong> to show or hide the preview keyboard at the bottom of the editor.</p>
+            </div>
+          </div>
+        </section>
+
+        <section class="section">
+          <div class="section-heading">
+            <p class="eyebrow">Reference</p>
+            <h2>Quick workflow summary</h2>
+          </div>
+          <div class="release-grid">
+            <div class="release-card">
+              <h3>Preset workflow</h3>
+              <ol class="manual-list">
+                <li>Step presets with <strong>PART</strong> or <strong>VALUE PROGRAM</strong>.</li>
+                <li>Read the current bank / slot / category from the LCD.</li>
+                <li>Use <strong>SEARCH</strong> for the preset browser page.</li>
+              </ol>
+            </div>
+            <div class="release-card">
+              <h3>Edit workflow</h3>
+              <ol class="manual-list">
+                <li>Choose a section with <strong>EDIT</strong> or <strong>SELECT</strong>.</li>
+                <li>Watch the LCD page change to that section.</li>
+                <li>Use <strong>VALUE 1 / 2 / 3</strong> to edit the pinned page.</li>
+              </ol>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

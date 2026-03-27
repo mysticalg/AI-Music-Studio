@@ -226,8 +226,109 @@ juce::StringArray matrixDestinationChoices()
         "Reverb Time",
         "Low EQ Gain",
         "Mid EQ Gain",
-        "High EQ Gain"
+        "High EQ Gain",
+        "Reverb Damping",
+        "Low EQ Freq",
+        "Low EQ Q",
+        "Mid EQ Freq",
+        "Mid EQ Q",
+        "High EQ Freq",
+        "High EQ Q",
+        "Master Level",
+        "Detune",
+        "Sync Amount",
+        "Gate Length",
+        "Filter Env Amt",
+        "Osc2 Mix",
+        "Ring Mod"
     };
+}
+
+struct WavetableFrameDescriptor
+{
+    std::array<float, 8> harmonics {};
+    float phaseWarp = 0.0f;
+    float asymmetry = 0.0f;
+    float fold = 0.0f;
+};
+
+using WavetableFrameSet = std::array<WavetableFrameDescriptor, 5>;
+
+constexpr WavetableFrameSet kVirusFormantFrames { {
+    { { 1.00f, 0.24f, 0.12f, 0.08f, 0.04f, 0.02f, 0.00f, 0.00f },  0.02f,  0.01f, 0.02f },
+    { { 0.92f, 0.42f, 0.26f, 0.12f, 0.08f, 0.04f, 0.01f, 0.00f },  0.05f,  0.04f, 0.06f },
+    { { 0.78f, 0.58f, 0.36f, 0.20f, 0.12f, 0.06f, 0.03f, 0.00f },  0.08f,  0.06f, 0.10f },
+    { { 0.62f, 0.46f, 0.52f, 0.30f, 0.18f, 0.10f, 0.06f, 0.02f },  0.11f,  0.10f, 0.14f },
+    { { 0.44f, 0.34f, 0.56f, 0.42f, 0.24f, 0.16f, 0.10f, 0.04f },  0.14f,  0.12f, 0.18f }
+} };
+
+constexpr WavetableFrameSet kVirusComplexFrames { {
+    { { 1.00f, 0.58f, 0.34f, 0.18f, 0.10f, 0.06f, 0.03f, 0.01f },  0.02f, -0.04f, 0.04f },
+    { { 0.94f, 0.52f, 0.44f, 0.26f, 0.14f, 0.08f, 0.05f, 0.02f },  0.05f, -0.08f, 0.08f },
+    { { 0.86f, 0.46f, 0.40f, 0.34f, 0.22f, 0.12f, 0.07f, 0.03f },  0.08f, -0.12f, 0.12f },
+    { { 0.74f, 0.40f, 0.34f, 0.30f, 0.28f, 0.18f, 0.10f, 0.05f },  0.11f, -0.16f, 0.18f },
+    { { 0.62f, 0.34f, 0.28f, 0.26f, 0.26f, 0.22f, 0.14f, 0.08f },  0.14f, -0.20f, 0.24f }
+} };
+
+constexpr WavetableFrameSet kVirusMetalFrames { {
+    { { 1.00f, 0.18f, 0.42f, 0.10f, 0.26f, 0.08f, 0.18f, 0.04f },  0.06f,  0.08f, 0.10f },
+    { { 0.92f, 0.14f, 0.48f, 0.16f, 0.32f, 0.12f, 0.24f, 0.06f },  0.10f,  0.12f, 0.18f },
+    { { 0.84f, 0.10f, 0.54f, 0.22f, 0.36f, 0.18f, 0.28f, 0.08f },  0.14f,  0.16f, 0.28f },
+    { { 0.72f, 0.08f, 0.48f, 0.28f, 0.40f, 0.24f, 0.34f, 0.12f },  0.18f,  0.20f, 0.40f },
+    { { 0.60f, 0.06f, 0.40f, 0.34f, 0.44f, 0.30f, 0.38f, 0.16f },  0.22f,  0.24f, 0.54f }
+} };
+
+constexpr WavetableFrameSet kVirusVocalFrames { {
+    { { 1.00f, 0.22f, 0.08f, 0.22f, 0.06f, 0.03f, 0.00f, 0.00f },  0.02f,  0.02f, 0.02f },
+    { { 0.94f, 0.34f, 0.12f, 0.18f, 0.10f, 0.04f, 0.02f, 0.00f },  0.04f,  0.04f, 0.04f },
+    { { 0.88f, 0.12f, 0.30f, 0.08f, 0.20f, 0.06f, 0.03f, 0.01f },  0.06f,  0.06f, 0.08f },
+    { { 0.82f, 0.26f, 0.10f, 0.24f, 0.12f, 0.08f, 0.03f, 0.02f },  0.08f,  0.08f, 0.10f },
+    { { 0.76f, 0.18f, 0.06f, 0.14f, 0.08f, 0.04f, 0.02f, 0.00f },  0.10f,  0.10f, 0.12f }
+} };
+
+const WavetableFrameSet& virusWavetableFramesForVariant (int variant)
+{
+    switch (variant)
+    {
+        case 0: return kVirusFormantFrames;
+        case 1: return kVirusComplexFrames;
+        case 2: return kVirusMetalFrames;
+        case 3:
+        default: return kVirusVocalFrames;
+    }
+}
+
+float sampleVirusWavetableFrame (float phase,
+                                 float frequency,
+                                 double sampleRate,
+                                 const WavetableFrameDescriptor& frame)
+{
+    const auto brightnessLimit = juce::jlimit (0.18f, 1.0f,
+                                               static_cast<float> ((sampleRate * 0.42) / juce::jmax (frequency * 8.0f, 1.0f)));
+    auto warpedPhase = phase + std::sin (twoPi * phase) * frame.phaseWarp * 0.1f;
+    warpedPhase += std::sin (twoPi * phase * 2.0f) * frame.asymmetry * 0.025f;
+    warpedPhase -= std::floor (warpedPhase);
+
+    float sample = 0.0f;
+    float normaliser = 0.0f;
+
+    for (size_t harmonicIndex = 0; harmonicIndex < frame.harmonics.size(); ++harmonicIndex)
+    {
+        const auto harmonic = static_cast<float> (harmonicIndex + 1);
+        if (frequency * harmonic >= static_cast<float> (sampleRate) * 0.45f)
+            continue;
+
+        const auto gain = frame.harmonics[harmonicIndex] * brightnessLimit;
+        const auto phaseOffset = ((harmonicIndex % 2 == 0) ? frame.asymmetry : -frame.asymmetry) * 0.055f * harmonic;
+        sample += std::sin (twoPi * ((warpedPhase * harmonic) + phaseOffset)) * gain;
+        normaliser += std::abs (gain);
+    }
+
+    if (normaliser > 0.0001f)
+        sample /= normaliser;
+
+    const auto folded = std::tanh (sample * (1.0f + frame.fold * 2.8f));
+    return juce::jlimit (-1.0f, 1.0f, juce::jmap (juce::jlimit (0.0f, 1.0f, frame.fold * 0.55f), sample, folded));
 }
 
 juce::File vecPadLibraryRoot()
@@ -646,6 +747,32 @@ void AdvancedVSTiAudioProcessor::previewDrumPad (int midiNote, float velocity)
                                  0);
 }
 
+bool AdvancedVSTiAudioProcessor::toggleArpHold()
+{
+    const bool enabled = ! arpHoldEnabled.load();
+    arpHoldEnabled.store (enabled);
+    if (! enabled)
+        pendingReleaseHeldNotes.store (true);
+    return enabled;
+}
+
+bool AdvancedVSTiAudioProcessor::isArpHoldEnabled() const noexcept
+{
+    return arpHoldEnabled.load();
+}
+
+void AdvancedVSTiAudioProcessor::panicAllNotes()
+{
+    pendingPanicAllNotes.store (true);
+}
+
+void AdvancedVSTiAudioProcessor::auditionPresetNote (int midiNote, float velocity, int durationMs)
+{
+    pendingAuditionVelocity.store (juce::jlimit (1, 127, juce::roundToInt (juce::jlimit (0.0f, 1.0f, velocity) * 127.0f)));
+    pendingAuditionDurationMs.store (juce::jmax (80, durationMs));
+    pendingAuditionNote.store (juce::jlimit (0, 127, midiNote));
+}
+
 bool AdvancedVSTiAudioProcessor::isVec1DrumPadFlavor() const noexcept
 {
     return buildFlavor() == InstrumentFlavor::vec1DrumPad;
@@ -806,6 +933,12 @@ void AdvancedVSTiAudioProcessor::reset()
     lfo1Phase = 0.0f;
     lfo2Phase = 0.0f;
     lfo3Phase = 0.0f;
+    arpHoldEnabled.store (false);
+    pendingReleaseHeldNotes.store (false);
+    pendingPanicAllNotes.store (false);
+    pendingAuditionNote.store (-1);
+    activeAuditionNote = -1;
+    auditionSamplesRemaining = 0;
 
     leftFilter.reset();
     rightFilter.reset();
@@ -1404,6 +1537,10 @@ void AdvancedVSTiAudioProcessor::handleMidiMessage (const juce::MidiMessage& msg
             return;
 
         const auto note = msg.getNoteNumber();
+        const bool keepLatchedForArp = arpHoldEnabled.load() && renderParams.arpEnabled;
+        if (keepLatchedForArp)
+            return;
+
         heldNotes.removeAllInstancesOf (note);
         for (auto& voice : voices)
         {
@@ -1515,6 +1652,76 @@ float AdvancedVSTiAudioProcessor::basicOscSample (float& phase, float frequency,
     }
 }
 
+void AdvancedVSTiAudioProcessor::applyPendingUiActions (juce::MidiBuffer& midiMessages, int blockSamples)
+{
+    auto releaseAllNotes = [this] (bool hardKill)
+    {
+        heldNotes.clear();
+        arpStep = 0;
+        keyboardState.reset();
+
+        for (auto& voice : voices)
+        {
+            if (! voice.active)
+                continue;
+
+            if (hardKill)
+            {
+                voice.active = false;
+                voice.midiNote = -1;
+                voice.velocity = 0.0f;
+                voice.ampEnv.reset();
+                voice.filterEnv.reset();
+            }
+            else
+            {
+                voice.ampEnv.noteOff();
+                voice.filterEnv.noteOff();
+            }
+        }
+    };
+
+    if (pendingPanicAllNotes.exchange (false))
+    {
+        pendingReleaseHeldNotes.store (false);
+        activeAuditionNote = -1;
+        auditionSamplesRemaining = 0;
+        releaseAllNotes (true);
+    }
+    else if (pendingReleaseHeldNotes.exchange (false))
+    {
+        activeAuditionNote = -1;
+        auditionSamplesRemaining = 0;
+        releaseAllNotes (false);
+    }
+
+    if (activeAuditionNote >= 0)
+    {
+        auditionSamplesRemaining -= blockSamples;
+        if (auditionSamplesRemaining <= 0)
+        {
+            midiMessages.addEvent (juce::MidiMessage::noteOff (1, activeAuditionNote), 0);
+            activeAuditionNote = -1;
+            auditionSamplesRemaining = 0;
+        }
+    }
+
+    const auto requestedNote = pendingAuditionNote.exchange (-1);
+    if (requestedNote >= 0)
+    {
+        if (activeAuditionNote >= 0)
+            midiMessages.addEvent (juce::MidiMessage::noteOff (1, activeAuditionNote), 0);
+
+        const auto velocity = static_cast<juce::uint8> (juce::jlimit (1, 127, pendingAuditionVelocity.load()));
+        midiMessages.addEvent (juce::MidiMessage::noteOn (1, requestedNote, velocity), 0);
+        activeAuditionNote = requestedNote;
+        auditionSamplesRemaining = juce::jmax (1,
+                                               juce::roundToInt (currentSampleRate
+                                                                 * static_cast<double> (juce::jmax (80, pendingAuditionDurationMs.load()))
+                                                                 / 1000.0));
+    }
+}
+
 float AdvancedVSTiAudioProcessor::hypersawSample (float phase, float shape) const
 {
     constexpr std::array<float, 5> offsets { -2.0f, -1.0f, 0.0f, 1.0f, 2.0f };
@@ -1534,52 +1741,23 @@ float AdvancedVSTiAudioProcessor::hypersawSample (float phase, float shape) cons
 
 float AdvancedVSTiAudioProcessor::wavetableOscSample (float& phase, float frequency, float shape, int variant)
 {
-    juce::ignoreUnused (frequency);
-    const auto wrapped = phase;
-    const auto position = juce::jlimit (0.05f, 0.95f, shape);
-    const auto angle = twoPi * wrapped;
-    const auto sweep = juce::jmap (position, 0.0f, 1.0f, 0.2f, 1.0f);
+    const auto position = juce::jmap (juce::jlimit (0.05f, 0.95f, shape), 0.05f, 0.95f, 0.0f, 1.0f);
+    const auto& frames = virusWavetableFramesForVariant (variant);
+    const auto framePosition = position * static_cast<float> (frames.size() - 1);
+    const auto frameA = juce::jlimit (0, static_cast<int> (frames.size()) - 1, static_cast<int> (std::floor (framePosition)));
+    const auto frameB = juce::jlimit (0, static_cast<int> (frames.size()) - 1, frameA + 1);
+    const auto blend = framePosition - static_cast<float> (frameA);
 
-    switch (variant)
-    {
-        case 0: // Formant
-        {
-            const auto f1 = std::sin (angle);
-            const auto f2 = std::sin (angle * (2.0f + position * 4.0f));
-            const auto f3 = std::sin (angle * (4.0f + position * 7.0f));
-            return juce::jlimit (-1.0f, 1.0f, (f1 * 0.55f) + (f2 * 0.3f * sweep) + (f3 * 0.2f * position));
-        }
-        case 1: // Complex
-        {
-            const auto saw = (2.0f * wrapped) - 1.0f;
-            const auto square = wrapped < (0.15f + position * 0.7f) ? 1.0f : -1.0f;
-            const auto bend = std::sin (twoPi * (wrapped + std::sin (angle * (1.0f + position * 3.0f)) * 0.18f));
-            return juce::jlimit (-1.0f, 1.0f, (saw * 0.45f) + (square * 0.28f) + (bend * 0.35f));
-        }
-        case 2: // Metal
-        {
-            const auto mod = std::sin (angle * (3.0f + position * 11.0f));
-            const auto carrier = std::sin (twoPi * (wrapped + mod * (0.08f + position * 0.42f)));
-            const auto edge = std::sin (angle * (6.0f + position * 17.0f)) * 0.22f;
-            return juce::jlimit (-1.0f, 1.0f, carrier + edge);
-        }
-        case 3: // Vocal
-        default:
-        {
-            const auto a = std::sin (angle) + std::sin (angle * 2.0f) * 0.34f;
-            const auto e = std::sin (angle) + std::sin (angle * 3.0f) * 0.28f;
-            const auto i = std::sin (angle) + std::sin (angle * 5.0f) * 0.22f;
-            const auto o = std::sin (angle) + std::sin (angle * 2.0f) * 0.18f + std::sin (angle * 4.0f) * 0.12f;
-            const auto u = std::sin (angle) * 0.78f + std::sin (angle * 2.0f) * 0.12f;
+    const auto sampleA = sampleVirusWavetableFrame (phase,
+                                                    frequency,
+                                                    currentSampleRate,
+                                                    frames[static_cast<size_t> (frameA)]);
+    const auto sampleB = sampleVirusWavetableFrame (phase,
+                                                    frequency,
+                                                    currentSampleRate,
+                                                    frames[static_cast<size_t> (frameB)]);
 
-            const auto vowelPos = position * 4.0f;
-            const auto indexA = juce::jlimit (0, 4, static_cast<int> (std::floor (vowelPos)));
-            const auto indexB = juce::jlimit (0, 4, indexA + 1);
-            const auto blend = vowelPos - static_cast<float> (indexA);
-            const std::array<float, 5> vowels { a, e, i, o, u };
-            return juce::jlimit (-1.0f, 1.0f, juce::jmap (blend, vowels[static_cast<size_t> (indexA)], vowels[static_cast<size_t> (indexB)]));
-        }
-    }
+    return juce::jlimit (-1.0f, 1.0f, juce::jmap (blend, sampleA, sampleB));
 }
 
 float AdvancedVSTiAudioProcessor::renderDrumVoiceSample (VoiceState& voice)
@@ -2021,11 +2199,16 @@ float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice, SampleMo
         float pulseWidth = 0.0f;
         float shape = 0.0f;
         float fmAmount = 0.0f;
+        float detune = 0.0f;
+        float syncAmount = 0.0f;
+        float gateLength = 0.0f;
         float filterGain = 0.0f;
         float ampLevel = 0.0f;
         float oscVolume = 0.0f;
         float subOscVolume = 0.0f;
         float noiseVolume = 0.0f;
+        float osc2Mix = 0.0f;
+        float ringModAmount = 0.0f;
     } voiceMod;
 
     auto applyMatrixDestination = [&] (int destination, float value)
@@ -2057,6 +2240,20 @@ float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice, SampleMo
             case MatrixDestination::lowEqGain: sampleModSums.lowEqGain += value * 10.0f; break;
             case MatrixDestination::midEqGain: sampleModSums.midEqGain += value * 10.0f; break;
             case MatrixDestination::highEqGain: sampleModSums.highEqGain += value * 10.0f; break;
+            case MatrixDestination::reverbDamping: sampleModSums.reverbDamping += value * 0.35f; break;
+            case MatrixDestination::lowEqFreq: sampleModSums.lowEqFreq += value * 280.0f; break;
+            case MatrixDestination::lowEqQ: sampleModSums.lowEqQ += value * 0.28f; break;
+            case MatrixDestination::midEqFreq: sampleModSums.midEqFreq += value * 1200.0f; break;
+            case MatrixDestination::midEqQ: sampleModSums.midEqQ += value * 0.8f; break;
+            case MatrixDestination::highEqFreq: sampleModSums.highEqFreq += value * 2400.0f; break;
+            case MatrixDestination::highEqQ: sampleModSums.highEqQ += value * 0.22f; break;
+            case MatrixDestination::masterLevel: sampleModSums.masterLevel += value * 0.28f; break;
+            case MatrixDestination::detune: voiceMod.detune += value * 0.08f; break;
+            case MatrixDestination::syncAmount: voiceMod.syncAmount += value * 0.45f; break;
+            case MatrixDestination::gateLength: voiceMod.gateLength += value * 1.2f; break;
+            case MatrixDestination::filterEnvAmount: sampleModSums.filterEnvAmount += value * 0.4f; break;
+            case MatrixDestination::osc2Mix: voiceMod.osc2Mix += value * 0.45f; break;
+            case MatrixDestination::ringModAmount: voiceMod.ringModAmount += value * 0.4f; break;
             case MatrixDestination::assign:
             case MatrixDestination::off:
             default:
@@ -2133,14 +2330,15 @@ float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice, SampleMo
     float s = 0.0f;
     for (int i = 0; i < params.unisonVoices; ++i)
     {
-        const auto spread = (static_cast<float> (i) - (params.unisonVoices - 1) * 0.5f) * params.detune;
+        const auto spread = (static_cast<float> (i) - (params.unisonVoices - 1) * 0.5f)
+                            * juce::jlimit (0.0f, 0.25f, params.detune + voiceMod.detune);
         const auto osc1Pitch = params.osc1Semitone + params.osc1Detune + spread;
         s += oscSampleForState (voice.unisonPhases[static_cast<size_t> (i)],
                                 voice.unisonSyncPhases[static_cast<size_t> (i)],
                                 voice.unisonSamplePositions[static_cast<size_t> (i)],
                                 baseHz * std::pow (2.0f, osc1Pitch / 12.0f) + fm,
                                 params.oscType,
-                                params.syncAmount,
+                                juce::jlimit (0.0f, 4.0f, params.syncAmount + voiceMod.syncAmount),
                                 osc1Shape);
     }
     s /= static_cast<float> (params.unisonVoices);
@@ -2227,11 +2425,12 @@ float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice, SampleMo
         const auto osc3Hz = juce::jlimit (10.0f, 12000.0f, baseHz * osc3Ratio);
         const auto osc2 = basicOscSample (voice.osc2Phase, osc2Hz, static_cast<OscType> (params.osc2Type), osc2Shape);
         const auto sub = basicOscSample (voice.subPhase, osc3Hz, static_cast<OscType> (params.osc3Type), osc3Shape);
-        const auto ring = (s * osc2) * params.ringModAmount;
+        const auto ring = (s * osc2) * juce::jlimit (0.0f, 1.0f, params.ringModAmount + voiceMod.ringModAmount);
         const auto noiseBed = (random.nextFloat() * 2.0f - 1.0f) * juce::jlimit (0.0f, 1.2f, params.noiseLevel + voiceMod.noiseVolume);
-        const auto oscBlend = juce::jlimit (0.0f, 1.0f, params.osc2Mix);
+        const auto oscBlend = juce::jlimit (0.0f, 1.0f, params.osc2Mix + voiceMod.osc2Mix);
         const auto fmGrip = juce::jlimit (0.0f, 1.0f, (params.fmAmount + voiceMod.fmAmount) / 1000.0f);
-        const auto syncEdge = std::sin (twoPi * std::fmod ((voice.phase * (2.0f + params.syncAmount * 0.8f)) + (voice.osc2Phase * 0.37f), 1.0f));
+        const auto syncEdge = std::sin (twoPi * std::fmod ((voice.phase * (2.0f + juce::jlimit (0.0f, 4.0f, params.syncAmount + voiceMod.syncAmount) * 0.8f))
+                                                           + (voice.osc2Phase * 0.37f), 1.0f));
         const auto oscDrive = juce::jlimit (0.0f, 2.0f, 1.0f + voiceMod.oscVolume);
         const auto filterGain = juce::jlimit (0.2f, 2.2f, 1.0f + voiceMod.filterGain);
         const auto subLevel = juce::jlimit (0.0f, 1.2f, params.subOscLevel + voiceMod.subOscVolume);
@@ -2253,7 +2452,7 @@ float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice, SampleMo
     ++sampleModSums.activeVoices;
 
     voice.noteAge += 1.0f / static_cast<float> (currentSampleRate);
-    const auto gatePass = voice.noteAge < params.gateLength ? 1.0f : 0.0f;
+    const auto gatePass = voice.noteAge < juce::jlimit (0.01f, 8.0f, params.gateLength + voiceMod.gateLength) ? 1.0f : 0.0f;
 
     const auto gatePhase = params.lfo3EnvMode ? std::fmod (params.rhythmGateRate * voice.noteAge, 1.0f) : lfo3Phase;
     const auto rg = 0.5f * (1.0f + lfoValue (params.lfo3Shape, gatePhase));
@@ -2560,6 +2759,8 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         pendingPreviewMidi.clear();
     }
 
+    applyPendingUiActions (midiMessages, buffer.getNumSamples());
+
     keyboardState.processNextMidiBuffer (midiMessages, 0, buffer.getNumSamples(), true);
 
     leftFilter.setResonance (renderParams.resonance);
@@ -2641,9 +2842,17 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     float blockDelayFeedbackMod = 0.0f;
     float blockReverbMixMod = 0.0f;
     float blockReverbTimeMod = 0.0f;
+    float blockReverbDampingMod = 0.0f;
     float blockLowEqGainMod = 0.0f;
+    float blockLowEqFreqMod = 0.0f;
+    float blockLowEqQMod = 0.0f;
     float blockMidEqGainMod = 0.0f;
+    float blockMidEqFreqMod = 0.0f;
+    float blockMidEqQMod = 0.0f;
     float blockHighEqGainMod = 0.0f;
+    float blockHighEqFreqMod = 0.0f;
+    float blockHighEqQMod = 0.0f;
+    float blockMasterLevelMod = 0.0f;
     juce::MidiBuffer::Iterator midiIterator (midiMessages);
     juce::MidiMessage nextMidiMessage;
     int nextMidiSample = 0;
@@ -2695,8 +2904,13 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         leftFilter2Cascade.setResonance (dynamicResonance);
         rightFilter2Cascade.setResonance (dynamicResonance);
 
+        const auto dynamicFilterEnvAmount = juce::jlimit (0.0f,
+                                                          1.5f,
+                                                          renderParams.filterEnvAmount
+                                                              + (sampleModSums.filterEnvAmount / static_cast<float> (activeVoicesThisSample)));
+
         auto cutoff = renderParams.cutoff;
-        cutoff += currentFilterEnvPeak * renderParams.filterEnvAmount * 10000.0f;
+        cutoff += currentFilterEnvPeak * dynamicFilterEnvAmount * 10000.0f;
         cutoff += sampleModSums.cutoff1 / static_cast<float> (activeVoicesThisSample);
         cutoff = juce::jlimit (20.0f, 20000.0f, cutoff);
         leftFilter.setCutoffFrequency (cutoff);
@@ -2705,7 +2919,7 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         rightFilterCascade.setCutoffFrequency (cutoff);
 
         auto cutoff2 = renderParams.cutoff2;
-        cutoff2 += currentFilterEnvPeak * renderParams.filterEnvAmount * 6500.0f;
+        cutoff2 += currentFilterEnvPeak * dynamicFilterEnvAmount * 6500.0f;
         cutoff2 += sampleModSums.cutoff2 / static_cast<float> (activeVoicesThisSample);
         cutoff2 = juce::jlimit (20.0f, 20000.0f, cutoff2);
         leftFilter2.setCutoffFrequency (cutoff2);
@@ -2769,9 +2983,17 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         blockDelayFeedbackMod += sampleModSums.delayFeedback / static_cast<float> (activeVoicesThisSample);
         blockReverbMixMod += sampleModSums.reverbMix / static_cast<float> (activeVoicesThisSample);
         blockReverbTimeMod += sampleModSums.reverbTime / static_cast<float> (activeVoicesThisSample);
+        blockReverbDampingMod += sampleModSums.reverbDamping / static_cast<float> (activeVoicesThisSample);
         blockLowEqGainMod += sampleModSums.lowEqGain / static_cast<float> (activeVoicesThisSample);
+        blockLowEqFreqMod += sampleModSums.lowEqFreq / static_cast<float> (activeVoicesThisSample);
+        blockLowEqQMod += sampleModSums.lowEqQ / static_cast<float> (activeVoicesThisSample);
         blockMidEqGainMod += sampleModSums.midEqGain / static_cast<float> (activeVoicesThisSample);
+        blockMidEqFreqMod += sampleModSums.midEqFreq / static_cast<float> (activeVoicesThisSample);
+        blockMidEqQMod += sampleModSums.midEqQ / static_cast<float> (activeVoicesThisSample);
         blockHighEqGainMod += sampleModSums.highEqGain / static_cast<float> (activeVoicesThisSample);
+        blockHighEqFreqMod += sampleModSums.highEqFreq / static_cast<float> (activeVoicesThisSample);
+        blockHighEqQMod += sampleModSums.highEqQ / static_cast<float> (activeVoicesThisSample);
+        blockMasterLevelMod += sampleModSums.masterLevel / static_cast<float> (activeVoicesThisSample);
 
         lfo1Phase = std::fmod (lfo1Phase + renderParams.lfo1Rate / static_cast<float> (currentSampleRate), 1.0f);
         lfo2Phase = std::fmod (lfo2Phase + renderParams.lfo2Rate / static_cast<float> (currentSampleRate), 1.0f);
@@ -2796,9 +3018,17 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             renderParams.delayFeedback = juce::jlimit (0.0f, 0.92f, renderParams.delayFeedback + blockDelayFeedbackMod * invSamples);
             renderParams.reverbMix = juce::jlimit (0.0f, 1.0f, renderParams.reverbMix + blockReverbMixMod * invSamples);
             renderParams.reverbTime = juce::jlimit (0.1f, 1.0f, renderParams.reverbTime + blockReverbTimeMod * invSamples);
+            renderParams.reverbDamping = juce::jlimit (0.0f, 1.0f, renderParams.reverbDamping + blockReverbDampingMod * invSamples);
             renderParams.lowEqGainDb = juce::jlimit (-16.0f, 16.0f, renderParams.lowEqGainDb + blockLowEqGainMod * invSamples);
+            renderParams.lowEqFreq = juce::jlimit (40.0f, 1200.0f, renderParams.lowEqFreq + blockLowEqFreqMod * invSamples);
+            renderParams.lowEqQ = juce::jlimit (0.3f, 2.5f, renderParams.lowEqQ + blockLowEqQMod * invSamples);
             renderParams.midEqGainDb = juce::jlimit (-16.0f, 16.0f, renderParams.midEqGainDb + blockMidEqGainMod * invSamples);
+            renderParams.midEqFreq = juce::jlimit (120.0f, 8000.0f, renderParams.midEqFreq + blockMidEqFreqMod * invSamples);
+            renderParams.midEqQ = juce::jlimit (0.3f, 8.0f, renderParams.midEqQ + blockMidEqQMod * invSamples);
             renderParams.highEqGainDb = juce::jlimit (-16.0f, 16.0f, renderParams.highEqGainDb + blockHighEqGainMod * invSamples);
+            renderParams.highEqFreq = juce::jlimit (1200.0f, 16000.0f, renderParams.highEqFreq + blockHighEqFreqMod * invSamples);
+            renderParams.highEqQ = juce::jlimit (0.3f, 2.5f, renderParams.highEqQ + blockHighEqQMod * invSamples);
+            renderParams.masterLevel = juce::jlimit (0.0f, 1.5f, renderParams.masterLevel + blockMasterLevelMod * invSamples);
         }
 
         applyAdvancedEffects (buffer);

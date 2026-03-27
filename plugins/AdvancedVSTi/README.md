@@ -14,7 +14,7 @@ This folder adds a JUCE-based VST instrument scaffold with these implemented blo
 
 The shared source now builds ten VST3 products:
 
-- `AdvancedVSTi`
+- `Virus Synth`
 - `AI Drum Machine`
 - `AI 808 Machine`
 - `AI Bass Synth`

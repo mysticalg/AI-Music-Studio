@@ -92,6 +92,69 @@ Pushing a `v*` tag triggers `.github/workflows/release.yml`, which builds the Wi
 
 The project site is served from the `docs/` folder via `.github/workflows/deploy-pages.yml`. Any push to `main` that changes `docs/`, `README.md`, or the Pages workflow republishes the site.
 
+## Virus Synth
+
+The bundled flagship instrument is now **Virus Synth**, a Virus TI-inspired editor and synth engine with:
+
+- fixed-pixel Access-style panel layout
+- themed hardware-style knobs, LEDs, and buttons
+- preset browsing through the LCD / OSD area
+- focused oscillator editing with shared top-row controls
+- filter, FX, arpeggiator, matrix, and LFO OSD pages
+- preview keyboard and background-image toggle inside the editor
+
+![Virus Synth overview](docs/assets/screenshots/virus/virus-synth-overview.png)
+
+### Virus Synth quick start
+
+1. Open **Panels > Instruments and FX** and set the track instrument type to **VSTI Rack**.
+2. Choose **Virus Synth** from the rack instrument list.
+3. Open the editor window and use the **PART** buttons or **VALUE PROGRAM - / +** buttons to browse presets.
+4. Use **OSC SELECT** to choose which oscillator the shared top-row controls edit.
+5. Press **FILTER EDIT** or **FX EDIT** to open a pinned LCD page, then use **VALUE 1 / 2 / 3** to change the page parameters.
+6. Use **LFO SELECT** to focus an LFO, then adjust **amount**, **rate**, and **destination** from the LCD page with the value knobs.
+7. Toggle **BG** to switch between the faceplate view and the schematic view, and toggle **KB** to show the preview keyboard.
+
+### Virus Synth step-by-step guide
+
+1. Load the synth from the rack:
+   use the track rack panel to assign **Virus Synth** to a track, then open the editor.
+
+   ![Rack assignment](docs/assets/screenshots/instrument-panel.png)
+
+2. Browse presets from the LCD:
+   the center display acts like the Virus OSD. Use the side **PART** buttons or the lower-right **VALUE PROGRAM** buttons to step through patches.
+
+   ![Virus LCD preset view](docs/assets/screenshots/virus/virus-synth-lcd.png)
+
+3. Edit the active oscillator:
+   the top oscillator row is shared. Press **SELECT** to focus `OSC 1`, `OSC 2`, or `OSC 3`, then change wave, shape / pulse width, semitone, detune, and FM amount.
+
+   ![Virus oscillator and modulation area](docs/assets/screenshots/virus/virus-synth-modulators.png)
+
+4. Use the modulation pages:
+   press an `LFO SELECT` button once to focus that LFO. The LCD then exposes its amount, rate, and destination on **VALUE 1 / 2 / 3**. Repeated presses cycle the visible destination LEDs.
+
+5. Use filter and FX edit pages:
+   press **FILTER EDIT** to cycle the filter pages, or **FX EDIT** to open the focused upper or lower FX page. The LCD tells you what the three value knobs currently edit.
+
+   ![Virus filter and FX area](docs/assets/screenshots/virus/virus-synth-filters-fx.png)
+
+6. Use shifted functions:
+   click **SHIFT** to latch the red secondary layer. The LED above **SHIFT** confirms that the shifted functions are active.
+
+7. Shape the output:
+   use the filter section for dual-filter editing, the upper FX row for delay / reverb / EQ pages, and the lower FX row for distortion / chorus / phaser / others.
+
+Shifted functions currently include:
+- `SHIFT + ARP ON` for arp hold
+- `SHIFT + MONO` for panic / all notes off
+- `SHIFT + STORE` for random preset
+- `SHIFT + SEARCH` to audition the current preset
+
+For the full web manual with screenshots, see the GitHub Pages guide:
+[Virus Synth User Manual](https://mysticalg.github.io/AI-Music-Studio/virus-synth.html)
+
 ## macOS notes
 
 - The app now stores preferences, renders, and user-imported helper assets in a per-user app data folder instead of the current working directory.
@@ -138,7 +201,7 @@ The project site is served from the `docs/` folder via `.github/workflows/deploy
 
 A JUCE-based instrument scaffold is available in `plugins/AdvancedVSTi` with core synthesis modules (multi-wave oscillator, unison, FM, sync, filter modes, ADSR + curved envelopes, LFO routing, arp, rhythm gate). The shared source now builds multiple bundled VST3 instruments:
 
-- `AdvancedVSTi`
+- `Virus Synth`
 - `AI Drum Machine`
 - `AI 808 Machine`
 - `AI Bass Synth`
