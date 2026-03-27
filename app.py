@@ -10785,12 +10785,18 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
         self._track_vsti_windows_pending_reopen = visible_window_rows
+        # Flush latest parameter / state data from every open editor bridge
+        # *before* we tear them down, so the saved state reflects any
+        # preset changes or knob tweaks the user made.
+        self._flush_native_vst_editor_state_rows()
         open_rows = (
             {int(row) for row in getattr(self, '_track_vsti_windows', {}).keys()}
             | {int(row) for row in getattr(self, '_track_native_vst_host_bridges', {}).keys()}
         )
         for row in sorted(open_rows, reverse=True):
-            self._close_track_vsti_window(int(row), teardown_host=True, suppress_finished_reload=True)
+            # Close the editor window but leave the bridge alive so that
+            # _stop_native_vst_host_bridge can capture the full plugin state.
+            self._close_track_vsti_window(int(row), teardown_host=False, suppress_finished_reload=True)
             self._stop_native_vst_host_bridge(int(row), capture_state=True)
 
     def _preview_note_with_native_vst_host(
@@ -16585,8 +16591,12 @@ class MainWindow(QtWidgets.QMainWindow):
             != self._native_vst_bridge_parameter_signature(status_values)
         )
 
+        # Detect large parameter changes (>16 deltas) which typically
+        # indicate a preset/program change rather than individual knob tweaks.
+        likely_preset_change = bool(delta_values) and len(delta_values) > 16
+
         state_captured = False
-        if force_save or (parameter_changed and not live_native_playback_safe):
+        if force_save or (parameter_changed and not live_native_playback_safe) or (parameter_changed and likely_preset_change):
             state_captured = self._capture_native_vst_host_bridge_state(
                 row,
                 bridge=bridge,
@@ -16603,8 +16613,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     sync_hosts = False
                 elif len(delta_values) <= 16:
                     payload_values = dict(delta_values)
-                else:
-                    sync_hosts = False
+                # When >16 parameters changed (preset change), keep
+                # sync_hosts=True and payload_values=None so the full
+                # parameter set is sent to the playback engine.
             if live_native_playback_safe:
                 self._apply_track_vsti_parameters_live(
                     track,
