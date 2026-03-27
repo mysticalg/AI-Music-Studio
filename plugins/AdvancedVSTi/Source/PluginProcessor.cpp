@@ -2760,7 +2760,6 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     }
 
     applyPendingUiActions (midiMessages, buffer.getNumSamples());
-
     keyboardState.processNextMidiBuffer (midiMessages, 0, buffer.getNumSamples(), true);
 
     leftFilter.setResonance (renderParams.resonance);
@@ -4535,7 +4534,6 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
         };
 
         resetAdvancedMatrix();
-
         applyAdvancedSettings ({
             { "MASTERLEVEL", 1.0f },
             { "MONOENABLE", 0.0f },
