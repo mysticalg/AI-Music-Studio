@@ -6523,6 +6523,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ai_settings_dialog: AISettingsDialog | None = None
         self._audio_settings_dialog: AudioSettingsDialog | None = None
         self._track_vsti_windows: dict[int, QtWidgets.QDialog] = {}
+        self._track_vsti_windows_pending_reopen: set[int] = set()
         self._track_native_vsti_close_events: dict[int, threading.Event] = {}
         self._track_native_vsti_hwnds: dict[int, int] = {}
         self._track_native_vsti_processes: dict[int, QtCore.QProcess] = {}
@@ -10773,13 +10774,24 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
         self._release_live_midi_host()
+        # Remember which rows had visible VSTi editor windows so we can
+        # reopen them after playback stops.  Preserve any already-pending
+        # rows from a prior suspend that hasn't been flushed yet.
+        visible_window_rows: set[int] = set(getattr(self, '_track_vsti_windows_pending_reopen', set()))
+        for row, dialog in getattr(self, '_track_vsti_windows', {}).items():
+            try:
+                if dialog is not None and dialog.isVisible():
+                    visible_window_rows.add(int(row))
+            except Exception:
+                pass
+        self._track_vsti_windows_pending_reopen = visible_window_rows
         open_rows = (
             {int(row) for row in getattr(self, '_track_vsti_windows', {}).keys()}
             | {int(row) for row in getattr(self, '_track_native_vst_host_bridges', {}).keys()}
         )
         for row in sorted(open_rows, reverse=True):
             self._close_track_vsti_window(int(row), teardown_host=True, suppress_finished_reload=True)
-            self._stop_native_vst_host_bridge(int(row), capture_state=False)
+            self._stop_native_vst_host_bridge(int(row), capture_state=True)
 
     def _preview_note_with_native_vst_host(
         self,
@@ -12504,6 +12516,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cleanup_track_rows = sorted(int(row) for row in getattr(self, '_track_native_vst_host_bridges', {}).keys())
         if direct_row is None and live_direct_row is None and not cleanup_track_rows and not bool(graph_transport_active):
             self._deferred_playback_stop_cleanup = None
+            self._reopen_suspended_track_vsti_windows()
             return
         token = int(getattr(self, '_deferred_playback_stop_cleanup_token', 0) or 0) + 1
         self._deferred_playback_stop_cleanup_token = token
@@ -12572,6 +12585,24 @@ class MainWindow(QtWidgets.QMainWindow):
             )
         self._discard_realtime_track_states()
         self._realtime_reset_pending = True
+        self._reopen_suspended_track_vsti_windows()
+
+    def _reopen_suspended_track_vsti_windows(self) -> None:
+        """Reopen VSTi editor windows that were visible before transport started."""
+        rows_to_reopen = getattr(self, '_track_vsti_windows_pending_reopen', set())
+        self._track_vsti_windows_pending_reopen = set()
+        for row in sorted(rows_to_reopen):
+            if row < 0 or row >= len(self.project.tracks):
+                continue
+            # Skip if a window is already open for this row.
+            existing = self._track_vsti_windows.get(row)
+            if existing is not None:
+                try:
+                    if existing.isVisible():
+                        continue
+                except Exception:
+                    pass
+            self._toggle_track_vsti_window(row, True)
 
     def _queue_pending_playback_start(self, start_tick: int) -> None:
         requested_tick = int(start_tick)
@@ -14980,6 +15011,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self._refresh_transport_controls()
         if pending_start and not bool(getattr(self, '_playback_active', False)):
+            self._reopen_suspended_track_vsti_windows()
             self.statusBar().showMessage('Playback start cancelled')
             return
         _APP_LOGGER.info(
