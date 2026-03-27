@@ -242,6 +242,12 @@ private:
     void refreshVirusFxMenuOsd (bool lowerSection);
     void refreshVirusArpMenuOsd();
     void refreshVirusPresetOsd();
+    void bindVirusKnobToParam (int knobIndex,
+                               const juce::String& paramId,
+                               const juce::String& title,
+                               const juce::String& hint,
+                               std::function<void()> onValueChange = {});
+    void refreshVirusShiftAwareKnobBindings();
     void clearVirusLfoMenu (bool clearOsd = false);
     void showVirusOsdMessage (const juce::String& title,
                               const juce::String& value,
@@ -302,6 +308,7 @@ private:
     bool virusActivePresetMenu = false;
     bool virusActiveArpMenu = false;
     bool virusShiftMode = false;
+    double virusPresetNavigationGuardUntilMs = 0.0;
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>> sliderAttachments;
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment>> comboAttachments;
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment>> buttonAttachments;

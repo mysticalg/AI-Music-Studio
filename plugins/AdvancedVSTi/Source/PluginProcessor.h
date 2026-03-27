@@ -229,6 +229,7 @@ private:
         float highEqQ = 0.0f;
         float masterLevel = 0.0f;
         float filterEnvAmount = 0.0f;
+        float notePitch = 0.0f;
         int activeVoices = 0;
     };
 
@@ -282,8 +283,11 @@ private:
         float cutoff = 1200.0f;
         float cutoff2 = 2200.0f;
         float resonance = 0.4f;
+        float resonance2 = 0.4f;
         float filterEnvAmount = 0.5f;
         float filterBalance = 0.0f;
+        float panorama = 0.0f;
+        float keyFollow = 0.0f;
         float lfo1Rate = 2.0f;
         float lfo1Amount = 0.0f;
         int lfo1Destination = 0;
@@ -302,6 +306,9 @@ private:
         float rhythmGateDepth = 0.0f;
         float fxMix = 0.0f;
         float fxIntensity = 0.0f;
+        float fxRate = 0.65f;
+        float fxColour = 0.5f;
+        float fxSpread = 0.4f;
         float delaySend = 0.0f;
         float delayTimeSec = 0.32f;
         float delayFeedback = 0.25f;
@@ -317,6 +324,7 @@ private:
         float highEqGainDb = 0.0f;
         float highEqFreq = 5000.0f;
         float highEqQ = 0.8f;
+        int saturationType = 0;
         std::array<ModMatrixSlot, 6> modulationMatrix {};
         float drumMasterLevel = 1.0f;
         float drumKickAttack = 0.5f;

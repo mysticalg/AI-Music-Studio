@@ -165,6 +165,233 @@ juce::StringArray advancedOscillatorChoices()
     };
 }
 
+juce::StringArray builtInAdvancedVirusPresetChoices()
+{
+    return {
+        "Init Saw", "Init Square", "Wide Pad", "Mono Lead",
+        "TF Rectify Cm", "Feedy Seq Cm", "Rhy Arp", "Solar Systems Seq Cm",
+        "Zipp Cm", "Squib Fm", "Infinity Dbm", "Rev UFO Cm",
+        "Lazer Gallop Bbm", "Deep Solar Bass Cm", "Wavepad Cm", "Tweeker",
+        "Poly Sin Fm", "Omni Cm", "Mystery G", "Big Sweep Cm"
+    };
+}
+
+struct ImportedVirusPresetData
+{
+    juce::String name;
+    juce::String bankLabel;
+    juce::String sourceFile;
+    int slot = 0;
+    std::vector<uint8_t> payload;
+};
+
+constexpr std::array<uint8_t, 3> accessManufacturerId { 0x00, 0x20, 0x33 };
+constexpr int virusPatchNameOffset = 248;
+constexpr int virusPatchNameLength = 10;
+
+juce::String decodeVirusPatchName (const std::vector<uint8_t>& payload)
+{
+    juce::String result;
+
+    for (int index = 0; index < virusPatchNameLength; ++index)
+    {
+        const auto offset = virusPatchNameOffset + index;
+        if (! juce::isPositiveAndBelow (offset, static_cast<int> (payload.size())))
+            break;
+
+        const auto byte = payload[static_cast<size_t> (offset)];
+        result += (byte >= 32 && byte <= 126)
+                      ? juce::String::charToString (static_cast<juce::juce_wchar> (byte))
+                      : " ";
+    }
+
+    return result.trim();
+}
+
+juce::String shortVirusBankLabel (const juce::File& midiFile, int fileOrdinal)
+{
+    auto base = midiFile.getFileNameWithoutExtension().trim();
+    base = base.retainCharacters ("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ");
+
+    juce::StringArray tokens;
+    tokens.addTokens (base, " ", {});
+    tokens.removeEmptyStrings();
+
+    juce::String label;
+    for (const auto& token : tokens)
+    {
+        if (token.containsOnly ("0123456789"))
+            label << token;
+        else
+            label << token.substring (0, 1).toUpperCase();
+    }
+
+    if (label.isEmpty())
+        label = "BANK" + juce::String (fileOrdinal + 1);
+
+    return label.substring (0, 6);
+}
+
+std::vector<juce::File> findVirusBankMidiFiles()
+{
+    std::vector<juce::File> midiFiles;
+
+    auto addMidiFilesFrom = [&midiFiles] (const juce::File& folder)
+    {
+        if (! folder.isDirectory())
+            return;
+
+        auto files = folder.findChildFiles (juce::File::findFiles, false, "*.mid");
+        for (const auto& file : files)
+        {
+            if (! file.getFullPathName().containsIgnoreCase ("__MACOSX"))
+                midiFiles.push_back (file);
+        }
+    };
+
+    auto searchUpwardForFolder = [&addMidiFilesFrom] (juce::File start)
+    {
+        for (int depth = 0; depth < 12 && start.exists(); ++depth)
+        {
+            const auto candidate = start.getChildFile ("Virus_TI_EDM_Soundbank_2015");
+            if (candidate.isDirectory())
+            {
+                addMidiFilesFrom (candidate);
+                return true;
+            }
+
+            start = start.getParentDirectory();
+        }
+
+        return false;
+    };
+
+    searchUpwardForFolder (juce::File::getCurrentWorkingDirectory());
+    searchUpwardForFolder (juce::File::getSpecialLocation (juce::File::currentExecutableFile).getParentDirectory());
+
+   #if JUCE_WINDOWS
+    HMODULE moduleHandle = nullptr;
+    if (GetModuleHandleExW (GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR> (&findVirusBankMidiFiles),
+                            &moduleHandle) != 0)
+    {
+        wchar_t modulePath[MAX_PATH] {};
+        if (GetModuleFileNameW (moduleHandle, modulePath, MAX_PATH) > 0)
+            searchUpwardForFolder (juce::File (juce::String (modulePath)).getParentDirectory());
+    }
+   #endif
+
+    std::sort (midiFiles.begin(), midiFiles.end(),
+               [] (const juce::File& lhs, const juce::File& rhs)
+               {
+                   return lhs.getFullPathName().compareIgnoreCase (rhs.getFullPathName()) < 0;
+               });
+
+    midiFiles.erase (std::unique (midiFiles.begin(), midiFiles.end(),
+                                  [] (const juce::File& lhs, const juce::File& rhs)
+                                  {
+                                      return lhs.getFullPathName().equalsIgnoreCase (rhs.getFullPathName());
+                                  }),
+                     midiFiles.end());
+    return midiFiles;
+}
+
+std::vector<ImportedVirusPresetData> loadImportedVirusPresets()
+{
+    std::vector<ImportedVirusPresetData> presets;
+    const auto midiFiles = findVirusBankMidiFiles();
+    juce::StringArray usedNames;
+
+    for (int fileIndex = 0; fileIndex < static_cast<int> (midiFiles.size()); ++fileIndex)
+    {
+        const auto& midiFile = midiFiles[static_cast<size_t> (fileIndex)];
+        juce::FileInputStream stream (midiFile);
+        if (! stream.openedOk())
+            continue;
+
+        juce::MidiFile midi;
+        if (! midi.readFrom (stream))
+            continue;
+
+        const auto bankLabel = shortVirusBankLabel (midiFile, fileIndex);
+
+        for (int trackIndex = 0; trackIndex < midi.getNumTracks(); ++trackIndex)
+        {
+            const auto* track = midi.getTrack (trackIndex);
+            if (track == nullptr)
+                continue;
+
+            for (int eventIndex = 0; eventIndex < track->getNumEvents(); ++eventIndex)
+            {
+                const auto* event = track->getEventPointer (eventIndex);
+                if (event == nullptr || ! event->message.isSysEx())
+                    continue;
+
+                const auto* data = event->message.getSysExData();
+                const auto dataSize = event->message.getSysExDataSize();
+                if (data == nullptr || dataSize < virusPatchNameOffset + virusPatchNameLength)
+                    continue;
+                if (static_cast<uint8_t> (data[0]) != accessManufacturerId[0]
+                    || static_cast<uint8_t> (data[1]) != accessManufacturerId[1]
+                    || static_cast<uint8_t> (data[2]) != accessManufacturerId[2])
+                    continue;
+
+                ImportedVirusPresetData preset;
+                preset.bankLabel = bankLabel;
+                preset.sourceFile = midiFile.getFileName();
+                preset.slot = static_cast<uint8_t> (data[7]);
+                preset.payload.assign (data, data + dataSize);
+
+                auto patchName = decodeVirusPatchName (preset.payload);
+                if (patchName.isEmpty())
+                    patchName = "Imported " + juce::String (presets.size() + 1);
+
+                auto uniqueName = patchName;
+                int duplicateIndex = 2;
+                while (usedNames.contains (uniqueName, true))
+                    uniqueName = patchName + " (" + bankLabel + " " + juce::String (duplicateIndex++) + ")";
+
+                preset.name = uniqueName;
+                usedNames.add (uniqueName);
+                presets.push_back (std::move (preset));
+            }
+        }
+    }
+
+    return presets;
+}
+
+const std::vector<ImportedVirusPresetData>& importedVirusPresets()
+{
+    static const auto presets = loadImportedVirusPresets();
+    return presets;
+}
+
+float importedPayloadNorm (const ImportedVirusPresetData& preset, int offset)
+{
+    if (preset.payload.empty())
+        return 0.0f;
+
+    const auto index = static_cast<size_t> (juce::jlimit (0, static_cast<int> (preset.payload.size()) - 1, offset));
+    return static_cast<float> (preset.payload[index]) / 127.0f;
+}
+
+bool importedNameContains (const juce::String& lowerName, std::initializer_list<const char*> needles)
+{
+    for (const auto* needle : needles)
+    {
+        if (lowerName.containsIgnoreCase (needle))
+            return true;
+    }
+
+    return false;
+}
+
+float importedRange (const ImportedVirusPresetData& preset, int offset, float minValue, float maxValue)
+{
+    return juce::jmap (importedPayloadNorm (preset, offset), minValue, maxValue);
+}
+
 juce::StringArray virusLfoDestinationChoices()
 {
     return {
@@ -1024,13 +1251,11 @@ juce::StringArray AdvancedVSTiAudioProcessor::presetChoicesForFlavor()
         return { "Dusty Keys", "Tape Choir", "Velvet Pluck", "Vox Chop", "Sub Stab", "Glass Bell" };
     if constexpr (buildFlavor() == InstrumentFlavor::acid303)
         return { "Acid Saw", "Acid Square", "Rounded 303", "Reso Line" };
-    return {
-        "Init Saw", "Init Square", "Wide Pad", "Mono Lead",
-        "TF Rectify Cm", "Feedy Seq Cm", "Rhy Arp", "Solar Systems Seq Cm",
-        "Zipp Cm", "Squib Fm", "Infinity Dbm", "Rev UFO Cm",
-        "Lazer Gallop Bbm", "Deep Solar Bass Cm", "Wavepad Cm", "Tweeker",
-        "Poly Sin Fm", "Omni Cm", "Mystery G", "Big Sweep Cm"
-    };
+
+    auto names = builtInAdvancedVirusPresetChoices();
+    for (const auto& imported : importedVirusPresets())
+        names.add (imported.name);
+    return names;
 }
 
 juce::String AdvancedVSTiAudioProcessor::externalPadSampleParameterIdForIndex (int padIndex)
@@ -2440,7 +2665,25 @@ float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice, SampleMo
         s += (sub * (params.osc3Enabled ? subLevel : 0.0f)) + noiseBed + ring + (syncEdge * fmGrip * 0.22f);
         s *= filterGain;
         s = smoothTowards (s, 0.08f + (params.reverbMix * 0.02f), voice.toneState);
-        s = softSaturate (s * (1.2f + (params.fxIntensity * 0.3f))) * 0.94f;
+        const auto driven = s * (1.2f + (params.fxIntensity * 0.3f));
+        switch (juce::jlimit (0, 3, params.saturationType))
+        {
+            case 1:
+                s = std::tanh (driven * 0.92f) * 0.94f;
+                break;
+            case 2:
+                s = std::atan (driven * 1.35f) * 0.78f;
+                break;
+            case 3:
+            {
+                const auto folded = std::abs (std::fmod (driven + 1.0f, 4.0f) - 2.0f) - 1.0f;
+                s = softSaturate (folded * 1.05f) * 0.9f;
+                break;
+            }
+            default:
+                s = softSaturate (driven) * 0.94f;
+                break;
+        }
     }
     else
     {
@@ -2449,6 +2692,7 @@ float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice, SampleMo
 
     sampleModSums.filterEnvPeak = juce::jmax (sampleModSums.filterEnvPeak, filtEnv);
     sampleModSums.ampEnvPeak = juce::jmax (sampleModSums.ampEnvPeak, ampEnv);
+    sampleModSums.notePitch += (static_cast<float> (voice.midiNote) - 60.0f) / 12.0f;
     ++sampleModSums.activeVoices;
 
     voice.noteAge += 1.0f / static_cast<float> (currentSampleRate);
@@ -2588,8 +2832,11 @@ void AdvancedVSTiAudioProcessor::updateRenderParameters()
     renderParams.cutoff = paramValue (apvts, "CUTOFF");
     renderParams.cutoff2 = paramValue (apvts, "CUTOFF2");
     renderParams.resonance = paramValue (apvts, "RESONANCE");
+    renderParams.resonance2 = buildFlavor() == InstrumentFlavor::advanced ? paramValue (apvts, "RESONANCE2") : renderParams.resonance;
     renderParams.filterEnvAmount = paramValue (apvts, "FILTERENVAMOUNT");
     renderParams.filterBalance = paramValue (apvts, "FILTERBALANCE");
+    renderParams.panorama = buildFlavor() == InstrumentFlavor::advanced ? paramValue (apvts, "PANORAMA") : 0.0f;
+    renderParams.keyFollow = buildFlavor() == InstrumentFlavor::advanced ? paramValue (apvts, "KEYFOLLOW") : 0.0f;
     if constexpr (buildFlavor() != InstrumentFlavor::vec1DrumPad)
     {
         renderParams.sampleBank = paramIndex (apvts, "SAMPLEBANK");
@@ -2634,6 +2881,9 @@ void AdvancedVSTiAudioProcessor::updateRenderParameters()
     renderParams.rhythmGateDepth = renderParams.lfo3Enabled ? paramValue (apvts, "RHYTHMGATE_DEPTH") : 0.0f;
     renderParams.fxMix = paramValue (apvts, "FXMIX");
     renderParams.fxIntensity = paramValue (apvts, "FXINTENSITY");
+    renderParams.fxRate = buildFlavor() == InstrumentFlavor::advanced ? paramValue (apvts, "FXRATE") : 0.65f;
+    renderParams.fxColour = buildFlavor() == InstrumentFlavor::advanced ? paramValue (apvts, "FXCOLOUR") : 0.5f;
+    renderParams.fxSpread = buildFlavor() == InstrumentFlavor::advanced ? paramValue (apvts, "FXSPREAD") : 0.4f;
     renderParams.delaySend = paramValue (apvts, "DELAYSEND");
     renderParams.delayTimeSec = paramValue (apvts, "DELAYTIME");
     renderParams.delayFeedback = paramValue (apvts, "DELAYFEEDBACK");
@@ -2649,6 +2899,7 @@ void AdvancedVSTiAudioProcessor::updateRenderParameters()
     renderParams.highEqGainDb = buildFlavor() == InstrumentFlavor::advanced ? paramValue (apvts, "HIGHEQGAIN") : 0.0f;
     renderParams.highEqFreq = buildFlavor() == InstrumentFlavor::advanced ? paramValue (apvts, "HIGHEQFREQ") : 5000.0f;
     renderParams.highEqQ = buildFlavor() == InstrumentFlavor::advanced ? paramValue (apvts, "HIGHEQQ") : 0.8f;
+    renderParams.saturationType = buildFlavor() == InstrumentFlavor::advanced ? paramIndex (apvts, "SATURATIONTYPE") : 0;
 
     for (auto& slot : renderParams.modulationMatrix)
     {
@@ -2894,23 +3145,28 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
 
         const auto resonanceMod = sampleModSums.resonance / static_cast<float> (activeVoicesThisSample);
         const auto dynamicResonance = juce::jlimit (0.1f, 12.0f, renderParams.resonance + resonanceMod);
+        const auto dynamicResonance2 = juce::jlimit (0.1f, 12.0f, renderParams.resonance2 + resonanceMod);
         leftFilter.setResonance (dynamicResonance);
         rightFilter.setResonance (dynamicResonance);
         leftFilterCascade.setResonance (dynamicResonance);
         rightFilterCascade.setResonance (dynamicResonance);
-        leftFilter2.setResonance (dynamicResonance);
-        rightFilter2.setResonance (dynamicResonance);
-        leftFilter2Cascade.setResonance (dynamicResonance);
-        rightFilter2Cascade.setResonance (dynamicResonance);
+        leftFilter2.setResonance (dynamicResonance2);
+        rightFilter2.setResonance (dynamicResonance2);
+        leftFilter2Cascade.setResonance (dynamicResonance2);
+        rightFilter2Cascade.setResonance (dynamicResonance2);
 
         const auto dynamicFilterEnvAmount = juce::jlimit (0.0f,
                                                           1.5f,
                                                           renderParams.filterEnvAmount
                                                               + (sampleModSums.filterEnvAmount / static_cast<float> (activeVoicesThisSample)));
 
+        const auto averageNotePitch = sampleModSums.notePitch / static_cast<float> (activeVoicesThisSample);
+        const auto keyFollowRatio = std::pow (2.0f, averageNotePitch * renderParams.keyFollow);
+
         auto cutoff = renderParams.cutoff;
         cutoff += currentFilterEnvPeak * dynamicFilterEnvAmount * 10000.0f;
         cutoff += sampleModSums.cutoff1 / static_cast<float> (activeVoicesThisSample);
+        cutoff *= keyFollowRatio;
         cutoff = juce::jlimit (20.0f, 20000.0f, cutoff);
         leftFilter.setCutoffFrequency (cutoff);
         rightFilter.setCutoffFrequency (cutoff);
@@ -2920,6 +3176,7 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         auto cutoff2 = renderParams.cutoff2;
         cutoff2 += currentFilterEnvPeak * dynamicFilterEnvAmount * 6500.0f;
         cutoff2 += sampleModSums.cutoff2 / static_cast<float> (activeVoicesThisSample);
+        cutoff2 *= keyFollowRatio;
         cutoff2 = juce::jlimit (20.0f, 20000.0f, cutoff2);
         leftFilter2.setCutoffFrequency (cutoff2);
         rightFilter2.setCutoffFrequency (cutoff2);
@@ -2966,7 +3223,10 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             }
         }
 
-        const auto panorama = juce::jlimit (-1.0f, 1.0f, sampleModSums.panorama / static_cast<float> (activeVoicesThisSample));
+        const auto panorama = juce::jlimit (-1.0f,
+                                            1.0f,
+                                            renderParams.panorama
+                                                + (sampleModSums.panorama / static_cast<float> (activeVoicesThisSample)));
         const auto panLeftGain = juce::jlimit (0.0f, 1.0f, panorama <= 0.0f ? 1.0f : 1.0f - panorama);
         const auto panRightGain = juce::jlimit (0.0f, 1.0f, panorama >= 0.0f ? 1.0f : 1.0f + panorama);
         mixedL *= panLeftGain;
@@ -3042,36 +3302,51 @@ void AdvancedVSTiAudioProcessor::applyAdvancedEffects (juce::AudioBuffer<float>&
     auto* right = buffer.getWritePointer (1);
     const auto numSamples = buffer.getNumSamples();
     const auto fxMix = juce::jlimit (0.0f, 1.0f, renderParams.fxMix);
+    const auto fxRate = juce::jlimit (0.02f, 12.0f, renderParams.fxRate);
+    const auto fxColour = juce::jlimit (0.0f, 1.0f, renderParams.fxColour);
+    const auto fxSpread = juce::jlimit (0.0f, 1.0f, renderParams.fxSpread);
     const auto delaySend = juce::jlimit (0.0f, 1.0f, renderParams.delaySend);
     const auto reverbMix = juce::jlimit (0.0f, 1.0f, renderParams.reverbMix);
     const auto feedback = juce::jlimit (0.0f, 0.95f, renderParams.delayFeedback);
 
-    chorusLeft.setRate (0.12f + renderParams.fxIntensity * 1.8f);
-    chorusRight.setRate (0.14f + renderParams.fxIntensity * 1.7f);
-    chorusLeft.setDepth (0.1f + renderParams.fxIntensity * 0.75f);
-    chorusRight.setDepth (0.12f + renderParams.fxIntensity * 0.72f);
-    chorusLeft.setCentreDelay (6.0f + renderParams.fxIntensity * 12.0f);
-    chorusRight.setCentreDelay (7.0f + renderParams.fxIntensity * 11.0f);
-    chorusLeft.setFeedback (0.05f + renderParams.fxIntensity * 0.18f);
-    chorusRight.setFeedback (0.04f + renderParams.fxIntensity * 0.18f);
+    const auto chorusRate = juce::jlimit (0.05f, 6.0f, fxRate);
+    const auto chorusDepth = juce::jlimit (0.05f, 0.95f, 0.18f + renderParams.fxIntensity * 0.65f + fxSpread * 0.08f);
+    const auto chorusDelay = 5.0f + fxColour * 11.0f;
+    const auto chorusFeedback = juce::jlimit (-0.25f, 0.6f, -0.05f + fxSpread * 0.55f);
+    chorusLeft.setRate (chorusRate);
+    chorusRight.setRate (chorusRate * (1.02f + fxSpread * 0.05f));
+    chorusLeft.setDepth (chorusDepth);
+    chorusRight.setDepth (juce::jlimit (0.05f, 0.95f, chorusDepth * (0.96f + fxSpread * 0.06f)));
+    chorusLeft.setCentreDelay (chorusDelay);
+    chorusRight.setCentreDelay (chorusDelay + 0.8f + fxSpread * 2.2f);
+    chorusLeft.setFeedback (chorusFeedback);
+    chorusRight.setFeedback (chorusFeedback * 0.92f);
 
-    flangerLeft.setRate (0.04f + renderParams.fxIntensity * 0.7f);
-    flangerRight.setRate (0.05f + renderParams.fxIntensity * 0.75f);
-    flangerLeft.setDepth (0.2f + renderParams.fxIntensity * 0.78f);
-    flangerRight.setDepth (0.22f + renderParams.fxIntensity * 0.74f);
-    flangerLeft.setCentreDelay (1.2f + renderParams.fxIntensity * 3.1f);
-    flangerRight.setCentreDelay (1.4f + renderParams.fxIntensity * 2.8f);
-    flangerLeft.setFeedback (0.08f + renderParams.fxIntensity * 0.42f);
-    flangerRight.setFeedback (0.08f + renderParams.fxIntensity * 0.42f);
+    const auto flangerRate = juce::jlimit (0.03f, 3.0f, fxRate * 0.55f);
+    const auto flangerDepth = juce::jlimit (0.08f, 0.98f, 0.22f + renderParams.fxIntensity * 0.72f);
+    const auto flangerDelay = 0.7f + fxColour * 4.6f;
+    const auto flangerFeedback = juce::jlimit (-0.85f, 0.85f, fxSpread * 1.4f - 0.7f);
+    flangerLeft.setRate (flangerRate);
+    flangerRight.setRate (flangerRate * (1.04f + fxSpread * 0.08f));
+    flangerLeft.setDepth (flangerDepth);
+    flangerRight.setDepth (juce::jlimit (0.08f, 0.98f, flangerDepth * (0.94f + fxSpread * 0.08f)));
+    flangerLeft.setCentreDelay (flangerDelay);
+    flangerRight.setCentreDelay (flangerDelay + 0.35f + fxSpread * 1.2f);
+    flangerLeft.setFeedback (flangerFeedback);
+    flangerRight.setFeedback (flangerFeedback * 0.95f);
 
-    phaserLeft.setRate (0.08f + renderParams.fxIntensity * 1.3f);
-    phaserRight.setRate (0.09f + renderParams.fxIntensity * 1.35f);
-    phaserLeft.setDepth (0.15f + renderParams.fxIntensity * 0.72f);
-    phaserRight.setDepth (0.17f + renderParams.fxIntensity * 0.68f);
-    phaserLeft.setCentreFrequency (400.0f + renderParams.fxIntensity * 1600.0f);
-    phaserRight.setCentreFrequency (520.0f + renderParams.fxIntensity * 1500.0f);
-    phaserLeft.setFeedback (0.05f + renderParams.fxIntensity * 0.25f);
-    phaserRight.setFeedback (0.05f + renderParams.fxIntensity * 0.25f);
+    const auto phaserRate = juce::jlimit (0.03f, 5.0f, fxRate * 0.7f);
+    const auto phaserDepth = juce::jlimit (0.05f, 0.95f, 0.18f + renderParams.fxIntensity * 0.68f);
+    const auto phaserCentre = 180.0f + fxColour * 2600.0f;
+    const auto phaserFeedback = juce::jlimit (-0.6f, 0.78f, fxSpread * 1.05f - 0.18f);
+    phaserLeft.setRate (phaserRate);
+    phaserRight.setRate (phaserRate * (1.03f + fxSpread * 0.04f));
+    phaserLeft.setDepth (phaserDepth);
+    phaserRight.setDepth (juce::jlimit (0.05f, 0.95f, phaserDepth * (0.97f + fxSpread * 0.05f)));
+    phaserLeft.setCentreFrequency (phaserCentre);
+    phaserRight.setCentreFrequency (phaserCentre * (1.08f + fxSpread * 0.08f));
+    phaserLeft.setFeedback (phaserFeedback);
+    phaserRight.setFeedback (phaserFeedback * 0.94f);
 
     juce::Reverb::Parameters reverbParams;
     reverbParams.roomSize = juce::jlimit (0.05f, 1.0f, renderParams.reverbTime);
@@ -3155,33 +3430,42 @@ void AdvancedVSTiAudioProcessor::applyAdvancedEffects (juce::AudioBuffer<float>&
                     case 1:
                     {
                         const auto drive = 1.2f + renderParams.fxIntensity * 10.0f;
-                        wetL = std::tanh (dryL * drive);
-                        wetR = std::tanh (dryR * drive);
+                        const auto bias = fxSpread * 0.6f - 0.3f;
+                        const auto shape = 0.35f + fxColour * 0.65f;
+                        const auto drivenL = std::tanh ((dryL + bias) * drive);
+                        const auto drivenR = std::tanh ((dryR + bias) * drive);
+                        wetL = juce::jlimit (-1.2f, 1.2f, drivenL * (0.7f + shape * 0.45f) + dryL * (0.4f - shape * 0.2f));
+                        wetR = juce::jlimit (-1.2f, 1.2f, drivenR * (0.7f + shape * 0.45f) + dryR * (0.4f - shape * 0.2f));
                         break;
                     }
                     case 2:
                     {
-                        const auto asymL = dryL + std::tanh ((dryL + 0.25f) * (1.4f + renderParams.fxIntensity * 5.0f)) * 0.35f;
-                        const auto asymR = dryR + std::tanh ((dryR + 0.25f) * (1.4f + renderParams.fxIntensity * 5.0f)) * 0.35f;
-                        wetL = std::tanh (asymL);
-                        wetR = std::tanh (asymR);
+                        const auto color = fxColour * 2.0f - 1.0f;
+                        const auto bias = fxSpread * 0.9f - 0.45f;
+                        const auto shapeDrive = 1.2f + renderParams.fxIntensity * 4.8f;
+                        const auto charL = std::tanh ((dryL + bias) * shapeDrive) + color * dryL * std::abs (dryL) * 0.6f;
+                        const auto charR = std::tanh ((dryR + bias) * shapeDrive) + color * dryR * std::abs (dryR) * 0.6f;
+                        wetL = juce::jlimit (-1.2f, 1.2f, charL);
+                        wetR = juce::jlimit (-1.2f, 1.2f, charR);
                         break;
                     }
                     case 6:
                     {
-                        const auto modFreq = 70.0f + renderParams.fxIntensity * 900.0f;
+                        const auto modFreq = 8.0f + fxRate * 180.0f + fxColour * 520.0f;
+                        const auto stereoPhase = 0.15f + fxSpread * 1.8f;
                         const auto phase = twoPi * (static_cast<float> (sample) / static_cast<float> (currentSampleRate)) * modFreq;
                         const auto mod = std::sin (phase);
                         wetL = dryL * mod;
-                        wetR = dryR * std::cos (phase);
+                        wetR = dryR * std::cos (phase + stereoPhase);
                         break;
                     }
                     case 7:
                     {
-                        const auto shiftHz = 20.0f + renderParams.fxIntensity * 1200.0f;
+                        const auto shiftHz = 10.0f + fxRate * 120.0f + fxColour * 1800.0f;
+                        const auto stereoOffset = 1.0f + fxSpread * 0.18f;
                         const auto phase = twoPi * (static_cast<float> (sample) / static_cast<float> (currentSampleRate)) * shiftHz;
                         wetL = std::sin (std::asin (juce::jlimit (-0.99f, 0.99f, dryL)) + phase);
-                        wetR = std::sin (std::asin (juce::jlimit (-0.99f, 0.99f, dryR)) + phase * 1.03f);
+                        wetR = std::sin (std::asin (juce::jlimit (-0.99f, 0.99f, dryR)) + phase * stereoOffset);
                         break;
                     }
                     default:
@@ -3335,9 +3619,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
     float cutoffDefault = 1200.0f;
     float cutoff2Default = 2400.0f;
     float resonanceDefault = 0.4f;
+    float resonance2Default = 0.4f;
     float resonanceMax = 10.0f;
     float filterEnvAmountDefault = 0.5f;
     float filterBalanceDefault = 0.0f;
+    float panoramaDefault = 0.0f;
+    float keyFollowDefault = 0.0f;
     int sampleBankDefault = 0;
     float sampleStartDefault = 0.0f;
     float sampleEndDefault = 1.0f;
@@ -3365,6 +3652,9 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
     int fxTypeDefault = 0;
     float fxMixDefault = 0.0f;
     float fxIntensityDefault = 0.0f;
+    float fxRateDefault = 0.65f;
+    float fxColourDefault = 0.5f;
+    float fxSpreadDefault = 0.4f;
     float delaySendDefault = 0.0f;
     float delayTimeDefault = 0.34f;
     float delayFeedbackDefault = 0.25f;
@@ -3380,6 +3670,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
     float highEqGainDefault = 0.0f;
     float highEqFreqDefault = 5000.0f;
     float highEqQDefault = 0.8f;
+    int saturationTypeDefault = 0;
     float drumMasterLevelDefault = 1.0f;
     float drumKickAttackDefault = 0.5f;
     float drumSnareToneDefault = 0.5f;
@@ -3532,6 +3823,9 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
         fxTypeDefault = 3;
         fxMixDefault = 0.16f;
         fxIntensityDefault = 0.24f;
+        fxRateDefault = 0.42f;
+        fxColourDefault = 0.54f;
+        fxSpreadDefault = 0.48f;
         delaySendDefault = 0.08f;
         delayTimeDefault = 0.34f;
         delayFeedbackDefault = 0.22f;
@@ -3691,8 +3985,11 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
         cutoffDefault = 2200.0f;
         cutoff2Default = 5400.0f;
         resonanceDefault = 0.36f;
+        resonance2Default = 0.24f;
         filterEnvAmountDefault = 0.42f;
         filterBalanceDefault = 0.28f;
+        panoramaDefault = 0.0f;
+        keyFollowDefault = 0.22f;
         lfo1RateDefault = 0.18f;
         lfo1PitchDefault = 0.0f;
         lfo1AmountDefault = 0.0f;
@@ -3716,6 +4013,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
         lowEqGainDefault = 0.0f;
         midEqGainDefault = 0.0f;
         highEqGainDefault = 0.0f;
+        saturationTypeDefault = 0;
     }
 
     const auto oscChoices = buildFlavor() == InstrumentFlavor::advanced ? advancedOscillatorChoices() : classicOscillatorChoices();
@@ -3826,8 +4124,15 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("CUTOFF", "Cutoff", 20.0f, 20000.0f, cutoffDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("CUTOFF2", "Cutoff 2", 20.0f, 20000.0f, cutoff2Default));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("RESONANCE", "Resonance", 0.1f, resonanceMax, resonanceDefault));
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("RESONANCE2", "Resonance 2", 0.1f, resonanceMax, resonance2Default));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("FILTERENVAMOUNT", "Filter Env Amount", 0.0f, 1.0f, filterEnvAmountDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("FILTERBALANCE", "Filter Balance", 0.0f, 1.0f, filterBalanceDefault));
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+    {
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("PANORAMA", "Panorama", -1.0f, 1.0f, panoramaDefault));
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("KEYFOLLOW", "Keyfollow", 0.0f, 1.0f, keyFollowDefault));
+    }
 
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("LFO1RATE", "LFO1 Rate", 0.05f, 40.0f, lfo1RateDefault));
     params.push_back (std::make_unique<juce::AudioParameterChoice> ("LFO1SHAPE", "LFO1 Shape", juce::StringArray { "Sine", "Triangle", "Saw", "Noise", "Square" }, lfo1ShapeDefault));
@@ -3877,8 +4182,16 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
         params.push_back (std::make_unique<juce::AudioParameterChoice> ("LFO3ASSIGNDEST", "LFO3 Assign Destination", matrixDestinationChoices(), lfo3AssignDestinationDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("RHYTHMGATE_DEPTH", "Rhythm Gate Depth", 0.0f, 1.0f, rhythmDepthDefault));
     params.push_back (std::make_unique<juce::AudioParameterChoice> ("FXTYPE", "FX Type", juce::StringArray { "Off", "Distortion", "Character", "Chorus", "Phaser", "Flanger", "Ring Mod", "Freq Shift" }, fxTypeDefault));
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+        params.push_back (std::make_unique<juce::AudioParameterChoice> ("SATURATIONTYPE", "Saturation Type", juce::StringArray { "Soft", "Warm", "Drive", "Fold" }, saturationTypeDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("FXMIX", "FX Mix", 0.0f, 1.0f, fxMixDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("FXINTENSITY", "FX Intensity", 0.0f, 1.0f, fxIntensityDefault));
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("FXRATE", "FX Rate", 0.02f, 12.0f, fxRateDefault));
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("FXCOLOUR", "FX Colour", 0.0f, 1.0f, fxColourDefault));
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("FXSPREAD", "FX Spread", 0.0f, 1.0f, fxSpreadDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("DELAYSEND", "Delay Send", 0.0f, 1.0f, delaySendDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("DELAYTIME", "Delay Time", 0.05f, 1.2f, delayTimeDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("DELAYFEEDBACK", "Delay Feedback", 0.0f, 0.92f, delayFeedbackDefault));
@@ -4007,6 +4320,31 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
         setParameterActual ("LFO1ENABLE", 1.0f);
         setParameterActual ("LFO2ENABLE", 1.0f);
         setParameterActual ("LFO3ENABLE", 1.0f);
+        setParameterActual ("PANORAMA", 0.0f);
+        setParameterActual ("KEYFOLLOW", 0.22f);
+        setParameterActual ("RESONANCE2", 0.24f);
+        setParameterActual ("SATURATIONTYPE", 0.0f);
+        setParameterActual ("FXTYPE", 0.0f);
+        setParameterActual ("FXMIX", 0.16f);
+        setParameterActual ("FXINTENSITY", 0.24f);
+        setParameterActual ("FXRATE", 0.42f);
+        setParameterActual ("FXCOLOUR", 0.54f);
+        setParameterActual ("FXSPREAD", 0.48f);
+        setParameterActual ("DELAYSEND", 0.08f);
+        setParameterActual ("DELAYTIME", 0.34f);
+        setParameterActual ("DELAYFEEDBACK", 0.22f);
+        setParameterActual ("REVERBMIX", 0.12f);
+        setParameterActual ("REVERBTIME", 0.48f);
+        setParameterActual ("REVERBDAMP", 0.4f);
+        setParameterActual ("LOWEQGAIN", 0.0f);
+        setParameterActual ("LOWEQFREQ", 220.0f);
+        setParameterActual ("LOWEQQ", 0.8f);
+        setParameterActual ("MIDEQGAIN", 0.0f);
+        setParameterActual ("MIDEQFREQ", 1400.0f);
+        setParameterActual ("MIDEQQ", 1.1f);
+        setParameterActual ("HIGHEQGAIN", 0.0f);
+        setParameterActual ("HIGHEQFREQ", 5000.0f);
+        setParameterActual ("HIGHEQQ", 0.8f);
     }
 
     if constexpr (buildFlavor() == InstrumentFlavor::bassSynth)
@@ -4626,6 +4964,206 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
             { "HIGHEQFREQ", 5000.0f },
             { "HIGHEQQ", 0.8f },
         });
+
+        const auto builtInCount = builtInAdvancedVirusPresetChoices().size();
+        const auto importedIndex = presetIndex - builtInCount;
+        const auto& importedPresets = importedVirusPresets();
+
+        if (juce::isPositiveAndBelow (importedIndex, static_cast<int> (importedPresets.size())))
+        {
+            const auto& imported = importedPresets[static_cast<size_t> (importedIndex)];
+            const auto lowerName = imported.name.toLowerCase();
+
+            const auto pitchSeed = importedPayloadNorm (imported, 18);
+            const auto colourSeed = importedPayloadNorm (imported, 36);
+            const auto motionSeed = importedPayloadNorm (imported, 64);
+            const auto filterSeed = importedPayloadNorm (imported, 82);
+            const auto ampSeed = importedPayloadNorm (imported, 101);
+            const auto fxSeed = importedPayloadNorm (imported, 154);
+            const auto envSeed = importedPayloadNorm (imported, 188);
+
+            const bool isBass = importedNameContains (lowerName, { "bass", "sub", "303", "acid" });
+            const bool isLead = importedNameContains (lowerName, { "lead", "lazer", "solo", "hero", "gallop", "zipp" });
+            const bool isPad = importedNameContains (lowerName, { "pad", "wash", "choir", "solar", "omni", "mystery", "swell" });
+            const bool isArp = importedNameContains (lowerName, { "arp", "seq", "gallop", "pulse", "step" });
+            const bool isFm = importedNameContains (lowerName, { "fm", "sin", "metal", "bell" });
+            const bool isNoise = importedNameContains (lowerName, { "noise", "dirty", "chip", "ufo", "rev" });
+            const bool isWide = importedNameContains (lowerName, { "wide", "omni", "solar", "wave", "pad", "poly" });
+            const bool isBright = importedNameContains (lowerName, { "high", "glass", "chip", "bright", "air" });
+            const bool isDark = importedNameContains (lowerName, { "deep", "dark", "mystery" });
+
+            int osc1Type = 1;
+            int osc2Type = 1;
+
+            if (importedNameContains (lowerName, { "square", "chip" }))
+                osc1Type = 2;
+            else if (isFm)
+                osc1Type = 0;
+            else if (isPad)
+                osc1Type = 5 + static_cast<int> (std::floor (colourSeed * 4.0f));
+
+            if (importedNameContains (lowerName, { "vocal", "choir" }))
+                osc2Type = 9;
+            else if (importedNameContains (lowerName, { "form", "talk" }))
+                osc2Type = 6;
+            else if (importedNameContains (lowerName, { "metal" }))
+                osc2Type = 8;
+            else if (isFm)
+                osc2Type = 0;
+            else if (isPad)
+                osc2Type = 7 + static_cast<int> (std::round (pitchSeed));
+            else if (importedNameContains (lowerName, { "square", "chip" }))
+                osc2Type = 2;
+
+            osc1Type = juce::jlimit (0, 9, osc1Type);
+            osc2Type = juce::jlimit (0, 9, osc2Type);
+
+            const float cutoff = isBass ? importedRange (imported, 120, 120.0f, 1800.0f)
+                                        : (isPad ? importedRange (imported, 120, 1400.0f, 5200.0f)
+                                                 : importedRange (imported, 120, 700.0f, 7200.0f));
+            const float cutoff2 = juce::jmax (cutoff + 120.0f, importedRange (imported, 127, 1800.0f, 12000.0f));
+            const float resonance = importedRange (imported, 128, isBass ? 0.18f : 0.12f, isLead ? 0.72f : 0.56f);
+            const float envAmount = importedRange (imported, 132, isPad ? 0.08f : 0.16f, isLead ? 0.8f : 0.62f);
+            const float ampAttack = isPad ? importedRange (imported, 138, 0.08f, 1.8f)
+                                          : importedRange (imported, 138, 0.001f, isBass ? 0.08f : 0.28f);
+            const float ampDecay = importedRange (imported, 140, isPad ? 0.45f : 0.08f, isPad ? 1.9f : 0.95f);
+            const float ampSustain = importedRange (imported, 142, isArp ? 0.05f : 0.32f, isPad ? 0.96f : 0.84f);
+            const float ampRelease = importedRange (imported, 144, isArp ? 0.04f : 0.12f, isPad ? 2.6f : 0.9f);
+            const float filtAttack = importedRange (imported, 146, 0.001f, isPad ? 0.5f : 0.1f);
+            const float filtDecay = importedRange (imported, 148, 0.06f, isPad ? 1.6f : 0.7f);
+            const float filtSustain = importedRange (imported, 150, 0.04f, isPad ? 0.72f : 0.44f);
+            const float filtRelease = importedRange (imported, 152, 0.04f, isPad ? 1.8f : 0.8f);
+
+            const int fxType = isFm ? 6 : (isPad ? 3 : (isNoise ? 1 : ((fxSeed > 0.72f) ? 5 : 0)));
+            const float fxMix = importedRange (imported, 168, 0.04f, isPad ? 0.34f : 0.24f);
+            const float fxIntensity = importedRange (imported, 170, 0.12f, isFm ? 0.72f : 0.5f);
+            const float fxRate = importedRange (imported, 171, 0.08f, 7.2f);
+            const float fxColour = importedRange (imported, 172, 0.18f, 0.9f);
+            const float fxSpread = importedRange (imported, 173, 0.1f, 0.95f);
+            const float delaySend = importedRange (imported, 174, 0.0f, isPad ? 0.26f : 0.14f);
+            const float delayTime = importedRange (imported, 175, 0.18f, 0.72f);
+            const float delayFeedback = importedRange (imported, 176, 0.06f, 0.48f);
+            const float reverbMix = importedRange (imported, 177, 0.02f, isPad ? 0.34f : 0.18f);
+            const float reverbTime = importedRange (imported, 178, 0.24f, 0.92f);
+            const float reverbDamp = importedRange (imported, 179, 0.2f, 0.82f);
+
+            const float lfoAmount = importedRange (imported, 194, isPad ? 0.04f : 0.0f, isPad ? 0.22f : 0.14f);
+            const float lfoRate = importedRange (imported, 196, 0.08f, isArp ? 8.0f : 2.0f);
+
+            applyAdvancedSettings ({
+                { "MONOENABLE", isBass || isLead ? 1.0f : 0.0f },
+                { "ARPENABLE", isArp ? 1.0f : 0.0f },
+                { "ARPMODE", isArp ? static_cast<float> (juce::jlimit (0, 3, 1 + static_cast<int> (std::floor (motionSeed * 3.0f)))) : 0.0f },
+                { "ARPRATE", isArp ? importedRange (imported, 210, 4.0f, 12.0f) : 4.0f },
+                { "OSCTYPE", static_cast<float> (osc1Type) },
+                { "OSC2TYPE", static_cast<float> (osc2Type) },
+                { "UNISON", isWide ? 2.0f : 1.0f },
+                { "DETUNE", importedRange (imported, 114, isBass ? 0.006f : 0.012f, isWide ? 0.09f : 0.05f) },
+                { "OSC1SEMITONE", 0.0f },
+                { "OSC1DETUNE", importedRange (imported, 115, -0.05f, 0.05f) },
+                { "OSC1PW", importedRange (imported, 116, 0.22f, 0.82f) },
+                { "OSC2SEMITONE", isBass ? -12.0f : (isBright ? 12.0f : (importedPayloadNorm (imported, 117) > 0.66f ? 7.0f : 0.0f)) },
+                { "OSC2DETUNE", importedRange (imported, 118, -0.12f, 0.12f) },
+                { "OSC2PW", importedRange (imported, 119, 0.22f, 0.82f) },
+                { "OSC2MIX", importedRange (imported, 121, 0.18f, 0.58f) },
+                { "OSC3ENABLE", importedPayloadNorm (imported, 122) > 0.28f ? 1.0f : 0.0f },
+                { "OSC3SEMITONE", isBass ? -12.0f : 0.0f },
+                { "OSC3DETUNE", importedRange (imported, 123, -0.05f, 0.05f) },
+                { "OSC3PW", importedRange (imported, 124, 0.24f, 0.76f) },
+                { "SUBOSCLEVEL", importedRange (imported, 125, isBass ? 0.18f : 0.0f, isBass ? 0.62f : 0.24f) },
+                { "NOISELEVEL", importedRange (imported, 126, 0.0f, isNoise ? 0.34f : 0.12f) },
+                { "RINGMOD", importedRange (imported, 129, 0.0f, isFm ? 0.42f : 0.18f) },
+                { "FMAMOUNT", importedRange (imported, 130, isFm ? 90.0f : 0.0f, isFm ? 760.0f : 220.0f) },
+                { "SYNC", importedRange (imported, 131, 0.0f, isLead ? 0.66f : 0.28f) },
+                { "FILTER1ENABLE", 1.0f },
+                { "FILTER2ENABLE", importedPayloadNorm (imported, 133) > 0.22f ? 1.0f : 0.0f },
+                { "FILTERTYPE", static_cast<float> (juce::jlimit (0, 3, static_cast<int> (std::floor (filterSeed * 4.0f)))) },
+                { "FILTER2TYPE", static_cast<float> (juce::jlimit (0, 3, static_cast<int> (std::floor (importedPayloadNorm (imported, 134) * 4.0f)))) },
+                { "CUTOFF", cutoff },
+                { "CUTOFF2", cutoff2 },
+                { "RESONANCE", resonance },
+                { "FILTERENVAMOUNT", envAmount },
+                { "FILTERBALANCE", importedRange (imported, 135, 0.08f, 0.52f) },
+                { "PANORAMA", importedRange (imported, 136, -0.35f, 0.35f) },
+                { "KEYFOLLOW", importedRange (imported, 137, isDark ? 0.06f : 0.18f, 0.82f) },
+                { "AMPATTACK", ampAttack },
+                { "AMPDECAY", ampDecay },
+                { "AMPSUSTAIN", ampSustain },
+                { "AMPRELEASE", ampRelease },
+                { "FILTATTACK", filtAttack },
+                { "FILTDECAY", filtDecay },
+                { "FILTSUSTAIN", filtSustain },
+                { "FILTRELEASE", filtRelease },
+                { "LFO1ENABLE", lfoAmount > 0.01f ? 1.0f : 0.0f },
+                { "LFO1RATE", lfoRate },
+                { "LFO1SHAPE", static_cast<float> (juce::jlimit (0, 4, static_cast<int> (std::floor (importedPayloadNorm (imported, 198) * 5.0f)))) },
+                { "LFO1ENVMODE", isArp ? 1.0f : 0.0f },
+                { "LFO1AMOUNT", lfoAmount },
+                { "LFO1DEST", static_cast<float> (juce::jlimit (0, 10, static_cast<int> (std::floor (importedPayloadNorm (imported, 199) * 11.0f)))) },
+                { "LFO1ASSIGNDEST", static_cast<float> (static_cast<int> (MatrixDestination::off)) },
+                { "LFO2ENABLE", importedPayloadNorm (imported, 200) > 0.18f ? 1.0f : 0.0f },
+                { "LFO2RATE", importedRange (imported, 201, 0.08f, 6.2f) },
+                { "LFO2SHAPE", static_cast<float> (juce::jlimit (0, 4, static_cast<int> (std::floor (importedPayloadNorm (imported, 202) * 5.0f)))) },
+                { "LFO2ENVMODE", isPad ? 0.0f : 1.0f },
+                { "LFO2AMOUNT", importedRange (imported, 203, 0.0f, 0.24f) },
+                { "LFO2DEST", static_cast<float> (juce::jlimit (0, 10, static_cast<int> (std::floor (importedPayloadNorm (imported, 204) * 11.0f)))) },
+                { "LFO2ASSIGNDEST", static_cast<float> (static_cast<int> (MatrixDestination::off)) },
+                { "LFO3ENABLE", importedPayloadNorm (imported, 205) > 0.36f ? 1.0f : 0.0f },
+                { "RHYTHMGATE_RATE", importedRange (imported, 206, 2.0f, 12.0f) },
+                { "LFO3SHAPE", static_cast<float> (juce::jlimit (0, 4, static_cast<int> (std::floor (importedPayloadNorm (imported, 207) * 5.0f)))) },
+                { "LFO3ENVMODE", 1.0f },
+                { "LFO3AMOUNT", importedRange (imported, 208, 0.0f, 0.26f) },
+                { "LFO3DEST", static_cast<float> (juce::jlimit (0, 10, static_cast<int> (std::floor (importedPayloadNorm (imported, 209) * 11.0f)))) },
+                { "LFO3ASSIGNDEST", static_cast<float> (static_cast<int> (MatrixDestination::assign)) },
+                { "FXTYPE", static_cast<float> (fxType) },
+                { "FXMIX", fxMix },
+                { "FXINTENSITY", fxIntensity },
+                { "FXRATE", fxRate },
+                { "FXCOLOUR", fxColour },
+                { "FXSPREAD", fxSpread },
+                { "DELAYSEND", delaySend },
+                { "DELAYTIME", delayTime },
+                { "DELAYFEEDBACK", delayFeedback },
+                { "REVERBMIX", reverbMix },
+                { "REVERBTIME", reverbTime },
+                { "REVERBDAMP", reverbDamp },
+                { "LOWEQGAIN", importedRange (imported, 180, -4.0f, 4.0f) },
+                { "LOWEQFREQ", importedRange (imported, 181, 90.0f, 420.0f) },
+                { "LOWEQQ", importedRange (imported, 182, 0.5f, 1.4f) },
+                { "MIDEQGAIN", importedRange (imported, 183, -4.0f, 4.0f) },
+                { "MIDEQFREQ", importedRange (imported, 184, 420.0f, 4200.0f) },
+                { "MIDEQQ", importedRange (imported, 185, 0.6f, 1.7f) },
+                { "HIGHEQGAIN", importedRange (imported, 186, -4.0f, 4.0f) },
+                { "HIGHEQFREQ", importedRange (imported, 187, 1800.0f, 9000.0f) },
+                { "HIGHEQQ", importedRange (imported, 189, 0.5f, 1.4f) },
+                { "SATURATIONTYPE", static_cast<float> (juce::jlimit (0, 3, static_cast<int> (std::floor (colourSeed * 4.0f)))) },
+                { "MASTERLEVEL", importedRange (imported, 190, 0.9f, isBass ? 1.18f : 1.06f) },
+            });
+
+            resetAdvancedMatrix();
+            if (motionSeed > 0.42f)
+            {
+                setParameterActual ("MATRIX1SOURCE", 1.0f);
+                setParameterActual ("MATRIX1DEST1", static_cast<float> (static_cast<int> (MatrixDestination::cutoff1)));
+                setParameterActual ("MATRIX1AMOUNT1", importedRange (imported, 220, -0.12f, 0.22f));
+                if (isWide)
+                {
+                    setParameterActual ("MATRIX1DEST2", static_cast<float> (static_cast<int> (MatrixDestination::panorama)));
+                    setParameterActual ("MATRIX1AMOUNT2", importedRange (imported, 221, 0.02f, 0.18f));
+                }
+            }
+
+            if (envSeed > 0.55f)
+            {
+                setParameterActual ("MATRIX2SOURCE", 5.0f);
+                setParameterActual ("MATRIX2DEST1", static_cast<float> (static_cast<int> (MatrixDestination::filterBalance)));
+                setParameterActual ("MATRIX2AMOUNT1", importedRange (imported, 222, -0.14f, 0.22f));
+            }
+
+            remapLegacyFxType();
+            syncLegacyLfoRouting();
+            return;
+        }
 
         switch (presetIndex)
         {

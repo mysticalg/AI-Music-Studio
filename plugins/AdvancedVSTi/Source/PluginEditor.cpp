@@ -84,6 +84,21 @@ const std::array<juce::String, 11> kVirusModDestinationLabels {
 const std::array<juce::String, 5> kVirusUpperFxLabels { "DELAY", "REVERB", "LOW EQ", "MID EQ", "HIGH EQ" };
 const std::array<juce::String, 5> kVirusLowerFxLabels { "DISTORTION", "CHARACTER", "CHORUS", "PHASER", "OTHERS" };
 
+juce::String virusLowerFxAlgorithmLabel (int fxTypeIndex)
+{
+    switch (fxTypeIndex)
+    {
+        case 1: return "DISTORTION";
+        case 2: return "CHARACTER";
+        case 3: return "CHORUS";
+        case 4: return "PHASER";
+        case 5: return "FLANGER";
+        case 6: return "RING MOD";
+        case 7: return "FREQ SHIFT";
+        default: return "OFF";
+    }
+}
+
 struct VirusPresetDisplayInfo
 {
     juce::String bankLabel;
@@ -1424,6 +1439,8 @@ AdvancedVSTiAudioProcessorEditor::AdvancedVSTiAudioProcessorEditor (AdvancedVSTi
     if (isTributeVirus())
     {
         updateVirusOscillatorBindings();
+        updateVirusModulatorBindings();
+        refreshVirusShiftAwareKnobBindings();
         syncVirusPanelButtons();
     }
 
@@ -1782,7 +1799,14 @@ void AdvancedVSTiAudioProcessorEditor::showVirusOsdForParam (const juce::String&
     if (paramId == "PRESET")
     {
         virusActivePresetMenu = true;
+        virusPresetNavigationGuardUntilMs = juce::Time::getMillisecondCounterHiRes() + 350.0;
         refreshVirusValueKnobBindings();
+        refreshVirusPresetOsd();
+        return;
+    }
+
+    if (virusActivePresetMenu && juce::Time::getMillisecondCounterHiRes() < virusPresetNavigationGuardUntilMs)
+    {
         refreshVirusPresetOsd();
         return;
     }
@@ -1809,6 +1833,37 @@ void AdvancedVSTiAudioProcessorEditor::showVirusOsdForParam (const juce::String&
         const auto title = titleOverride.isNotEmpty() ? titleOverride : parameter->getName (36);
         showVirusOsdMessage (title, valueText, detail, pinned, lifetimeMs);
     }
+}
+
+void AdvancedVSTiAudioProcessorEditor::bindVirusKnobToParam (int knobIndex,
+                                                             const juce::String& paramId,
+                                                             const juce::String& title,
+                                                             const juce::String& hint,
+                                                             std::function<void()> onValueChange)
+{
+    if (! isTributeVirus() || ! juce::isPositiveAndBelow (knobIndex, knobCards.size())
+        || ! juce::isPositiveAndBelow (knobIndex, static_cast<int> (sliderAttachments.size())))
+        return;
+
+    if (auto* parameter = dynamic_cast<juce::RangedAudioParameter*> (audioProcessor.apvts.getParameter (paramId)))
+        knobCards[knobIndex]->slider.setValue (parameter->convertFrom0to1 (parameter->getValue()), juce::dontSendNotification);
+
+    sliderAttachments[static_cast<size_t> (knobIndex)] =
+        std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (audioProcessor.apvts,
+                                                                                 paramId,
+                                                                                 knobCards[knobIndex]->slider);
+    knobCards[knobIndex]->slider.setTooltip (buildControlTooltip (title, hint));
+    knobCards[knobIndex]->slider.onValueChange = [this,
+                                                  paramId,
+                                                  title,
+                                                  hint,
+                                                  onValueChange = std::move (onValueChange)]() mutable
+    {
+        if (onValueChange != nullptr)
+            onValueChange();
+        else
+            showVirusOsdForParam (paramId, title, hint);
+    };
 }
 
 void AdvancedVSTiAudioProcessorEditor::refreshVirusMatrixMenuOsd()
@@ -1973,17 +2028,68 @@ void AdvancedVSTiAudioProcessorEditor::refreshVirusFxMenuOsd (bool lowerSection)
 
     if (lowerSection)
     {
-        const auto effectIndex = juce::jlimit (0, static_cast<int> (kVirusLowerFxLabels.size()) - 1, virusLowerFxLegendIndex);
+        const auto fxType = dynamic_cast<juce::AudioParameterChoice*> (audioProcessor.apvts.getParameter ("FXTYPE"));
+        const auto fxIndex = fxType != nullptr ? juce::jlimit (0, fxType->choices.size() - 1, fxType->getIndex()) : 0;
+        const auto algorithmLabel = virusLowerFxAlgorithmLabel (fxIndex);
+
+        if (fxIndex == 1)
+        {
+            const auto value = "MIX "
+                               + parameterValueText (audioProcessor.apvts, "FXMIX")
+                               + "   DRIVE "
+                               + parameterValueText (audioProcessor.apvts, "FXINTENSITY")
+                               + "   TONE "
+                               + parameterValueText (audioProcessor.apvts, "FXCOLOUR");
+            showVirusOsdMessage (algorithmLabel, value, "V1 MIX   V2 DRIVE   V3 TONE", true, 60000.0);
+            return;
+        }
+
+        if (fxIndex == 2)
+        {
+            const auto value = "MIX "
+                               + parameterValueText (audioProcessor.apvts, "FXMIX")
+                               + "   COLOR "
+                               + parameterValueText (audioProcessor.apvts, "FXCOLOUR")
+                               + "   BIAS "
+                               + parameterValueText (audioProcessor.apvts, "FXSPREAD");
+            showVirusOsdMessage (algorithmLabel, value, "V1 MIX   V2 COLOR   V3 BIAS", true, 60000.0);
+            return;
+        }
+
+        if (fxIndex == 3)
+        {
+            const auto value = "MIX "
+                               + parameterValueText (audioProcessor.apvts, "FXMIX")
+                               + "   RATE "
+                               + parameterValueText (audioProcessor.apvts, "FXRATE")
+                               + "   DEPTH "
+                               + parameterValueText (audioProcessor.apvts, "FXINTENSITY");
+            showVirusOsdMessage (algorithmLabel, value, "V1 MIX   V2 RATE   V3 DEPTH", true, 60000.0);
+            return;
+        }
+
+        if (fxIndex == 4)
+        {
+            const auto value = "MIX "
+                               + parameterValueText (audioProcessor.apvts, "FXMIX")
+                               + "   RATE "
+                               + parameterValueText (audioProcessor.apvts, "FXRATE")
+                               + "   FEEDBACK "
+                               + parameterValueText (audioProcessor.apvts, "FXSPREAD");
+            showVirusOsdMessage (algorithmLabel, value, "V1 MIX   V2 RATE   V3 FEEDBACK", true, 60000.0);
+            return;
+        }
+
         const auto value = "TYPE "
-                           + parameterValueText (audioProcessor.apvts, "FXTYPE")
+                           + algorithmLabel
                            + "   MIX "
                            + parameterValueText (audioProcessor.apvts, "FXMIX")
-                           + "   INT "
-                           + parameterValueText (audioProcessor.apvts, "FXINTENSITY");
+                           + "   MOTION "
+                           + parameterValueText (audioProcessor.apvts, "FXRATE");
 
-        showVirusOsdMessage (kVirusLowerFxLabels[static_cast<size_t> (effectIndex)],
+        showVirusOsdMessage ("OTHERS",
                              value,
-                             "V1 TYPE   V2 MIX   V3 INTENSITY",
+                             "V1 TYPE   V2 MIX   V3 MOTION",
                              true,
                              60000.0);
         return;
@@ -2126,26 +2232,12 @@ void AdvancedVSTiAudioProcessorEditor::refreshVirusValueKnobBindings()
         return dynamic_cast<juce::RangedAudioParameter*> (audioProcessor.apvts.getParameter (paramId));
     };
 
-    auto bindParamKnob = [this, rangedParameter] (int knobIndex,
-                                                  const juce::String& paramId,
-                                                  const juce::String& title,
-                                                  const juce::String& hint)
+    auto bindParamKnob = [this] (int knobIndex,
+                                 const juce::String& paramId,
+                                 const juce::String& title,
+                                 const juce::String& hint)
     {
-        if (! juce::isPositiveAndBelow (knobIndex, knobCards.size()) || ! juce::isPositiveAndBelow (knobIndex, static_cast<int> (sliderAttachments.size())))
-            return;
-
-        if (auto* parameter = rangedParameter (paramId))
-            knobCards[knobIndex]->slider.setValue (parameter->convertFrom0to1 (parameter->getValue()), juce::dontSendNotification);
-
-        sliderAttachments[static_cast<size_t> (knobIndex)] =
-            std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (audioProcessor.apvts,
-                                                                                     paramId,
-                                                                                     knobCards[knobIndex]->slider);
-        knobCards[knobIndex]->slider.setTooltip (buildControlTooltip (title, hint));
-        knobCards[knobIndex]->slider.onValueChange = [this, paramId, title, hint]
-        {
-            showVirusOsdForParam (paramId, title, hint);
-        };
+        bindVirusKnobToParam (knobIndex, paramId, title, hint);
     };
 
     auto bindMenuKnob = [this] (int knobIndex,
@@ -2345,9 +2437,41 @@ void AdvancedVSTiAudioProcessorEditor::refreshVirusValueKnobBindings()
             return;
         }
 
-        bindParamKnob (30, "FXTYPE", "Value 1", "Lower effect type");
-        bindParamKnob (31, "FXMIX", "Value 2", "Lower effect mix");
-        bindParamKnob (32, "FXINTENSITY", "Value 3", "Lower effect intensity");
+        const auto lowerFxType = [this] () -> int
+        {
+            if (auto* parameter = dynamic_cast<juce::AudioParameterChoice*> (audioProcessor.apvts.getParameter ("FXTYPE")))
+                return juce::jlimit (0, parameter->choices.size() - 1, parameter->getIndex());
+            return 0;
+        }();
+
+        switch (lowerFxType)
+        {
+            case 1:
+                bindParamKnob (30, "FXMIX", "Value 1", "Distortion mix");
+                bindParamKnob (31, "FXINTENSITY", "Value 2", "Distortion drive");
+                bindParamKnob (32, "FXCOLOUR", "Value 3", "Distortion tone");
+                break;
+            case 2:
+                bindParamKnob (30, "FXMIX", "Value 1", "Character mix");
+                bindParamKnob (31, "FXCOLOUR", "Value 2", "Character colour");
+                bindParamKnob (32, "FXSPREAD", "Value 3", "Character bias");
+                break;
+            case 3:
+                bindParamKnob (30, "FXMIX", "Value 1", "Chorus mix");
+                bindParamKnob (31, "FXRATE", "Value 2", "Chorus rate");
+                bindParamKnob (32, "FXINTENSITY", "Value 3", "Chorus depth");
+                break;
+            case 4:
+                bindParamKnob (30, "FXMIX", "Value 1", "Phaser mix");
+                bindParamKnob (31, "FXRATE", "Value 2", "Phaser rate");
+                bindParamKnob (32, "FXSPREAD", "Value 3", "Phaser feedback");
+                break;
+            default:
+                bindParamKnob (30, "FXTYPE", "Value 1", "Other effect algorithm");
+                bindParamKnob (31, "FXMIX", "Value 2", "Other effect mix");
+                bindParamKnob (32, "FXRATE", "Value 3", "Other effect motion");
+                break;
+        }
 
         knobCards[30]->slider.onValueChange = [this] { syncVirusPanelButtons(); refreshVirusFxMenuOsd (true); };
         knobCards[31]->slider.onValueChange = [this] { refreshVirusFxMenuOsd (true); };
@@ -2382,6 +2506,109 @@ void AdvancedVSTiAudioProcessorEditor::refreshVirusValueKnobBindings()
     bindParamKnob (30, "ARPRATE", "Value 1", "Arp rate");
     bindParamKnob (31, "RHYTHMGATE_RATE", "Value 2", "Rhythm gate rate");
     bindParamKnob (32, "RHYTHMGATE_DEPTH", "Value 3", "Rhythm gate depth");
+}
+
+void AdvancedVSTiAudioProcessorEditor::refreshVirusShiftAwareKnobBindings()
+{
+    if (! isTributeVirus() || knobCards.size() <= 37 || sliderAttachments.size() <= 37)
+        return;
+
+    const auto specs = buildKnobSpecs();
+
+    auto restoreStaticPrimary = [this, &specs] (int knobIndex)
+    {
+        if (! juce::isPositiveAndBelow (knobIndex, static_cast<int> (specs.size())))
+            return;
+
+        const auto& spec = specs[static_cast<size_t> (knobIndex)];
+        bindVirusKnobToParam (knobIndex, spec.paramId, spec.title, spec.hint);
+    };
+
+    auto bindOscKnob = [this] (int knobIndex,
+                               const juce::String& paramId,
+                               const juce::String& title,
+                               const juce::String& hint)
+    {
+        bindVirusKnobToParam (knobIndex,
+                              paramId,
+                              title,
+                              hint,
+                              [this, paramId, title, hint]
+                              {
+                                  showVirusOsdForParam (paramId, title, hint);
+                                  if (virusActiveOscMenu >= 0)
+                                      refreshVirusOscMenuOsd();
+                              });
+    };
+
+    auto bindLfoKnob = [this] (int knobIndex,
+                               const juce::String& paramId,
+                               const juce::String& title,
+                               const juce::String& hint)
+    {
+        bindVirusKnobToParam (knobIndex,
+                              paramId,
+                              title,
+                              hint,
+                              [this, paramId, title, hint]
+                              {
+                                  showVirusOsdForParam (paramId, title, hint);
+                                  if (virusActiveLfoMenu >= 0)
+                                      refreshVirusLfoMenuOsd();
+                              });
+    };
+
+    const auto oscIndex = juce::jlimit (0, 2, virusOscillatorIndex);
+    const auto oscLabel = "OSC " + juce::String (oscIndex + 1);
+    const auto oscWaveParamId = oscIndex == 0 ? "OSCTYPE" : (oscIndex == 1 ? "OSC2TYPE" : "OSC3TYPE");
+    const auto oscShapeParamId = oscIndex == 0 ? "OSC1PW" : (oscIndex == 1 ? "OSC2PW" : "OSC3PW");
+    const auto oscSemitoneParamId = oscIndex == 0 ? "OSC1SEMITONE" : (oscIndex == 1 ? "OSC2SEMITONE" : "OSC3SEMITONE");
+    const auto oscDetuneParamId = oscIndex == 0 ? "OSC1DETUNE" : (oscIndex == 1 ? "OSC2DETUNE" : "OSC3DETUNE");
+
+    const auto lfoIndex = juce::jlimit (0, 2, virusModulatorIndex);
+    const auto lfoLabel = "LFO " + juce::String (lfoIndex + 1);
+
+    if (! virusShiftMode)
+    {
+        bindLfoKnob (3,
+                     virusLfoRateParamId (lfoIndex),
+                     lfoLabel + " Rate",
+                     "Speed for the selected LFO");
+        bindOscKnob (7, oscWaveParamId, oscLabel + " Wave", "Waveform for the selected oscillator");
+        bindOscKnob (15, oscShapeParamId, oscLabel + " Wave Select / PW", "Pulse width / shape for the selected oscillator");
+        bindOscKnob (8, oscSemitoneParamId, oscLabel + " Semitone", "Tune the selected oscillator in semitones");
+        bindOscKnob (16, oscDetuneParamId, oscLabel + " Detune", "Fine tune the selected oscillator");
+
+        for (const auto knobIndex : { 9, 10, 11, 12, 13, 18, 19, 26, 29, 35, 36, 37 })
+            restoreStaticPrimary (knobIndex);
+
+        return;
+    }
+
+    bindLfoKnob (3,
+                 virusLfoAmountParamId (lfoIndex),
+                 lfoLabel + " Contour",
+                 "Shift: selected LFO amount");
+    bindOscKnob (7, oscShapeParamId, oscLabel + " Shape", "Shift: selected oscillator shape / pulse width");
+    bindOscKnob (8, "OSCGATE", "Portamento", "Shift: note glide / gate time");
+    bindOscKnob (9, "PANORAMA", "Panorama", "Shift: stereo panorama");
+    bindOscKnob (10, "SUBOSCLEVEL", "OSC3 Volume", "Shift: oscillator 3 / sub volume");
+    bindOscKnob (11, "RINGMOD", "Ring Modulator", "Shift: ring mod depth");
+    bindOscKnob (12, "SATURATIONTYPE", "Saturation Type", "Shift: drive character");
+    bindOscKnob (13, "FMENABLE", "FM Mode", "Shift: FM on / off");
+    bindOscKnob (16, "DETUNE", "Unison Detune", "Shift: global unison spread");
+    bindOscKnob (18, "RESONANCE2", "Resonance 2", "Shift: filter 2 resonance");
+    bindOscKnob (19, "KEYFOLLOW", "Keyfollow", "Shift: note tracking into the filters");
+    bindOscKnob (26, "MASTERLEVEL", "Patch Volume", "Shift: patch output level");
+    bindOscKnob (29, "ARPRATE", "Tempo", "Shift: arp / tempo rate");
+
+    const int eqBandIndex = virusUpperFxLegendIndex >= 2 ? juce::jlimit (2, 4, virusUpperFxLegendIndex) : 2;
+    const juce::String eqPrefix = eqBandIndex == 2 ? "LOWEQ" : (eqBandIndex == 3 ? "MIDEQ" : "HIGHEQ");
+    const juce::String eqLabel = eqBandIndex == 2 ? "Low EQ" : (eqBandIndex == 3 ? "Mid EQ" : "High EQ");
+
+    bindOscKnob (35, eqPrefix + "GAIN", eqLabel + " Gain", juce::String ("Shift: ") + eqLabel + " gain");
+    bindOscKnob (36, eqPrefix + "FREQ", eqLabel + " Freq", juce::String ("Shift: ") + eqLabel + " frequency");
+    bindOscKnob (37, eqPrefix + "Q", eqLabel + " Q", juce::String ("Shift: ") + eqLabel + " Q");
 }
 
 void AdvancedVSTiAudioProcessorEditor::syncVirusPanelButtons()
@@ -2572,6 +2799,8 @@ void AdvancedVSTiAudioProcessorEditor::updateVirusOscillatorBindings()
                                                                                      knobCards[knobIndex]->slider);
         knobCards[knobIndex]->slider.setTooltip (tooltips[static_cast<size_t> (oscIndex)][static_cast<size_t> (localIndex)]);
     }
+
+    refreshVirusShiftAwareKnobBindings();
 }
 
 void AdvancedVSTiAudioProcessorEditor::updateVirusModulatorBindings()
@@ -2604,6 +2833,8 @@ void AdvancedVSTiAudioProcessorEditor::updateVirusModulatorBindings()
         if (virusActiveLfoMenu >= 0)
             refreshVirusLfoMenuOsd();
     };
+
+    refreshVirusShiftAwareKnobBindings();
 }
 
 AdvancedVSTiAudioProcessorEditor::LedToggleButton* AdvancedVSTiAudioProcessorEditor::addVirusPanelButton (
@@ -2863,6 +3094,8 @@ void AdvancedVSTiAudioProcessorEditor::buildVirusPanelButtons()
     auto setShiftMode = [this] (bool enabled, const juce::String& detail = {})
     {
         virusShiftMode = enabled;
+        refreshVirusShiftAwareKnobBindings();
+        refreshVirusValueKnobBindings();
         syncVirusPanelButtons();
         showVirusOsdMessage ("SHIFT",
                              enabled ? "ON" : "OFF",
@@ -2943,6 +3176,7 @@ void AdvancedVSTiAudioProcessorEditor::buildVirusPanelButtons()
         const bool keepFxMenuOpen = virusActiveFxMenu == 0;
         clearVirusLfoMenu();
         virusUpperFxLegendIndex = juce::jlimit (0, 4, index);
+        refreshVirusShiftAwareKnobBindings();
         syncVirusPanelButtons();
         if (keepFxMenuOpen)
         {
@@ -3145,6 +3379,7 @@ void AdvancedVSTiAudioProcessorEditor::buildVirusPanelButtons()
     {
         clearVirusLfoMenu();
         virusActivePresetMenu = true;
+        virusPresetNavigationGuardUntilMs = juce::Time::getMillisecondCounterHiRes() + 350.0;
         stepChoiceParameter ("PRESET", delta);
         refreshVirusValueKnobBindings();
         refreshVirusPresetOsd();
@@ -3472,6 +3707,7 @@ void AdvancedVSTiAudioProcessorEditor::buildVirusPanelButtons()
     }
 
     updateVirusModulatorBindings();
+    refreshVirusShiftAwareKnobBindings();
     refreshVirusValueKnobBindings();
     syncVirusPanelButtons();
 }
@@ -3718,6 +3954,9 @@ std::vector<AdvancedVSTiAudioProcessorEditor::KnobSpec> AdvancedVSTiAudioProcess
 
             { "FXMIX", "FX Mix", "Insert blend" },
             { "FXINTENSITY", "FX Int", "Insert depth" },
+            { "FXRATE", "FX Rate", "Insert movement" },
+            { "FXCOLOUR", "FX Color", "Insert tone" },
+            { "FXSPREAD", "FX Spread", "Insert width" },
             { "DELAYSEND", "Delay Send", "Send level" },
             { "DELAYTIME", "Delay Time", "Echo space" },
             { "DELAYFEEDBACK", "Feedback", "Echo repeats" },
@@ -3858,6 +4097,9 @@ std::vector<AdvancedVSTiAudioProcessorEditor::KnobSpec> AdvancedVSTiAudioProcess
             { "AMPRELEASE", "Amp Rel", "Level tail" },
             { "FXMIX", "FX Mix", "Insert blend" },
             { "FXINTENSITY", "FX Int", "Insert depth" },
+            { "FXRATE", "FX Rate", "Movement speed" },
+            { "FXCOLOUR", "FX Color", "Tone / color" },
+            { "FXSPREAD", "FX Spread", "Width / feedback" },
             { "DELAYSEND", "Delay", "Echo send" },
             { "DELAYTIME", "Dly Time", "Echo space" },
             { "DELAYFEEDBACK", "Feedback", "Echo repeats" },
