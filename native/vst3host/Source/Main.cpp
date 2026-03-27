@@ -457,6 +457,7 @@ public:
                 || command == "start_audio_stream"
                 || command == "set_audio_engine_transport"
                 || command == "set_audio_engine_track_parameters"
+                || command == "set_audio_engine_track_state"
                 || command == "seek_audio_engine"
                 || command == "set_transport_notes"
                 || command == "start_inprocess_transport"
@@ -1613,6 +1614,51 @@ private:
             return response;
         }
 
+        if (command == "set_audio_engine_track_state")
+        {
+            const auto trackIndex = static_cast<int>(object->hasProperty("track_index")
+                ? object->getProperty("track_index") : juce::var(-1));
+            const auto path = object->getProperty("path").toString().trim();
+
+            juce::ScopedLock lock(pluginLock);
+            if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(audioEngine.tracks.size())))
+                return makeResponse(false, "Invalid audio engine track index");
+
+            auto& track = audioEngine.tracks[static_cast<size_t>(trackIndex)];
+            if (track.plugin == nullptr)
+                return makeResponse(false, "Audio engine track has no plugin loaded");
+
+            if (path.isEmpty())
+                return makeResponse(false, "Missing state path");
+
+            const auto stateFile = juce::File(path);
+            if (!stateFile.existsAsFile())
+                return makeResponse(false, "State file not found");
+
+            if (!loadPluginStateIntoInstance(*track.plugin, stateFile))
+                return makeResponse(false, "Could not load plugin state into audio engine track");
+
+            track.statePath = path;
+            track.parameterSignature = {};
+
+            // Apply parameter overlay if provided.
+            if (object->hasProperty("parameters"))
+            {
+                juce::String error;
+                int appliedCount = 0;
+                juce::StringArray unmatchedParameters;
+                applyRequestedParameterValuesToPlugin(
+                    *track.plugin,
+                    object->getProperty("parameters"),
+                    error, appliedCount, unmatchedParameters);
+                track.parameterSignature = parameterPayloadSignature(object->getProperty("parameters"));
+            }
+
+            auto response = makeResponse(true, "Audio engine track state loaded");
+            appendStatusFields(response);
+            setResponseField(response, "state_path", stateFile.getFullPathName());
+            return response;
+        }
 
         if (command == "seek_audio_engine")
         {

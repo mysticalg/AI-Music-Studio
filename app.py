@@ -16553,6 +16553,29 @@ class MainWindow(QtWidgets.QMainWindow):
                             track.rack_vsti,
                         )
 
+        # Hot-reload state into the running audio engine track without
+        # restarting transport.
+        if self._native_audio_engine_active():
+            track_index = self._track_index_for_object(track) if track is not None else int(row)
+            engine_rows = list(getattr(self, '_native_audio_engine_track_rows', []) or [])
+            if int(track_index) in engine_rows:
+                engine_track_index = engine_rows.index(int(track_index))
+                engine_bridge = getattr(self, '_native_output_bridge', None)
+                if engine_bridge is not None:
+                    try:
+                        engine_bridge.command(
+                            'set_audio_engine_track_state',
+                            track_index=int(engine_track_index),
+                            path=str(state_path),
+                            parameters=dict(parameter_values),
+                        )
+                    except Exception:
+                        _APP_LOGGER.exception(
+                            "Failed loading state into audio engine track row=%s engine_track=%s",
+                            row,
+                            engine_track_index,
+                        )
+
     def _sync_track_native_vst_editor_bridge_state(
         self,
         row: int,
