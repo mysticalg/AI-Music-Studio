@@ -11,11 +11,20 @@ endif()
 
 add_subdirectory(${JUCE_DIR} JUCE)
 
-set(AIMS_ASSET_SOURCES ../../virus.jpg)
+set(AIMS_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+get_filename_component(AIMS_REPO_ROOT "${AIMS_REPO_ROOT}" ABSOLUTE)
+
+set(AIMS_VIRUS_IMAGE "${AIMS_REPO_ROOT}/virus.jpg")
+if(NOT EXISTS "${AIMS_VIRUS_IMAGE}")
+  message(FATAL_ERROR "Required Virus faceplate image not found: ${AIMS_VIRUS_IMAGE}")
+endif()
+
+set(AIMS_ASSET_SOURCES "${AIMS_VIRUS_IMAGE}")
 set(AIMS_HAS_TR909_IMAGE 0)
 set(AIMS_VEC1_LIBRARY_DIR "D:/OneDrive/Music/Sound Design/Sample Library/sample library/VEC1")
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../tr9092.jpg")
-  list(APPEND AIMS_ASSET_SOURCES ../../tr9092.jpg)
+set(AIMS_TR909_IMAGE "${AIMS_REPO_ROOT}/tr9092.jpg")
+if(EXISTS "${AIMS_TR909_IMAGE}")
+  list(APPEND AIMS_ASSET_SOURCES "${AIMS_TR909_IMAGE}")
   set(AIMS_HAS_TR909_IMAGE 1)
 endif()
 juce_add_binary_data(AIMusicStudioVirusAssets SOURCES ${AIMS_ASSET_SOURCES})
