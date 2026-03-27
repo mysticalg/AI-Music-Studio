@@ -292,6 +292,7 @@ private:
     int virusFilterEditIndex = 0;
     int virusUpperFxLegendIndex = 0;
     int virusLowerFxLegendIndex = 0;
+    int virusArpPageIndex = 0;
     int virusPanelModeIndex = 2;
     std::array<int, 3> virusModLeftTargetIndices { 0, 2, 4 };
     std::array<int, 3> virusModRightTargetIndices { -1, -1, -1 };

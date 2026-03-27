@@ -23,6 +23,17 @@ public:
         bool canStepRight = false;
     };
 
+    struct VirusPresetMetadata
+    {
+        bool imported = false;
+        juce::String bankLabel;
+        juce::String slotLabel;
+        juce::String categoryCode;
+        juce::String descriptorA;
+        juce::String descriptorB;
+        juce::String descriptorC;
+    };
+
     AdvancedVSTiAudioProcessor();
     ~AdvancedVSTiAudioProcessor() override;
 
@@ -64,6 +75,7 @@ public:
     [[nodiscard]] bool isArpHoldEnabled() const noexcept;
     void panicAllNotes();
     void auditionPresetNote (int midiNote = 60, float velocity = 0.9f, int durationMs = 420);
+    [[nodiscard]] VirusPresetMetadata getVirusPresetMetadata (int presetIndex) const;
 
     juce::AudioProcessorValueTreeState apvts;
 
@@ -166,7 +178,10 @@ private:
     struct VoiceState
     {
         bool active = false;
+        bool arpControlled = false;
         int midiNote = -1;
+        float currentMidiNote = -1.0f;
+        float targetMidiNote = -1.0f;
         float velocity = 0.0f;
         float phase = 0.0f;
         float osc2Phase = 0.0f;
@@ -261,6 +276,7 @@ private:
 
         float masterLevel = 1.0f;
         float detune = 0.0f;
+        float portamentoTime = 0.0f;
         float fmAmount = 0.0f;
         float syncAmount = 0.0f;
         float gateLength = 8.0f;
@@ -298,7 +314,11 @@ private:
         int lfo2Destination = 5;
         int lfo2AssignDestination = static_cast<int> (MatrixDestination::off);
         float lfo2Filter = 0.0f;
+        int arpPattern = 0;
+        int arpOctaves = 1;
         float arpRate = 4.0f;
+        float arpSwing = 0.0f;
+        float arpGate = 0.85f;
         float rhythmGateRate = 8.0f;
         float lfo3Amount = 0.0f;
         int lfo3Destination = 10;
@@ -440,7 +460,14 @@ private:
     float lfo1Phase = 0.0f;
     float lfo2Phase = 0.0f;
     float lfo3Phase = 0.0f;
-    int arpStep = 0;
+    int arpPatternStep = -1;
+    int arpNoteIndex = -1;
+    int arpOctaveIndex = 0;
+    int arpDirection = 1;
+    int arpSamplesUntilNextStep = 0;
+    int arpGateSamplesRemaining = 0;
+    bool arpSwingPhase = false;
+    bool arpWasEnabled = false;
     juce::Array<int> heldNotes;
     juce::MidiKeyboardState keyboardState;
     std::atomic<int> pendingPresetIndex { -1 };
@@ -577,8 +604,10 @@ private:
     void updateRenderParameters();
     void applyEnvelopeSettings();
     void applyPendingUiActions (juce::MidiBuffer& midiMessages, int blockSamples);
-    void advanceArpIfNeeded();
-    int getArpNote() const;
+    void resetArpState();
+    void startVoiceForMidiNote (int midiNote, float velocity, int externalPadIndex, bool arpControlled);
+    void releaseArpVoices (bool immediate);
+    void triggerArpStep();
     void applyPresetByIndex (int presetIndex);
     void setParameterActual (const char* paramId, float value);
     void parameterChanged (const juce::String& parameterID, float newValue) override;

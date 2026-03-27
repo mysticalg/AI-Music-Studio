@@ -109,8 +109,14 @@ struct VirusPresetDisplayInfo
     juce::String descriptorC;
 };
 
-VirusPresetDisplayInfo virusPresetDisplayInfo (const juce::String& presetName, int presetIndex, int totalPrograms)
+VirusPresetDisplayInfo virusPresetDisplayInfo (const AdvancedVSTiAudioProcessor& processor,
+                                              const juce::String& presetName,
+                                              int presetIndex,
+                                              int totalPrograms)
 {
+    if (const auto metadata = processor.getVirusPresetMetadata (presetIndex); metadata.imported)
+        return { metadata.bankLabel, metadata.slotLabel, metadata.categoryCode, metadata.descriptorA, metadata.descriptorB, metadata.descriptorC };
+
     const auto normalized = presetName.toLowerCase();
     const auto bankLetter = static_cast<juce_wchar> ('A' + juce::jlimit (0, 25, presetIndex / 128));
     juce::ignoreUnused (totalPrograms);
@@ -2168,16 +2174,52 @@ void AdvancedVSTiAudioProcessorEditor::refreshVirusArpMenuOsd()
     if (! isTributeVirus())
         return;
 
+    const auto pageIndex = juce::jlimit (0, 2, virusArpPageIndex);
+
+    if (pageIndex == 0)
+    {
+        const auto value = "MODE "
+                           + parameterValueText (audioProcessor.apvts, "ARPMODE")
+                           + "   OCT "
+                           + parameterValueText (audioProcessor.apvts, "ARPOCTAVES")
+                           + "   PAT "
+                           + parameterValueText (audioProcessor.apvts, "ARPPATTERN");
+
+        showVirusOsdMessage ("ARP MODE",
+                             value,
+                             "V1 MODE   V2 OCTAVES   V3 PATTERN",
+                             true,
+                             60000.0);
+        return;
+    }
+
+    if (pageIndex == 1)
+    {
+        const auto value = "RATE "
+                           + parameterValueText (audioProcessor.apvts, "ARPRATE")
+                           + "   NOTE LEN "
+                           + parameterValueText (audioProcessor.apvts, "ARPGATE")
+                           + "   SWING "
+                           + parameterValueText (audioProcessor.apvts, "ARPSWING");
+
+        showVirusOsdMessage ("ARP TIMING",
+                             value,
+                             "V1 RATE   V2 NOTE LEN   V3 SWING",
+                             true,
+                             60000.0);
+        return;
+    }
+
     const auto value = "ON "
                        + parameterValueText (audioProcessor.apvts, "ARPENABLE")
-                       + "   MODE "
-                       + parameterValueText (audioProcessor.apvts, "ARPMODE")
-                       + "   RATE "
-                       + parameterValueText (audioProcessor.apvts, "ARPRATE");
+                       + "   RHY RATE "
+                       + parameterValueText (audioProcessor.apvts, "RHYTHMGATE_RATE")
+                       + "   DEPTH "
+                       + parameterValueText (audioProcessor.apvts, "RHYTHMGATE_DEPTH");
 
     showVirusOsdMessage ("ARPEGGIATOR",
                          value,
-                         "V1 ON / OFF   V2 MODE   V3 RATE",
+                         "V1 ON / OFF   V2 RHY RATE   V3 RHY DEPTH",
                          true,
                          60000.0);
 }
@@ -2191,7 +2233,7 @@ void AdvancedVSTiAudioProcessorEditor::refreshVirusPresetOsd()
     auto presetName = audioProcessor.getProgramName (presetIndex);
     if (presetName.isEmpty())
         presetName = "Init Preset";
-    const auto presetInfo = virusPresetDisplayInfo (presetName, presetIndex, audioProcessor.getNumPrograms());
+    const auto presetInfo = virusPresetDisplayInfo (audioProcessor, presetName, presetIndex, audioProcessor.getNumPrograms());
 
     showVirusOsdMessage (virusPanelModeIndex == 1 ? "MULTI" : "SINGLE",
                          presetName,
@@ -2209,6 +2251,7 @@ void AdvancedVSTiAudioProcessorEditor::clearVirusLfoMenu (bool clearOsd)
     virusActiveFxMenu = -1;
     virusActivePresetMenu = false;
     virusActiveArpMenu = false;
+    virusArpPageIndex = 0;
     virusOsdPinned = false;
     refreshVirusValueKnobBindings();
 
@@ -2481,9 +2524,24 @@ void AdvancedVSTiAudioProcessorEditor::refreshVirusValueKnobBindings()
 
     if (virusActiveArpMenu)
     {
-        bindParamKnob (30, "ARPENABLE", "Value 1", "Arpeggiator on / off");
-        bindParamKnob (31, "ARPMODE", "Value 2", "Arpeggiator mode");
-        bindParamKnob (32, "ARPRATE", "Value 3", "Arpeggiator rate");
+        switch (juce::jlimit (0, 2, virusArpPageIndex))
+        {
+            case 0:
+                bindParamKnob (30, "ARPMODE", "Value 1", "Arpeggiator mode");
+                bindParamKnob (31, "ARPOCTAVES", "Value 2", "Arpeggiator octave span");
+                bindParamKnob (32, "ARPPATTERN", "Value 3", "Arpeggiator rhythm pattern");
+                break;
+            case 1:
+                bindParamKnob (30, "ARPRATE", "Value 1", "Arpeggiator rate");
+                bindParamKnob (31, "ARPGATE", "Value 2", "Arpeggiator note length");
+                bindParamKnob (32, "ARPSWING", "Value 3", "Arpeggiator swing amount");
+                break;
+            default:
+                bindParamKnob (30, "ARPENABLE", "Value 1", "Arpeggiator on / off");
+                bindParamKnob (31, "RHYTHMGATE_RATE", "Value 2", "Rhythm gate rate");
+                bindParamKnob (32, "RHYTHMGATE_DEPTH", "Value 3", "Rhythm gate depth");
+                break;
+        }
 
         knobCards[30]->slider.onValueChange = [this] { syncVirusPanelButtons(); refreshVirusArpMenuOsd(); };
         knobCards[31]->slider.onValueChange = [this] { refreshVirusArpMenuOsd(); };
@@ -2527,16 +2585,17 @@ void AdvancedVSTiAudioProcessorEditor::refreshVirusShiftAwareKnobBindings()
     auto bindOscKnob = [this] (int knobIndex,
                                const juce::String& paramId,
                                const juce::String& title,
-                               const juce::String& hint)
+                               const juce::String& hint,
+                               bool refreshOscMenu)
     {
         bindVirusKnobToParam (knobIndex,
                               paramId,
                               title,
                               hint,
-                              [this, paramId, title, hint]
+                              [this, paramId, title, hint, refreshOscMenu]
                               {
                                   showVirusOsdForParam (paramId, title, hint);
-                                  if (virusActiveOscMenu >= 0)
+                                  if (refreshOscMenu && virusActiveOscMenu >= 0)
                                       refreshVirusOscMenuOsd();
                               });
     };
@@ -2544,16 +2603,17 @@ void AdvancedVSTiAudioProcessorEditor::refreshVirusShiftAwareKnobBindings()
     auto bindLfoKnob = [this] (int knobIndex,
                                const juce::String& paramId,
                                const juce::String& title,
-                               const juce::String& hint)
+                               const juce::String& hint,
+                               bool refreshLfoMenu)
     {
         bindVirusKnobToParam (knobIndex,
                               paramId,
                               title,
                               hint,
-                              [this, paramId, title, hint]
+                              [this, paramId, title, hint, refreshLfoMenu]
                               {
                                   showVirusOsdForParam (paramId, title, hint);
-                                  if (virusActiveLfoMenu >= 0)
+                                  if (refreshLfoMenu && virusActiveLfoMenu >= 0)
                                       refreshVirusLfoMenuOsd();
                               });
     };
@@ -2573,11 +2633,12 @@ void AdvancedVSTiAudioProcessorEditor::refreshVirusShiftAwareKnobBindings()
         bindLfoKnob (3,
                      virusLfoRateParamId (lfoIndex),
                      lfoLabel + " Rate",
-                     "Speed for the selected LFO");
-        bindOscKnob (7, oscWaveParamId, oscLabel + " Wave", "Waveform for the selected oscillator");
-        bindOscKnob (15, oscShapeParamId, oscLabel + " Wave Select / PW", "Pulse width / shape for the selected oscillator");
-        bindOscKnob (8, oscSemitoneParamId, oscLabel + " Semitone", "Tune the selected oscillator in semitones");
-        bindOscKnob (16, oscDetuneParamId, oscLabel + " Detune", "Fine tune the selected oscillator");
+                     "Speed for the selected LFO",
+                     true);
+        bindOscKnob (7, oscWaveParamId, oscLabel + " Wave", "Waveform for the selected oscillator", true);
+        bindOscKnob (15, oscShapeParamId, oscLabel + " Wave Select / PW", "Pulse width / shape for the selected oscillator", true);
+        bindOscKnob (8, oscSemitoneParamId, oscLabel + " Semitone", "Tune the selected oscillator in semitones", true);
+        bindOscKnob (16, oscDetuneParamId, oscLabel + " Detune", "Fine tune the selected oscillator", true);
 
         for (const auto knobIndex : { 9, 10, 11, 12, 13, 18, 19, 26, 29, 35, 36, 37 })
             restoreStaticPrimary (knobIndex);
@@ -2588,27 +2649,28 @@ void AdvancedVSTiAudioProcessorEditor::refreshVirusShiftAwareKnobBindings()
     bindLfoKnob (3,
                  virusLfoAmountParamId (lfoIndex),
                  lfoLabel + " Contour",
-                 "Shift: selected LFO amount");
-    bindOscKnob (7, oscShapeParamId, oscLabel + " Shape", "Shift: selected oscillator shape / pulse width");
-    bindOscKnob (8, "OSCGATE", "Portamento", "Shift: note glide / gate time");
-    bindOscKnob (9, "PANORAMA", "Panorama", "Shift: stereo panorama");
-    bindOscKnob (10, "SUBOSCLEVEL", "OSC3 Volume", "Shift: oscillator 3 / sub volume");
-    bindOscKnob (11, "RINGMOD", "Ring Modulator", "Shift: ring mod depth");
-    bindOscKnob (12, "SATURATIONTYPE", "Saturation Type", "Shift: drive character");
-    bindOscKnob (13, "FMENABLE", "FM Mode", "Shift: FM on / off");
-    bindOscKnob (16, "DETUNE", "Unison Detune", "Shift: global unison spread");
-    bindOscKnob (18, "RESONANCE2", "Resonance 2", "Shift: filter 2 resonance");
-    bindOscKnob (19, "KEYFOLLOW", "Keyfollow", "Shift: note tracking into the filters");
-    bindOscKnob (26, "MASTERLEVEL", "Patch Volume", "Shift: patch output level");
-    bindOscKnob (29, "ARPRATE", "Tempo", "Shift: arp / tempo rate");
+                 "Shift: selected LFO amount",
+                 false);
+    bindOscKnob (7, oscShapeParamId, oscLabel + " Shape", "Shift: selected oscillator shape / pulse width", false);
+    bindOscKnob (8, "PORTAMENTO", "Portamento", "Shift: note glide time", false);
+    bindOscKnob (9, "PANORAMA", "Panorama", "Shift: stereo panorama", false);
+    bindOscKnob (10, "SUBOSCLEVEL", "OSC3 Volume", "Shift: oscillator 3 / sub volume", false);
+    bindOscKnob (11, "RINGMOD", "Ring Modulator", "Shift: ring mod depth", false);
+    bindOscKnob (12, "SATURATIONTYPE", "Saturation Type", "Shift: drive character", false);
+    bindOscKnob (13, "FMENABLE", "FM Mode", "Shift: FM on / off", false);
+    bindOscKnob (16, "DETUNE", "Unison Detune", "Shift: global unison spread", false);
+    bindOscKnob (18, "RESONANCE2", "Resonance 2", "Shift: filter 2 resonance", false);
+    bindOscKnob (19, "KEYFOLLOW", "Keyfollow", "Shift: note tracking into the filters", false);
+    bindOscKnob (26, "MASTERLEVEL", "Patch Volume", "Shift: patch output level", false);
+    bindOscKnob (29, "ARPRATE", "Tempo", "Shift: arp / tempo rate", false);
 
     const int eqBandIndex = virusUpperFxLegendIndex >= 2 ? juce::jlimit (2, 4, virusUpperFxLegendIndex) : 2;
     const juce::String eqPrefix = eqBandIndex == 2 ? "LOWEQ" : (eqBandIndex == 3 ? "MIDEQ" : "HIGHEQ");
     const juce::String eqLabel = eqBandIndex == 2 ? "Low EQ" : (eqBandIndex == 3 ? "Mid EQ" : "High EQ");
 
-    bindOscKnob (35, eqPrefix + "GAIN", eqLabel + " Gain", juce::String ("Shift: ") + eqLabel + " gain");
-    bindOscKnob (36, eqPrefix + "FREQ", eqLabel + " Freq", juce::String ("Shift: ") + eqLabel + " frequency");
-    bindOscKnob (37, eqPrefix + "Q", eqLabel + " Q", juce::String ("Shift: ") + eqLabel + " Q");
+    bindOscKnob (35, eqPrefix + "GAIN", eqLabel + " Gain", juce::String ("Shift: ") + eqLabel + " gain", false);
+    bindOscKnob (36, eqPrefix + "FREQ", eqLabel + " Freq", juce::String ("Shift: ") + eqLabel + " frequency", false);
+    bindOscKnob (37, eqPrefix + "Q", eqLabel + " Q", juce::String ("Shift: ") + eqLabel + " Q", false);
 }
 
 void AdvancedVSTiAudioProcessorEditor::syncVirusPanelButtons()
@@ -3260,8 +3322,10 @@ void AdvancedVSTiAudioProcessorEditor::buildVirusPanelButtons()
 
     auto openArpMenu = [this]
     {
+        const auto nextPage = virusActiveArpMenu ? (virusArpPageIndex + 1) % 3 : 0;
         clearVirusLfoMenu();
         virusActiveArpMenu = true;
+        virusArpPageIndex = nextPage;
         refreshVirusValueKnobBindings();
         refreshVirusArpMenuOsd();
         repaint();
@@ -3863,7 +3927,8 @@ std::vector<AdvancedVSTiAudioProcessorEditor::ChoiceSpec> AdvancedVSTiAudioProce
         specs.push_back ({ "FXTYPE", "Effects", "Insert algorithm", { "Off", "Distortion", "Character", "Chorus", "Phaser", "Flanger", "Ring Mod", "Freq Shift" }, { "OFF", "DST", "CHR", "CHO", "PHA", "FLA", "RNG", "FSH" }, true, 3 });
         specs.push_back ({ "LFO1SHAPE", "LFO 1 Shape", "Primary motion", { "Sine", "Triangle", "Saw", "Noise", "Square" }, { "SIN", "TRI", "SAW", "NOI", "SQR" }, true, 3 });
         specs.push_back ({ "LFO2SHAPE", "LFO 2 Shape", "Secondary motion", { "Sine", "Triangle", "Saw", "Noise", "Square" }, { "SIN", "TRI", "SAW", "NOI", "SQR" }, true, 3 });
-        specs.push_back ({ "ARPMODE", "Arp Mode", "Pattern motion", { "Up", "Down", "UpDown", "Random" }, { "FWD", "REV", "ALT", "RND" }, true, 2 });
+        specs.push_back ({ "ARPMODE", "Arp Mode", "Pattern motion", { "Up", "Down", "UpDown", "Random", "As Played", "Chord" }, { "UP", "DWN", "ALT", "RND", "PLY", "CHD" }, true, 2 });
+        specs.push_back ({ "ARPPATTERN", "Arp Pattern", "Rhythmic preset pattern", { "Straight", "Offbeat", "Gallop", "Pulse", "Broken", "Triplet", "Stairs", "Wide" }, { "STR", "OFF", "GAL", "PLS", "BRK", "TRI", "STA", "WDE" }, true, 2 });
         return specs;
     }
 
@@ -4852,7 +4917,7 @@ void AdvancedVSTiAudioProcessorEditor::paintOverChildren (juce::Graphics& g)
             displayValue = audioProcessor.getProgramName (presetIndex);
             if (displayValue.isEmpty())
                 displayValue = "Init Preset";
-            const auto presetInfo = virusPresetDisplayInfo (displayValue, presetIndex, totalPrograms);
+            const auto presetInfo = virusPresetDisplayInfo (audioProcessor, displayValue, presetIndex, totalPrograms);
             displayHeaderCenter = "CAT:" + presetInfo.categoryCode;
             displayHeaderRight = presetInfo.bankLabel + " " + presetInfo.slotLabel;
             displayDetail = presetInfo.descriptorA + "|" + presetInfo.descriptorB + "|" + presetInfo.descriptorC;
@@ -4860,7 +4925,7 @@ void AdvancedVSTiAudioProcessorEditor::paintOverChildren (juce::Graphics& g)
         }
         else if (displayTitle == "SINGLE" || displayTitle == "MULTI")
         {
-            const auto presetInfo = virusPresetDisplayInfo (displayValue, presetIndex, totalPrograms);
+            const auto presetInfo = virusPresetDisplayInfo (audioProcessor, displayValue, presetIndex, totalPrograms);
             displayHeaderCenter = "CAT:" + presetInfo.categoryCode;
             displayHeaderRight = presetInfo.bankLabel + " " + presetInfo.slotLabel;
             usePresetLayout = true;

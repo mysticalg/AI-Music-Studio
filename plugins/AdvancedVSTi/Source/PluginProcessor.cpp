@@ -176,6 +176,90 @@ juce::StringArray builtInAdvancedVirusPresetChoices()
     };
 }
 
+struct ArpPatternStep
+{
+    bool active = true;
+    bool advanceNote = true;
+    float velocity = 1.0f;
+    float gateScale = 1.0f;
+    int octaveOffset = 0;
+};
+
+struct ArpPatternDefinition
+{
+    const char* name = "Straight";
+    std::vector<ArpPatternStep> steps;
+};
+
+const std::vector<ArpPatternDefinition>& virusArpPatterns()
+{
+    static const std::vector<ArpPatternDefinition> patterns {
+        { "Straight", {
+            { true,  true, 1.00f, 1.00f, 0 }, { true,  true, 0.96f, 0.96f, 0 },
+            { true,  true, 0.90f, 0.92f, 0 }, { true,  true, 0.96f, 0.96f, 0 },
+            { true,  true, 1.00f, 1.00f, 0 }, { true,  true, 0.96f, 0.96f, 0 },
+            { true,  true, 0.90f, 0.92f, 0 }, { true,  true, 0.96f, 0.96f, 0 }
+        } },
+        { "Offbeat", {
+            { false, true, 0.00f, 0.00f, 0 }, { true,  true, 0.98f, 0.86f, 0 },
+            { false, true, 0.00f, 0.00f, 0 }, { true,  true, 1.00f, 0.86f, 0 },
+            { false, true, 0.00f, 0.00f, 0 }, { true,  true, 0.94f, 0.84f, 0 },
+            { false, true, 0.00f, 0.00f, 0 }, { true,  true, 1.00f, 0.88f, 0 }
+        } },
+        { "Gallop", {
+            { true,  true, 1.00f, 0.52f, 0 }, { false, true, 0.00f, 0.00f, 0 },
+            { true,  true, 0.86f, 0.48f, 0 }, { true,  true, 1.00f, 0.92f, 0 },
+            { true,  true, 1.00f, 0.52f, 0 }, { false, true, 0.00f, 0.00f, 0 },
+            { true,  true, 0.86f, 0.48f, 0 }, { true,  true, 0.94f, 0.90f, 0 }
+        } },
+        { "Pulse", {
+            { true,  true, 1.00f, 0.46f, 0 }, { true,  true, 0.54f, 0.46f, 0 },
+            { true,  true, 0.90f, 0.46f, 0 }, { true,  true, 0.54f, 0.46f, 0 },
+            { true,  true, 1.00f, 0.46f, 0 }, { true,  true, 0.54f, 0.46f, 0 },
+            { true,  true, 0.90f, 0.46f, 0 }, { true,  true, 0.54f, 0.46f, 0 }
+        } },
+        { "Broken", {
+            { true,  true, 1.00f, 0.82f, 0 }, { true,  false, 0.72f, 0.34f, 0 },
+            { false, true, 0.00f, 0.00f, 0 }, { true,  true, 0.90f, 0.78f, 1 },
+            { true,  true, 0.82f, 0.68f, 0 }, { false, true, 0.00f, 0.00f, 0 },
+            { true,  true, 0.96f, 0.74f, -1 }, { true,  false, 0.62f, 0.36f, -1 }
+        } },
+        { "Triplet", {
+            { true, true, 1.00f, 0.74f, 0 }, { true, true, 0.86f, 0.74f, 0 }, { true, true, 0.92f, 0.74f, 0 },
+            { true, true, 1.00f, 0.74f, 1 }, { true, true, 0.86f, 0.74f, 0 }, { true, true, 0.92f, 0.74f, 0 },
+            { true, true, 1.00f, 0.74f, 0 }, { true, true, 0.86f, 0.74f, -1 }, { true, true, 0.92f, 0.74f, 0 },
+            { true, true, 1.00f, 0.74f, 0 }, { true, true, 0.86f, 0.74f, 0 }, { true, true, 0.92f, 0.74f, 1 }
+        } },
+        { "Stairs", {
+            { true,  true, 0.96f, 0.86f, 0 }, { true,  true, 0.90f, 0.82f, 0 },
+            { true,  true, 0.96f, 0.86f, 1 }, { true,  true, 0.90f, 0.82f, 1 },
+            { true,  true, 0.96f, 0.86f, 2 }, { true,  true, 0.90f, 0.82f, 2 },
+            { true,  true, 0.96f, 0.86f, 1 }, { true,  true, 0.90f, 0.82f, 0 }
+        } },
+        { "Wide", {
+            { true,  true, 1.00f, 0.92f, 0 }, { true,  true, 0.86f, 0.62f, 1 },
+            { true,  false, 0.62f, 0.30f, 1 }, { true,  true, 0.94f, 0.82f, -1 },
+            { true,  true, 1.00f, 0.92f, 0 }, { true,  true, 0.86f, 0.62f, 1 },
+            { true,  false, 0.62f, 0.30f, 1 }, { true,  true, 0.94f, 0.82f, -1 }
+        } }
+    };
+
+    return patterns;
+}
+
+juce::StringArray virusArpPatternChoices()
+{
+    juce::StringArray choices;
+    for (const auto& pattern : virusArpPatterns())
+        choices.add (pattern.name);
+    return choices;
+}
+
+juce::StringArray virusArpModeChoices()
+{
+    return { "Up", "Down", "UpDown", "Random", "As Played", "Chord" };
+}
+
 struct ImportedVirusPresetData
 {
     juce::String name;
@@ -390,6 +474,93 @@ bool importedNameContains (const juce::String& lowerName, std::initializer_list<
 float importedRange (const ImportedVirusPresetData& preset, int offset, float minValue, float maxValue)
 {
     return juce::jmap (importedPayloadNorm (preset, offset), minValue, maxValue);
+}
+
+float importedAverageNorm (const ImportedVirusPresetData& preset, int startOffset, int count)
+{
+    if (preset.payload.empty() || count <= 0)
+        return 0.0f;
+
+    double sum = 0.0;
+    int actualCount = 0;
+    for (int index = 0; index < count; ++index)
+    {
+        const auto offset = startOffset + index;
+        if (! juce::isPositiveAndBelow (offset, static_cast<int> (preset.payload.size())))
+            break;
+
+        sum += static_cast<double> (preset.payload[static_cast<size_t> (offset)]) / 127.0;
+        ++actualCount;
+    }
+
+    if (actualCount == 0)
+        return 0.0f;
+
+    return static_cast<float> (sum / static_cast<double> (actualCount));
+}
+
+float importedAverageRange (const ImportedVirusPresetData& preset, int startOffset, int count, float minValue, float maxValue)
+{
+    return juce::jmap (importedAverageNorm (preset, startOffset, count), minValue, maxValue);
+}
+
+int importedChoice (const ImportedVirusPresetData& preset, int startOffset, int count, int choiceCount)
+{
+    if (choiceCount <= 1)
+        return 0;
+
+    return juce::jlimit (0, choiceCount - 1,
+                         static_cast<int> (std::floor (importedAverageNorm (preset, startOffset, count) * static_cast<float> (choiceCount))));
+}
+
+juce::String importedVirusCategoryCode (const ImportedVirusPresetData& preset)
+{
+    const auto lowerName = preset.name.toLowerCase();
+    if (importedNameContains (lowerName, { "pad", "wash", "swell", "choir", "omni", "solar" }))
+        return "PAD";
+    if (importedNameContains (lowerName, { "lead", "lazer", "solo", "hero", "squib" }))
+        return "LEAD";
+    if (importedNameContains (lowerName, { "bass", "sub", "303", "acid" }))
+        return "BASS";
+    if (importedNameContains (lowerName, { "arp", "seq", "step", "gallop" }))
+        return "SEQ";
+    if (importedNameContains (lowerName, { "pluck", "zip", "chip" }))
+        return "PLUCK";
+    if (importedNameContains (lowerName, { "ufo", "sweep", "fx", "rev" }))
+        return "FX";
+    if (importedNameContains (lowerName, { "fm", "sin", "bell", "metal" }))
+        return "DIGI";
+    return "SYNTH";
+}
+
+AdvancedVSTiAudioProcessor::VirusPresetMetadata importedVirusPresetMetadata (const ImportedVirusPresetData& preset)
+{
+    AdvancedVSTiAudioProcessor::VirusPresetMetadata info;
+    info.imported = true;
+    info.bankLabel = preset.bankLabel.isEmpty() ? "RAM-I" : preset.bankLabel;
+    info.slotLabel = juce::String (preset.slot + 1).paddedLeft ('0', 3);
+    info.categoryCode = importedVirusCategoryCode (preset);
+
+    const auto lowerName = preset.name.toLowerCase();
+    if (info.categoryCode == "PAD")
+        return { true, info.bankLabel, info.slotLabel, info.categoryCode, "ATMOS", "WARM", "WIDE" };
+    if (info.categoryCode == "LEAD")
+        return { true, info.bankLabel, info.slotLabel, info.categoryCode, "SOLO", "EDGE", "FOCUS" };
+    if (info.categoryCode == "BASS")
+        return { true, info.bankLabel, info.slotLabel, info.categoryCode, "SUB", "PUNCH", "DRIVE" };
+    if (info.categoryCode == "SEQ")
+        return { true, info.bankLabel, info.slotLabel, info.categoryCode, "MOTION", "RHYTHM", "STEP" };
+    if (info.categoryCode == "PLUCK")
+        return { true, info.bankLabel, info.slotLabel, info.categoryCode, "ATTACK", "BRIGHT", "SHORT" };
+    if (info.categoryCode == "FX")
+        return { true, info.bankLabel, info.slotLabel, info.categoryCode, "SWEEP", "SPACE", "MOTION" };
+    if (info.categoryCode == "DIGI")
+        return { true, info.bankLabel, info.slotLabel, info.categoryCode, "FM", "GLASS", "METAL" };
+    if (importedNameContains (lowerName, { "square" }))
+        return { true, info.bankLabel, info.slotLabel, info.categoryCode, "SQUARE", "BRIGHT", "VINTAGE" };
+    if (importedNameContains (lowerName, { "saw" }))
+        return { true, info.bankLabel, info.slotLabel, info.categoryCode, "SAW", "STACK", "CLASSIC" };
+    return { true, info.bankLabel, info.slotLabel, info.categoryCode, "IMPORT", "ACCESS", preset.sourceFile.upToFirstOccurrenceOf (".", false, false).substring (0, 8).toUpperCase() };
 }
 
 juce::StringArray virusLfoDestinationChoices()
@@ -694,6 +865,11 @@ enum class DrumVoiceKind
 float midiToHz (int note)
 {
     return 440.0f * std::pow (2.0f, (note - 69) / 12.0f);
+}
+
+float midiToHzFloat (float note)
+{
+    return 440.0f * std::pow (2.0f, (note - 69.0f) / 12.0f);
 }
 
 float shapedEnv (float value, float curve)
@@ -1156,10 +1332,11 @@ void AdvancedVSTiAudioProcessor::releaseResources() {}
 void AdvancedVSTiAudioProcessor::reset()
 {
     heldNotes.clear();
-    arpStep = 0;
+    resetArpState();
     lfo1Phase = 0.0f;
     lfo2Phase = 0.0f;
     lfo3Phase = 0.0f;
+    arpWasEnabled = false;
     arpHoldEnabled.store (false);
     pendingReleaseHeldNotes.store (false);
     pendingPanicAllNotes.store (false);
@@ -1469,6 +1646,23 @@ const juce::String AdvancedVSTiAudioProcessor::getProgramName (int index)
     return {};
 }
 
+AdvancedVSTiAudioProcessor::VirusPresetMetadata AdvancedVSTiAudioProcessor::getVirusPresetMetadata (int presetIndex) const
+{
+    VirusPresetMetadata info;
+
+    if constexpr (buildFlavor() != InstrumentFlavor::advanced)
+        return info;
+
+    const auto builtInCount = builtInAdvancedVirusPresetChoices().size();
+    const auto importedIndex = presetIndex - builtInCount;
+    const auto& imported = importedVirusPresets();
+
+    if (juce::isPositiveAndBelow (importedIndex, static_cast<int> (imported.size())))
+        return importedVirusPresetMetadata (imported[static_cast<size_t> (importedIndex)]);
+
+    return info;
+}
+
 void AdvancedVSTiAudioProcessor::refreshSampleBank()
 {
     const auto banks = sampleBankChoices();
@@ -1623,11 +1817,290 @@ int AdvancedVSTiAudioProcessor::activeVoiceLimit() const noexcept
     return voiceLimitForFlavor();
 }
 
+void AdvancedVSTiAudioProcessor::resetArpState()
+{
+    arpPatternStep = -1;
+    arpNoteIndex = -1;
+    arpOctaveIndex = 0;
+    arpDirection = 1;
+    arpSamplesUntilNextStep = 0;
+    arpGateSamplesRemaining = 0;
+    arpSwingPhase = false;
+}
+
+void AdvancedVSTiAudioProcessor::startVoiceForMidiNote (int midiNote, float velocity, int externalPadIndex, bool isArpControlled)
+{
+    const auto polyphonyLimit = activeVoiceLimit();
+    int voiceIndex = 0;
+    bool foundVoice = false;
+    float oldestVoiceAge = -1.0f;
+    float glideStartNote = static_cast<float> (midiNote);
+
+    const bool allowPortamento = buildFlavor() == InstrumentFlavor::advanced
+                                 && renderParams.monoEnabled
+                                 && renderParams.portamentoTime > 0.0001f;
+
+    if constexpr (isMonophonicFlavor())
+    {
+        heldNotes.clear();
+        for (auto& activeVoice : voices)
+        {
+            if (! activeVoice.active)
+                continue;
+
+            activeVoice.active = false;
+            activeVoice.arpControlled = false;
+            activeVoice.ampEnv.reset();
+            activeVoice.filterEnv.reset();
+        }
+    }
+
+    for (int i = 0; i < polyphonyLimit; ++i)
+    {
+        auto& candidate = voices[static_cast<size_t> (i)];
+        if (! candidate.active)
+        {
+            voiceIndex = i;
+            foundVoice = true;
+            break;
+        }
+
+        if (candidate.noteAge > oldestVoiceAge)
+        {
+            oldestVoiceAge = candidate.noteAge;
+            voiceIndex = i;
+        }
+    }
+
+    auto& voice = voices[static_cast<size_t> (voiceIndex)];
+    if (allowPortamento && voice.active)
+    {
+        glideStartNote = voice.currentMidiNote >= 0.0f ? voice.currentMidiNote
+                                                       : static_cast<float> (voice.midiNote);
+    }
+
+    if (! foundVoice && voice.active)
+    {
+        voice.ampEnv.reset();
+        voice.filterEnv.reset();
+    }
+
+    voice.active = true;
+    voice.arpControlled = isArpControlled;
+    voice.midiNote = midiNote;
+    voice.currentMidiNote = allowPortamento ? glideStartNote : static_cast<float> (midiNote);
+    voice.targetMidiNote = static_cast<float> (midiNote);
+    voice.velocity = velocity;
+    voice.phase = 0.0f;
+    voice.osc2Phase = 0.0f;
+    voice.subPhase = 0.0f;
+    voice.fmPhase = 0.0f;
+    voice.syncPhase = 0.0f;
+    voice.samplePos = 0.0f;
+    voice.noteAge = 0.0f;
+    voice.auxPhase = 0.0f;
+    voice.toneState = 0.0f;
+    voice.colourState = 0.0f;
+    voice.externalPadIndex = externalPadIndex;
+    voice.externalSamplePosition = 0.0;
+    voice.externalSample = (externalPadIndex >= 0 && juce::isPositiveAndBelow (externalPadIndex, vecPadCount))
+                               ? std::atomic_load (&externalPadSamples[static_cast<size_t> (externalPadIndex)])
+                               : std::shared_ptr<const ExternalSampleData> {};
+    voice.unisonPhases.fill (0.0f);
+    voice.unisonSyncPhases.fill (0.0f);
+    voice.unisonSamplePositions.fill (0.0f);
+    voice.ampEnv.noteOn();
+    voice.filterEnv.noteOn();
+
+    if (renderParams.lfo1EnvMode)
+        lfo1Phase = 0.0f;
+    if (renderParams.lfo2EnvMode)
+        lfo2Phase = 0.0f;
+    if (renderParams.lfo3EnvMode)
+        lfo3Phase = 0.0f;
+}
+
+void AdvancedVSTiAudioProcessor::releaseArpVoices (bool immediate)
+{
+    for (auto& voice : voices)
+    {
+        if (! voice.active || ! voice.arpControlled)
+            continue;
+
+        if (immediate)
+        {
+            voice.active = false;
+            voice.arpControlled = false;
+            voice.midiNote = -1;
+            voice.currentMidiNote = -1.0f;
+            voice.targetMidiNote = -1.0f;
+            voice.velocity = 0.0f;
+            voice.ampEnv.reset();
+            voice.filterEnv.reset();
+        }
+        else
+        {
+            voice.ampEnv.noteOff();
+            voice.filterEnv.noteOff();
+        }
+    }
+}
+
+void AdvancedVSTiAudioProcessor::triggerArpStep()
+{
+    if (! renderParams.arpEnabled || heldNotes.isEmpty())
+    {
+        releaseArpVoices (false);
+        resetArpState();
+        return;
+    }
+
+    const auto& patterns = virusArpPatterns();
+    if (patterns.empty())
+        return;
+
+    const auto patternIndex = juce::jlimit (0, static_cast<int> (patterns.size()) - 1, renderParams.arpPattern);
+    const auto& pattern = patterns[static_cast<size_t> (patternIndex)];
+    if (pattern.steps.empty())
+        return;
+
+    const auto previousPatternStep = arpPatternStep;
+    arpPatternStep = (arpPatternStep + 1) % static_cast<int> (pattern.steps.size());
+    const bool patternWrapped = previousPatternStep >= 0 && arpPatternStep == 0;
+    const auto& step = pattern.steps[static_cast<size_t> (arpPatternStep)];
+
+    const auto arpOctaves = juce::jlimit (1, 4, renderParams.arpOctaves);
+    const auto arpMode = renderParams.arpMode;
+
+    juce::Array<int> orderedNotes (heldNotes);
+    if (arpMode != 4)
+        orderedNotes.sort();
+
+    if (orderedNotes.isEmpty())
+        return;
+
+    auto nextOrderedNote = [&orderedNotes, this, arpMode, arpOctaves, &step] (bool shouldAdvance) -> int
+    {
+        const auto noteCount = orderedNotes.size();
+        if (noteCount <= 0)
+            return -1;
+
+        if (arpMode == 3)
+        {
+            if (shouldAdvance || arpNoteIndex < 0 || arpNoteIndex >= noteCount)
+                arpNoteIndex = random.nextInt (noteCount);
+
+            const auto octaveIndex = juce::jlimit (0, arpOctaves - 1,
+                                                   random.nextInt (arpOctaves) + step.octaveOffset);
+            return orderedNotes[arpNoteIndex] + (octaveIndex * 12);
+        }
+
+        if (arpNoteIndex < 0 || arpNoteIndex >= noteCount)
+        {
+            arpDirection = arpMode == 1 ? -1 : 1;
+            arpNoteIndex = arpMode == 1 ? noteCount - 1 : 0;
+        }
+        else if (shouldAdvance)
+        {
+            bool wrapped = false;
+
+            switch (arpMode)
+            {
+                case 1:
+                    --arpNoteIndex;
+                    if (arpNoteIndex < 0)
+                    {
+                        arpNoteIndex = noteCount - 1;
+                        wrapped = true;
+                    }
+                    break;
+                case 2:
+                    if (noteCount == 1)
+                    {
+                        wrapped = true;
+                    }
+                    else
+                    {
+                        arpNoteIndex += arpDirection;
+                        if (arpNoteIndex >= noteCount)
+                        {
+                            arpDirection = -1;
+                            arpNoteIndex = noteCount - 2;
+                            wrapped = true;
+                        }
+                        else if (arpNoteIndex < 0)
+                        {
+                            arpDirection = 1;
+                            arpNoteIndex = 1;
+                            wrapped = true;
+                        }
+                    }
+                    break;
+                case 4:
+                case 0:
+                default:
+                    ++arpNoteIndex;
+                    if (arpNoteIndex >= noteCount)
+                    {
+                        arpNoteIndex = 0;
+                        wrapped = true;
+                    }
+                    break;
+            }
+
+            if (wrapped && arpOctaves > 1)
+                arpOctaveIndex = (arpOctaveIndex + 1) % arpOctaves;
+        }
+
+        const auto transposedOctave = juce::jlimit (0, arpOctaves - 1, arpOctaveIndex + step.octaveOffset);
+        return orderedNotes[juce::jlimit (0, noteCount - 1, arpNoteIndex)] + (transposedOctave * 12);
+    };
+
+    releaseArpVoices (true);
+
+    if (arpMode == 5 && patternWrapped && arpOctaves > 1)
+        arpOctaveIndex = (arpOctaveIndex + 1) % arpOctaves;
+
+    if (step.active)
+    {
+        const auto stepVelocity = juce::jlimit (0.05f, 1.0f, step.velocity);
+
+        if (arpMode == 5)
+        {
+            for (const auto note : orderedNotes)
+            {
+                const auto transposedOctave = juce::jlimit (0, arpOctaves - 1, arpOctaveIndex + step.octaveOffset);
+                startVoiceForMidiNote (note + (transposedOctave * 12), stepVelocity, -1, true);
+            }
+        }
+        else
+        {
+            const auto midiNote = nextOrderedNote (step.advanceNote || previousPatternStep < 0);
+            if (midiNote >= 0)
+                startVoiceForMidiNote (midiNote, stepVelocity, -1, true);
+        }
+    }
+
+    const auto baseStepSamples = juce::jmax (1, static_cast<int> (currentSampleRate / juce::jmax (0.25f, renderParams.arpRate)));
+    const auto swingAmount = juce::jlimit (0.0f, 0.75f, renderParams.arpSwing);
+    const auto swingScale = swingAmount <= 0.0001f
+                                ? 1.0f
+                                : (arpSwingPhase ? 1.0f + (swingAmount * 0.5f)
+                                                 : juce::jmax (0.25f, 1.0f - (swingAmount * 0.5f)));
+    arpSwingPhase = ! arpSwingPhase;
+    arpSamplesUntilNextStep = juce::jmax (1, juce::roundToInt (static_cast<float> (baseStepSamples) * swingScale));
+    arpGateSamplesRemaining = step.active
+                                  ? juce::jmax (1,
+                                                juce::roundToInt (static_cast<float> (arpSamplesUntilNextStep)
+                                                                  * juce::jlimit (0.08f, 1.5f, renderParams.arpGate)
+                                                                  * juce::jlimit (0.1f, 1.5f, step.gateScale)))
+                                  : 0;
+}
+
 void AdvancedVSTiAudioProcessor::handleMidiMessage (const juce::MidiMessage& msg)
 {
     if (msg.isNoteOn())
     {
-        const auto polyphonyLimit = activeVoiceLimit();
         int externalPadIndex = -1;
         if constexpr (buildFlavor() == InstrumentFlavor::vec1DrumPad)
         {
@@ -1656,80 +2129,24 @@ void AdvancedVSTiAudioProcessor::handleMidiMessage (const juce::MidiMessage& msg
             }
         }
 
-        int voiceIndex = 0;
-        bool foundVoice = false;
-        float oldestVoiceAge = -1.0f;
-
-        if constexpr (isMonophonicFlavor())
-        {
-            heldNotes.clear();
-            for (auto& activeVoice : voices)
-            {
-                if (! activeVoice.active)
-                    continue;
-
-                activeVoice.active = false;
-                activeVoice.ampEnv.reset();
-                activeVoice.filterEnv.reset();
-            }
-        }
-
-        for (int i = 0; i < polyphonyLimit; ++i)
-        {
-            auto& candidate = voices[static_cast<size_t> (i)];
-            if (! candidate.active)
-            {
-                voiceIndex = i;
-                foundVoice = true;
-                break;
-            }
-
-            if (candidate.noteAge > oldestVoiceAge)
-            {
-                oldestVoiceAge = candidate.noteAge;
-                voiceIndex = i;
-            }
-        }
-
-        auto& voice = voices[static_cast<size_t> (voiceIndex)];
-        if (! foundVoice && voice.active)
-        {
-            voice.ampEnv.reset();
-            voice.filterEnv.reset();
-        }
-        voice.active = true;
-        voice.midiNote = msg.getNoteNumber();
-        voice.velocity = msg.getFloatVelocity();
-        voice.phase = 0.0f;
-        voice.osc2Phase = 0.0f;
-        voice.subPhase = 0.0f;
-        voice.fmPhase = 0.0f;
-        voice.syncPhase = 0.0f;
-        voice.samplePos = 0.0f;
-        voice.noteAge = 0.0f;
-        voice.auxPhase = 0.0f;
-        voice.toneState = 0.0f;
-        voice.colourState = 0.0f;
-        voice.externalPadIndex = externalPadIndex;
-        voice.externalSamplePosition = 0.0;
-        voice.externalSample = (externalPadIndex >= 0 && juce::isPositiveAndBelow (externalPadIndex, vecPadCount))
-                                   ? std::atomic_load (&externalPadSamples[static_cast<size_t> (externalPadIndex)])
-                                   : std::shared_ptr<const ExternalSampleData> {};
-        voice.unisonPhases.fill (0.0f);
-        voice.unisonSyncPhases.fill (0.0f);
-        voice.unisonSamplePositions.fill (0.0f);
-        voice.ampEnv.noteOn();
-        voice.filterEnv.noteOn();
-
-        if (renderParams.lfo1EnvMode)
-            lfo1Phase = 0.0f;
-        if (renderParams.lfo2EnvMode)
-            lfo2Phase = 0.0f;
-        if (renderParams.lfo3EnvMode)
-            lfo3Phase = 0.0f;
-
         if constexpr (! isDrumFlavor())
-            heldNotes.addIfNotAlreadyThere (voice.midiNote);
+        {
+            heldNotes.addIfNotAlreadyThere (msg.getNoteNumber());
+
+            if (renderParams.arpEnabled)
+            {
+                if (heldNotes.size() == 1)
+                    resetArpState();
+
+                arpSamplesUntilNextStep = 0;
+                arpGateSamplesRemaining = 0;
+                return;
+            }
+        }
+
+        startVoiceForMidiNote (msg.getNoteNumber(), msg.getFloatVelocity(), externalPadIndex, false);
+        if constexpr (! isDrumFlavor())
+            heldNotes.addIfNotAlreadyThere (msg.getNoteNumber());
         return;
     }
 
@@ -1767,6 +2184,16 @@ void AdvancedVSTiAudioProcessor::handleMidiMessage (const juce::MidiMessage& msg
             return;
 
         heldNotes.removeAllInstancesOf (note);
+        if (renderParams.arpEnabled)
+        {
+            if (heldNotes.isEmpty())
+            {
+                releaseArpVoices (false);
+                resetArpState();
+            }
+            return;
+        }
+
         for (auto& voice : voices)
         {
             if (voice.active && voice.midiNote == note)
@@ -1882,7 +2309,7 @@ void AdvancedVSTiAudioProcessor::applyPendingUiActions (juce::MidiBuffer& midiMe
     auto releaseAllNotes = [this] (bool hardKill)
     {
         heldNotes.clear();
-        arpStep = 0;
+        resetArpState();
         keyboardState.reset();
 
         for (auto& voice : voices)
@@ -1893,7 +2320,10 @@ void AdvancedVSTiAudioProcessor::applyPendingUiActions (juce::MidiBuffer& midiMe
             if (hardKill)
             {
                 voice.active = false;
+                voice.arpControlled = false;
                 voice.midiNote = -1;
+                voice.currentMidiNote = -1.0f;
+                voice.targetMidiNote = -1.0f;
                 voice.velocity = 0.0f;
                 voice.ampEnv.reset();
                 voice.filterEnv.reset();
@@ -2545,7 +2975,21 @@ float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice, SampleMo
         }
     }
 
-    auto baseHz = midiToHz (voice.midiNote);
+    if (params.portamentoTime > 0.0001f)
+    {
+        const auto glideCoeff = 1.0f - std::exp (-1.0f / juce::jmax (1.0f, static_cast<float> (currentSampleRate) * params.portamentoTime));
+        voice.currentMidiNote += (voice.targetMidiNote - voice.currentMidiNote) * glideCoeff;
+    }
+    else
+    {
+        voice.currentMidiNote = voice.targetMidiNote >= 0.0f ? voice.targetMidiNote
+                                                             : static_cast<float> (voice.midiNote);
+    }
+
+    const auto soundingMidiNote = voice.currentMidiNote >= 0.0f ? voice.currentMidiNote
+                                                                 : static_cast<float> (voice.midiNote);
+
+    auto baseHz = midiToHzFloat (soundingMidiNote);
     baseHz *= std::pow (2.0f, voiceMod.osc1Pitch / 12.0f);
 
     const auto fm = fmOperator (voice, baseHz, juce::jmax (0.0f, params.fmAmount + voiceMod.fmAmount));
@@ -2692,7 +3136,7 @@ float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice, SampleMo
 
     sampleModSums.filterEnvPeak = juce::jmax (sampleModSums.filterEnvPeak, filtEnv);
     sampleModSums.ampEnvPeak = juce::jmax (sampleModSums.ampEnvPeak, ampEnv);
-    sampleModSums.notePitch += (static_cast<float> (voice.midiNote) - 60.0f) / 12.0f;
+    sampleModSums.notePitch += (soundingMidiNote - 60.0f) / 12.0f;
     ++sampleModSums.activeVoices;
 
     voice.noteAge += 1.0f / static_cast<float> (currentSampleRate);
@@ -2703,38 +3147,12 @@ float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice, SampleMo
     const auto rhythmGate = 1.0f - params.rhythmGateDepth + params.rhythmGateDepth * rg;
 
     if (! voice.ampEnv.isActive())
-        voice.active = false;
-
-    return s * ampEnv * juce::jlimit (0.0f, 2.0f, 1.0f + voiceMod.ampLevel) * gatePass * rhythmGate * voice.velocity;
-}
-
-void AdvancedVSTiAudioProcessor::advanceArpIfNeeded()
-{
-    if (heldNotes.isEmpty())
-        return;
-
-    const auto mode = renderParams.arpMode;
-    if (mode == 3)
     {
-        arpStep = random.nextInt (heldNotes.size());
-        return;
+        voice.active = false;
+        voice.arpControlled = false;
     }
 
-    ++arpStep;
-    if (arpStep >= heldNotes.size())
-        arpStep = 0;
-}
-
-int AdvancedVSTiAudioProcessor::getArpNote() const
-{
-    if (heldNotes.isEmpty())
-        return -1;
-
-    const auto mode = renderParams.arpMode;
-    if (mode == 1)
-        return heldNotes[heldNotes.size() - 1 - juce::jlimit (0, heldNotes.size() - 1, arpStep)];
-
-    return heldNotes[juce::jlimit (0, heldNotes.size() - 1, arpStep)];
+    return s * ampEnv * juce::jlimit (0.0f, 2.0f, 1.0f + voiceMod.ampLevel) * gatePass * rhythmGate * voice.velocity;
 }
 
 void AdvancedVSTiAudioProcessor::updateRenderParameters()
@@ -2776,6 +3194,7 @@ void AdvancedVSTiAudioProcessor::updateRenderParameters()
         renderParams.masterLevel = paramValue (apvts, "MASTERLEVEL");
 
     renderParams.detune = paramValue (apvts, "DETUNE");
+    renderParams.portamentoTime = buildFlavor() == InstrumentFlavor::advanced ? paramValue (apvts, "PORTAMENTO") : 0.0f;
     if constexpr (buildFlavor() == InstrumentFlavor::advanced)
     {
         const auto fmEnabled = paramValue (apvts, "FMENABLE") >= 0.5f;
@@ -2869,7 +3288,11 @@ void AdvancedVSTiAudioProcessor::updateRenderParameters()
     renderParams.lfo2AssignDestination = buildFlavor() == InstrumentFlavor::advanced ? paramIndex (apvts, "LFO2ASSIGNDEST")
                                                                                      : static_cast<int> (MatrixDestination::off);
     renderParams.lfo2Filter = renderParams.lfo2Enabled ? paramValue (apvts, "LFO2FILTER") : 0.0f;
+    renderParams.arpPattern = buildFlavor() == InstrumentFlavor::advanced ? paramIndex (apvts, "ARPPATTERN") : 0;
+    renderParams.arpOctaves = buildFlavor() == InstrumentFlavor::advanced ? 1 + paramIndex (apvts, "ARPOCTAVES") : 1;
     renderParams.arpRate = paramValue (apvts, "ARPRATE");
+    renderParams.arpSwing = buildFlavor() == InstrumentFlavor::advanced ? paramValue (apvts, "ARPSWING") : 0.0f;
+    renderParams.arpGate = buildFlavor() == InstrumentFlavor::advanced ? paramValue (apvts, "ARPGATE") : 0.85f;
     renderParams.rhythmGateRate = paramValue (apvts, "RHYTHMGATE_RATE");
     renderParams.lfo3Amount = renderParams.lfo3Enabled
                                   ? (buildFlavor() == InstrumentFlavor::advanced ? paramValue (apvts, "LFO3AMOUNT")
@@ -3083,8 +3506,28 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
         rightFilter2Cascade.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (juce::jlimit (0, 3, renderParams.filter2Type)));
     }
 
-    int arpCounter = 0;
-    const auto arpIntervalSamples = juce::jmax (1, static_cast<int> (currentSampleRate / juce::jmax (0.25f, renderParams.arpRate)));
+    if (arpWasEnabled && ! renderParams.arpEnabled)
+    {
+        releaseArpVoices (false);
+        resetArpState();
+    }
+    else if (! arpWasEnabled && renderParams.arpEnabled)
+    {
+        for (auto& voice : voices)
+        {
+            if (! voice.active)
+                continue;
+
+            voice.ampEnv.noteOff();
+            voice.filterEnv.noteOff();
+        }
+
+        arpSamplesUntilNextStep = 0;
+        arpGateSamplesRemaining = 0;
+    }
+
+    arpWasEnabled = renderParams.arpEnabled;
+
     float blockFxMixMod = 0.0f;
     float blockFxIntensityMod = 0.0f;
     float blockDelaySendMod = 0.0f;
@@ -3116,22 +3559,19 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             hasMidi = midiIterator.getNextEvent (nextMidiMessage, nextMidiSample);
         }
 
-        if (renderParams.arpEnabled && ++arpCounter >= arpIntervalSamples)
+        if (renderParams.arpEnabled)
         {
-            arpCounter = 0;
-            advanceArpIfNeeded();
-            const auto arpNote = getArpNote();
-            if (arpNote >= 0)
+            if (arpSamplesUntilNextStep <= 0)
+                triggerArpStep();
+
+            if (arpGateSamplesRemaining > 0)
             {
-                for (auto& voice : voices)
-                {
-                    if (voice.active)
-                    {
-                        voice.midiNote = arpNote;
-                        break;
-                    }
-                }
+                --arpGateSamplesRemaining;
+                if (arpGateSamplesRemaining == 0)
+                    releaseArpVoices (false);
             }
+
+            --arpSamplesUntilNextStep;
         }
 
         SampleModulationSums sampleModSums;
@@ -3584,6 +4024,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
     float fmDefault = 0.0f;
     float syncDefault = 0.0f;
     float gateDefault = 8.0f;
+    float portamentoDefault = 0.0f;
     float osc1SemitoneDefault = 0.0f;
     float osc1DetuneDefault = 0.0f;
     float osc1PulseWidthDefault = 0.5f;
@@ -3678,7 +4119,11 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
 
     int presetDefault = 0;
     int arpModeDefault = 0;
+    int arpPatternDefault = 0;
+    int arpOctavesDefault = 0;
     float arpRateDefault = 4.0f;
+    float arpSwingDefault = 0.0f;
+    float arpGateDefault = 0.85f;
     float rhythmRateDefault = 8.0f;
     float rhythmDepthDefault = 0.0f;
     std::array<float, 7> drumVoiceTuneDefaults {
@@ -3971,6 +4416,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
         fmDefault = 120.0f;
         syncDefault = 0.24f;
         gateDefault = 3.2f;
+        portamentoDefault = 0.0f;
         ampAttackDefault = 0.004f;
         ampDecayDefault = 0.28f;
         ampSustainDefault = 0.74f;
@@ -4074,6 +4520,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
         params.push_back (std::make_unique<juce::AudioParameterFloat> ("FMAMOUNT", "FM Amount", 0.0f, 1000.0f, fmDefault));
         params.push_back (std::make_unique<juce::AudioParameterFloat> ("SYNC", "Sync", 0.0f, 4.0f, syncDefault));
         params.push_back (std::make_unique<juce::AudioParameterFloat> ("OSCGATE", "Osc Note Length Gate", 0.01f, 8.0f, gateDefault));
+        if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+            params.push_back (std::make_unique<juce::AudioParameterFloat> ("PORTAMENTO", "Portamento", 0.0f, 1.5f, portamentoDefault));
     }
     if constexpr (buildFlavor() == InstrumentFlavor::advanced)
     {
@@ -4162,10 +4610,18 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
         params.push_back (std::make_unique<juce::AudioParameterChoice> ("LFO2ASSIGNDEST", "LFO2 Assign Destination", matrixDestinationChoices(), lfo2AssignDestinationDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("LFO2FILTER", "LFO2 -> Filter", 0.0f, 1.0f, lfo2FilterDefault));
 
-    params.push_back (std::make_unique<juce::AudioParameterChoice> ("ARPMODE", "Arp Mode", juce::StringArray { "Up", "Down", "UpDown", "Random" }, arpModeDefault));
+    params.push_back (std::make_unique<juce::AudioParameterChoice> ("ARPMODE", "Arp Mode", virusArpModeChoices(), arpModeDefault));
     if constexpr (buildFlavor() == InstrumentFlavor::advanced)
         params.push_back (std::make_unique<juce::AudioParameterBool> ("ARPENABLE", "Arp Enabled", false));
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+        params.push_back (std::make_unique<juce::AudioParameterChoice> ("ARPPATTERN", "Arp Pattern", virusArpPatternChoices(), arpPatternDefault));
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+        params.push_back (std::make_unique<juce::AudioParameterChoice> ("ARPOCTAVES", "Arp Octaves", juce::StringArray { "1", "2", "3", "4" }, arpOctavesDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("ARPRATE", "Arp Rate", 0.25f, 16.0f, arpRateDefault));
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("ARPSWING", "Arp Swing", 0.0f, 0.75f, arpSwingDefault));
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+        params.push_back (std::make_unique<juce::AudioParameterFloat> ("ARPGATE", "Arp Gate", 0.08f, 1.5f, arpGateDefault));
 
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("RHYTHMGATE_RATE", "Rhythm Gate Rate", 0.25f, 32.0f, rhythmRateDefault));
     if constexpr (buildFlavor() == InstrumentFlavor::advanced)
@@ -4301,6 +4757,10 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
     setParameterActual ("RHYTHMGATE_DEPTH", 0.0f);
     setParameterActual ("ARPMODE", 0.0f);
     setParameterActual ("ARPRATE", 4.0f);
+    setParameterActual ("ARPPATTERN", 0.0f);
+    setParameterActual ("ARPOCTAVES", 0.0f);
+    setParameterActual ("ARPSWING", 0.0f);
+    setParameterActual ("ARPGATE", 0.85f);
     setParameterActual ("LFO1RATE", 0.1f);
     setParameterActual ("LFO2RATE", 0.1f);
     if constexpr (buildFlavor() == InstrumentFlavor::advanced)
@@ -4316,6 +4776,7 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
     {
         setParameterActual ("MASTERLEVEL", 1.0f);
         setParameterActual ("MONOENABLE", 0.0f);
+        setParameterActual ("PORTAMENTO", 0.0f);
         setParameterActual ("ARPENABLE", 0.0f);
         setParameterActual ("LFO1ENABLE", 1.0f);
         setParameterActual ("LFO2ENABLE", 1.0f);
@@ -4875,9 +5336,14 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
         applyAdvancedSettings ({
             { "MASTERLEVEL", 1.0f },
             { "MONOENABLE", 0.0f },
+            { "PORTAMENTO", 0.0f },
             { "ARPENABLE", 0.0f },
             { "ARPMODE", 0.0f },
+            { "ARPPATTERN", 0.0f },
+            { "ARPOCTAVES", 0.0f },
             { "ARPRATE", 4.0f },
+            { "ARPSWING", 0.0f },
+            { "ARPGATE", 0.85f },
             { "OSCTYPE", 1.0f },
             { "OSC2TYPE", 2.0f },
             { "OSC3TYPE", 2.0f },
@@ -4974,13 +5440,16 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
             const auto& imported = importedPresets[static_cast<size_t> (importedIndex)];
             const auto lowerName = imported.name.toLowerCase();
 
-            const auto pitchSeed = importedPayloadNorm (imported, 18);
-            const auto colourSeed = importedPayloadNorm (imported, 36);
-            const auto motionSeed = importedPayloadNorm (imported, 64);
-            const auto filterSeed = importedPayloadNorm (imported, 82);
-            const auto ampSeed = importedPayloadNorm (imported, 101);
-            const auto fxSeed = importedPayloadNorm (imported, 154);
-            const auto envSeed = importedPayloadNorm (imported, 188);
+            const auto pitchSeed = importedAverageNorm (imported, 16, 8);
+            const auto colourSeed = importedAverageNorm (imported, 32, 12);
+            const auto motionSeed = importedAverageNorm (imported, 60, 16);
+            const auto filterSeed = importedAverageNorm (imported, 80, 16);
+            const auto filter2Seed = importedAverageNorm (imported, 96, 16);
+            const auto ampSeed = importedAverageNorm (imported, 120, 16);
+            const auto envSeed = importedAverageNorm (imported, 144, 16);
+            const auto fxSeed = importedAverageNorm (imported, 168, 16);
+            const auto lfoSeed = importedAverageNorm (imported, 192, 16);
+            const auto matrixSeed = importedAverageNorm (imported, 216, 16);
 
             const bool isBass = importedNameContains (lowerName, { "bass", "sub", "303", "acid" });
             const bool isLead = importedNameContains (lowerName, { "lead", "lazer", "solo", "hero", "gallop", "zipp" });
@@ -4991,16 +5460,20 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
             const bool isWide = importedNameContains (lowerName, { "wide", "omni", "solar", "wave", "pad", "poly" });
             const bool isBright = importedNameContains (lowerName, { "high", "glass", "chip", "bright", "air" });
             const bool isDark = importedNameContains (lowerName, { "deep", "dark", "mystery" });
+            const bool isPluck = importedNameContains (lowerName, { "pluck", "zip", "chip", "stab" });
 
             int osc1Type = 1;
             int osc2Type = 1;
+            int osc3Type = 2;
 
             if (importedNameContains (lowerName, { "square", "chip" }))
                 osc1Type = 2;
             else if (isFm)
                 osc1Type = 0;
             else if (isPad)
-                osc1Type = 5 + static_cast<int> (std::floor (colourSeed * 4.0f));
+                osc1Type = 5 + importedChoice (imported, 40, 8, 4);
+            else if (colourSeed > 0.78f)
+                osc1Type = 5 + importedChoice (imported, 44, 8, 4);
 
             if (importedNameContains (lowerName, { "vocal", "choir" }))
                 osc2Type = 9;
@@ -5011,18 +5484,29 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
             else if (isFm)
                 osc2Type = 0;
             else if (isPad)
-                osc2Type = 7 + static_cast<int> (std::round (pitchSeed));
+                osc2Type = 6 + importedChoice (imported, 48, 8, 4);
             else if (importedNameContains (lowerName, { "square", "chip" }))
                 osc2Type = 2;
 
+            if (isNoise)
+                osc3Type = 3;
+            else if (isFm)
+                osc3Type = 0;
+            else if (isPad && colourSeed > 0.52f)
+                osc3Type = 6 + importedChoice (imported, 56, 8, 4);
+            else if (isPluck)
+                osc3Type = 2;
+
             osc1Type = juce::jlimit (0, 9, osc1Type);
             osc2Type = juce::jlimit (0, 9, osc2Type);
+            osc3Type = juce::jlimit (0, 9, osc3Type);
 
             const float cutoff = isBass ? importedRange (imported, 120, 120.0f, 1800.0f)
                                         : (isPad ? importedRange (imported, 120, 1400.0f, 5200.0f)
                                                  : importedRange (imported, 120, 700.0f, 7200.0f));
             const float cutoff2 = juce::jmax (cutoff + 120.0f, importedRange (imported, 127, 1800.0f, 12000.0f));
             const float resonance = importedRange (imported, 128, isBass ? 0.18f : 0.12f, isLead ? 0.72f : 0.56f);
+            const float resonance2 = importedAverageRange (imported, 129, 4, 0.12f, isPad ? 0.52f : 0.42f);
             const float envAmount = importedRange (imported, 132, isPad ? 0.08f : 0.16f, isLead ? 0.8f : 0.62f);
             const float ampAttack = isPad ? importedRange (imported, 138, 0.08f, 1.8f)
                                           : importedRange (imported, 138, 0.001f, isBass ? 0.08f : 0.28f);
@@ -5034,7 +5518,7 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
             const float filtSustain = importedRange (imported, 150, 0.04f, isPad ? 0.72f : 0.44f);
             const float filtRelease = importedRange (imported, 152, 0.04f, isPad ? 1.8f : 0.8f);
 
-            const int fxType = isFm ? 6 : (isPad ? 3 : (isNoise ? 1 : ((fxSeed > 0.72f) ? 5 : 0)));
+            const int fxType = isFm ? 6 : (isPad ? 3 : (isNoise ? 1 : ((fxSeed > 0.78f) ? 5 : 0)));
             const float fxMix = importedRange (imported, 168, 0.04f, isPad ? 0.34f : 0.24f);
             const float fxIntensity = importedRange (imported, 170, 0.12f, isFm ? 0.72f : 0.5f);
             const float fxRate = importedRange (imported, 171, 0.08f, 7.2f);
@@ -5053,39 +5537,50 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
             applyAdvancedSettings ({
                 { "MONOENABLE", isBass || isLead ? 1.0f : 0.0f },
                 { "ARPENABLE", isArp ? 1.0f : 0.0f },
-                { "ARPMODE", isArp ? static_cast<float> (juce::jlimit (0, 3, 1 + static_cast<int> (std::floor (motionSeed * 3.0f)))) : 0.0f },
+                { "ARPMODE", isArp ? static_cast<float> (juce::jlimit (0, 5, 1 + static_cast<int> (std::floor (motionSeed * 4.0f)))) : 0.0f },
+                { "ARPPATTERN", isArp ? static_cast<float> (juce::jlimit (0, static_cast<int> (virusArpPatterns().size()) - 1, static_cast<int> (std::floor (importedPayloadNorm (imported, 209) * static_cast<float> (virusArpPatterns().size()))))) : 0.0f },
+                { "ARPOCTAVES", isArp ? static_cast<float> (juce::jlimit (0, 3, static_cast<int> (std::floor (importedPayloadNorm (imported, 211) * 4.0f)))) : 0.0f },
                 { "ARPRATE", isArp ? importedRange (imported, 210, 4.0f, 12.0f) : 4.0f },
+                { "ARPSWING", isArp ? importedRange (imported, 212, 0.0f, 0.32f) : 0.0f },
+                { "ARPGATE", isArp ? importedRange (imported, 213, 0.38f, 1.1f) : 0.85f },
                 { "OSCTYPE", static_cast<float> (osc1Type) },
                 { "OSC2TYPE", static_cast<float> (osc2Type) },
-                { "UNISON", isWide ? 2.0f : 1.0f },
+                { "OSC3TYPE", static_cast<float> (osc3Type) },
+                { "UNISON", isWide || matrixSeed > 0.66f ? 2.0f : 1.0f },
                 { "DETUNE", importedRange (imported, 114, isBass ? 0.006f : 0.012f, isWide ? 0.09f : 0.05f) },
-                { "OSC1SEMITONE", 0.0f },
+                { "OSC1SEMITONE", (pitchSeed > 0.86f && ! isBass) ? 12.0f : 0.0f },
                 { "OSC1DETUNE", importedRange (imported, 115, -0.05f, 0.05f) },
-                { "OSC1PW", importedRange (imported, 116, 0.22f, 0.82f) },
+                { "OSC1PW", importedRange (imported, 116, 0.18f, 0.86f) },
                 { "OSC2SEMITONE", isBass ? -12.0f : (isBright ? 12.0f : (importedPayloadNorm (imported, 117) > 0.66f ? 7.0f : 0.0f)) },
                 { "OSC2DETUNE", importedRange (imported, 118, -0.12f, 0.12f) },
-                { "OSC2PW", importedRange (imported, 119, 0.22f, 0.82f) },
+                { "OSC2PW", importedRange (imported, 119, 0.18f, 0.86f) },
                 { "OSC2MIX", importedRange (imported, 121, 0.18f, 0.58f) },
                 { "OSC3ENABLE", importedPayloadNorm (imported, 122) > 0.28f ? 1.0f : 0.0f },
                 { "OSC3SEMITONE", isBass ? -12.0f : 0.0f },
                 { "OSC3DETUNE", importedRange (imported, 123, -0.05f, 0.05f) },
-                { "OSC3PW", importedRange (imported, 124, 0.24f, 0.76f) },
+                { "OSC3PW", importedRange (imported, 124, 0.18f, 0.84f) },
                 { "SUBOSCLEVEL", importedRange (imported, 125, isBass ? 0.18f : 0.0f, isBass ? 0.62f : 0.24f) },
                 { "NOISELEVEL", importedRange (imported, 126, 0.0f, isNoise ? 0.34f : 0.12f) },
                 { "RINGMOD", importedRange (imported, 129, 0.0f, isFm ? 0.42f : 0.18f) },
+                { "RINGMODENABLE", (isFm || isNoise || importedPayloadNorm (imported, 129) > 0.22f) ? 1.0f : 0.0f },
                 { "FMAMOUNT", importedRange (imported, 130, isFm ? 90.0f : 0.0f, isFm ? 760.0f : 220.0f) },
+                { "FMENABLE", (isFm || importedPayloadNorm (imported, 130) > 0.18f) ? 1.0f : 0.0f },
                 { "SYNC", importedRange (imported, 131, 0.0f, isLead ? 0.66f : 0.28f) },
+                { "SYNCENABLE", (isLead || importedPayloadNorm (imported, 131) > 0.18f) ? 1.0f : 0.0f },
                 { "FILTER1ENABLE", 1.0f },
                 { "FILTER2ENABLE", importedPayloadNorm (imported, 133) > 0.22f ? 1.0f : 0.0f },
                 { "FILTERTYPE", static_cast<float> (juce::jlimit (0, 3, static_cast<int> (std::floor (filterSeed * 4.0f)))) },
-                { "FILTER2TYPE", static_cast<float> (juce::jlimit (0, 3, static_cast<int> (std::floor (importedPayloadNorm (imported, 134) * 4.0f)))) },
+                { "FILTER2TYPE", static_cast<float> (juce::jlimit (0, 3, static_cast<int> (std::floor (filter2Seed * 4.0f)))) },
+                { "FILTERSLOPE", static_cast<float> (importedChoice (imported, 133, 3, 3)) },
+                { "FILTER2SLOPE", static_cast<float> (importedChoice (imported, 136, 3, 3)) },
                 { "CUTOFF", cutoff },
                 { "CUTOFF2", cutoff2 },
                 { "RESONANCE", resonance },
+                { "RESONANCE2", resonance2 },
                 { "FILTERENVAMOUNT", envAmount },
                 { "FILTERBALANCE", importedRange (imported, 135, 0.08f, 0.52f) },
-                { "PANORAMA", importedRange (imported, 136, -0.35f, 0.35f) },
-                { "KEYFOLLOW", importedRange (imported, 137, isDark ? 0.06f : 0.18f, 0.82f) },
+                { "PANORAMA", importedAverageRange (imported, 136, 3, -0.35f, 0.35f) },
+                { "KEYFOLLOW", importedAverageRange (imported, 139, 3, isDark ? 0.06f : 0.18f, 0.82f) },
                 { "AMPATTACK", ampAttack },
                 { "AMPDECAY", ampDecay },
                 { "AMPSUSTAIN", ampSustain },
@@ -5094,27 +5589,32 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
                 { "FILTDECAY", filtDecay },
                 { "FILTSUSTAIN", filtSustain },
                 { "FILTRELEASE", filtRelease },
+                { "ENVCURVE", juce::jlimit (-0.65f, 0.65f, (ampSeed - 0.5f) * 1.1f) },
                 { "LFO1ENABLE", lfoAmount > 0.01f ? 1.0f : 0.0f },
                 { "LFO1RATE", lfoRate },
-                { "LFO1SHAPE", static_cast<float> (juce::jlimit (0, 4, static_cast<int> (std::floor (importedPayloadNorm (imported, 198) * 5.0f)))) },
+                { "LFO1SHAPE", static_cast<float> (juce::jlimit (0, 4, importedChoice (imported, 198, 3, 5))) },
                 { "LFO1ENVMODE", isArp ? 1.0f : 0.0f },
                 { "LFO1AMOUNT", lfoAmount },
-                { "LFO1DEST", static_cast<float> (juce::jlimit (0, 10, static_cast<int> (std::floor (importedPayloadNorm (imported, 199) * 11.0f)))) },
-                { "LFO1ASSIGNDEST", static_cast<float> (static_cast<int> (MatrixDestination::off)) },
+                { "LFO1DEST", static_cast<float> (juce::jlimit (0, 10, importedChoice (imported, 199, 3, 11))) },
+                { "LFO1ASSIGNDEST", static_cast<float> (juce::jlimit (1, static_cast<int> (MatrixDestination::ringModAmount),
+                                                                       1 + importedChoice (imported, 212, 4, static_cast<int> (MatrixDestination::ringModAmount)))) },
                 { "LFO2ENABLE", importedPayloadNorm (imported, 200) > 0.18f ? 1.0f : 0.0f },
                 { "LFO2RATE", importedRange (imported, 201, 0.08f, 6.2f) },
-                { "LFO2SHAPE", static_cast<float> (juce::jlimit (0, 4, static_cast<int> (std::floor (importedPayloadNorm (imported, 202) * 5.0f)))) },
+                { "LFO2SHAPE", static_cast<float> (juce::jlimit (0, 4, importedChoice (imported, 202, 3, 5))) },
                 { "LFO2ENVMODE", isPad ? 0.0f : 1.0f },
-                { "LFO2AMOUNT", importedRange (imported, 203, 0.0f, 0.24f) },
-                { "LFO2DEST", static_cast<float> (juce::jlimit (0, 10, static_cast<int> (std::floor (importedPayloadNorm (imported, 204) * 11.0f)))) },
-                { "LFO2ASSIGNDEST", static_cast<float> (static_cast<int> (MatrixDestination::off)) },
+                { "LFO2AMOUNT", importedRange (imported, 203, 0.0f, 0.18f + lfoSeed * 0.12f) },
+                { "LFO2DEST", static_cast<float> (juce::jlimit (0, 10, importedChoice (imported, 204, 3, 11))) },
+                { "LFO2ASSIGNDEST", static_cast<float> (juce::jlimit (1, static_cast<int> (MatrixDestination::ringModAmount),
+                                                                       1 + importedChoice (imported, 214, 4, static_cast<int> (MatrixDestination::ringModAmount)))) },
                 { "LFO3ENABLE", importedPayloadNorm (imported, 205) > 0.36f ? 1.0f : 0.0f },
                 { "RHYTHMGATE_RATE", importedRange (imported, 206, 2.0f, 12.0f) },
-                { "LFO3SHAPE", static_cast<float> (juce::jlimit (0, 4, static_cast<int> (std::floor (importedPayloadNorm (imported, 207) * 5.0f)))) },
+                { "LFO3SHAPE", static_cast<float> (juce::jlimit (0, 4, importedChoice (imported, 207, 3, 5))) },
                 { "LFO3ENVMODE", 1.0f },
                 { "LFO3AMOUNT", importedRange (imported, 208, 0.0f, 0.26f) },
-                { "LFO3DEST", static_cast<float> (juce::jlimit (0, 10, static_cast<int> (std::floor (importedPayloadNorm (imported, 209) * 11.0f)))) },
-                { "LFO3ASSIGNDEST", static_cast<float> (static_cast<int> (MatrixDestination::assign)) },
+                { "RHYTHMGATE_DEPTH", importedRange (imported, 208, 0.0f, 0.32f) },
+                { "LFO3DEST", static_cast<float> (juce::jlimit (0, 10, importedChoice (imported, 209, 3, 11))) },
+                { "LFO3ASSIGNDEST", static_cast<float> (juce::jlimit (1, static_cast<int> (MatrixDestination::ringModAmount),
+                                                                       1 + importedChoice (imported, 216, 4, static_cast<int> (MatrixDestination::ringModAmount)))) },
                 { "FXTYPE", static_cast<float> (fxType) },
                 { "FXMIX", fxMix },
                 { "FXINTENSITY", fxIntensity },
@@ -5136,7 +5636,7 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
                 { "HIGHEQGAIN", importedRange (imported, 186, -4.0f, 4.0f) },
                 { "HIGHEQFREQ", importedRange (imported, 187, 1800.0f, 9000.0f) },
                 { "HIGHEQQ", importedRange (imported, 189, 0.5f, 1.4f) },
-                { "SATURATIONTYPE", static_cast<float> (juce::jlimit (0, 3, static_cast<int> (std::floor (colourSeed * 4.0f)))) },
+                { "SATURATIONTYPE", static_cast<float> (juce::jlimit (0, 3, importedChoice (imported, 191, 2, 4))) },
                 { "MASTERLEVEL", importedRange (imported, 190, 0.9f, isBass ? 1.18f : 1.06f) },
             });
 
@@ -5158,6 +5658,16 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
                 setParameterActual ("MATRIX2SOURCE", 5.0f);
                 setParameterActual ("MATRIX2DEST1", static_cast<float> (static_cast<int> (MatrixDestination::filterBalance)));
                 setParameterActual ("MATRIX2AMOUNT1", importedRange (imported, 222, -0.14f, 0.22f));
+            }
+
+            if (matrixSeed > 0.28f)
+            {
+                setParameterActual ("MATRIX3SOURCE", static_cast<float> (juce::jlimit (1, 5, 1 + importedChoice (imported, 223, 3, 5))));
+                setParameterActual ("MATRIX3DEST1", static_cast<float> (juce::jlimit (1, static_cast<int> (MatrixDestination::ringModAmount),
+                                                                                        1 + importedChoice (imported, 226, 4, static_cast<int> (MatrixDestination::ringModAmount)))));
+                setParameterActual ("MATRIX3AMOUNT1", importedAverageRange (imported, 230, 4, -0.18f, 0.24f));
+                setParameterActual ("MATRIX3DEST2", static_cast<float> (static_cast<int> (MatrixDestination::fxMix)));
+                setParameterActual ("MATRIX3AMOUNT2", importedAverageRange (imported, 234, 4, 0.0f, 0.16f));
             }
 
             remapLegacyFxType();
@@ -5217,7 +5727,7 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
                 break;
             case 5:
                 applyAdvancedSettings ({
-                    { "MONOENABLE", 1.0f }, { "ARPENABLE", 1.0f }, { "ARPMODE", 2.0f }, { "ARPRATE", 8.0f },
+                    { "MONOENABLE", 1.0f }, { "ARPENABLE", 1.0f }, { "ARPMODE", 2.0f }, { "ARPPATTERN", 2.0f }, { "ARPOCTAVES", 1.0f }, { "ARPRATE", 8.0f }, { "ARPSWING", 0.14f }, { "ARPGATE", 0.72f },
                     { "OSCTYPE", 1.0f }, { "OSC2TYPE", 2.0f }, { "DETUNE", 0.03f }, { "OSC2SEMITONE", 12.0f },
                     { "OSC2MIX", 0.36f }, { "SUBOSCLEVEL", 0.08f }, { "NOISELEVEL", 0.05f }, { "RINGMOD", 0.14f },
                     { "FMAMOUNT", 90.0f }, { "SYNC", 0.22f }, { "FILTERTYPE", 1.0f }, { "CUTOFF", 1500.0f },
@@ -5231,7 +5741,7 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
                 break;
             case 6:
                 applyAdvancedSettings ({
-                    { "ARPENABLE", 1.0f }, { "ARPMODE", 0.0f }, { "ARPRATE", 6.0f }, { "OSCTYPE", 1.0f },
+                    { "ARPENABLE", 1.0f }, { "ARPMODE", 0.0f }, { "ARPPATTERN", 1.0f }, { "ARPOCTAVES", 1.0f }, { "ARPRATE", 6.0f }, { "ARPSWING", 0.08f }, { "ARPGATE", 0.82f }, { "OSCTYPE", 1.0f },
                     { "OSC2TYPE", 1.0f }, { "DETUNE", 0.02f }, { "OSC2SEMITONE", 7.0f }, { "OSC2MIX", 0.32f },
                     { "SUBOSCLEVEL", 0.12f }, { "NOISELEVEL", 0.01f }, { "FMAMOUNT", 30.0f }, { "SYNC", 0.1f },
                     { "CUTOFF", 1200.0f }, { "CUTOFF2", 3800.0f }, { "RESONANCE", 0.38f }, { "FILTERENVAMOUNT", 0.42f },
@@ -5242,7 +5752,7 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
                 break;
             case 7:
                 applyAdvancedSettings ({
-                    { "MONOENABLE", 1.0f }, { "ARPENABLE", 1.0f }, { "ARPMODE", 3.0f }, { "ARPRATE", 10.0f },
+                    { "MONOENABLE", 1.0f }, { "ARPENABLE", 1.0f }, { "ARPMODE", 3.0f }, { "ARPPATTERN", 6.0f }, { "ARPOCTAVES", 2.0f }, { "ARPRATE", 10.0f }, { "ARPSWING", 0.18f }, { "ARPGATE", 0.68f },
                     { "OSCTYPE", 1.0f }, { "OSC2TYPE", 2.0f }, { "DETUNE", 0.04f }, { "OSC2SEMITONE", 12.0f },
                     { "OSC2MIX", 0.46f }, { "NOISELEVEL", 0.12f }, { "RINGMOD", 0.22f }, { "FMAMOUNT", 180.0f },
                     { "SYNC", 0.4f }, { "FILTERTYPE", 1.0f }, { "CUTOFF", 2800.0f }, { "CUTOFF2", 7800.0f },
@@ -5304,7 +5814,7 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
                 break;
             case 12:
                 applyAdvancedSettings ({
-                    { "MONOENABLE", 1.0f }, { "ARPENABLE", 1.0f }, { "ARPMODE", 2.0f }, { "ARPRATE", 12.0f },
+                    { "MONOENABLE", 1.0f }, { "ARPENABLE", 1.0f }, { "ARPMODE", 2.0f }, { "ARPPATTERN", 3.0f }, { "ARPOCTAVES", 1.0f }, { "ARPRATE", 12.0f }, { "ARPSWING", 0.1f }, { "ARPGATE", 0.64f },
                     { "OSCTYPE", 1.0f }, { "OSC2TYPE", 2.0f }, { "UNISON", 1.0f }, { "DETUNE", 0.015f },
                     { "OSC2SEMITONE", 12.0f }, { "OSC2MIX", 0.3f }, { "SUBOSCLEVEL", 0.0f }, { "NOISELEVEL", 0.02f },
                     { "RINGMOD", 0.04f }, { "FMAMOUNT", 220.0f }, { "SYNC", 0.55f }, { "FILTERTYPE", 1.0f },
