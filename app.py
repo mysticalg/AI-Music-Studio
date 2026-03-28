@@ -1195,10 +1195,40 @@ class MidiSection:
     name: str = "MIDI Part"
 
 
+DEFAULT_STARTUP_TRACK_LAYOUT: tuple[tuple[str, str, int, str], ...] = (
+    ("TB303", "AI TB303", 0, "synth"),
+    ("VEC Drum Machine", "AI VEC1 Drum Pads", 9, "drums"),
+    ("Noisemaker", "TAL-NoiseMaker", 1, "synth"),
+    ("Virus", "Virus Synth", 2, "synth"),
+    ("AI Organ", "AI Organ", 3, "keys"),
+    ("AI Piano", "AI Piano", 4, "keys"),
+    ("AI Flute", "AI Flute", 5, "woodwind"),
+    ("AI Sax", "AI Saxophone", 6, "woodwind"),
+    ("AI Violin", "AI Violin", 7, "strings"),
+)
+
+
+def build_default_startup_tracks() -> list[TrackState]:
+    tracks: list[TrackState] = []
+    for track_name, rack_name, midi_channel, synth_profile in DEFAULT_STARTUP_TRACK_LAYOUT:
+        tracks.append(
+            TrackState(
+                name=str(track_name),
+                track_type="instrument",
+                instrument=str(rack_name),
+                instrument_mode="VSTI Rack",
+                rack_vsti=str(rack_name),
+                midi_channel=int(midi_channel),
+                synth_profile=str(synth_profile),
+            )
+        )
+    return tracks
+
+
 class ProjectState:
     def __init__(self) -> None:
         default_bar_tick = TICKS_PER_BAR
-        self.tracks: list[TrackState] = [TrackState(name="Track 1")]
+        self.tracks: list[TrackState] = build_default_startup_tracks()
         self.bpm = DEFAULT_BPM
         self.quantize_enabled = True
         self.quantize_div = 8
@@ -7797,7 +7827,7 @@ class MainWindow(QtWidgets.QMainWindow):
             blob = self._decode_project_blob(raw_track.get('vsti_state_b64'))
             if blob:
                 track_state_blobs[index] = blob
-        project.tracks = tracks or [TrackState(name='Track 1')]
+        project.tracks = tracks or build_default_startup_tracks()
 
         project.vsti_paths = [str(item) for item in project_root.get('vsti_paths', []) if isinstance(item, str)]
         project.vsti_folder_paths = [str(item) for item in project_root.get('vsti_folder_paths', []) if isinstance(item, str)]
