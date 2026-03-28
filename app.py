@@ -8466,6 +8466,22 @@ class MainWindow(QtWidgets.QMainWindow):
                         continue
                     if size > 0:
                         values.add(size)
+        # If probe returned no buffer sizes (e.g. during playback fallback),
+        # query the running native output bridge directly.
+        if not values and self._native_output_bridge_alive():
+            bridge = getattr(self, '_native_output_bridge', None)
+            if bridge is not None:
+                live_status = self._native_output_status(bridge, allow_cached=True, max_age_sec=5.0)
+                if isinstance(live_status, dict):
+                    raw_values = live_status.get('available_audio_buffer_sizes')
+                    if isinstance(raw_values, list):
+                        for raw in raw_values:
+                            try:
+                                size = int(raw)
+                            except Exception:
+                                continue
+                            if size > 0:
+                                values.add(size)
         selected = int(getattr(self, 'native_vst_host_buffer_size', 0) or 0)
         effective = int(self._native_vst_host_target_buffer_size())
         if selected > 0:
@@ -8630,20 +8646,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def _buffer_choice_values_for_sample_rate(sample_rate: int, *, include_value: int = 0) -> list[int]:
         rate = max(1, int(sample_rate))
         max_frames = max(64, min(192000, int(round(float(rate)))))
-        sample_values = {
-            64, 96, 128, 192, 240, 256, 384, 480, 512, 768, 960, 1024,
-            1536, 1920, 2048, 3072, 4096, 6144, 8192, 12288, 16384,
+        # Standard power-of-2 buffer sizes used by most DAWs and audio drivers.
+        values = {
+            32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384,
         }
-        ms_values = {
-            2, 4, 5, 8, 10, 12, 16, 20, 24, 32, 40, 50, 64, 80,
-            100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000,
-        }
-        values = {int(v) for v in sample_values if 64 <= int(v) <= max_frames}
-        for ms in ms_values:
-            values.add(max(64, int(round((float(rate) * float(ms)) / 1000.0))))
+        values = {int(v) for v in values if 64 <= int(v) <= max_frames}
         if int(include_value) > 0:
             values.add(int(include_value))
-        values.add(max_frames)
         return sorted(v for v in values if 64 <= int(v) <= max_frames)
 
     def _native_vst_host_target_buffer_size(self) -> int:
