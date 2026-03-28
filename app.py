@@ -17020,7 +17020,8 @@ class MainWindow(QtWidgets.QMainWindow):
             if self._normalized_vsti_path(str(entry.path)) != self._normalized_vsti_path(entry_path):
                 continue
             if self._capture_native_vst_host_bridge_state(int(row), bridge=bridge, track=track, entry=entry):
-                self._sync_native_vst_state_to_active_hosts(int(row), track, entry, source_bridge=bridge)
+                if not self._should_defer_live_native_vst_state_reload(track):
+                    self._sync_native_vst_state_to_active_hosts(int(row), track, entry, source_bridge=bridge)
         if self._pending_native_vst_state_syncs:
             self._schedule_deferred_native_vst_state_sync_flush()
 
@@ -17122,6 +17123,7 @@ class MainWindow(QtWidgets.QMainWindow):
         payload = {
             'slot_index': int(slot_index),
             'path': str(state_file),
+            'state_mtime_ns': int(self._path_mtime_ns(state_file)),
         }
         if parameter_values is not None:
             payload['parameters'] = dict(parameter_values)
@@ -17156,6 +17158,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         parameter_values = self._sanitize_native_vst_bridge_parameter_values(track.vsti_parameters)
         generation = self._track_vsti_parameter_generation(track)
+        state_mtime_ns = int(self._path_mtime_ns(state_path))
 
         shared_info = self._shared_native_output_bridge_track_info()
         if shared_info is not None and int(shared_info[0]) == int(row):
@@ -17215,6 +17218,7 @@ class MainWindow(QtWidgets.QMainWindow):
                             track_index=int(engine_track_index),
                             path=str(state_path),
                             parameters=dict(parameter_values),
+                            state_mtime_ns=state_mtime_ns,
                         )
                     except Exception:
                         _APP_LOGGER.exception(
@@ -17345,7 +17349,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 track,
                 entry,
             )
-        if state_captured:
+        if state_captured and not self._should_defer_live_native_vst_state_reload(track):
             self._sync_native_vst_state_to_active_hosts(int(row), track, entry, source_bridge=bridge)
 
         setattr(bridge, '_aims_editor_open', editor_open)
@@ -17958,6 +17962,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 return True
 
         return False
+
+    def _should_defer_live_native_vst_state_reload(self, track: TrackState) -> bool:
+        return bool(getattr(self, '_playback_active', False)) and self._native_vst_parameter_change_is_live_safe(track)
 
     def _apply_track_vsti_parameters_live(
         self,
@@ -19767,11 +19774,13 @@ class MainWindow(QtWidgets.QMainWindow):
         graph_track_paths: list[str] = []
         for idx, track, entry in tracks:
             state_path = self._effective_vsti_state_path(track, entry)
+            state_mtime_ns = self._path_mtime_ns(state_path) if state_path is not None and state_path.exists() else 0
             gain = max(0.0, float(track.volume) * (10.0 ** (float(track.vsti_output_gain_db) / 20.0)))
             payload_track: dict[str, object] = {
                 'name': str(track.name or entry.name),
                 'plugin_path': str(entry.path),
                 'state_path': str(state_path) if state_path is not None and state_path.exists() else '',
+                'state_mtime_ns': int(state_mtime_ns),
                 'parameters': dict(track.vsti_parameters),
                 'gain': float(gain),
                 'pan': float(clamp(float(track.pan), -1.0, 1.0)),
@@ -19822,6 +19831,7 @@ class MainWindow(QtWidgets.QMainWindow):
             }
             if entry is not None and self._track_can_use_native_audio_engine(track, entry):
                 state_path = self._effective_vsti_state_path(track, entry)
+                state_mtime_ns = self._path_mtime_ns(state_path) if state_path is not None and state_path.exists() else 0
                 gain = max(0.0, float(track.volume) * (10.0 ** (float(track.vsti_output_gain_db) / 20.0)))
                 midi_channel = int(clamp(track.midi_channel, 0, 15)) + 1
                 payload_track.update(
@@ -19829,6 +19839,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         'track_type': 'instrument',
                         'plugin_path': str(entry.path),
                         'state_path': str(state_path) if state_path is not None and state_path.exists() else '',
+                        'state_mtime_ns': int(state_mtime_ns),
                         'parameters': dict(track.vsti_parameters),
                         'gain': float(gain),
                         'notes': [

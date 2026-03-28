@@ -637,6 +637,7 @@ private:
             juce::String name;
             juce::String pluginPath;
             juce::String statePath;
+            int64_t stateMtimeNs = 0;
             juce::String parameterSignature;
             std::unique_ptr<juce::AudioPluginInstance> plugin;
         };
@@ -644,6 +645,7 @@ private:
         juce::String name;
         juce::String pluginPath;
         juce::String statePath;
+        int64_t stateMtimeNs = 0;
         juce::String parameterSignature;
         juce::String fxChainSignature;
         std::unique_ptr<juce::AudioPluginInstance> plugin;
@@ -725,6 +727,7 @@ private:
             juce::String name;
             juce::String pluginPath;
             juce::String statePath;
+            int64_t stateMtimeNs = 0;
             juce::String parameterSignature;
             std::unique_ptr<juce::AudioPluginInstance> plugin;
         };
@@ -733,6 +736,7 @@ private:
         juce::String name;
         juce::String pluginPath;
         juce::String statePath;
+        int64_t stateMtimeNs = 0;
         juce::String parameterSignature;
         juce::String fxChainSignature;
         std::unique_ptr<juce::AudioPluginInstance> plugin;
@@ -1168,6 +1172,9 @@ private:
             const auto slotIndex = static_cast<int>(object->hasProperty("slot_index")
                 ? object->getProperty("slot_index")
                 : juce::var(-1));
+            const auto stateMtimeNs = object->hasProperty("state_mtime_ns")
+                ? static_cast<int64_t>(static_cast<double>(object->getProperty("state_mtime_ns")))
+                : int64_t(0);
             if (!juce::isPositiveAndBelow(slotIndex, static_cast<int>(persistentGraphSlots.size())))
                 return makeResponse(false, "Graph slot not loaded");
 
@@ -1212,6 +1219,7 @@ private:
                 }
 
                 slot.statePath = stateFile.getFullPathName();
+                slot.stateMtimeNs = stateMtimeNs;
             }
 
             auto response = makeResponse(true, "Graph slot state loaded");
@@ -1640,6 +1648,9 @@ private:
             const auto trackIndex = static_cast<int>(object->hasProperty("track_index")
                 ? object->getProperty("track_index") : juce::var(-1));
             const auto path = object->getProperty("path").toString().trim();
+            const auto stateMtimeNs = object->hasProperty("state_mtime_ns")
+                ? static_cast<int64_t>(static_cast<double>(object->getProperty("state_mtime_ns")))
+                : int64_t(0);
 
             juce::ScopedLock lock(pluginLock);
             if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(audioEngine.tracks.size())))
@@ -1662,6 +1673,7 @@ private:
                 return makeResponse(false, "Could not load plugin state into audio engine track");
 
             track.statePath = path;
+            track.stateMtimeNs = stateMtimeNs;
             track.parameterSignature = {};
 
             // Apply parameter overlay if provided.
@@ -3975,6 +3987,7 @@ private:
         slot.name.clear();
         slot.pluginPath.clear();
         slot.statePath.clear();
+        slot.stateMtimeNs = 0;
         slot.parameterSignature.clear();
     }
 
@@ -3992,6 +4005,7 @@ private:
         slot.name.clear();
         slot.pluginPath.clear();
         slot.statePath.clear();
+        slot.stateMtimeNs = 0;
         slot.parameterSignature.clear();
         slot.fxChainSignature.clear();
         slot.scheduledEvents.clear();
@@ -4473,6 +4487,9 @@ private:
 
             const auto pluginPath = normaliseVst3PathForSettings(trackObject->getProperty("plugin_path").toString().trim());
             const auto statePath = trackObject->getProperty("state_path").toString().trim();
+            const auto stateMtimeNs = trackObject->hasProperty("state_mtime_ns")
+                ? static_cast<int64_t>(static_cast<double>(trackObject->getProperty("state_mtime_ns")))
+                : int64_t(0);
             const auto parameterSignature = parameterPayloadSignature(trackObject->getProperty("parameters"));
             const auto fxChainSignature = graphEffectChainPayloadSignature(trackObject->getProperty("fx_chain"));
             const auto name = trackObject->hasProperty("name")
@@ -4498,6 +4515,7 @@ private:
             const auto canReuse = slot.plugin != nullptr
                 && slot.pluginPath == pluginPath
                 && slot.statePath == statePath
+                && (static_cast<bool>(graphTransportEnabled.load()) || slot.stateMtimeNs == stateMtimeNs)
                 && slot.parameterSignature == parameterSignature
                 && slot.fxChainSignature == fxChainSignature;
             if (canReuse)
@@ -4535,6 +4553,7 @@ private:
             slot.name = name.isNotEmpty() ? name : juce::File(pluginPath).getFileNameWithoutExtension();
             slot.pluginPath = pluginPath;
             slot.statePath = statePath;
+            slot.stateMtimeNs = stateMtimeNs;
             slot.parameterSignature = parameterSignature;
             slot.fxChainSignature = fxChainSignature;
             slot.plugin = std::move(instance);
@@ -4941,6 +4960,11 @@ private:
             slot.plugin->releaseResources();
         }
         slot.plugin.reset();
+        slot.name.clear();
+        slot.pluginPath.clear();
+        slot.statePath.clear();
+        slot.stateMtimeNs = 0;
+        slot.parameterSignature.clear();
     }
 
     void releaseAudioEngineTrack(AudioEngineTrack& track)
@@ -4958,6 +4982,12 @@ private:
         track.notes.clear();
         track.audioClips.clear();
         track.automationLanes.clear();
+        track.name.clear();
+        track.pluginPath.clear();
+        track.statePath.clear();
+        track.stateMtimeNs = 0;
+        track.parameterSignature.clear();
+        track.fxChainSignature.clear();
         track.baseVolume = 1.0f;
         track.basePan = 0.0f;
         track.baseOutputGainDb = 0.0f;
@@ -5397,6 +5427,9 @@ private:
                 : AudioEngineTrackKind::instrument;
             const auto pluginPath = normaliseVst3PathForSettings(trackObject->getProperty("plugin_path").toString().trim());
             const auto statePath = trackObject->getProperty("state_path").toString().trim();
+            const auto stateMtimeNs = trackObject->hasProperty("state_mtime_ns")
+                ? static_cast<int64_t>(static_cast<double>(trackObject->getProperty("state_mtime_ns")))
+                : int64_t(0);
             const auto parameterSignature = parameterPayloadSignature(trackObject->getProperty("parameters"));
             const auto fxChainSignature = graphEffectChainPayloadSignature(trackObject->getProperty("fx_chain"));
             const auto name = trackObject->hasProperty("name")
@@ -5520,6 +5553,7 @@ private:
 
             const auto canReuse = track.kind == requestedKind
                 && track.statePath == statePath
+                && (keepTransportRunning || track.stateMtimeNs == stateMtimeNs)
                 && track.parameterSignature == parameterSignature
                 && track.fxChainSignature == fxChainSignature
                 && (
@@ -5557,6 +5591,7 @@ private:
 
                     track.pluginPath = pluginPath;
                     track.statePath = statePath;
+                    track.stateMtimeNs = stateMtimeNs;
                     track.parameterSignature = parameterSignature;
                     track.fxChainSignature = fxChainSignature;
                     track.plugin = std::move(instance);
@@ -5565,6 +5600,7 @@ private:
                 {
                     track.pluginPath = {};
                     track.statePath = statePath;
+                    track.stateMtimeNs = stateMtimeNs;
                     track.parameterSignature = parameterSignature;
                     track.fxChainSignature = fxChainSignature;
                 }
