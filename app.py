@@ -11912,9 +11912,8 @@ class MainWindow(QtWidgets.QMainWindow):
         row_set = {int(row) for row in (changed_rows or set()) if int(row) >= 0}
         if not row_set:
             return False
-        engine_rows = list(getattr(self, '_native_audio_engine_track_rows', []) or [])
         for row in row_set:
-            if int(row) not in engine_rows or row < 0 or row >= len(self.project.tracks):
+            if row < 0 or row >= len(self.project.tracks):
                 return False
             track = self.project.tracks[int(row)]
             if track.track_type != 'instrument':
@@ -11939,6 +11938,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if bridge is None or self._native_audio_engine_client(bridge) is None:
             return False
         row_set = sorted({int(row) for row in (changed_rows or set()) if int(row) >= 0})
+        engine_rows = list(getattr(self, '_native_audio_engine_track_rows', []) or [])
+        if any(int(row) not in engine_rows for row in row_set):
+            if not self._refresh_active_native_audio_engine_tracks(preserve_transport=True):
+                return False
+            engine_rows = list(getattr(self, '_native_audio_engine_track_rows', []) or [])
+            if any(int(row) not in engine_rows for row in row_set):
+                return False
         for row in row_set:
             track = self.project.tracks[int(row)] if 0 <= int(row) < len(self.project.tracks) else None
             if track is None:
@@ -13420,6 +13426,48 @@ class MainWindow(QtWidgets.QMainWindow):
         self._cache_native_output_status(bridge, status)
         self._native_audio_engine_running = bool(status.get('audio_engine_running', self._native_audio_engine_running))
         self._native_audio_engine_position_frame = int(status.get('audio_engine_position_frame', self._native_audio_engine_position_frame) or 0)
+        return True
+
+    def _refresh_active_native_audio_engine_tracks(self, *, preserve_transport: bool = True) -> bool:
+        if not self._native_audio_engine_active():
+            return False
+        bridge = getattr(self, '_native_output_bridge', None)
+        client = self._native_audio_engine_client(bridge)
+        if bridge is None or client is None:
+            return False
+
+        candidate_tracks = self._native_audio_engine_candidates()
+        payload_tracks = self._build_native_audio_engine_payload_tracks(candidate_tracks)
+        loop_start_tick, loop_end_tick = self._loop_tick_bounds() if self.project.loop_enabled else (0, 0)
+        try:
+            status = client.set_tracks(
+                payload_tracks,
+                bpm=float(max(1, self.project.bpm)),
+                ticks_per_beat=TICKS_PER_BEAT,
+                loop_enabled=bool(self.project.loop_enabled),
+                loop_start_tick=int(loop_start_tick),
+                loop_end_tick=int(loop_end_tick),
+                metronome_enabled=bool(getattr(self.project, 'metronome_enabled', False)),
+                preserve_transport=bool(preserve_transport),
+            )
+        except Exception:
+            _APP_LOGGER.exception("Failed refreshing active native audio engine track list")
+            return False
+
+        if preserve_transport and not bool(status.get('audio_engine_running', False)):
+            _APP_LOGGER.warning("Active native audio engine track refresh lost running transport")
+            return False
+
+        self._native_audio_engine_track_rows = [int(row) for row, _track, _entry in candidate_tracks]
+        self._cache_native_output_status(bridge, status)
+        self._native_audio_engine_running = bool(status.get('audio_engine_running', self._native_audio_engine_running))
+        self._native_audio_engine_position_frame = int(
+            status.get('audio_engine_position_frame', self._native_audio_engine_position_frame) or 0
+        )
+        self._playback_frame_position = int(self._native_audio_engine_position_frame)
+        self._playback_logical_origin_frame = int(self._native_audio_engine_position_frame)
+        self._set_native_track_meter_levels(self._native_audio_engine_track_peak_levels(status))
+        self._update_track_meter_levels(self._native_track_meter_levels)
         return True
 
     def _seek_active_native_audio_engine(self, start_tick: int) -> bool:
@@ -23206,6 +23254,10 @@ class MainWindow(QtWidgets.QMainWindow):
             refresh_sample_timeline=True,
             refresh_arrangement=True,
         )
+        if bool(hasattr(self, 'playback_timer') and self.playback_timer.isActive()) and self._native_audio_engine_active():
+            entry = self._native_instrument_entry_for_track(state)
+            if entry is not None and self._track_can_use_native_audio_engine(state, entry):
+                self._refresh_active_native_audio_engine_tracks(preserve_transport=True)
 
     @staticmethod
     def _duplicate_track_state(source: TrackState, duplicate_number: int) -> TrackState:

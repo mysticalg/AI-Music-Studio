@@ -1589,6 +1589,8 @@ private:
                 ? static_cast<int64_t>(static_cast<double>(object->getProperty("loop_end_tick"))) : int64_t(0);
             const auto metronomeEnabled = object->hasProperty("metronome_enabled")
                 ? static_cast<bool>(object->getProperty("metronome_enabled")) : false;
+            const auto preserveTransport = object->hasProperty("preserve_transport")
+                ? static_cast<bool>(object->getProperty("preserve_transport")) : false;
 
             juce::Array<juce::var> trackErrors;
             juce::String error;
@@ -1602,6 +1604,7 @@ private:
                         loopStartTick,
                         loopEndTick,
                         metronomeEnabled,
+                        preserveTransport,
                         trackErrors,
                         error))
                 {
@@ -5242,6 +5245,7 @@ private:
                               int64_t loopStartTick,
                               int64_t loopEndTick,
                               bool metronomeEnabled,
+                              bool preserveTransport,
                               juce::Array<juce::var>& trackErrors,
                               juce::String& error)
     {
@@ -5253,6 +5257,11 @@ private:
             return false;
         }
 
+        const auto sampleRate = juce::jmax(1.0, currentSampleRate);
+        const auto preserveRunningState = preserveTransport && audioEngine.running;
+        const auto preservedTick = preserveRunningState
+            ? audioEngine.frameToTickDouble(audioEngine.positionFrame, sampleRate)
+            : 0.0;
         const auto shouldPrepare = currentSampleRate > 0.0 && currentBlockSize > 0;
         if (shouldPrepare)
             releaseAudioEngineResources();
@@ -5572,6 +5581,22 @@ private:
 
         if (shouldPrepare)
             prepareAudioEngineForPlayback();
+
+        if (preserveRunningState)
+        {
+            auto targetFrame = audioEngine.tickToFrame(static_cast<int64_t>(std::llround(preservedTick)), sampleRate);
+            const auto loopStartFrame = audioEngine.tickToFrame(audioEngine.loopStartTick, sampleRate);
+            const auto loopEndFrame = audioEngine.tickToFrame(audioEngine.loopEndTick, sampleRate);
+            if (audioEngine.loopEnabled && loopEndFrame > loopStartFrame
+                && (targetFrame < loopStartFrame || targetFrame >= loopEndFrame))
+            {
+                targetFrame = loopStartFrame;
+            }
+
+            audioEngine.positionFrame = juce::jmax<int64_t>(0, targetFrame);
+            audioEngine.running = true;
+            audioEngine.bootstrapPending = true;
+        }
 
         return true;
     }
