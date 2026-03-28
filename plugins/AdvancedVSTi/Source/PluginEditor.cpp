@@ -3935,7 +3935,7 @@ std::vector<AdvancedVSTiAudioProcessorEditor::ChoiceSpec> AdvancedVSTiAudioProce
     if (name.contains ("303"))
     {
         specs.push_back ({ "OSCTYPE", "Waveform", "Switch the acid core source", { "Sine", "Saw", "Square", "Noise", "Sample" }, {}, false, 0 });
-        specs.push_back ({ "FILTERTYPE", "Filter Mode", "Tribute panel with modern filter options", { "LP", "BP", "HP", "Notch" }, {}, false, 0 });
+        specs.push_back ({ "FILTERTYPE", "Filter Mode", "Tribute panel with modern filter options", { "Off", "LP", "BP", "HP", "Notch" }, {}, false, 0 });
         specs.push_back ({ "FILTERSLOPE", "Slope", "Acid roll-off steepness", { "12 dB", "16 dB", "24 dB" }, {}, false, 0 });
         return specs;
     }
@@ -3943,7 +3943,7 @@ std::vector<AdvancedVSTiAudioProcessorEditor::ChoiceSpec> AdvancedVSTiAudioProce
     if (name.contains ("string"))
     {
         specs.push_back ({ "OSCTYPE", "Oscillator", "Core ensemble source", { "Sine", "Saw", "Square", "Noise", "Sample" }, {}, false, 0 });
-        specs.push_back ({ "FILTERTYPE", "Filter", "Main timbre curve", { "LP", "BP", "HP", "Notch" }, {}, false, 0 });
+        specs.push_back ({ "FILTERTYPE", "Filter", "Main timbre curve", { "Off", "LP", "BP", "HP", "Notch" }, {}, false, 0 });
         specs.push_back ({ "FILTERSLOPE", "Slope", "Filter roll-off", { "12 dB", "16 dB", "24 dB" }, {}, false, 0 });
         specs.push_back ({ "FXTYPE", "FX Type", "Insert color", { "Off", "Distortion", "Character", "Chorus", "Phaser", "Flanger", "Ring Mod", "Freq Shift" }, {}, false, 0 });
         return specs;
@@ -3952,7 +3952,7 @@ std::vector<AdvancedVSTiAudioProcessorEditor::ChoiceSpec> AdvancedVSTiAudioProce
     if (name.contains ("sampler"))
     {
         specs.push_back ({ "SAMPLEBANK", "Source", "Generated sample bank", { "Dusty Keys", "Tape Choir", "Velvet Pluck", "Vox Chop", "Sub Stab", "Glass Bell" }, {}, false, 0 });
-        specs.push_back ({ "FILTERTYPE", "Filter", "Playback filter curve", { "LP", "BP", "HP", "Notch" }, {}, false, 0 });
+        specs.push_back ({ "FILTERTYPE", "Filter", "Playback filter curve", { "Off", "LP", "BP", "HP", "Notch" }, {}, false, 0 });
         specs.push_back ({ "FILTERSLOPE", "Slope", "Playback roll-off", { "12 dB", "16 dB", "24 dB" }, {}, false, 0 });
         return specs;
     }
@@ -3965,7 +3965,7 @@ std::vector<AdvancedVSTiAudioProcessorEditor::ChoiceSpec> AdvancedVSTiAudioProce
     }
 
     specs.push_back ({ "OSCTYPE", "Oscillator", "Core harmonic source", { "Sine", "Saw", "Square", "Noise", "Sample" }, {}, false, 0 });
-    specs.push_back ({ "FILTERTYPE", "Filter", "Main timbre curve", { "LP", "BP", "HP", "Notch" }, {}, false, 0 });
+    specs.push_back ({ "FILTERTYPE", "Filter", "Main timbre curve", { "Off", "LP", "BP", "HP", "Notch" }, {}, false, 0 });
     specs.push_back ({ "FILTERSLOPE", "Slope", "Filter roll-off", { "12 dB", "16 dB", "24 dB" }, {}, false, 0 });
     return specs;
 }

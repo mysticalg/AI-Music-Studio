@@ -8,7 +8,7 @@
 namespace
 {
 constexpr float twoPi = juce::MathConstants<float>::twoPi;
-constexpr int pluginStateVersion = 3;
+constexpr int pluginStateVersion = 4;
 constexpr std::array<const char*, 15> drumVoiceLevelParamIds {
     "DRUMLEVEL_KICK",
     "DRUMLEVEL_SNARE",
@@ -1081,7 +1081,7 @@ constexpr std::array<float, 6> drum808VoiceDecayDefaults {
     0.72f, 0.62f, 0.58f, 0.54f, 0.28f, 0.74f
 };
 
-bool migrateLegacyDrumFilterChoice (juce::ValueTree state)
+bool migrateLegacyFilterChoiceWithInsertedOffState (juce::ValueTree state)
 {
     if (! state.isValid())
         return false;
@@ -1102,7 +1102,7 @@ bool migrateLegacyDrumFilterChoice (juce::ValueTree state)
 
     for (int index = 0; index < state.getNumChildren(); ++index)
     {
-        if (migrateLegacyDrumFilterChoice (state.getChild (index)))
+        if (migrateLegacyFilterChoiceWithInsertedOffState (state.getChild (index)))
             return true;
     }
 
@@ -3185,10 +3185,10 @@ void AdvancedVSTiAudioProcessor::updateRenderParameters()
     renderParams.fxType = paramIndex (apvts, "FXTYPE");
     renderParams.osc3Type = static_cast<int> (OscType::square);
     renderParams.masterLevel = 1.0f;
-    if constexpr (isDrumFlavor())
-        renderParams.filterType = juce::jlimit (0, 4, paramIndex (apvts, "FILTERTYPE"));
-    else
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
         renderParams.filterType = juce::jlimit (0, 3, paramIndex (apvts, "FILTERTYPE"));
+    else
+        renderParams.filterType = juce::jlimit (0, 4, paramIndex (apvts, "FILTERTYPE"));
 
     if constexpr (buildFlavor() == InstrumentFlavor::advanced)
         renderParams.masterLevel = paramValue (apvts, "MASTERLEVEL");
@@ -3482,7 +3482,18 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     reverb.setParameters (reverbParams);
 
     bool bypassFilter = false;
-    if constexpr (isDrumFlavor())
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+    {
+        leftFilter.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (renderParams.filterType));
+        rightFilter.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (renderParams.filterType));
+        leftFilterCascade.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (renderParams.filterType));
+        rightFilterCascade.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (renderParams.filterType));
+        leftFilter2.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (juce::jlimit (0, 3, renderParams.filter2Type)));
+        rightFilter2.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (juce::jlimit (0, 3, renderParams.filter2Type)));
+        leftFilter2Cascade.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (juce::jlimit (0, 3, renderParams.filter2Type)));
+        rightFilter2Cascade.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (juce::jlimit (0, 3, renderParams.filter2Type)));
+    }
+    else
     {
         bypassFilter = renderParams.filterType == 0;
         if (! bypassFilter)
@@ -3493,17 +3504,6 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
             leftFilterCascade.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (filterMode));
             rightFilterCascade.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (filterMode));
         }
-    }
-    else
-    {
-        leftFilter.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (renderParams.filterType));
-        rightFilter.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (renderParams.filterType));
-        leftFilterCascade.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (renderParams.filterType));
-        rightFilterCascade.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (renderParams.filterType));
-        leftFilter2.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (juce::jlimit (0, 3, renderParams.filter2Type)));
-        rightFilter2.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (juce::jlimit (0, 3, renderParams.filter2Type)));
-        leftFilter2Cascade.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (juce::jlimit (0, 3, renderParams.filter2Type)));
-        rightFilter2Cascade.setType (static_cast<juce::dsp::StateVariableTPTFilterType> (juce::jlimit (0, 3, renderParams.filter2Type)));
     }
 
     if (arpWasEnabled && ! renderParams.arpEnabled)
@@ -3993,11 +3993,16 @@ void AdvancedVSTiAudioProcessor::setStateInformation (const void* data, int size
     if (xmlState != nullptr && xmlState->hasTagName (apvts.state.getType()))
     {
         auto restoredState = juce::ValueTree::fromXml (*xmlState);
+        const auto savedStateVersion = static_cast<int> (restoredState.getProperty ("STATE_VERSION", 1));
         if constexpr (isDrumFlavor())
         {
-            const auto savedStateVersion = static_cast<int> (restoredState.getProperty ("STATE_VERSION", 1));
+            if (savedStateVersion < 3)
+                migrateLegacyFilterChoiceWithInsertedOffState (restoredState);
+        }
+        else if constexpr (buildFlavor() != InstrumentFlavor::advanced)
+        {
             if (savedStateVersion < pluginStateVersion)
-                migrateLegacyDrumFilterChoice (restoredState);
+                migrateLegacyFilterChoiceWithInsertedOffState (restoredState);
         }
 
         const juce::ScopedValueSetter<bool> suppress (suppressPresetCallback, true);
@@ -4559,10 +4564,10 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("FILTRELEASE", "Filter Release", 0.001f, 10.0f, filtReleaseDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("ENVCURVE", "Envelope Curve", -1.0f, 1.0f, envCurveDefault));
 
-    if constexpr (isDrumFlavor())
-        params.push_back (std::make_unique<juce::AudioParameterChoice> ("FILTERTYPE", "Filter Type", juce::StringArray { "Off", "LP", "BP", "HP", "Notch" }, filterTypeDefault));
-    else
+    if constexpr (buildFlavor() == InstrumentFlavor::advanced)
         params.push_back (std::make_unique<juce::AudioParameterChoice> ("FILTERTYPE", "Filter Type", juce::StringArray { "LP", "BP", "HP", "Notch" }, filterTypeDefault));
+    else
+        params.push_back (std::make_unique<juce::AudioParameterChoice> ("FILTERTYPE", "Filter Type", juce::StringArray { "Off", "LP", "BP", "HP", "Notch" }, filterTypeDefault));
     params.push_back (std::make_unique<juce::AudioParameterChoice> ("FILTER2TYPE", "Filter 2 Type", juce::StringArray { "LP", "BP", "HP", "Notch" }, filter2TypeDefault));
     if constexpr (buildFlavor() == InstrumentFlavor::advanced)
     {
@@ -4763,6 +4768,8 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
     setParameterActual ("ARPGATE", 0.85f);
     setParameterActual ("LFO1RATE", 0.1f);
     setParameterActual ("LFO2RATE", 0.1f);
+    if constexpr (buildFlavor() != InstrumentFlavor::advanced && ! isDrumFlavor())
+        setParameterActual ("FILTERTYPE", 0.0f);
     if constexpr (buildFlavor() == InstrumentFlavor::advanced)
     {
         setParameterActual ("LFO1ENVMODE", 0.0f);
