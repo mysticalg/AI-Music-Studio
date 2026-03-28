@@ -8948,7 +8948,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 if idx in sample_track_rows:
                     candidates.append((idx, track, None))
                 continue
-            if track.track_type != 'instrument' or not track.notes:
+            if track.track_type != 'instrument':
                 continue
             entry = self._native_instrument_entry_for_track(track)
             if entry is not None and self._track_can_use_native_audio_engine(track, entry):
