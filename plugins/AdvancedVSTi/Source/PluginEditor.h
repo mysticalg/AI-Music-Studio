@@ -283,7 +283,7 @@ private:
     std::unique_ptr<juce::MidiKeyboardComponent> virusKeyboard;
     juce::Image virusTemplateImage;
     juce::Image backgroundImage;
-    bool virusShowBackground = true;
+    bool virusShowBackground = false;
     bool virusKeyboardVisible = false;
     int virusMatrixSlotIndex = 0;
     int virusMatrixTargetIndex = 0;

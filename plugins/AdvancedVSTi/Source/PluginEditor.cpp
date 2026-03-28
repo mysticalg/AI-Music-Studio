@@ -1426,7 +1426,7 @@ AdvancedVSTiAudioProcessorEditor::AdvancedVSTiAudioProcessorEditor (AdvancedVSTi
     if (isTributeVirus())
     {
         virusTemplateImage = juce::ImageCache::getFromMemory (BinaryData::virus_jpg, BinaryData::virus_jpgSize);
-        virusShowBackground = virusTemplateImage.isValid();
+        virusShowBackground = false;
         startTimerHz (15);
     }
     else if (audioProcessor.isVec1DrumPadFlavor())
