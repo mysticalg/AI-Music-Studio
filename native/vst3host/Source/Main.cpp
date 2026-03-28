@@ -490,6 +490,7 @@ public:
                 || command == "queue_audio" || command == "clear_audio_queue"
                 || command == "start_audio_stream"
                 || command == "set_audio_engine_transport"
+                || command == "set_audio_engine_track_audibility"
                 || command == "set_audio_engine_track_notes"
                 || command == "set_audio_engine_track_parameters"
                 || command == "set_audio_engine_track_state"
@@ -815,6 +816,7 @@ private:
         bool noteBootstrapPending = false;
         std::vector<AudioEngineAudioClip> audioClips;
         std::vector<AudioEngineAutomationLane> automationLanes;
+        bool audible = true;
         float baseVolume = 1.0f;
         float basePan = 0.0f;
         float baseOutputGainDb = 0.0f;
@@ -1700,6 +1702,45 @@ private:
             auto response = makeResponse(true, "Audio engine track notes updated");
             appendStatusFields(response);
             setResponseField(response, "note_count", static_cast<int>(track.notes.size()));
+            return response;
+        }
+
+        if (command == "set_audio_engine_track_audibility")
+        {
+            auto* updatesArray = object->getProperty("updates").getArray();
+            if (updatesArray == nullptr)
+                return makeResponse(false, "set_audio_engine_track_audibility requires an updates array");
+
+            juce::ScopedLock lock(pluginLock);
+            int updatedCount = 0;
+            for (const auto& updateVar : *updatesArray)
+            {
+                auto* updateObject = updateVar.getDynamicObject();
+                if (updateObject == nullptr)
+                    continue;
+
+                const auto trackIndex = static_cast<int>(updateObject->hasProperty("track_index")
+                    ? updateObject->getProperty("track_index") : juce::var(-1));
+                if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(audioEngine.tracks.size())))
+                    continue;
+
+                auto& track = audioEngine.tracks[static_cast<size_t>(trackIndex)];
+                const auto newAudible = !updateObject->hasProperty("audible")
+                    || static_cast<bool>(updateObject->getProperty("audible"));
+                if (track.audible == newAudible)
+                    continue;
+
+                track.audible = newAudible;
+                track.peakLevel = 0.0f;
+                resetAudioEngineTrackProcessingState(track);
+                track.noteBootstrapPending = newAudible && audioEngine.running
+                    && track.kind == AudioEngineTrackKind::instrument;
+                ++updatedCount;
+            }
+
+            auto response = makeResponse(true, "Audio engine track audibility updated");
+            appendStatusFields(response);
+            setResponseField(response, "updated_count", updatedCount);
             return response;
         }
 
@@ -4864,6 +4905,7 @@ private:
         track.noteBootstrapPending = false;
         track.audioClips.clear();
         track.automationLanes.clear();
+        track.audible = true;
         track.baseVolume = 1.0f;
         track.basePan = 0.0f;
         track.baseOutputGainDb = 0.0f;
@@ -5547,6 +5589,8 @@ private:
                 ? std::move(audioClips)
                 : std::vector<AudioEngineAudioClip>{};
             track.automationLanes = std::move(automationLanes);
+            track.audible = !trackObject->hasProperty("audible")
+                || static_cast<bool>(trackObject->getProperty("audible"));
             track.baseVolume = baseVolume;
             track.basePan = pan;
             track.baseOutputGainDb = outputGainDb;
@@ -5695,6 +5739,12 @@ private:
             {
                 track.stereoBuffer.setSize(2, chunkSamples, false, false, true);
                 track.stereoBuffer.clear();
+                if (!track.audible)
+                {
+                    track.peakLevel = 0.0f;
+                    track.noteBootstrapPending = false;
+                    continue;
+                }
                 const auto trackBootstrapActive = bootstrapActive || track.noteBootstrapPending;
                 if (track.kind == AudioEngineTrackKind::instrument)
                 {

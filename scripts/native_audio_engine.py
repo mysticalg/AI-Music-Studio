@@ -73,6 +73,15 @@ class NativeAudioEngineClient:
             reset_processing=bool(reset_processing),
         )
 
+    def update_track_audibility(
+        self,
+        updates: list[dict[str, object]],
+    ) -> dict[str, Any]:
+        return self.bridge.command(
+            "set_audio_engine_track_audibility",
+            updates=list(updates),
+        )
+
     def stop(self) -> dict[str, Any]:
         return self.bridge.command("stop_audio_engine")
 
