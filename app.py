@@ -19911,12 +19911,14 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> list[dict[str, object]]:
         payload_tracks: list[dict[str, object]] = []
         sample_rate = max(1, int(self._playback_sample_rate))
+        solo_tracks = self._active_solo_track_indices()
         for idx, track, entry in tracks:
             payload_track: dict[str, object] = {
                 'name': str(track.name or (entry.name if entry is not None else f'Track {idx + 1}')),
                 'volume': float(track.volume),
                 'output_gain_db': float(track.vsti_output_gain_db),
                 'pan': float(clamp(float(track.pan), -1.0, 1.0)),
+                'audible': bool(self._track_is_audible(int(idx), solo_tracks)),
             }
             if entry is not None and self._track_can_use_native_audio_engine(track, entry):
                 state_path = self._effective_vsti_state_path(track, entry)
@@ -23458,7 +23460,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._schedule_selected_track_panel_refresh(row)
         current_audible = self._track_is_audible(row, self._active_solo_track_indices())
         changed_rows = {int(row)} if previous_audible != current_audible else set()
-        if previous_audible and not current_audible:
+        if previous_audible and not current_audible and not self._native_audio_engine_active():
             graph_rows = self._graph_native_transport_row_set() if self._graph_native_transport_active() else set()
             if int(row) not in graph_rows:
                 self._force_note_off_for_track(row)
@@ -23485,7 +23487,11 @@ class MainWindow(QtWidgets.QMainWindow):
             if previous_audible_map.get(idx, False) != self._track_is_audible(idx, solo_tracks)
         }
         for idx in range(len(self.project.tracks)):
-            if idx in changed_rows and not self._track_is_audible(idx, solo_tracks):
+            if (
+                not self._native_audio_engine_active()
+                and idx in changed_rows
+                and not self._track_is_audible(idx, solo_tracks)
+            ):
                 if int(idx) not in graph_rows:
                     self._force_note_off_for_track(idx)
         rows_to_refresh = set(changed_rows)
@@ -23572,11 +23578,65 @@ class MainWindow(QtWidgets.QMainWindow):
         self.instruments.load_track()
         self.automation_editor.load_track()
 
+    def _try_live_safe_active_native_audio_engine_audibility_refresh(
+        self,
+        changed_rows: set[int] | None = None,
+    ) -> bool:
+        if not bool(hasattr(self, 'playback_timer') and self.playback_timer.isActive()):
+            return False
+        if not self._native_audio_engine_active():
+            return False
+        bridge = getattr(self, '_native_output_bridge', None)
+        client = self._native_audio_engine_client(bridge)
+        if bridge is None or client is None:
+            return False
+
+        changed_row_set = {int(row) for row in (changed_rows or set()) if int(row) >= 0}
+        if not changed_row_set:
+            return False
+
+        active_rows = [int(row) for row in (getattr(self, '_native_audio_engine_track_rows', []) or []) if int(row) >= 0]
+        if not active_rows:
+            return False
+
+        row_to_engine_index = {int(row): int(index) for index, row in enumerate(active_rows)}
+        solo_tracks = self._active_solo_track_indices()
+        for row in changed_row_set:
+            if row not in row_to_engine_index and self._track_is_audible(row, solo_tracks):
+                return False
+
+        updated = False
+        try:
+            for row in sorted(changed_row_set):
+                engine_index = row_to_engine_index.get(int(row))
+                if engine_index is None or row < 0 or row >= len(self.project.tracks):
+                    continue
+                track = self.project.tracks[int(row)]
+                client.set_track_mix(
+                    int(engine_index),
+                    volume=float(track.volume),
+                    output_gain_db=float(track.vsti_output_gain_db),
+                    pan=float(clamp(float(track.pan), -1.0, 1.0)),
+                    audible=bool(self._track_is_audible(int(row), solo_tracks)),
+                )
+                updated = True
+        except Exception:
+            _APP_LOGGER.exception("Failed live-refreshing native audio engine audibility state")
+            return False
+
+        if not updated:
+            return False
+
+        self._cancel_pending_transport_reprepare()
+        return True
+
     def _restart_native_transport_for_audibility_change(self, changed_rows: set[int] | None = None) -> None:
         if not hasattr(self, 'playback_timer') or not self.playback_timer.isActive():
             return
         changed_row_set = {int(row) for row in (changed_rows or set()) if int(row) >= 0}
         if self._native_audio_engine_active():
+            if self._try_live_safe_active_native_audio_engine_audibility_refresh(changed_row_set):
+                return
             if self._try_live_safe_active_native_audio_engine_refresh(changed_row_set):
                 return
             self._schedule_transport_reprepare(reason='audibility change', delay_ms=0)

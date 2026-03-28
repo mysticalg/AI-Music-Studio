@@ -747,6 +747,7 @@ private:
         float baseVolume = 1.0f;
         float basePan = 0.0f;
         float baseOutputGainDb = 0.0f;
+        bool audible = true;
         float peakLevel = 0.0f;
         juce::AudioBuffer<float> processBuffer;
         juce::AudioBuffer<float> stereoBuffer;
@@ -1659,6 +1660,34 @@ private:
             auto response = makeResponse(true, "Audio engine track notes updated");
             setResponseField(response, "track_index", trackIndex);
             setResponseField(response, "note_count", noteCount);
+            return response;
+        }
+
+        if (command == "set_audio_engine_track_mix_state")
+        {
+            const auto trackIndex = static_cast<int>(object->hasProperty("track_index")
+                ? object->getProperty("track_index") : juce::var(-1));
+            const auto volume = object->hasProperty("volume")
+                ? static_cast<float>(static_cast<double>(object->getProperty("volume")))
+                : 1.0f;
+            const auto outputGainDb = object->hasProperty("output_gain_db")
+                ? static_cast<float>(static_cast<double>(object->getProperty("output_gain_db")))
+                : 0.0f;
+            const auto pan = object->hasProperty("pan")
+                ? static_cast<float>(static_cast<double>(object->getProperty("pan")))
+                : 0.0f;
+            const auto audible = !object->hasProperty("audible")
+                || static_cast<bool>(object->getProperty("audible"));
+
+            juce::String error;
+            {
+                juce::ScopedLock lock(pluginLock);
+                if (!updateAudioEngineTrackMixState(trackIndex, volume, outputGainDb, pan, audible, error))
+                    return makeResponse(false, error.isNotEmpty() ? error : "Could not update audio engine track mix");
+            }
+
+            auto response = makeResponse(true, "Audio engine track mix updated");
+            setResponseField(response, "track_index", trackIndex);
             return response;
         }
 
@@ -5010,6 +5039,7 @@ private:
         track.baseVolume = 1.0f;
         track.basePan = 0.0f;
         track.baseOutputGainDb = 0.0f;
+        track.audible = true;
         track.processBuffer.setSize(0, 0);
         track.stereoBuffer.setSize(0, 0);
         track.peakLevel = 0.0f;
@@ -5181,6 +5211,11 @@ private:
     {
         if (stereoBuffer.getNumSamples() <= 0)
             return;
+        if (!track.audible)
+        {
+            stereoBuffer.clear();
+            return;
+        }
 
         const AudioEngineAutomationLane* volumeLane = nullptr;
         const AudioEngineAutomationLane* panLane = nullptr;
@@ -5511,6 +5546,8 @@ private:
             const auto outputGainDb = trackObject->hasProperty("output_gain_db")
                 ? static_cast<float>(static_cast<double>(trackObject->getProperty("output_gain_db")))
                 : 0.0f;
+            const auto audible = !trackObject->hasProperty("audible")
+                || static_cast<bool>(trackObject->getProperty("audible"));
 
             auto notes = parseAudioEngineTrackNotes(trackObject->getProperty("notes"));
 
@@ -5748,6 +5785,7 @@ private:
             track.baseVolume = baseVolume;
             track.basePan = pan;
             track.baseOutputGainDb = outputGainDb;
+            track.audible = audible;
             track.peakLevel = 0.0f;
             if (shouldPrepare && !canReuse)
                 prepareAudioEngineTrackForPlayback(track);
@@ -5839,6 +5877,27 @@ private:
 
         track.notes = parseAudioEngineTrackNotes(notesVar);
         noteCount = static_cast<int>(track.notes.size());
+        return true;
+    }
+
+    bool updateAudioEngineTrackMixState(int trackIndex,
+                                        float volume,
+                                        float outputGainDb,
+                                        float pan,
+                                        bool audible,
+                                        juce::String& error)
+    {
+        if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(audioEngine.tracks.size())))
+        {
+            error = "Invalid audio engine track index";
+            return false;
+        }
+
+        auto& track = audioEngine.tracks[static_cast<size_t>(trackIndex)];
+        track.baseVolume = juce::jmax(0.0f, volume);
+        track.baseOutputGainDb = outputGainDb;
+        track.basePan = juce::jlimit(-1.0f, 1.0f, pan);
+        track.audible = audible;
         return true;
     }
 

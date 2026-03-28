@@ -42,6 +42,24 @@ class NativeAudioEngineClient:
             notes=list(notes),
         )
 
+    def set_track_mix(
+        self,
+        track_index: int,
+        *,
+        volume: float,
+        output_gain_db: float,
+        pan: float,
+        audible: bool,
+    ) -> dict[str, Any]:
+        return self.bridge.command(
+            "set_audio_engine_track_mix_state",
+            track_index=int(track_index),
+            volume=float(volume),
+            output_gain_db=float(output_gain_db),
+            pan=float(pan),
+            audible=bool(audible),
+        )
+
     def play(self, start_tick: int = 0) -> dict[str, Any]:
         return self.bridge.command("start_audio_engine", start_tick=int(start_tick))
 
