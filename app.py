@@ -6729,8 +6729,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._pending_playback_start_retry_timer.setSingleShot(True)
         self._pending_playback_start_retry_timer.setInterval(40)
         self._pending_playback_start_retry_timer.timeout.connect(self._flush_pending_playback_start_retry)
-        if self._native_output_bridge_supported():
-            self._begin_async_native_output_bridge_warm()
         self._deferred_playback_stop_cleanup: dict[str, object] | None = None
         self._deferred_playback_stop_cleanup_token = 0
         self._playback_stop_cleanup_timer = QtCore.QTimer(self)
@@ -6949,6 +6947,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._setup_shortcuts()
         self._populate_track_list()
         self.track_list.setCurrentRow(0)
+        QtCore.QTimer.singleShot(0, lambda: self._prewarm_selected_native_track_for_edit(delay_ms=0))
         self.refresh_sample_library()
         self.scan_sample_paths()
         self._apply_tools_window_preferences()
@@ -11033,6 +11032,30 @@ class MainWindow(QtWidgets.QMainWindow):
         ):
             self._warm_native_vst_host_for_track(row, delay_ms=delay_ms)
             self._schedule_native_output_bridge_warm(delay_ms=delay_ms)
+
+    def _prewarm_selected_native_track_for_edit(self, *, delay_ms: int = 0) -> None:
+        row = int(self.current_track_index())
+        if row < 0 or row >= len(self.project.tracks):
+            return
+        track = self.project.tracks[row]
+        entry = self._native_instrument_entry_for_track(track)
+        if (
+            track.track_type != 'instrument'
+            or entry is None
+            or not entry.is_instrument
+            or not entry.host_supported
+            or not self._can_use_native_vst_host(entry)
+        ):
+            if self._native_output_bridge_supported():
+                self._begin_async_native_output_bridge_warm()
+            return
+        self._warm_native_vst_host_for_track(row, delay_ms=delay_ms)
+        if not (hasattr(self, 'playback_timer') and self.playback_timer.isActive()):
+            direct_candidate = self._direct_live_midi_candidate(row)
+            if direct_candidate is not None and self._native_output_bridge_supported():
+                self._begin_async_native_output_bridge_warm(direct_plugin=direct_candidate)
+            elif self._native_output_bridge_supported():
+                self._begin_async_native_output_bridge_warm()
 
     def _suspend_track_native_vst_hosts_for_transport(self) -> None:
         for timer in list(getattr(self, '_native_vst_host_warm_timers', {}).values()):
@@ -22170,17 +22193,24 @@ class MainWindow(QtWidgets.QMainWindow):
             and entry.host_supported
             and self._can_use_native_vst_host(entry)
         ):
+            direct_candidate = None
             if (
                 not (hasattr(self, 'playback_timer') and self.playback_timer.isActive())
                 and self._track_can_use_direct_native_transport(track, entry)
-                and self._trigger_live_track_note_preview(
-                    pitch,
-                    velocity,
-                    duration_tick,
-                    row=int(track_index),
-                )
             ):
-                return True
+                direct_candidate = self._direct_live_midi_candidate(int(track_index))
+                if direct_candidate is not None:
+                    direct_signature = self._native_output_bridge_target_signature(direct_candidate)
+                    if self._native_output_bridge_matches_signature(direct_signature):
+                        if self._trigger_live_track_note_preview(
+                            pitch,
+                            velocity,
+                            duration_tick,
+                            row=int(track_index),
+                        ):
+                            return True
+                    elif self._native_output_bridge_supported():
+                        self._begin_async_native_output_bridge_warm(direct_plugin=direct_candidate)
             return self._preview_note_with_native_vst_host(
                 int(track_index),
                 track,
@@ -23118,6 +23148,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._schedule_selected_track_panel_refresh(row)
         if bool(track.live_armed):
             self._schedule_native_vst_host_warm_for_row(row, delay_ms=220)
+        elif not bool(hasattr(self, 'playback_timer') and self.playback_timer.isActive()):
+            QtCore.QTimer.singleShot(0, lambda target_row=int(row): self._prewarm_selected_native_track_for_edit(delay_ms=0) if self.current_track_index() == target_row else None)
         QtCore.QTimer.singleShot(0, self._refresh_live_midi_host)
         rows_to_refresh = {int(row)}
         if previous_row != row:
@@ -23419,6 +23451,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_vsti_rack_ui()
         self.scan_sample_paths()
         self.on_notes_changed()
+        QtCore.QTimer.singleShot(0, lambda: self._prewarm_selected_native_track_for_edit(delay_ms=0))
         self._update_window_title()
 
     def on_notes_changed(self) -> None:
