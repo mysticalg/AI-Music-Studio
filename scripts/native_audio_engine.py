@@ -55,6 +55,17 @@ class NativeAudioEngineClient:
             metronome_enabled=bool(metronome_enabled),
         )
 
+    def update_track_notes(
+        self,
+        track_index: int,
+        notes: list[dict[str, object]],
+    ) -> dict[str, Any]:
+        return self.bridge.command(
+            "set_audio_engine_track_notes",
+            track_index=int(track_index),
+            notes=list(notes),
+        )
+
     def stop(self) -> dict[str, Any]:
         return self.bridge.command("stop_audio_engine")
 

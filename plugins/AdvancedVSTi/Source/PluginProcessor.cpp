@@ -6121,14 +6121,25 @@ void AdvancedVSTiAudioProcessor::handleAsyncUpdate()
 {
     const auto presetIndex = pendingPresetIndex.exchange (-1);
     const auto shouldRefreshExternalPads = pendingExternalPadReload.exchange (false);
+    bool appliedPresetChange = false;
 
     if (presetIndex >= 0)
+    {
         applyPresetByIndex (presetIndex);
+        appliedPresetChange = true;
+    }
 
     if constexpr (buildFlavor() == InstrumentFlavor::vec1DrumPad)
     {
         if (presetIndex >= 0 || shouldRefreshExternalPads)
             refreshExternalPadSamples();
+    }
+
+    if (appliedPresetChange)
+    {
+        updateHostDisplay (juce::AudioProcessorListener::ChangeDetails {}
+                               .withProgramChanged (true)
+                               .withNonParameterStateChanged (true));
     }
 }
 

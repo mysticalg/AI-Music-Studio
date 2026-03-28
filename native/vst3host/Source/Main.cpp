@@ -8,6 +8,8 @@
 #include <crtdbg.h>
 #endif
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -91,6 +93,26 @@ class HostCommandServer final : private juce::Thread
 public:
     HostCommandServer(HostComponent& ownerIn, int requestedPortIn);
     ~HostCommandServer() override;
+
+    bool startServer();
+    void stopServer();
+    int getBoundPort() const noexcept;
+
+private:
+    void run() override;
+    void handleClient(juce::StreamingSocket& client);
+
+    HostComponent& owner;
+    const int requestedPort;
+    std::atomic<int> boundPort{0};
+    std::unique_ptr<juce::StreamingSocket> listener;
+};
+
+class HostStateEventServer final : private juce::Thread
+{
+public:
+    HostStateEventServer(HostComponent& ownerIn, int requestedPortIn);
+    ~HostStateEventServer() override;
 
     bool startServer();
     void stopServer();
@@ -342,17 +364,28 @@ public:
         if (requestedCommandPort > 0)
         {
             commandServer = std::make_unique<HostCommandServer>(*this, requestedCommandPort);
-            if (commandServer->startServer())
-                statusLabel.setText("Ready  |  Command port " + juce::String(commandServer->getBoundPort()),
-                                    juce::dontSendNotification);
+            stateEventServer = std::make_unique<HostStateEventServer>(*this, 0);
+            const auto commandStarted = commandServer->startServer();
+            const auto stateEventStarted = stateEventServer->startServer();
+            if (commandStarted)
+            {
+                auto statusText = "Ready  |  Command port " + juce::String(commandServer->getBoundPort());
+                if (stateEventStarted)
+                    statusText << "  |  State events " + juce::String(stateEventServer->getBoundPort());
+                statusLabel.setText(statusText, juce::dontSendNotification);
+            }
             else
+            {
+                stateEventServer.reset();
                 statusLabel.setText("Ready  |  Command server failed", juce::dontSendNotification);
+            }
         }
     }
 
     ~HostComponent() override
     {
         persistManagedState();
+        stateEventServer.reset();
         commandServer.reset();
         if (audioInitialised)
         {
@@ -457,6 +490,7 @@ public:
                 || command == "queue_audio" || command == "clear_audio_queue"
                 || command == "start_audio_stream"
                 || command == "set_audio_engine_transport"
+                || command == "set_audio_engine_track_notes"
                 || command == "set_audio_engine_track_parameters"
                 || command == "set_audio_engine_track_state"
                 || command == "seek_audio_engine"
@@ -489,7 +523,54 @@ public:
         return commandServer != nullptr ? commandServer->getBoundPort() : 0;
     }
 
+    int getActiveStateEventPort() const noexcept
+    {
+        return stateEventServer != nullptr ? stateEventServer->getBoundPort() : 0;
+    }
+
+    int getCurrentPluginStateGeneration() const noexcept
+    {
+        return pluginStateGeneration.load(std::memory_order_relaxed);
+    }
+
+    bool isPluginLoaded() const
+    {
+        juce::ScopedLock lock(pluginLock);
+        return pluginInstance != nullptr;
+    }
+
+    int waitForPluginStateGenerationChange(int lastSeenGeneration, int timeoutMs) const
+    {
+        std::unique_lock<std::mutex> lock(pluginStateChangeMutex);
+        pluginStateChangeCondition.wait_for(
+            lock,
+            std::chrono::milliseconds(juce::jmax(1, timeoutMs)),
+            [this, lastSeenGeneration]
+            {
+                return pluginStateGeneration.load(std::memory_order_relaxed) != lastSeenGeneration;
+            });
+        return pluginStateGeneration.load(std::memory_order_relaxed);
+    }
+
 private:
+    void notifyPluginStateGenerationWaiters() const
+    {
+        pluginStateChangeCondition.notify_all();
+    }
+
+    void resetPluginStateGeneration()
+    {
+        pluginStateGeneration.store(0, std::memory_order_relaxed);
+        lastPluginStateChecksum = 0;
+        notifyPluginStateGenerationWaiters();
+    }
+
+    void incrementPluginStateGeneration() const
+    {
+        pluginStateGeneration.fetch_add(1, std::memory_order_relaxed);
+        notifyPluginStateGenerationWaiters();
+    }
+
     struct ScheduledMidiEvent
     {
         int64_t frame = 0;
@@ -731,6 +812,7 @@ private:
         std::unique_ptr<juce::AudioPluginInstance> plugin;
         std::vector<EffectSlot> fxChain;
         std::vector<AudioEngineTrackNote> notes;
+        bool noteBootstrapPending = false;
         std::vector<AudioEngineAudioClip> audioClips;
         std::vector<AudioEngineAutomationLane> automationLanes;
         float baseVolume = 1.0f;
@@ -801,7 +883,10 @@ private:
         if (command == "status")
         {
             auto response = makeResponse(true, "status");
-            appendStatusFields(response);
+            const auto skipStateProbe = static_cast<bool>(object->hasProperty("skip_state_probe")
+                ? object->getProperty("skip_state_probe")
+                : juce::var(false));
+            appendStatusFields(response, !skipStateProbe);
             return response;
         }
 
@@ -1587,6 +1672,30 @@ private:
             return response;
         }
 
+        if (command == "set_audio_engine_track_notes")
+        {
+            const auto trackIndex = static_cast<int>(object->hasProperty("track_index")
+                ? object->getProperty("track_index") : juce::var(-1));
+            const auto bootstrapActive = object->hasProperty("bootstrap_active")
+                ? static_cast<bool>(object->getProperty("bootstrap_active")) : false;
+
+            juce::ScopedLock lock(pluginLock);
+            if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(audioEngine.tracks.size())))
+                return makeResponse(false, "Invalid audio engine track index");
+
+            auto& track = audioEngine.tracks[static_cast<size_t>(trackIndex)];
+            if (track.kind != AudioEngineTrackKind::instrument || track.plugin == nullptr)
+                return makeResponse(false, "Audio engine track has no instrument loaded");
+
+            track.notes = parseAudioEngineTrackNotes(object->getProperty("notes"));
+            track.noteBootstrapPending = bootstrapActive && audioEngine.running;
+
+            auto response = makeResponse(true, "Audio engine track notes updated");
+            appendStatusFields(response);
+            setResponseField(response, "note_count", static_cast<int>(track.notes.size()));
+            return response;
+        }
+
         if (command == "set_audio_engine_track_parameters")
         {
             const auto trackIndex = static_cast<int>(object->hasProperty("track_index")
@@ -1887,6 +1996,7 @@ private:
             setResponseField(response, "sample_rate", currentSampleRate);
             setResponseField(response, "buffer_size", currentBlockSize);
             setResponseField(response, "command_port", getActiveCommandPort());
+            setResponseField(response, "state_event_port", getActiveStateEventPort());
             setResponseField(response, "bridge_mode", bridgeMode);
             setResponseField(response, "input_buses", describeBuses(true));
             setResponseField(response, "frames", frames);
@@ -1915,7 +2025,7 @@ private:
         return makeResponse(false, "Unknown command: " + command);
     }
 
-    void appendStatusFields(juce::var& response) const
+    void appendStatusFields(juce::var& response, bool includeEditorStateProbe = true) const
     {
         bool pluginIsInstrument = false;
         bool pluginIsEffect = false;
@@ -2012,21 +2122,25 @@ private:
 
         // Detect plugin state changes that don't fire audioProcessorChanged
         // by checksumming the actual state blob on each status poll.
-        // Only check when editor is open to avoid false positives from
+        // Only check when the editor is open to avoid false positives from
         // plugins that embed playback-related data in their state.
-        if (pluginInstance != nullptr && editorWindow != nullptr)
+        if (includeEditorStateProbe)
         {
-            juce::MemoryBlock stateBlock;
-            pluginInstance->getStateInformation(stateBlock);
-            uint64_t checksum = 0xcbf29ce484222325ULL; // FNV-1a offset basis
-            for (size_t i = 0; i < stateBlock.getSize(); ++i)
+            juce::ScopedLock lock(pluginLock);
+            if (pluginInstance != nullptr && editorWindow != nullptr)
             {
-                checksum ^= static_cast<uint64_t>(static_cast<const uint8_t*>(stateBlock.getData())[i]);
-                checksum *= 0x100000001b3ULL; // FNV-1a prime
+                juce::MemoryBlock stateBlock;
+                pluginInstance->getStateInformation(stateBlock);
+                uint64_t checksum = 0xcbf29ce484222325ULL; // FNV-1a offset basis
+                for (size_t i = 0; i < stateBlock.getSize(); ++i)
+                {
+                    checksum ^= static_cast<uint64_t>(static_cast<const uint8_t*>(stateBlock.getData())[i]);
+                    checksum *= 0x100000001b3ULL; // FNV-1a prime
+                }
+                if (checksum != lastPluginStateChecksum && lastPluginStateChecksum != 0)
+                    incrementPluginStateGeneration();
+                lastPluginStateChecksum = checksum;
             }
-            if (checksum != lastPluginStateChecksum && lastPluginStateChecksum != 0)
-                pluginStateGeneration.fetch_add(1, std::memory_order_relaxed);
-            lastPluginStateChecksum = checksum;
         }
 
         setResponseField(response, "state_generation", pluginStateGeneration.load(std::memory_order_relaxed));
@@ -2034,6 +2148,7 @@ private:
         setResponseField(response, "buffer_size", currentBlockSize);
         setResponseField(response, "rendered_sample_frames", static_cast<double>(renderedSampleFrames.load()));
         setResponseField(response, "command_port", getActiveCommandPort());
+        setResponseField(response, "state_event_port", getActiveStateEventPort());
         setResponseField(response, "bridge_mode", bridgeMode);
         setResponseField(response, "plugin_output_gain", pluginOutputGain.load());
         setResponseField(response, "plugin_output_pan", pluginOutputPan.load());
@@ -2400,7 +2515,7 @@ private:
     void audioProcessorParameterChanged(juce::AudioProcessor*, int, float) override {}
     void audioProcessorChanged(juce::AudioProcessor*, const juce::AudioProcessorListener::ChangeDetails&) override
     {
-        pluginStateGeneration.fetch_add(1, std::memory_order_relaxed);
+        incrementPluginStateGeneration();
     }
 
     void buttonClicked(juce::Button* button) override
@@ -3237,8 +3352,7 @@ private:
             pluginInstance = std::move(instance);
             pluginInstance->disableNonMainBuses();
             pluginInstance->addListener(this);
-            lastPluginStateChecksum = 0;
-            pluginStateGeneration.store(0, std::memory_order_relaxed);
+            resetPluginStateGeneration();
         }
 
         pathEditor.setText(pluginFile.getFullPathName(), juce::dontSendNotification);
@@ -3265,6 +3379,7 @@ private:
             juce::ScopedLock lock(pluginLock);
             pluginInstance.reset();
             pluginDescription = {};
+            resetPluginStateGeneration();
         }
         statusLabel.setText("Plugin unloaded", juce::dontSendNotification);
         updateButtons();
@@ -4739,6 +4854,7 @@ private:
             releaseAudioEngineEffectSlot(effectSlot);
         track.fxChain.clear();
         track.notes.clear();
+        track.noteBootstrapPending = false;
         track.audioClips.clear();
         track.automationLanes.clear();
         track.baseVolume = 1.0f;
@@ -5069,6 +5185,52 @@ private:
         return true;
     }
 
+    static std::vector<AudioEngineTrackNote> parseAudioEngineTrackNotes(const juce::var& notesVar)
+    {
+        std::vector<AudioEngineTrackNote> notes;
+        if (auto* notesArray = notesVar.getArray())
+        {
+            notes.reserve(static_cast<size_t>(notesArray->size()));
+            for (const auto& noteVar : *notesArray)
+            {
+                auto* noteObject = noteVar.getDynamicObject();
+                if (noteObject == nullptr)
+                    continue;
+
+                AudioEngineTrackNote note;
+                note.startTick = static_cast<int>(noteObject->hasProperty("start_tick")
+                    ? noteObject->getProperty("start_tick")
+                    : juce::var(0));
+                note.endTick = static_cast<int>(noteObject->hasProperty("end_tick")
+                    ? noteObject->getProperty("end_tick")
+                    : juce::var(note.startTick + 1));
+                note.pitch = clampMidiNote(static_cast<int>(noteObject->hasProperty("pitch")
+                    ? noteObject->getProperty("pitch")
+                    : juce::var(60)));
+                note.velocity = juce::jlimit(1, 127, static_cast<int>(noteObject->hasProperty("velocity")
+                    ? noteObject->getProperty("velocity")
+                    : juce::var(100)));
+                note.channel = clampMidiChannel(static_cast<int>(noteObject->hasProperty("channel")
+                    ? noteObject->getProperty("channel")
+                    : juce::var(kDefaultMidiChannel)));
+                note.endTick = juce::jmax(note.startTick + 1, note.endTick);
+                notes.push_back(note);
+            }
+        }
+
+        std::sort(notes.begin(), notes.end(), [](const AudioEngineTrackNote& a, const AudioEngineTrackNote& b)
+        {
+            if (a.startTick != b.startTick)
+                return a.startTick < b.startTick;
+            if (a.endTick != b.endTick)
+                return a.endTick < b.endTick;
+            if (a.channel != b.channel)
+                return a.channel < b.channel;
+            return a.pitch < b.pitch;
+        });
+        return notes;
+    }
+
     bool configureAudioEngine(const juce::var& tracksVar,
                               double bpm,
                               int ticksPerBeat,
@@ -5142,46 +5304,7 @@ private:
                 ? static_cast<float>(static_cast<double>(trackObject->getProperty("output_gain_db")))
                 : 0.0f;
 
-            std::vector<AudioEngineTrackNote> notes;
-            if (auto* notesArray = trackObject->getProperty("notes").getArray())
-            {
-                notes.reserve(static_cast<size_t>(notesArray->size()));
-                for (const auto& noteVar : *notesArray)
-                {
-                    auto* noteObject = noteVar.getDynamicObject();
-                    if (noteObject == nullptr)
-                        continue;
-
-                    AudioEngineTrackNote note;
-                    note.startTick = static_cast<int>(noteObject->hasProperty("start_tick")
-                        ? noteObject->getProperty("start_tick")
-                        : juce::var(0));
-                    note.endTick = static_cast<int>(noteObject->hasProperty("end_tick")
-                        ? noteObject->getProperty("end_tick")
-                        : juce::var(note.startTick + 1));
-                    note.pitch = clampMidiNote(static_cast<int>(noteObject->hasProperty("pitch")
-                        ? noteObject->getProperty("pitch")
-                        : juce::var(60)));
-                    note.velocity = juce::jlimit(1, 127, static_cast<int>(noteObject->hasProperty("velocity")
-                        ? noteObject->getProperty("velocity")
-                        : juce::var(100)));
-                    note.channel = clampMidiChannel(static_cast<int>(noteObject->hasProperty("channel")
-                        ? noteObject->getProperty("channel")
-                        : juce::var(kDefaultMidiChannel)));
-                    note.endTick = juce::jmax(note.startTick + 1, note.endTick);
-                    notes.push_back(note);
-                }
-            }
-            std::sort(notes.begin(), notes.end(), [](const AudioEngineTrackNote& a, const AudioEngineTrackNote& b)
-            {
-                if (a.startTick != b.startTick)
-                    return a.startTick < b.startTick;
-                if (a.endTick != b.endTick)
-                    return a.endTick < b.endTick;
-                if (a.channel != b.channel)
-                    return a.channel < b.channel;
-                return a.pitch < b.pitch;
-            });
+            auto notes = parseAudioEngineTrackNotes(trackObject->getProperty("notes"));
 
             std::vector<AudioEngineAudioClip> audioClips;
             if (requestedKind == AudioEngineTrackKind::audio)
@@ -5406,6 +5529,7 @@ private:
             track.notes = requestedKind == AudioEngineTrackKind::instrument
                 ? std::move(notes)
                 : std::vector<AudioEngineTrackNote>{};
+            track.noteBootstrapPending = false;
             track.audioClips = requestedKind == AudioEngineTrackKind::audio
                 ? std::move(audioClips)
                 : std::vector<AudioEngineAudioClip>{};
@@ -5542,6 +5666,7 @@ private:
             {
                 track.stereoBuffer.setSize(2, chunkSamples, false, false, true);
                 track.stereoBuffer.clear();
+                const auto trackBootstrapActive = bootstrapActive || track.noteBootstrapPending;
                 if (track.kind == AudioEngineTrackKind::instrument)
                 {
                     auto* plugin = track.plugin.get();
@@ -5562,7 +5687,7 @@ private:
                         chunkStartFrame,
                         chunkSamples,
                         sampleRate,
-                        bootstrapActive,
+                        trackBootstrapActive,
                         wrapAfterChunk,
                         loopEndFrame
                     );
@@ -5582,6 +5707,7 @@ private:
                 processAudioEngineEffectChain(track, track.stereoBuffer);
                 applyAudioEngineTrackMixAutomation(audioEngine, track, track.stereoBuffer, chunkStartFrame, sampleRate);
                 track.peakLevel = peakLevelForBuffer(track.stereoBuffer);
+                track.noteBootstrapPending = false;
                 buffer.addFrom(0, sampleOffset, track.stereoBuffer, 0, 0, chunkSamples);
                 buffer.addFrom(1, sampleOffset, track.stereoBuffer, 1, 0, chunkSamples);
             }
@@ -5725,6 +5851,8 @@ private:
     juce::AudioDeviceManager deviceManager;
     juce::MidiKeyboardState keyboardState;
     juce::CriticalSection pluginLock;
+    mutable std::mutex pluginStateChangeMutex;
+    mutable std::condition_variable pluginStateChangeCondition;
     juce::CriticalSection pendingMidiLock;
     juce::MidiBuffer pendingMidiMessages;
     juce::CriticalSection scheduledMidiLock;
@@ -5766,6 +5894,7 @@ private:
     int graphEditorSlotIndex = -1;
     std::unique_ptr<juce::FileChooser> fileChooser;
     std::unique_ptr<HostCommandServer> commandServer;
+    std::unique_ptr<HostStateEventServer> stateEventServer;
     bool bridgeMode = false;
     bool audioInitialised = false;
     juce::File managedStateFile;
@@ -5830,6 +5959,101 @@ void HostCommandServer::stopServer()
 int HostCommandServer::getBoundPort() const noexcept
 {
     return boundPort.load();
+}
+
+HostStateEventServer::HostStateEventServer(HostComponent& ownerIn, int requestedPortIn)
+    : juce::Thread("AI Music Studio VST Host State Event Server"),
+      owner(ownerIn),
+      requestedPort(requestedPortIn)
+{
+}
+
+HostStateEventServer::~HostStateEventServer()
+{
+    stopServer();
+}
+
+bool HostStateEventServer::startServer()
+{
+    listener = std::make_unique<juce::StreamingSocket>();
+    if (!listener->createListener(requestedPort, "127.0.0.1"))
+        return false;
+
+    boundPort = listener->getBoundPort();
+    startThread();
+    return true;
+}
+
+void HostStateEventServer::stopServer()
+{
+    signalThreadShouldExit();
+    if (listener != nullptr)
+        listener->close();
+    stopThread(2000);
+    listener.reset();
+}
+
+int HostStateEventServer::getBoundPort() const noexcept
+{
+    return boundPort.load();
+}
+
+void HostStateEventServer::run()
+{
+    while (!threadShouldExit())
+    {
+        if (listener == nullptr)
+            break;
+
+        const auto ready = listener->waitUntilReady(true, 200);
+        if (ready <= 0)
+            continue;
+
+        std::unique_ptr<juce::StreamingSocket> client(listener->waitForNextConnection());
+        if (client == nullptr)
+            continue;
+
+        {
+            int flag = 1;
+            ::setsockopt(static_cast<int>(client->getRawSocketHandle()),
+                         6, 1,
+                         reinterpret_cast<const char*>(&flag), sizeof(flag));
+        }
+
+        handleClient(*client);
+    }
+}
+
+void HostStateEventServer::handleClient(juce::StreamingSocket& client)
+{
+    auto sendEvent = [this, &client](const juce::String& eventName, int generation) -> bool
+    {
+        auto response = makeResponse(true, "Plugin state event");
+        setResponseField(response, "event", eventName);
+        setResponseField(response, "state_generation", generation);
+        setResponseField(response, "plugin_loaded", owner.isPluginLoaded());
+        setResponseField(response, "command_port", owner.getActiveCommandPort());
+        setResponseField(response, "state_event_port", owner.getActiveStateEventPort());
+        const auto responseLine = juce::JSON::toString(response, true) + "\n";
+        return client.write(responseLine.toRawUTF8(),
+                            static_cast<int>(responseLine.getNumBytesAsUTF8())) >= 0;
+    };
+
+    auto lastSeenGeneration = owner.getCurrentPluginStateGeneration();
+    if (!sendEvent("ready", lastSeenGeneration))
+        return;
+
+    while (!threadShouldExit())
+    {
+        const auto currentGeneration = owner.waitForPluginStateGenerationChange(lastSeenGeneration, 250);
+        if (threadShouldExit())
+            return;
+        if (currentGeneration == lastSeenGeneration)
+            continue;
+        lastSeenGeneration = currentGeneration;
+        if (!sendEvent("state_changed", currentGeneration))
+            return;
+    }
 }
 
 void HostCommandServer::run()

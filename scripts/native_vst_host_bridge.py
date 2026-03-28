@@ -6,6 +6,7 @@ import json
 import os
 import socket
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HOST_EXE_CANDIDATES = [
+    REPO_ROOT / "build" / "native-vst3host-liveedit" / "AIMusicStudioVSTHost_artefacts" / "Release" / "AI Music Studio VST Host.exe",
     REPO_ROOT / "build" / "native-vst3host-hotfix" / "AIMusicStudioVSTHost_artefacts" / "Release" / "AI Music Studio VST Host.exe",
     REPO_ROOT / "build" / "native-vst3host" / "AIMusicStudioVSTHost_artefacts" / "Release" / "AI Music Studio VST Host.exe",
 ]
@@ -23,12 +25,16 @@ HOST_EXE = (
     else HOST_EXE_CANDIDATES[0]
 )
 HOST_DLL_CANDIDATES = [
+    REPO_ROOT / "build" / "native-vst3host-liveedit" / "Release" / "AIMusicStudioVSTHostLib.dll",
     REPO_ROOT / "build" / "native-vst3host-hotfix" / "Release" / "AIMusicStudioVSTHostLib.dll",
     REPO_ROOT / "build" / "native-vst3host" / "Release" / "AIMusicStudioVSTHostLib.dll",
+    REPO_ROOT / "build" / "native-vst3host-liveedit" / "Debug" / "AIMusicStudioVSTHostLib.dll",
     REPO_ROOT / "build" / "native-vst3host-hotfix" / "Debug" / "AIMusicStudioVSTHostLib.dll",
     REPO_ROOT / "build" / "native-vst3host" / "Debug" / "AIMusicStudioVSTHostLib.dll",
+    REPO_ROOT / "build" / "native-vst3host-liveedit" / "RelWithDebInfo" / "AIMusicStudioVSTHostLib.dll",
     REPO_ROOT / "build" / "native-vst3host-hotfix" / "RelWithDebInfo" / "AIMusicStudioVSTHostLib.dll",
     REPO_ROOT / "build" / "native-vst3host" / "RelWithDebInfo" / "AIMusicStudioVSTHostLib.dll",
+    REPO_ROOT / "build" / "native-vst3host-liveedit" / "MinSizeRel" / "AIMusicStudioVSTHostLib.dll",
     REPO_ROOT / "build" / "native-vst3host-hotfix" / "MinSizeRel" / "AIMusicStudioVSTHostLib.dll",
     REPO_ROOT / "build" / "native-vst3host" / "MinSizeRel" / "AIMusicStudioVSTHostLib.dll",
 ]
@@ -168,6 +174,9 @@ class _InProcessHostBackend:
             finally:
                 self.handle = None
 
+    def set_state_change_callback(self, callback: Any) -> None:
+        _ = callback
+
 
 class _SubprocessHostBackend:
     def __init__(
@@ -199,6 +208,12 @@ class _SubprocessHostBackend:
         self._recv_buffer = bytearray()
         self._command_timeout = 2.0
         self._last_command_at = 0.0
+        self._state_event_port = 0
+        self._state_event_socket: socket.socket | None = None
+        self._state_event_recv_buffer = bytearray()
+        self._state_event_stop = threading.Event()
+        self._state_event_thread: threading.Thread | None = None
+        self._state_change_callback: Any = None
 
     def start(self, startup_timeout: float = 10.0) -> None:
         if not HOST_EXE.exists():
@@ -225,7 +240,9 @@ class _SubprocessHostBackend:
             args.append("--open-editor")
 
         self.process = subprocess.Popen(args)
-        self.wait_until_ready(timeout=startup_timeout)
+        status = self.wait_until_ready(timeout=startup_timeout)
+        self._state_event_port = int(status.get("state_event_port", 0) or 0) if isinstance(status, dict) else 0
+        self._start_state_event_listener()
 
     def wait_until_ready(self, timeout: float = 10.0) -> dict[str, Any]:
         deadline = time.time() + timeout
@@ -254,6 +271,17 @@ class _SubprocessHostBackend:
         except Exception:
             pass
 
+    def _close_state_event_socket(self) -> None:
+        sock = self._state_event_socket
+        self._state_event_socket = None
+        self._state_event_recv_buffer.clear()
+        if sock is None:
+            return
+        try:
+            sock.close()
+        except Exception:
+            pass
+
     def _ensure_socket(self) -> socket.socket:
         if self._socket is not None:
             return self._socket
@@ -264,17 +292,71 @@ class _SubprocessHostBackend:
         self._recv_buffer.clear()
         return sock
 
-    def _read_response_line(self, sock: socket.socket) -> str:
+    @staticmethod
+    def _read_line(sock: socket.socket, recv_buffer: bytearray, *, closed_message: str) -> str:
         while True:
-            newline_index = self._recv_buffer.find(b"\n")
+            newline_index = recv_buffer.find(b"\n")
             if newline_index >= 0:
-                line = bytes(self._recv_buffer[:newline_index])
-                del self._recv_buffer[:newline_index + 1]
+                line = bytes(recv_buffer[:newline_index])
+                del recv_buffer[:newline_index + 1]
                 return line.decode("utf-8", errors="replace").strip()
             chunk = sock.recv(65536)
             if not chunk:
-                raise ConnectionError("Native host closed the command socket")
-            self._recv_buffer.extend(chunk)
+                raise ConnectionError(closed_message)
+            recv_buffer.extend(chunk)
+
+    def _read_response_line(self, sock: socket.socket) -> str:
+        return self._read_line(sock, self._recv_buffer, closed_message="Native host closed the command socket")
+
+    def _start_state_event_listener(self) -> None:
+        if self._state_event_port <= 0 or self._state_event_thread is not None:
+            return
+        self._state_event_stop.clear()
+        self._state_event_thread = threading.Thread(
+            target=self._run_state_event_listener,
+            name=f"NativeVstStateEvents:{self.port}",
+            daemon=True,
+        )
+        self._state_event_thread.start()
+
+    def _run_state_event_listener(self) -> None:
+        while not self._state_event_stop.is_set():
+            try:
+                sock = socket.create_connection(("127.0.0.1", self._state_event_port), timeout=1.0)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock.settimeout(1.0)
+                self._state_event_socket = sock
+                self._state_event_recv_buffer.clear()
+                while not self._state_event_stop.is_set():
+                    try:
+                        raw = self._read_line(
+                            sock,
+                            self._state_event_recv_buffer,
+                            closed_message="Native host closed the state event socket",
+                        )
+                    except socket.timeout:
+                        continue
+                    if not raw:
+                        continue
+                    try:
+                        event = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    callback = self._state_change_callback
+                    if callback is None:
+                        continue
+                    try:
+                        callback(event)
+                    except Exception:
+                        pass
+            except Exception:
+                if self._state_event_stop.wait(0.2):
+                    break
+            finally:
+                self._close_state_event_socket()
+
+    def set_state_change_callback(self, callback: Any) -> None:
+        self._state_change_callback = callback
 
     def _should_retry_after_transport_error(self) -> bool:
         last_command_at = float(self._last_command_at or 0.0)
@@ -311,12 +393,19 @@ class _SubprocessHostBackend:
         raise RuntimeError("Native host command failed")
 
     def stop(self, timeout: float = 3.0) -> None:
+        self._state_event_stop.set()
+        self._close_state_event_socket()
+        thread = self._state_event_thread
+        self._state_event_thread = None
+        if thread is not None:
+            thread.join(timeout=max(0.1, min(timeout, 1.5)))
         try:
             self.command("quit")
         except Exception:  # noqa: BLE001
             pass
         finally:
             self._close_socket()
+            self._state_event_port = 0
 
         if self.process is None:
             return
@@ -360,6 +449,7 @@ class NativeVstHostBridge:
         self._backend: _InProcessHostBackend | _SubprocessHostBackend | None = None
         self.process: Any = None
         self.in_process = False
+        self._state_change_callback: Any = None
 
     def start(self, startup_timeout: float = 10.0) -> None:
         # Subprocess is the default backend.  The in-process backend (ctypes
@@ -391,6 +481,9 @@ class NativeVstHostBridge:
             audio_device_type=self.audio_device_type,
             audio_output_device_name=self.audio_output_device_name,
         )
+        if self._state_change_callback is not None:
+            in_process_backend.set_state_change_callback(self._state_change_callback)
+            subprocess_backend.set_state_change_callback(self._state_change_callback)
 
         backend: _InProcessHostBackend | _SubprocessHostBackend
         if use_in_process:
@@ -416,6 +509,11 @@ class NativeVstHostBridge:
         if self._backend is None:
             raise RuntimeError("Native VST host is not started")
         return self._backend.command(command, **payload)
+
+    def set_state_change_callback(self, callback: Any) -> None:
+        self._state_change_callback = callback
+        if self._backend is not None:
+            self._backend.set_state_change_callback(callback)
 
     def queue_audio(self, audio_f32le: bytes, *, channels: int = 2, stream_id: str = "main") -> dict[str, Any]:
         if not audio_f32le:
