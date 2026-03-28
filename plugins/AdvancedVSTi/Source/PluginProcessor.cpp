@@ -1397,6 +1397,22 @@ void AdvancedVSTiAudioProcessor::reset()
 
 juce::StringArray AdvancedVSTiAudioProcessor::sampleBankChoices()
 {
+    if constexpr (buildFlavor() == InstrumentFlavor::piano)
+        return { "Concert Grand", "Felt Upright", "Pop Piano", "Cinematic Hall" };
+    if constexpr (buildFlavor() == InstrumentFlavor::guitar)
+        return { "Steel Finger", "Steel Pick", "Nylon Warm", "Muted Clean" };
+    if constexpr (buildFlavor() == InstrumentFlavor::violin)
+        return { "Solo Legato", "Expressive Vib", "Studio Section", "Rosin Accent" };
+    if constexpr (buildFlavor() == InstrumentFlavor::flute)
+        return { "Concert Flute", "Breathy Alto", "Whistle Air", "Warm Low Flute" };
+    if constexpr (buildFlavor() == InstrumentFlavor::saxophone)
+        return { "Alto Solo", "Tenor Warm", "Baritone Air", "Jazz Bite" };
+    if constexpr (buildFlavor() == InstrumentFlavor::bassGuitar)
+        return { "Finger Bass", "Pick Bass", "Muted Bass", "Round Bass" };
+    if constexpr (buildFlavor() == InstrumentFlavor::harp)
+        return { "Concert Harp", "Close Mic", "Ambient Harp", "Muted Harmonics" };
+    if constexpr (buildFlavor() == InstrumentFlavor::organ)
+        return { "Tonewheel Full", "Jazz Drawbars", "Cathedral Pipes", "Warm Gospel" };
     return { "Dusty Keys", "Tape Choir", "Velvet Pluck", "Vox Chop", "Sub Stab", "Glass Bell" };
 }
 
@@ -1428,6 +1444,22 @@ juce::StringArray AdvancedVSTiAudioProcessor::presetChoicesForFlavor()
         return { "Dusty Keys", "Tape Choir", "Velvet Pluck", "Vox Chop", "Sub Stab", "Glass Bell" };
     if constexpr (buildFlavor() == InstrumentFlavor::acid303)
         return { "Acid Saw", "Acid Square", "Rounded 303", "Reso Line" };
+    if constexpr (buildFlavor() == InstrumentFlavor::piano)
+        return { "Concert Grand", "Felt Upright", "Pop Piano", "Cinematic Hall" };
+    if constexpr (buildFlavor() == InstrumentFlavor::guitar)
+        return { "Steel Finger", "Steel Pick", "Nylon Warm", "Muted Clean" };
+    if constexpr (buildFlavor() == InstrumentFlavor::violin)
+        return { "Solo Legato", "Expressive Vibrato", "Studio Section", "Rosin Accent" };
+    if constexpr (buildFlavor() == InstrumentFlavor::flute)
+        return { "Concert Flute", "Breathy Alto", "Whistle Air", "Warm Low Flute" };
+    if constexpr (buildFlavor() == InstrumentFlavor::saxophone)
+        return { "Alto Solo", "Tenor Warm", "Baritone Air", "Jazz Bite" };
+    if constexpr (buildFlavor() == InstrumentFlavor::bassGuitar)
+        return { "Finger Bass", "Pick Bass", "Muted Bass", "Round Bass" };
+    if constexpr (buildFlavor() == InstrumentFlavor::harp)
+        return { "Concert Harp", "Close Mic", "Ambient Harp", "Muted Harmonics" };
+    if constexpr (buildFlavor() == InstrumentFlavor::organ)
+        return { "Tonewheel Full", "Jazz Drawbars", "Cathedral Pipes", "Warm Gospel" };
 
     auto names = builtInAdvancedVirusPresetChoices();
     for (const auto& imported : importedVirusPresets())
@@ -1681,6 +1713,565 @@ void AdvancedVSTiAudioProcessor::buildGeneratedSampleBank (int bankIndex)
     {
         loadedSample.setSize (1, 1);
         loadedSample.clear();
+        return;
+    }
+
+    auto prepareBuffer = [&] (float seconds)
+    {
+        const auto samples = juce::jmax (256, juce::roundToInt (seconds * sampleRateF));
+        loadedSample.setSize (1, samples);
+        loadedSample.clear();
+        return samples;
+    };
+
+    auto normalizeBuffer = [&]
+    {
+        auto* normalizeDst = loadedSample.getWritePointer (0);
+        const auto totalSamples = loadedSample.getNumSamples();
+        float peak = 0.0f;
+        for (int i = 0; i < totalSamples; ++i)
+            peak = juce::jmax (peak, std::abs (normalizeDst[i]));
+
+        if (peak > 0.0001f)
+            juce::FloatVectorOperations::multiply (normalizeDst, 0.92f / peak, totalSamples);
+    };
+
+    auto renderAcousticBank = [&] (float lengthSec, const auto& sampleFn)
+    {
+        const auto numSamples = prepareBuffer (lengthSec);
+        auto* dst = loadedSample.getWritePointer (0);
+        float phaseA = 0.0f;
+        float phaseB = 0.0f;
+        float phaseC = 0.0f;
+        float phaseD = 0.0f;
+        float phaseE = 0.0f;
+        float phaseF = 0.0f;
+        float stateA = 0.0f;
+        float stateB = 0.0f;
+
+        for (int i = 0; i < numSamples; ++i)
+        {
+            const auto t = static_cast<float> (i) / sampleRateF;
+            const auto noise = random.nextFloat() * 2.0f - 1.0f;
+            dst[i] = sampleFn (t, noise, phaseA, phaseB, phaseC, phaseD, phaseE, phaseF, stateA, stateB);
+        }
+
+        normalizeBuffer();
+    };
+
+    if constexpr (buildFlavor() == InstrumentFlavor::piano)
+    {
+        float brightness = 1.0f;
+        float decay = 1.35f;
+        float hammer = 0.95f;
+        float resonance = 0.22f;
+        float body = 0.18f;
+        float hall = 0.08f;
+        float acousticLengthSec = 4.8f;
+
+        switch (bankIndex)
+        {
+            case 1:
+                brightness = 0.62f;
+                decay = 1.22f;
+                hammer = 0.58f;
+                resonance = 0.2f;
+                body = 0.22f;
+                hall = 0.04f;
+                acousticLengthSec = 3.9f;
+                break;
+            case 2:
+                brightness = 1.16f;
+                decay = 1.7f;
+                hammer = 1.12f;
+                resonance = 0.16f;
+                body = 0.14f;
+                hall = 0.06f;
+                acousticLengthSec = 4.2f;
+                break;
+            case 3:
+                brightness = 0.84f;
+                decay = 0.86f;
+                hammer = 0.76f;
+                resonance = 0.34f;
+                body = 0.24f;
+                hall = 0.2f;
+                acousticLengthSec = 6.2f;
+                break;
+            default:
+                break;
+        }
+
+        renderAcousticBank (acousticLengthSec, [&] (float t, float noise, float& phaseA, float& phaseB, float& phaseC, float& phaseD,
+                                                    float& phaseE, float& phaseF, float& stateA, float& stateB)
+        {
+            phaseA = std::fmod (phaseA + (261.6256f / sampleRateF), 1.0f);
+            phaseB = std::fmod (phaseB + ((261.6256f * 2.004f) / sampleRateF), 1.0f);
+            phaseC = std::fmod (phaseC + ((261.6256f * 3.011f) / sampleRateF), 1.0f);
+            phaseD = std::fmod (phaseD + ((261.6256f * 6.04f) / sampleRateF), 1.0f);
+            phaseE = std::fmod (phaseE + ((261.6256f * 0.5f) / sampleRateF), 1.0f);
+            phaseF = std::fmod (phaseF + ((261.6256f * 8.3f) / sampleRateF), 1.0f);
+            const auto attack = juce::jlimit (0.0f, 1.0f, t / 0.0025f);
+            const auto env = std::exp (-t * decay);
+            const auto hammerEnv = hammer * std::exp (-t * (48.0f + brightness * 18.0f));
+            const auto sympathetic = std::sin (twoPi * std::fmod (phaseE * 1.5f, 1.0f)) * resonance * std::exp (-t * 0.9f);
+            const auto bodyTone = (std::sin (twoPi * phaseE) * body) + (std::sin (twoPi * phaseF) * 0.05f * brightness * std::exp (-t * 2.0f));
+            stateB += (noise - stateB) * (0.06f + hall * 0.04f);
+
+            float sample = (std::sin (twoPi * phaseA) * 0.72f)
+                           + (std::sin (twoPi * phaseB) * 0.22f * brightness)
+                           + (std::sin (twoPi * phaseC) * 0.11f * brightness)
+                           + (std::sin (twoPi * phaseD) * 0.06f * brightness * std::exp (-t * 1.8f));
+            sample = (sample * env) + bodyTone + (sympathetic * 0.12f);
+            sample += noise * (0.018f * env + 0.13f * hammerEnv);
+            sample += stateB * resonance * 0.035f;
+            sample = smoothTowards (sample, 0.05f + hall * 0.02f, stateA);
+            return sample * attack;
+        });
+        return;
+    }
+
+    if constexpr (buildFlavor() == InstrumentFlavor::guitar)
+    {
+        float brightness = 0.94f;
+        float pick = 0.82f;
+        float decay = 1.6f;
+        float body = 0.2f;
+        float muted = 0.0f;
+        float acousticLengthSec = 3.4f;
+
+        switch (bankIndex)
+        {
+            case 1:
+                brightness = 1.16f;
+                pick = 1.12f;
+                decay = 1.95f;
+                body = 0.17f;
+                acousticLengthSec = 3.2f;
+                break;
+            case 2:
+                brightness = 0.68f;
+                pick = 0.56f;
+                decay = 1.28f;
+                body = 0.24f;
+                acousticLengthSec = 3.7f;
+                break;
+            case 3:
+                brightness = 0.8f;
+                pick = 0.92f;
+                decay = 2.8f;
+                body = 0.12f;
+                muted = 0.85f;
+                acousticLengthSec = 2.4f;
+                break;
+            default:
+                break;
+        }
+
+        renderAcousticBank (acousticLengthSec, [&] (float t, float noise, float& phaseA, float& phaseB, float& phaseC, float& phaseD,
+                                                    float& phaseE, float& phaseF, float& stateA, float& stateB)
+        {
+            phaseA = std::fmod (phaseA + (196.0f / sampleRateF), 1.0f);
+            phaseB = std::fmod (phaseB + ((196.0f * 2.01f) / sampleRateF), 1.0f);
+            phaseC = std::fmod (phaseC + ((196.0f * 3.02f) / sampleRateF), 1.0f);
+            phaseD = std::fmod (phaseD + ((196.0f * 5.08f) / sampleRateF), 1.0f);
+            phaseE = std::fmod (phaseE + (110.0f / sampleRateF), 1.0f);
+            phaseF = std::fmod (phaseF + (392.0f / sampleRateF), 1.0f);
+            const auto attack = juce::jlimit (0.0f, 1.0f, t / 0.003f);
+            const auto envA = std::exp (-t * decay);
+            const auto envB = std::exp (-t * (decay + 0.8f + muted));
+            const auto pickEnv = pick * std::exp (-t * (42.0f + muted * 30.0f));
+            stateB += (noise - stateB) * (0.1f + muted * 0.08f);
+
+            float sample = (std::sin (twoPi * phaseA) * 0.7f * envA)
+                           + (std::sin (twoPi * phaseB) * 0.22f * brightness * envB)
+                           + (std::sin (twoPi * phaseC) * 0.14f * brightness * std::exp (-t * (decay + 1.4f)))
+                           + (std::sin (twoPi * phaseD) * 0.08f * brightness * std::exp (-t * (decay + 2.2f)));
+            sample += (std::sin (twoPi * phaseE) * body * std::exp (-t * 1.2f));
+            sample += (std::sin (twoPi * phaseF) * 0.05f * std::exp (-t * 2.0f));
+            sample += (noise * 0.16f * pickEnv) + (stateB * 0.06f * pickEnv);
+            sample = smoothTowards (sample, 0.11f + muted * 0.07f, stateA);
+            return sample * attack * (1.0f - muted * 0.18f);
+        });
+        return;
+    }
+
+    if constexpr (buildFlavor() == InstrumentFlavor::violin)
+    {
+        float brightness = 0.9f;
+        float bowNoise = 0.13f;
+        float vibrato = 0.0035f;
+        float section = 0.0f;
+        float bite = 0.18f;
+        float acousticLengthSec = 4.6f;
+
+        switch (bankIndex)
+        {
+            case 1:
+                brightness = 0.98f;
+                bowNoise = 0.14f;
+                vibrato = 0.0055f;
+                bite = 0.14f;
+                break;
+            case 2:
+                brightness = 0.86f;
+                bowNoise = 0.1f;
+                vibrato = 0.0025f;
+                section = 0.12f;
+                bite = 0.12f;
+                break;
+            case 3:
+                brightness = 1.04f;
+                bowNoise = 0.17f;
+                vibrato = 0.0042f;
+                section = 0.03f;
+                bite = 0.24f;
+                acousticLengthSec = 3.8f;
+                break;
+            default:
+                break;
+        }
+
+        renderAcousticBank (acousticLengthSec, [&] (float t, float noise, float& phaseA, float& phaseB, float& phaseC, float& phaseD,
+                                                    float& phaseE, float& phaseF, float& stateA, float& stateB)
+        {
+            phaseE = std::fmod (phaseE + (5.8f / sampleRateF), 1.0f);
+            const auto swell = juce::jlimit (0.0f, 1.0f, t / (0.08f + section * 0.1f));
+            const auto release = std::exp (-juce::jmax (0.0f, t - (acousticLengthSec - 0.7f)) * 2.8f);
+            const auto vib = std::sin (twoPi * phaseE) * vibrato * (0.3f + 0.7f * swell);
+            phaseA = std::fmod (phaseA + ((196.0f * (1.0f + vib)) / sampleRateF), 1.0f);
+            phaseB = std::fmod (phaseB + ((196.0f * 2.01f * (1.0f + vib * 0.6f)) / sampleRateF), 1.0f);
+            phaseC = std::fmod (phaseC + ((196.0f * 3.04f * (1.0f + vib * 0.45f)) / sampleRateF), 1.0f);
+            phaseD = std::fmod (phaseD + ((196.0f * 4.08f * (1.0f + vib * 0.25f)) / sampleRateF), 1.0f);
+            phaseF = std::fmod (phaseF + (98.0f / sampleRateF), 1.0f);
+            stateB += (noise - stateB) * 0.065f;
+
+            float sample = (std::sin (twoPi * phaseA) * 0.54f)
+                           + (std::sin (twoPi * phaseB) * 0.24f * brightness)
+                           + (std::sin (twoPi * phaseC) * 0.14f * brightness)
+                           + (std::sin (twoPi * phaseD) * 0.08f * (0.75f + brightness * 0.3f));
+            sample += std::sin (twoPi * phaseF) * 0.05f * (0.6f + section);
+            sample += stateB * bowNoise;
+            sample += noise * bite * std::exp (-t * 24.0f);
+            sample = smoothTowards (sample, 0.035f, stateA);
+            return sample * swell * release;
+        });
+        return;
+    }
+
+    if constexpr (buildFlavor() == InstrumentFlavor::flute)
+    {
+        float breath = 0.16f;
+        float brightness = 0.8f;
+        float vibrato = 0.004f;
+        float warmth = 0.08f;
+        float chiff = 0.12f;
+        float acousticLengthSec = 4.2f;
+
+        switch (bankIndex)
+        {
+            case 1:
+                breath = 0.24f;
+                brightness = 0.68f;
+                vibrato = 0.0032f;
+                warmth = 0.14f;
+                break;
+            case 2:
+                breath = 0.28f;
+                brightness = 1.04f;
+                vibrato = 0.0048f;
+                chiff = 0.2f;
+                break;
+            case 3:
+                breath = 0.18f;
+                brightness = 0.62f;
+                vibrato = 0.0028f;
+                warmth = 0.2f;
+                chiff = 0.08f;
+                break;
+            default:
+                break;
+        }
+
+        renderAcousticBank (acousticLengthSec, [&] (float t, float noise, float& phaseA, float& phaseB, float& phaseC, float& phaseD,
+                                                    float& phaseE, float& phaseF, float& stateA, float& stateB)
+        {
+            juce::ignoreUnused (phaseF);
+            const auto swell = juce::jlimit (0.0f, 1.0f, t / (0.05f + breath * 0.08f));
+            const auto release = std::exp (-juce::jmax (0.0f, t - (acousticLengthSec - 0.55f)) * 3.0f);
+            phaseE = std::fmod (phaseE + (5.2f / sampleRateF), 1.0f);
+            const auto vib = std::sin (twoPi * phaseE) * vibrato * (0.2f + 0.8f * swell);
+            phaseA = std::fmod (phaseA + ((523.2511f * (1.0f + vib)) / sampleRateF), 1.0f);
+            phaseB = std::fmod (phaseB + ((523.2511f * 2.0f * (1.0f + vib * 0.45f)) / sampleRateF), 1.0f);
+            phaseC = std::fmod (phaseC + ((523.2511f * 3.05f) / sampleRateF), 1.0f);
+            phaseD = std::fmod (phaseD + ((523.2511f * 4.1f) / sampleRateF), 1.0f);
+            stateA += (noise - stateA) * (0.028f + warmth * 0.03f);
+
+            float sample = (std::sin (twoPi * phaseA) * 0.76f)
+                           + (std::sin (twoPi * phaseB) * 0.12f * brightness)
+                           + (std::sin (twoPi * phaseC) * 0.06f * brightness)
+                           + (std::sin (twoPi * phaseD) * 0.03f * brightness);
+            sample += stateA * breath;
+            sample += noise * chiff * std::exp (-t * 42.0f);
+            sample = smoothTowards (sample, 0.02f + warmth * 0.04f, stateB);
+            return sample * swell * release;
+        });
+        return;
+    }
+
+    if constexpr (buildFlavor() == InstrumentFlavor::saxophone)
+    {
+        float brightness = 0.9f;
+        float reed = 0.16f;
+        float vibrato = 0.0038f;
+        float growl = 0.14f;
+        float body = 0.1f;
+        float acousticLengthSec = 4.1f;
+
+        switch (bankIndex)
+        {
+            case 1:
+                brightness = 0.78f;
+                reed = 0.12f;
+                vibrato = 0.0034f;
+                growl = 0.1f;
+                body = 0.12f;
+                break;
+            case 2:
+                brightness = 0.66f;
+                reed = 0.18f;
+                vibrato = 0.0026f;
+                growl = 0.18f;
+                body = 0.16f;
+                break;
+            case 3:
+                brightness = 1.12f;
+                reed = 0.22f;
+                vibrato = 0.0046f;
+                growl = 0.28f;
+                body = 0.08f;
+                break;
+            default:
+                break;
+        }
+
+        renderAcousticBank (acousticLengthSec, [&] (float t, float noise, float& phaseA, float& phaseB, float& phaseC, float& phaseD,
+                                                    float& phaseE, float& phaseF, float& stateA, float& stateB)
+        {
+            juce::ignoreUnused (stateB);
+            const auto swell = juce::jlimit (0.0f, 1.0f, t / 0.06f);
+            const auto release = std::exp (-juce::jmax (0.0f, t - (acousticLengthSec - 0.6f)) * 2.8f);
+            phaseE = std::fmod (phaseE + (5.0f / sampleRateF), 1.0f);
+            phaseF = std::fmod (phaseF + (110.0f / sampleRateF), 1.0f);
+            const auto vib = std::sin (twoPi * phaseE) * vibrato * (0.2f + 0.8f * swell);
+            phaseA = std::fmod (phaseA + ((220.0f * (1.0f + vib)) / sampleRateF), 1.0f);
+            phaseB = std::fmod (phaseB + ((220.0f * 2.0f * (1.0f + vib * 0.5f)) / sampleRateF), 1.0f);
+            phaseC = std::fmod (phaseC + ((220.0f * 3.02f) / sampleRateF), 1.0f);
+            phaseD = std::fmod (phaseD + ((220.0f * 5.0f) / sampleRateF), 1.0f);
+            stateA += (noise - stateA) * 0.055f;
+
+            const auto growlWave = std::sin ((twoPi * phaseA) + (std::sin (twoPi * phaseE) * (1.2f + growl * 1.6f)));
+            float sample = (std::sin (twoPi * phaseA) * 0.56f)
+                           + (std::sin (twoPi * phaseB) * 0.24f * brightness)
+                           + (std::sin (twoPi * phaseC) * 0.18f * brightness)
+                           + (std::sin (twoPi * phaseD) * 0.08f * brightness);
+            sample += growlWave * growl * 0.18f;
+            sample += stateA * reed;
+            sample += std::sin (twoPi * phaseF) * body * 0.12f;
+            sample += noise * 0.12f * std::exp (-t * 28.0f);
+            return softSaturate (sample * 1.08f) * swell * release;
+        });
+        return;
+    }
+
+    if constexpr (buildFlavor() == InstrumentFlavor::bassGuitar)
+    {
+        float brightness = 0.76f;
+        float attack = 0.72f;
+        float body = 0.18f;
+        float round = 0.16f;
+        float muted = 0.0f;
+        float acousticLengthSec = 3.6f;
+
+        switch (bankIndex)
+        {
+            case 1:
+                brightness = 1.02f;
+                attack = 1.05f;
+                body = 0.14f;
+                round = 0.12f;
+                break;
+            case 2:
+                brightness = 0.64f;
+                attack = 0.6f;
+                body = 0.12f;
+                round = 0.1f;
+                muted = 0.92f;
+                acousticLengthSec = 2.6f;
+                break;
+            case 3:
+                brightness = 0.58f;
+                attack = 0.52f;
+                body = 0.22f;
+                round = 0.24f;
+                acousticLengthSec = 4.0f;
+                break;
+            default:
+                break;
+        }
+
+        renderAcousticBank (acousticLengthSec, [&] (float t, float noise, float& phaseA, float& phaseB, float& phaseC, float& phaseD,
+                                                    float& phaseE, float& phaseF, float& stateA, float& stateB)
+        {
+            juce::ignoreUnused (stateA);
+            phaseA = std::fmod (phaseA + (65.4064f / sampleRateF), 1.0f);
+            phaseB = std::fmod (phaseB + ((65.4064f * 2.0f) / sampleRateF), 1.0f);
+            phaseC = std::fmod (phaseC + ((65.4064f * 3.01f) / sampleRateF), 1.0f);
+            phaseD = std::fmod (phaseD + ((65.4064f * 5.02f) / sampleRateF), 1.0f);
+            phaseE = std::fmod (phaseE + ((65.4064f * 0.5f) / sampleRateF), 1.0f);
+            phaseF = std::fmod (phaseF + (130.8128f / sampleRateF), 1.0f);
+            const auto env = std::exp (-t * (0.92f + muted * 0.85f));
+            const auto attackEnv = attack * std::exp (-t * (34.0f + muted * 26.0f));
+            stateB += (noise - stateB) * 0.12f;
+
+            float sample = (std::sin (twoPi * phaseA) * 0.78f)
+                           + (std::sin (twoPi * phaseB) * 0.16f * brightness)
+                           + (std::sin (twoPi * phaseC) * 0.09f * brightness)
+                           + (std::sin (twoPi * phaseD) * 0.05f * brightness * std::exp (-t * 2.1f));
+            sample = (sample * env) + (std::sin (twoPi * phaseE) * round * 0.18f) + (std::sin (twoPi * phaseF) * body * 0.14f);
+            sample += noise * 0.1f * attackEnv;
+            sample += stateB * 0.05f * attackEnv;
+            return softSaturate (sample * 1.1f) * (1.0f - muted * 0.1f);
+        });
+        return;
+    }
+
+    if constexpr (buildFlavor() == InstrumentFlavor::harp)
+    {
+        float brightness = 1.0f;
+        float pluck = 0.84f;
+        float decay = 1.28f;
+        float resonance = 0.2f;
+        float air = 0.08f;
+        float acousticLengthSec = 5.2f;
+
+        switch (bankIndex)
+        {
+            case 1:
+                brightness = 0.88f;
+                pluck = 0.78f;
+                decay = 1.14f;
+                resonance = 0.16f;
+                air = 0.04f;
+                break;
+            case 2:
+                brightness = 1.04f;
+                pluck = 0.8f;
+                decay = 0.94f;
+                resonance = 0.28f;
+                air = 0.16f;
+                acousticLengthSec = 6.2f;
+                break;
+            case 3:
+                brightness = 0.72f;
+                pluck = 0.64f;
+                decay = 1.8f;
+                resonance = 0.12f;
+                air = 0.03f;
+                break;
+            default:
+                break;
+        }
+
+        renderAcousticBank (acousticLengthSec, [&] (float t, float noise, float& phaseA, float& phaseB, float& phaseC, float& phaseD,
+                                                    float& phaseE, float& phaseF, float& stateA, float& stateB)
+        {
+            juce::ignoreUnused (stateA);
+            phaseA = std::fmod (phaseA + (392.0f / sampleRateF), 1.0f);
+            phaseB = std::fmod (phaseB + ((392.0f * 2.0f) / sampleRateF), 1.0f);
+            phaseC = std::fmod (phaseC + ((392.0f * 4.03f) / sampleRateF), 1.0f);
+            phaseD = std::fmod (phaseD + ((392.0f * 6.12f) / sampleRateF), 1.0f);
+            phaseE = std::fmod (phaseE + (196.0f / sampleRateF), 1.0f);
+            phaseF = std::fmod (phaseF + ((392.0f * 8.15f) / sampleRateF), 1.0f);
+            const auto env = std::exp (-t * decay);
+            const auto pluckEnv = pluck * std::exp (-t * 52.0f);
+            stateB += (noise - stateB) * 0.05f;
+
+            float sample = (std::sin (twoPi * phaseA) * 0.62f)
+                           + (std::sin (twoPi * phaseB) * 0.2f * brightness)
+                           + (std::sin (twoPi * phaseC) * 0.1f * brightness)
+                           + (std::sin (twoPi * phaseD) * 0.08f * brightness)
+                           + (std::sin (twoPi * phaseF) * 0.04f * brightness * std::exp (-t * 2.2f));
+            sample = (sample * env) + (std::sin (twoPi * phaseE) * resonance * 0.18f);
+            sample += noise * 0.08f * pluckEnv;
+            sample += stateB * air;
+            return smoothTowards (sample, 0.08f, stateA);
+        });
+        return;
+    }
+
+    if constexpr (buildFlavor() == InstrumentFlavor::organ)
+    {
+        float h2 = 0.62f;
+        float h3 = 0.36f;
+        float h4 = 0.18f;
+        float h5 = 0.08f;
+        float click = 0.08f;
+        float chorus = 0.02f;
+        float acousticLengthSec = 4.6f;
+
+        switch (bankIndex)
+        {
+            case 1:
+                h2 = 0.48f;
+                h3 = 0.28f;
+                h4 = 0.1f;
+                h5 = 0.04f;
+                click = 0.05f;
+                chorus = 0.018f;
+                break;
+            case 2:
+                h2 = 0.74f;
+                h3 = 0.52f;
+                h4 = 0.26f;
+                h5 = 0.12f;
+                click = 0.11f;
+                chorus = 0.015f;
+                break;
+            case 3:
+                h2 = 0.56f;
+                h3 = 0.31f;
+                h4 = 0.14f;
+                h5 = 0.06f;
+                click = 0.06f;
+                chorus = 0.03f;
+                break;
+            default:
+                break;
+        }
+
+        renderAcousticBank (acousticLengthSec, [&] (float t, float noise, float& phaseA, float& phaseB, float& phaseC, float& phaseD,
+                                                    float& phaseE, float& phaseF, float& stateA, float& stateB)
+        {
+            juce::ignoreUnused (stateA, stateB);
+            phaseA = std::fmod (phaseA + (261.6256f / sampleRateF), 1.0f);
+            phaseB = std::fmod (phaseB + ((261.6256f * 2.0f) / sampleRateF), 1.0f);
+            phaseC = std::fmod (phaseC + ((261.6256f * 3.0f) / sampleRateF), 1.0f);
+            phaseD = std::fmod (phaseD + ((261.6256f * 4.0f) / sampleRateF), 1.0f);
+            phaseE = std::fmod (phaseE + ((261.6256f * 5.0f) / sampleRateF), 1.0f);
+            phaseF = std::fmod (phaseF + (0.72f / sampleRateF), 1.0f);
+            const auto attack = juce::jlimit (0.0f, 1.0f, t / 0.006f);
+            const auto release = std::exp (-juce::jmax (0.0f, t - (acousticLengthSec - 0.8f)) * 2.2f);
+            const auto drift = std::sin (twoPi * phaseF) * chorus;
+
+            float sample = std::sin (twoPi * phaseA)
+                           + (std::sin (twoPi * std::fmod (phaseB + drift, 1.0f)) * h2)
+                           + (std::sin (twoPi * std::fmod (phaseC - drift * 0.6f, 1.0f)) * h3)
+                           + (std::sin (twoPi * phaseD) * h4)
+                           + (std::sin (twoPi * phaseE) * h5);
+            sample = (sample * 0.42f) + (noise * click * std::exp (-t * 58.0f));
+            return softSaturate (sample * 1.1f) * attack * release;
+        });
         return;
     }
 
@@ -2267,8 +2858,13 @@ float AdvancedVSTiAudioProcessor::oscSampleForState (float& phase, float& syncPh
             const auto loopEnd = juce::jlimit (loopStart + 1, totalSamples, juce::roundToInt (renderParams.sampleEnd * static_cast<float> (totalSamples)));
             if (samplePos < static_cast<float> (loopStart) || samplePos >= static_cast<float> (loopEnd))
                 samplePos = static_cast<float> (loopStart);
-            const auto idx = juce::jlimit (loopStart, loopEnd - 1, static_cast<int> (samplePos));
-            const auto sample = loadedSample.getSample (0, idx);
+            const auto position = juce::jlimit (static_cast<float> (loopStart), static_cast<float> (loopEnd - 1), samplePos);
+            const auto indexA = juce::jlimit (loopStart, loopEnd - 1, static_cast<int> (position));
+            const auto indexB = juce::jlimit (loopStart, loopEnd - 1, indexA + 1);
+            const auto frac = juce::jlimit (0.0f, 1.0f, position - static_cast<float> (indexA));
+            const auto sample = juce::jmap (frac,
+                                            loadedSample.getSample (0, indexA),
+                                            loadedSample.getSample (0, indexB));
             const auto playbackRatio = juce::jlimit (0.125f, 8.0f, baseFreq / 261.6256f);
             samplePos += playbackRatio;
             if (samplePos >= static_cast<float> (loopEnd))
@@ -3069,6 +3665,74 @@ float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice, SampleMo
         const auto body = std::sin (twoPi * std::fmod (voice.phase * 0.5f, 1.0f)) * 0.08f;
         s = (s * 0.88f) + (glue * 0.1f) + body;
         s = softSaturate (s * 1.08f) * 0.95f;
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::piano)
+    {
+        voice.auxPhase = std::fmod (voice.auxPhase + (5.2f / static_cast<float> (currentSampleRate)), 1.0f);
+        const auto hammer = (random.nextFloat() * 2.0f - 1.0f) * 0.06f * std::exp (-voice.noteAge * 72.0f);
+        const auto body = std::sin (twoPi * std::fmod ((voice.phase * 0.5f) + (voice.auxPhase * 0.03f), 1.0f))
+                          * (0.08f + voice.velocity * 0.04f) * std::exp (-voice.noteAge * 1.9f);
+        s = smoothTowards ((s * 0.9f) + body + hammer, 0.055f, voice.toneState);
+        s = softSaturate (s * (1.04f + voice.velocity * 0.12f)) * 0.94f;
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::guitar)
+    {
+        const auto pickNoise = (random.nextFloat() * 2.0f - 1.0f) * 0.08f * std::exp (-voice.noteAge * 58.0f);
+        const auto body = std::sin (twoPi * std::fmod ((voice.phase * 0.5f) + 0.17f, 1.0f)) * 0.11f * std::exp (-voice.noteAge * 2.3f);
+        s = smoothTowards ((s * 0.84f) + body + pickNoise, 0.1f, voice.toneState);
+        s = softSaturate (s * 1.1f) * 0.92f;
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::violin)
+    {
+        voice.auxPhase = std::fmod (voice.auxPhase + (5.7f / static_cast<float> (currentSampleRate)), 1.0f);
+        const auto vibrato = std::sin (twoPi * voice.auxPhase) * (0.002f + voice.velocity * 0.004f);
+        voice.colourState = smoothTowards ((random.nextFloat() * 2.0f - 1.0f) * 0.12f, 0.06f, voice.colourState);
+        const auto singing = std::sin (twoPi * std::fmod ((voice.phase * 2.0f) + vibrato, 1.0f)) * 0.1f;
+        s = smoothTowards ((s * 0.82f) + singing + (voice.colourState * 0.14f), 0.03f, voice.toneState);
+        s = softSaturate (s * 1.08f) * 0.93f;
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::flute)
+    {
+        voice.auxPhase = std::fmod (voice.auxPhase + (5.1f / static_cast<float> (currentSampleRate)), 1.0f);
+        const auto vibrato = std::sin (twoPi * voice.auxPhase) * 0.0042f;
+        voice.colourState = smoothTowards ((random.nextFloat() * 2.0f - 1.0f) * 0.08f, 0.025f, voice.colourState);
+        const auto air = std::sin (twoPi * std::fmod ((voice.phase * 2.0f) + vibrato, 1.0f)) * 0.045f;
+        s = smoothTowards ((s * 0.9f) + air + (voice.colourState * (0.14f + voice.velocity * 0.05f)), 0.025f, voice.toneState);
+        s = softSaturate (s * 1.03f) * 0.96f;
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::saxophone)
+    {
+        voice.auxPhase = std::fmod (voice.auxPhase + (4.8f / static_cast<float> (currentSampleRate)), 1.0f);
+        const auto vibrato = std::sin (twoPi * voice.auxPhase) * 0.0038f;
+        voice.colourState = smoothTowards ((random.nextFloat() * 2.0f - 1.0f) * 0.11f, 0.05f, voice.colourState);
+        const auto growl = std::sin ((twoPi * voice.phase) + (std::sin (twoPi * voice.auxPhase) * 1.4f));
+        s = (s * 0.84f) + (growl * (0.08f + voice.velocity * 0.06f)) + (voice.colourState * 0.12f);
+        s += std::sin (twoPi * std::fmod ((voice.phase * 2.0f) + vibrato, 1.0f)) * 0.06f;
+        s = softSaturate (s * 1.14f) * 0.92f;
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::bassGuitar)
+    {
+        const auto fret = (random.nextFloat() * 2.0f - 1.0f) * 0.05f * std::exp (-voice.noteAge * 62.0f);
+        const auto sub = std::sin (twoPi * std::fmod (voice.phase * 0.5f, 1.0f)) * 0.14f;
+        s = smoothTowards ((s * 0.82f) + sub + fret, 0.1f, voice.toneState);
+        s = softSaturate (s * 1.14f) * 0.9f;
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::harp)
+    {
+        const auto shimmer = std::sin (twoPi * std::fmod ((voice.phase * 2.02f) + 0.23f, 1.0f)) * 0.08f * std::exp (-voice.noteAge * 2.4f);
+        const auto pluckNoise = (random.nextFloat() * 2.0f - 1.0f) * 0.05f * std::exp (-voice.noteAge * 64.0f);
+        s = smoothTowards ((s * 0.86f) + shimmer + pluckNoise, 0.08f, voice.toneState);
+        s = softSaturate (s * 1.06f) * 0.94f;
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::organ)
+    {
+        voice.auxPhase = std::fmod (voice.auxPhase + (0.78f / static_cast<float> (currentSampleRate)), 1.0f);
+        const auto drift = std::sin (twoPi * voice.auxPhase) * 0.02f;
+        const auto drawbar2 = std::sin (twoPi * std::fmod ((voice.phase * 2.0f) + drift, 1.0f)) * 0.12f;
+        const auto drawbar3 = std::sin (twoPi * std::fmod ((voice.phase * 3.0f) - drift, 1.0f)) * 0.08f;
+        const auto click = (random.nextFloat() * 2.0f - 1.0f) * 0.04f * std::exp (-voice.noteAge * 96.0f);
+        s = (s * 0.88f) + drawbar2 + drawbar3 + click;
+        s = softSaturate (s * 1.05f) * 0.95f;
     }
     else if constexpr (buildFlavor() == InstrumentFlavor::acid303)
     {
@@ -4375,6 +5039,222 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
         lfo2RateDefault = 0.1f;
         lfo2FilterDefault = 0.0f;
     }
+    else if constexpr (buildFlavor() == InstrumentFlavor::piano)
+    {
+        oscDefault = 4;
+        unisonDefault = 1;
+        detuneDefault = 0.0f;
+        fmDefault = 0.0f;
+        syncDefault = 0.0f;
+        gateDefault = 6.0f;
+        ampAttackDefault = 0.001f;
+        ampDecayDefault = 1.1f;
+        ampSustainDefault = 0.58f;
+        ampReleaseDefault = 0.72f;
+        filtAttackDefault = 0.001f;
+        filtDecayDefault = 0.32f;
+        filtSustainDefault = 0.84f;
+        filtReleaseDefault = 0.5f;
+        envCurveDefault = 0.06f;
+        cutoffDefault = 5600.0f;
+        resonanceDefault = 0.12f;
+        filterEnvAmountDefault = 0.12f;
+        sampleEndDefault = 0.98f;
+        fxTypeDefault = 2;
+        fxMixDefault = 0.06f;
+        fxIntensityDefault = 0.18f;
+        reverbMixDefault = 0.12f;
+        delaySendDefault = 0.02f;
+        lfo1RateDefault = 0.08f;
+        lfo2RateDefault = 0.05f;
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::guitar)
+    {
+        oscDefault = 4;
+        unisonDefault = 1;
+        detuneDefault = 0.0f;
+        gateDefault = 4.0f;
+        ampAttackDefault = 0.001f;
+        ampDecayDefault = 0.38f;
+        ampSustainDefault = 0.24f;
+        ampReleaseDefault = 0.24f;
+        filtAttackDefault = 0.001f;
+        filtDecayDefault = 0.22f;
+        filtSustainDefault = 0.36f;
+        filtReleaseDefault = 0.18f;
+        envCurveDefault = 0.12f;
+        cutoffDefault = 4200.0f;
+        resonanceDefault = 0.16f;
+        filterEnvAmountDefault = 0.28f;
+        sampleEndDefault = 0.96f;
+        fxTypeDefault = 2;
+        fxMixDefault = 0.08f;
+        fxIntensityDefault = 0.16f;
+        reverbMixDefault = 0.1f;
+        delaySendDefault = 0.04f;
+        lfo1RateDefault = 0.06f;
+        lfo2RateDefault = 0.04f;
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::violin)
+    {
+        oscDefault = 4;
+        unisonDefault = 1;
+        detuneDefault = 0.0f;
+        gateDefault = 8.0f;
+        ampAttackDefault = 0.05f;
+        ampDecayDefault = 0.52f;
+        ampSustainDefault = 0.86f;
+        ampReleaseDefault = 0.96f;
+        filtAttackDefault = 0.04f;
+        filtDecayDefault = 0.48f;
+        filtSustainDefault = 0.74f;
+        filtReleaseDefault = 0.82f;
+        envCurveDefault = 0.04f;
+        cutoffDefault = 3600.0f;
+        resonanceDefault = 0.18f;
+        filterEnvAmountDefault = 0.1f;
+        sampleEndDefault = 0.98f;
+        fxTypeDefault = 3;
+        fxMixDefault = 0.14f;
+        fxIntensityDefault = 0.22f;
+        reverbMixDefault = 0.18f;
+        delaySendDefault = 0.06f;
+        lfo1RateDefault = 0.12f;
+        lfo2RateDefault = 0.08f;
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::flute)
+    {
+        oscDefault = 4;
+        unisonDefault = 1;
+        detuneDefault = 0.0f;
+        gateDefault = 8.0f;
+        ampAttackDefault = 0.03f;
+        ampDecayDefault = 0.24f;
+        ampSustainDefault = 0.9f;
+        ampReleaseDefault = 0.34f;
+        filtAttackDefault = 0.02f;
+        filtDecayDefault = 0.18f;
+        filtSustainDefault = 0.88f;
+        filtReleaseDefault = 0.26f;
+        envCurveDefault = 0.02f;
+        cutoffDefault = 5200.0f;
+        resonanceDefault = 0.08f;
+        filterEnvAmountDefault = 0.08f;
+        sampleEndDefault = 0.98f;
+        fxTypeDefault = 3;
+        fxMixDefault = 0.06f;
+        fxIntensityDefault = 0.12f;
+        reverbMixDefault = 0.18f;
+        delaySendDefault = 0.04f;
+        lfo1RateDefault = 0.1f;
+        lfo2RateDefault = 0.06f;
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::saxophone)
+    {
+        oscDefault = 4;
+        unisonDefault = 1;
+        detuneDefault = 0.0f;
+        gateDefault = 8.0f;
+        ampAttackDefault = 0.018f;
+        ampDecayDefault = 0.3f;
+        ampSustainDefault = 0.82f;
+        ampReleaseDefault = 0.3f;
+        filtAttackDefault = 0.012f;
+        filtDecayDefault = 0.22f;
+        filtSustainDefault = 0.72f;
+        filtReleaseDefault = 0.22f;
+        envCurveDefault = 0.08f;
+        cutoffDefault = 3400.0f;
+        resonanceDefault = 0.22f;
+        filterEnvAmountDefault = 0.24f;
+        sampleEndDefault = 0.98f;
+        fxTypeDefault = 2;
+        fxMixDefault = 0.1f;
+        fxIntensityDefault = 0.18f;
+        reverbMixDefault = 0.12f;
+        delaySendDefault = 0.02f;
+        lfo1RateDefault = 0.1f;
+        lfo2RateDefault = 0.08f;
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::bassGuitar)
+    {
+        oscDefault = 4;
+        unisonDefault = 1;
+        detuneDefault = 0.0f;
+        gateDefault = 5.0f;
+        ampAttackDefault = 0.001f;
+        ampDecayDefault = 0.28f;
+        ampSustainDefault = 0.72f;
+        ampReleaseDefault = 0.18f;
+        filtAttackDefault = 0.001f;
+        filtDecayDefault = 0.2f;
+        filtSustainDefault = 0.56f;
+        filtReleaseDefault = 0.18f;
+        envCurveDefault = 0.1f;
+        cutoffDefault = 1500.0f;
+        resonanceDefault = 0.18f;
+        filterEnvAmountDefault = 0.22f;
+        sampleEndDefault = 0.96f;
+        fxTypeDefault = 1;
+        fxMixDefault = 0.04f;
+        fxIntensityDefault = 0.08f;
+        reverbMixDefault = 0.03f;
+        lfo1RateDefault = 0.05f;
+        lfo2RateDefault = 0.04f;
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::harp)
+    {
+        oscDefault = 4;
+        unisonDefault = 1;
+        detuneDefault = 0.0f;
+        gateDefault = 6.0f;
+        ampAttackDefault = 0.001f;
+        ampDecayDefault = 0.76f;
+        ampSustainDefault = 0.42f;
+        ampReleaseDefault = 1.0f;
+        filtAttackDefault = 0.001f;
+        filtDecayDefault = 0.34f;
+        filtSustainDefault = 0.62f;
+        filtReleaseDefault = 0.54f;
+        envCurveDefault = 0.04f;
+        cutoffDefault = 6200.0f;
+        resonanceDefault = 0.12f;
+        filterEnvAmountDefault = 0.18f;
+        sampleEndDefault = 0.98f;
+        fxTypeDefault = 3;
+        fxMixDefault = 0.08f;
+        fxIntensityDefault = 0.16f;
+        reverbMixDefault = 0.2f;
+        delaySendDefault = 0.06f;
+        lfo1RateDefault = 0.06f;
+        lfo2RateDefault = 0.05f;
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::organ)
+    {
+        oscDefault = 4;
+        unisonDefault = 1;
+        detuneDefault = 0.0f;
+        gateDefault = 8.0f;
+        ampAttackDefault = 0.001f;
+        ampDecayDefault = 0.08f;
+        ampSustainDefault = 1.0f;
+        ampReleaseDefault = 0.14f;
+        filtAttackDefault = 0.001f;
+        filtDecayDefault = 0.08f;
+        filtSustainDefault = 1.0f;
+        filtReleaseDefault = 0.08f;
+        envCurveDefault = 0.0f;
+        cutoffDefault = 7600.0f;
+        resonanceDefault = 0.04f;
+        filterEnvAmountDefault = 0.02f;
+        sampleEndDefault = 1.0f;
+        fxTypeDefault = 3;
+        fxMixDefault = 0.12f;
+        fxIntensityDefault = 0.18f;
+        reverbMixDefault = 0.14f;
+        lfo1RateDefault = 0.04f;
+        lfo2RateDefault = 0.03f;
+    }
     else if constexpr (buildFlavor() == InstrumentFlavor::acid303)
     {
         oscDefault = 1;
@@ -5248,6 +6128,305 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
             default:
                 setParameterActual ("CUTOFF", 4200.0f);
                 setParameterActual ("AMPRELEASE", 0.36f);
+                break;
+        }
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::piano)
+    {
+        setParameterActual ("SAMPLEBANK", static_cast<float> (juce::jlimit (0, juce::jmax (0, sampleBankChoices().size() - 1), presetIndex)));
+        switch (presetIndex)
+        {
+            case 1:
+                setParameterActual ("CUTOFF", 3600.0f);
+                setParameterActual ("AMPRELEASE", 0.58f);
+                setParameterActual ("FILTERENVAMOUNT", 0.08f);
+                setParameterActual ("REVERBMIX", 0.08f);
+                setParameterActual ("FXMIX", 0.04f);
+                break;
+            case 2:
+                setParameterActual ("CUTOFF", 6200.0f);
+                setParameterActual ("AMPRELEASE", 0.48f);
+                setParameterActual ("FILTERENVAMOUNT", 0.18f);
+                setParameterActual ("REVERBMIX", 0.1f);
+                setParameterActual ("FXMIX", 0.1f);
+                break;
+            case 3:
+                setParameterActual ("CUTOFF", 4600.0f);
+                setParameterActual ("AMPATTACK", 0.006f);
+                setParameterActual ("AMPRELEASE", 1.2f);
+                setParameterActual ("FILTERENVAMOUNT", 0.16f);
+                setParameterActual ("REVERBMIX", 0.26f);
+                setParameterActual ("DELAYSEND", 0.08f);
+                setParameterActual ("FXMIX", 0.08f);
+                break;
+            default:
+                setParameterActual ("CUTOFF", 5400.0f);
+                setParameterActual ("AMPRELEASE", 0.78f);
+                setParameterActual ("FILTERENVAMOUNT", 0.12f);
+                setParameterActual ("REVERBMIX", 0.14f);
+                break;
+        }
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::guitar)
+    {
+        setParameterActual ("SAMPLEBANK", static_cast<float> (juce::jlimit (0, juce::jmax (0, sampleBankChoices().size() - 1), presetIndex)));
+        switch (presetIndex)
+        {
+            case 1:
+                setParameterActual ("CUTOFF", 5400.0f);
+                setParameterActual ("AMPDECAY", 0.28f);
+                setParameterActual ("AMPSUSTAIN", 0.18f);
+                setParameterActual ("FILTERENVAMOUNT", 0.34f);
+                setParameterActual ("FXMIX", 0.06f);
+                setParameterActual ("REVERBMIX", 0.08f);
+                break;
+            case 2:
+                setParameterActual ("CUTOFF", 3000.0f);
+                setParameterActual ("AMPDECAY", 0.42f);
+                setParameterActual ("AMPSUSTAIN", 0.28f);
+                setParameterActual ("FILTERENVAMOUNT", 0.18f);
+                setParameterActual ("REVERBMIX", 0.12f);
+                break;
+            case 3:
+                setParameterActual ("CUTOFF", 2600.0f);
+                setParameterActual ("AMPDECAY", 0.18f);
+                setParameterActual ("AMPSUSTAIN", 0.1f);
+                setParameterActual ("AMPRELEASE", 0.14f);
+                setParameterActual ("FILTERENVAMOUNT", 0.26f);
+                setParameterActual ("FXMIX", 0.04f);
+                break;
+            default:
+                setParameterActual ("CUTOFF", 4200.0f);
+                setParameterActual ("AMPDECAY", 0.34f);
+                setParameterActual ("AMPSUSTAIN", 0.22f);
+                setParameterActual ("AMPRELEASE", 0.24f);
+                setParameterActual ("FILTERENVAMOUNT", 0.24f);
+                setParameterActual ("REVERBMIX", 0.1f);
+                break;
+        }
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::violin)
+    {
+        setParameterActual ("SAMPLEBANK", static_cast<float> (juce::jlimit (0, juce::jmax (0, sampleBankChoices().size() - 1), presetIndex)));
+        switch (presetIndex)
+        {
+            case 1:
+                setParameterActual ("CUTOFF", 3900.0f);
+                setParameterActual ("AMPATTACK", 0.07f);
+                setParameterActual ("AMPRELEASE", 1.1f);
+                setParameterActual ("LFO1PITCH", 0.35f);
+                setParameterActual ("FXMIX", 0.16f);
+                setParameterActual ("REVERBMIX", 0.2f);
+                break;
+            case 2:
+                setParameterActual ("UNISON", 2.0f);
+                setParameterActual ("CUTOFF", 3000.0f);
+                setParameterActual ("AMPATTACK", 0.12f);
+                setParameterActual ("AMPRELEASE", 1.2f);
+                setParameterActual ("LFO1PITCH", 0.18f);
+                setParameterActual ("FXMIX", 0.18f);
+                setParameterActual ("REVERBMIX", 0.24f);
+                break;
+            case 3:
+                setParameterActual ("CUTOFF", 2600.0f);
+                setParameterActual ("AMPATTACK", 0.015f);
+                setParameterActual ("AMPDECAY", 0.28f);
+                setParameterActual ("AMPSUSTAIN", 0.7f);
+                setParameterActual ("AMPRELEASE", 0.38f);
+                setParameterActual ("FILTERENVAMOUNT", 0.22f);
+                setParameterActual ("LFO1PITCH", 0.12f);
+                break;
+            default:
+                setParameterActual ("CUTOFF", 3400.0f);
+                setParameterActual ("AMPATTACK", 0.05f);
+                setParameterActual ("AMPRELEASE", 0.96f);
+                setParameterActual ("LFO1PITCH", 0.24f);
+                setParameterActual ("FXMIX", 0.12f);
+                setParameterActual ("REVERBMIX", 0.18f);
+                break;
+        }
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::flute)
+    {
+        setParameterActual ("SAMPLEBANK", static_cast<float> (juce::jlimit (0, juce::jmax (0, sampleBankChoices().size() - 1), presetIndex)));
+        switch (presetIndex)
+        {
+            case 1:
+                setParameterActual ("CUTOFF", 3600.0f);
+                setParameterActual ("AMPATTACK", 0.05f);
+                setParameterActual ("AMPSUSTAIN", 0.86f);
+                setParameterActual ("LFO1PITCH", 0.28f);
+                setParameterActual ("REVERBMIX", 0.22f);
+                break;
+            case 2:
+                setParameterActual ("CUTOFF", 6200.0f);
+                setParameterActual ("AMPATTACK", 0.02f);
+                setParameterActual ("FILTERENVAMOUNT", 0.12f);
+                setParameterActual ("LFO1PITCH", 0.18f);
+                setParameterActual ("REVERBMIX", 0.14f);
+                break;
+            case 3:
+                setParameterActual ("CUTOFF", 2800.0f);
+                setParameterActual ("AMPATTACK", 0.04f);
+                setParameterActual ("AMPSUSTAIN", 0.92f);
+                setParameterActual ("AMPRELEASE", 0.46f);
+                setParameterActual ("LFO1PITCH", 0.14f);
+                setParameterActual ("REVERBMIX", 0.2f);
+                break;
+            default:
+                setParameterActual ("CUTOFF", 5200.0f);
+                setParameterActual ("AMPATTACK", 0.03f);
+                setParameterActual ("AMPSUSTAIN", 0.9f);
+                setParameterActual ("AMPRELEASE", 0.34f);
+                setParameterActual ("LFO1PITCH", 0.22f);
+                setParameterActual ("REVERBMIX", 0.18f);
+                break;
+        }
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::saxophone)
+    {
+        setParameterActual ("SAMPLEBANK", static_cast<float> (juce::jlimit (0, juce::jmax (0, sampleBankChoices().size() - 1), presetIndex)));
+        switch (presetIndex)
+        {
+            case 1:
+                setParameterActual ("CUTOFF", 2800.0f);
+                setParameterActual ("RESONANCE", 0.18f);
+                setParameterActual ("AMPATTACK", 0.028f);
+                setParameterActual ("FILTERENVAMOUNT", 0.18f);
+                setParameterActual ("LFO1PITCH", 0.2f);
+                setParameterActual ("FXMIX", 0.08f);
+                break;
+            case 2:
+                setParameterActual ("CUTOFF", 2200.0f);
+                setParameterActual ("RESONANCE", 0.14f);
+                setParameterActual ("AMPATTACK", 0.032f);
+                setParameterActual ("AMPSUSTAIN", 0.9f);
+                setParameterActual ("AMPRELEASE", 0.36f);
+                setParameterActual ("LFO1PITCH", 0.14f);
+                setParameterActual ("FXMIX", 0.06f);
+                break;
+            case 3:
+                setParameterActual ("CUTOFF", 4200.0f);
+                setParameterActual ("RESONANCE", 0.28f);
+                setParameterActual ("AMPATTACK", 0.012f);
+                setParameterActual ("FILTERENVAMOUNT", 0.3f);
+                setParameterActual ("LFO1PITCH", 0.24f);
+                setParameterActual ("FXMIX", 0.14f);
+                setParameterActual ("FXINTENSITY", 0.24f);
+                break;
+            default:
+                setParameterActual ("CUTOFF", 3400.0f);
+                setParameterActual ("RESONANCE", 0.22f);
+                setParameterActual ("AMPATTACK", 0.018f);
+                setParameterActual ("AMPSUSTAIN", 0.82f);
+                setParameterActual ("AMPRELEASE", 0.3f);
+                setParameterActual ("LFO1PITCH", 0.18f);
+                break;
+        }
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::bassGuitar)
+    {
+        setParameterActual ("SAMPLEBANK", static_cast<float> (juce::jlimit (0, juce::jmax (0, sampleBankChoices().size() - 1), presetIndex)));
+        switch (presetIndex)
+        {
+            case 1:
+                setParameterActual ("CUTOFF", 2100.0f);
+                setParameterActual ("FILTERENVAMOUNT", 0.3f);
+                setParameterActual ("AMPDECAY", 0.22f);
+                setParameterActual ("AMPSUSTAIN", 0.64f);
+                setParameterActual ("FXMIX", 0.05f);
+                break;
+            case 2:
+                setParameterActual ("CUTOFF", 1100.0f);
+                setParameterActual ("AMPDECAY", 0.18f);
+                setParameterActual ("AMPSUSTAIN", 0.46f);
+                setParameterActual ("AMPRELEASE", 0.12f);
+                setParameterActual ("FILTERENVAMOUNT", 0.16f);
+                break;
+            case 3:
+                setParameterActual ("CUTOFF", 1300.0f);
+                setParameterActual ("RESONANCE", 0.14f);
+                setParameterActual ("AMPDECAY", 0.34f);
+                setParameterActual ("AMPSUSTAIN", 0.82f);
+                setParameterActual ("AMPRELEASE", 0.24f);
+                setParameterActual ("FXTYPE", 0.0f);
+                setParameterActual ("REVERBMIX", 0.02f);
+                break;
+            default:
+                setParameterActual ("CUTOFF", 1500.0f);
+                setParameterActual ("RESONANCE", 0.18f);
+                setParameterActual ("AMPDECAY", 0.28f);
+                setParameterActual ("AMPSUSTAIN", 0.72f);
+                setParameterActual ("AMPRELEASE", 0.18f);
+                break;
+        }
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::harp)
+    {
+        setParameterActual ("SAMPLEBANK", static_cast<float> (juce::jlimit (0, juce::jmax (0, sampleBankChoices().size() - 1), presetIndex)));
+        switch (presetIndex)
+        {
+            case 1:
+                setParameterActual ("CUTOFF", 5200.0f);
+                setParameterActual ("AMPDECAY", 0.66f);
+                setParameterActual ("AMPSUSTAIN", 0.36f);
+                setParameterActual ("AMPRELEASE", 0.82f);
+                setParameterActual ("REVERBMIX", 0.12f);
+                break;
+            case 2:
+                setParameterActual ("CUTOFF", 6000.0f);
+                setParameterActual ("AMPDECAY", 0.92f);
+                setParameterActual ("AMPSUSTAIN", 0.46f);
+                setParameterActual ("AMPRELEASE", 1.4f);
+                setParameterActual ("REVERBMIX", 0.28f);
+                setParameterActual ("DELAYSEND", 0.1f);
+                setParameterActual ("FXMIX", 0.12f);
+                break;
+            case 3:
+                setParameterActual ("CUTOFF", 3800.0f);
+                setParameterActual ("AMPDECAY", 0.38f);
+                setParameterActual ("AMPSUSTAIN", 0.24f);
+                setParameterActual ("AMPRELEASE", 0.52f);
+                setParameterActual ("FILTERENVAMOUNT", 0.12f);
+                break;
+            default:
+                setParameterActual ("CUTOFF", 6200.0f);
+                setParameterActual ("AMPDECAY", 0.76f);
+                setParameterActual ("AMPSUSTAIN", 0.42f);
+                setParameterActual ("AMPRELEASE", 1.0f);
+                setParameterActual ("REVERBMIX", 0.2f);
+                break;
+        }
+    }
+    else if constexpr (buildFlavor() == InstrumentFlavor::organ)
+    {
+        setParameterActual ("SAMPLEBANK", static_cast<float> (juce::jlimit (0, juce::jmax (0, sampleBankChoices().size() - 1), presetIndex)));
+        switch (presetIndex)
+        {
+            case 1:
+                setParameterActual ("CUTOFF", 6600.0f);
+                setParameterActual ("RESONANCE", 0.06f);
+                setParameterActual ("FXMIX", 0.1f);
+                setParameterActual ("REVERBMIX", 0.08f);
+                break;
+            case 2:
+                setParameterActual ("CUTOFF", 7200.0f);
+                setParameterActual ("AMPATTACK", 0.01f);
+                setParameterActual ("AMPRELEASE", 0.26f);
+                setParameterActual ("REVERBMIX", 0.26f);
+                setParameterActual ("FXMIX", 0.14f);
+                setParameterActual ("DELAYSEND", 0.06f);
+                break;
+            case 3:
+                setParameterActual ("CUTOFF", 5800.0f);
+                setParameterActual ("FILTERENVAMOUNT", 0.04f);
+                setParameterActual ("FXMIX", 0.16f);
+                setParameterActual ("REVERBMIX", 0.18f);
+                break;
+            default:
+                setParameterActual ("CUTOFF", 7600.0f);
+                setParameterActual ("FXMIX", 0.12f);
+                setParameterActual ("REVERBMIX", 0.14f);
                 break;
         }
     }

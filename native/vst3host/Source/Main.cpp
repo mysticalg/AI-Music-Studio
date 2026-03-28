@@ -491,6 +491,7 @@ public:
                 || command == "start_audio_stream"
                 || command == "set_audio_engine_transport"
                 || command == "set_audio_engine_track_audibility"
+                || command == "set_audio_engine_track_mix"
                 || command == "set_audio_engine_track_notes"
                 || command == "set_audio_engine_track_parameters"
                 || command == "set_audio_engine_track_state"
@@ -1739,6 +1740,54 @@ private:
             }
 
             auto response = makeResponse(true, "Audio engine track audibility updated");
+            appendStatusFields(response);
+            setResponseField(response, "updated_count", updatedCount);
+            return response;
+        }
+
+        if (command == "set_audio_engine_track_mix")
+        {
+            auto* updatesArray = object->getProperty("updates").getArray();
+            if (updatesArray == nullptr)
+                return makeResponse(false, "set_audio_engine_track_mix requires an updates array");
+
+            juce::ScopedLock lock(pluginLock);
+            int updatedCount = 0;
+            for (const auto& updateVar : *updatesArray)
+            {
+                auto* updateObject = updateVar.getDynamicObject();
+                if (updateObject == nullptr)
+                    continue;
+
+                const auto trackIndex = static_cast<int>(updateObject->hasProperty("track_index")
+                    ? updateObject->getProperty("track_index") : juce::var(-1));
+                if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(audioEngine.tracks.size())))
+                    continue;
+
+                auto& track = audioEngine.tracks[static_cast<size_t>(trackIndex)];
+                const auto newVolume = updateObject->hasProperty("volume")
+                    ? static_cast<float>(updateObject->getProperty("volume")) : track.baseVolume;
+                const auto newPan = updateObject->hasProperty("pan")
+                    ? static_cast<float>(updateObject->getProperty("pan")) : track.basePan;
+                const auto newOutputGainDb = updateObject->hasProperty("output_gain_db")
+                    ? static_cast<float>(updateObject->getProperty("output_gain_db")) : track.baseOutputGainDb;
+
+                const auto clampedVolume = juce::jmax(0.0f, newVolume);
+                const auto clampedPan = juce::jlimit(-1.0f, 1.0f, newPan);
+                if (std::abs(track.baseVolume - clampedVolume) < 1.0e-6f
+                    && std::abs(track.basePan - clampedPan) < 1.0e-6f
+                    && std::abs(track.baseOutputGainDb - newOutputGainDb) < 1.0e-6f)
+                {
+                    continue;
+                }
+
+                track.baseVolume = clampedVolume;
+                track.basePan = clampedPan;
+                track.baseOutputGainDb = newOutputGainDb;
+                ++updatedCount;
+            }
+
+            auto response = makeResponse(true, "Audio engine track mix updated");
             appendStatusFields(response);
             setResponseField(response, "updated_count", updatedCount);
             return response;

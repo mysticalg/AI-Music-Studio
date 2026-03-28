@@ -92,7 +92,15 @@ private:
         sampler,
         drum808,
         acid303,
-        vec1DrumPad
+        vec1DrumPad,
+        piano,
+        guitar,
+        violin,
+        flute,
+        saxophone,
+        bassGuitar,
+        harp,
+        organ
     };
 
     static constexpr int drumVoiceLevelCount = 15;
@@ -507,6 +515,22 @@ private:
         return InstrumentFlavor::acid303;
 #elif AIMS_INSTRUMENT_FLAVOR == 10
         return InstrumentFlavor::vec1DrumPad;
+#elif AIMS_INSTRUMENT_FLAVOR == 11
+        return InstrumentFlavor::piano;
+#elif AIMS_INSTRUMENT_FLAVOR == 12
+        return InstrumentFlavor::guitar;
+#elif AIMS_INSTRUMENT_FLAVOR == 13
+        return InstrumentFlavor::violin;
+#elif AIMS_INSTRUMENT_FLAVOR == 14
+        return InstrumentFlavor::flute;
+#elif AIMS_INSTRUMENT_FLAVOR == 15
+        return InstrumentFlavor::saxophone;
+#elif AIMS_INSTRUMENT_FLAVOR == 16
+        return InstrumentFlavor::bassGuitar;
+#elif AIMS_INSTRUMENT_FLAVOR == 17
+        return InstrumentFlavor::harp;
+#elif AIMS_INSTRUMENT_FLAVOR == 18
+        return InstrumentFlavor::organ;
 #else
         return InstrumentFlavor::advanced;
 #endif
@@ -526,7 +550,10 @@ private:
 
     [[nodiscard]] static constexpr bool isMonophonicFlavor() noexcept
     {
-        return buildFlavor() == InstrumentFlavor::bassSynth;
+        return buildFlavor() == InstrumentFlavor::bassSynth
+               || buildFlavor() == InstrumentFlavor::flute
+               || buildFlavor() == InstrumentFlavor::saxophone
+               || buildFlavor() == InstrumentFlavor::bassGuitar;
     }
 
     [[nodiscard]] static constexpr int voiceLimitForFlavor() noexcept
@@ -549,6 +576,22 @@ private:
             return 6;
         if constexpr (buildFlavor() == InstrumentFlavor::acid303)
             return 1;
+        if constexpr (buildFlavor() == InstrumentFlavor::piano)
+            return 16;
+        if constexpr (buildFlavor() == InstrumentFlavor::guitar)
+            return 6;
+        if constexpr (buildFlavor() == InstrumentFlavor::violin)
+            return 8;
+        if constexpr (buildFlavor() == InstrumentFlavor::flute)
+            return 1;
+        if constexpr (buildFlavor() == InstrumentFlavor::saxophone)
+            return 1;
+        if constexpr (buildFlavor() == InstrumentFlavor::bassGuitar)
+            return 1;
+        if constexpr (buildFlavor() == InstrumentFlavor::harp)
+            return 12;
+        if constexpr (buildFlavor() == InstrumentFlavor::organ)
+            return 16;
         if constexpr (buildFlavor() == InstrumentFlavor::advanced)
             return 8;
         return maxVoices;
@@ -562,11 +605,21 @@ private:
                       || buildFlavor() == InstrumentFlavor::vec1DrumPad
                       || buildFlavor() == InstrumentFlavor::sampler
                       || buildFlavor() == InstrumentFlavor::pluckSynth
+                      || buildFlavor() == InstrumentFlavor::piano
+                      || buildFlavor() == InstrumentFlavor::guitar
+                      || buildFlavor() == InstrumentFlavor::flute
+                      || buildFlavor() == InstrumentFlavor::saxophone
+                      || buildFlavor() == InstrumentFlavor::bassGuitar
+                      || buildFlavor() == InstrumentFlavor::harp
                       || buildFlavor() == InstrumentFlavor::acid303)
             return 1;
         if constexpr (buildFlavor() == InstrumentFlavor::stringSynth)
             return maxUnisonOscillators;
+        if constexpr (buildFlavor() == InstrumentFlavor::violin)
+            return 2;
         if constexpr (buildFlavor() == InstrumentFlavor::padSynth)
+            return 2;
+        if constexpr (buildFlavor() == InstrumentFlavor::organ)
             return 2;
         if constexpr (buildFlavor() == InstrumentFlavor::leadSynth)
             return 1;

@@ -82,6 +82,15 @@ class NativeAudioEngineClient:
             updates=list(updates),
         )
 
+    def update_track_mix(
+        self,
+        updates: list[dict[str, object]],
+    ) -> dict[str, Any]:
+        return self.bridge.command(
+            "set_audio_engine_track_mix",
+            updates=list(updates),
+        )
+
     def stop(self) -> dict[str, Any]:
         return self.bridge.command("stop_audio_engine")
 
