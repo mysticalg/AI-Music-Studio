@@ -12,6 +12,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -673,6 +674,12 @@ private:
         int channel = 1;
     };
 
+    struct ParameterValueUpdate
+    {
+        juce::String name;
+        float value = 0.0f;
+    };
+
     enum class AudioEngineTrackKind
     {
         instrument,
@@ -781,6 +788,13 @@ private:
         }
     };
 
+    struct QueuedAudioEngineTrackParameterUpdate
+    {
+        int trackIndex = -1;
+        juce::String parameterSignature;
+        std::vector<ParameterValueUpdate> parameters;
+    };
+
     juce::var handleRemoteCommand(const juce::var& request)
     {
         auto* object = request.getDynamicObject();
@@ -793,15 +807,19 @@ private:
 
         if (command == "ping")
         {
+            const auto lightweight = static_cast<bool>(object->getProperty("lightweight"));
+            const auto includePluginParameters = static_cast<bool>(object->getProperty("include_plugin_parameters"));
             auto response = makeResponse(true, "pong");
-            appendStatusFields(response);
+            appendStatusFields(response, lightweight, includePluginParameters);
             return response;
         }
 
         if (command == "status")
         {
+            const auto lightweight = static_cast<bool>(object->getProperty("lightweight"));
+            const auto includePluginParameters = static_cast<bool>(object->getProperty("include_plugin_parameters"));
             auto response = makeResponse(true, "status");
-            appendStatusFields(response);
+            appendStatusFields(response, lightweight, includePluginParameters);
             return response;
         }
 
@@ -858,7 +876,7 @@ private:
                 return makeResponse(false, "Could not load plugin state");
 
             auto response = makeResponse(true, "Plugin state loaded");
-            appendStatusFields(response);
+            appendStatusFields(response, true);
             setResponseField(response, "state_path", stateFile.getFullPathName());
             return response;
         }
@@ -877,7 +895,7 @@ private:
                 return makeResponse(false, "Could not save plugin state");
 
             auto response = makeResponse(true, "Plugin state saved");
-            appendStatusFields(response);
+            appendStatusFields(response, true);
             setResponseField(response, "state_path", stateFile.getFullPathName());
             return response;
         }
@@ -901,7 +919,7 @@ private:
         {
             closeEditorWindow();
             auto response = makeResponse(true, "Editor closed");
-            appendStatusFields(response);
+            appendStatusFields(response, true);
             return response;
         }
 
@@ -987,7 +1005,7 @@ private:
                 openGraphEditorWindow(slotIndex);
             });
             auto response = makeResponse(true, "Graph editor opened");
-            appendStatusFields(response);
+            appendStatusFields(response, true);
             setResponseField(response, "graph_editor_slot", slotIndex);
             return response;
         }
@@ -996,7 +1014,7 @@ private:
         {
             closeGraphEditorWindow();
             auto response = makeResponse(true, "Graph editor closed");
-            appendStatusFields(response);
+            appendStatusFields(response, true);
             return response;
         }
 
@@ -1069,9 +1087,7 @@ private:
                 : 0.0f;
             pluginOutputGain.store(juce::jmax(0.0f, gain));
             pluginOutputPan.store(juce::jlimit(-1.0f, 1.0f, pan));
-            auto response = makeResponse(true, "Output mix updated");
-            appendStatusFields(response);
-            return response;
+            return makeResponse(true, "Output mix updated");
         }
 
         if (command == "set_parameters")
@@ -1086,7 +1102,6 @@ private:
                 return makeResponse(false, error.isNotEmpty() ? error : "Could not update plugin parameters");
 
             auto response = makeResponse(true, "Plugin parameters updated");
-            appendStatusFields(response);
             setResponseField(response, "applied_parameter_count", appliedCount);
             if (!unmatchedParameters.isEmpty())
             {
@@ -1131,7 +1146,6 @@ private:
                 : parameterPayloadSignature(object->getProperty("parameters"));
             slot.parameterSignature = parameterSignature;
             auto response = makeResponse(true, "Graph slot parameters updated");
-            appendStatusFields(response);
             setResponseField(response, "graph_editor_slot", slotIndex);
             setResponseField(response, "applied_parameter_count", appliedCount);
             if (!unmatchedParameters.isEmpty())
@@ -1591,27 +1605,24 @@ private:
         {
             const auto trackIndex = static_cast<int>(object->hasProperty("track_index")
                 ? object->getProperty("track_index") : juce::var(-1));
-
-            juce::ScopedLock lock(pluginLock);
-            if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(audioEngine.tracks.size())))
+            if (!juce::isPositiveAndBelow(trackIndex, audioEngineTrackCount.load(std::memory_order_acquire)))
                 return makeResponse(false, "Invalid audio engine track index");
 
-            auto& track = audioEngine.tracks[static_cast<size_t>(trackIndex)];
-            if (track.plugin == nullptr)
-                return makeResponse(false, "Audio engine track has no plugin loaded");
-
             juce::String error;
-            int appliedCount = 0;
-            juce::StringArray unmatchedParameters;
-            if (!applyRequestedParameterValuesToPlugin(
-                    *track.plugin,
-                    object->getProperty("parameters"),
-                    error, appliedCount, unmatchedParameters))
+            std::vector<ParameterValueUpdate> parameterUpdates;
+            if (!parseRequestedParameterValues(object->getProperty("parameters"), parameterUpdates, error))
                 return makeResponse(false, error.isNotEmpty() ? error : "Could not update track parameters");
 
-            auto response = makeResponse(true, "Audio engine track parameters updated");
-            appendStatusFields(response);
-            setResponseField(response, "applied_parameter_count", appliedCount);
+            queueAudioEngineTrackParameterUpdate(
+                trackIndex,
+                parameterUpdates,
+                object->hasProperty("parameter_signature")
+                    ? std::optional<juce::String>(object->getProperty("parameter_signature").toString().trim())
+                    : std::nullopt
+            );
+
+            auto response = makeResponse(true, "Audio engine track parameters queued");
+            setResponseField(response, "queued_parameter_count", static_cast<int>(parameterUpdates.size()));
             return response;
         }
 
@@ -1628,6 +1639,8 @@ private:
             auto& track = audioEngine.tracks[static_cast<size_t>(trackIndex)];
             if (track.plugin == nullptr)
                 return makeResponse(false, "Audio engine track has no plugin loaded");
+
+            discardQueuedAudioEngineTrackParameterUpdate(trackIndex);
 
             if (path.isEmpty())
                 return makeResponse(false, "Missing state path");
@@ -1915,7 +1928,9 @@ private:
         return makeResponse(false, "Unknown command: " + command);
     }
 
-    void appendStatusFields(juce::var& response) const
+    void appendStatusFields(juce::var& response,
+                            bool lightweight = false,
+                            bool includePluginParameters = false) const
     {
         bool pluginIsInstrument = false;
         bool pluginIsEffect = false;
@@ -1940,24 +1955,27 @@ private:
                     || (pluginInstance->acceptsMidi() && pluginInstance->getTotalNumInputChannels() == 0);
                 pluginIsEffect = !pluginIsInstrument;
 
-                auto pluginParameters = pluginInstance->getParameters();
-                for (int index = 0; index < pluginParameters.size(); ++index)
+                if (!lightweight || includePluginParameters)
                 {
-                    auto* parameter = pluginParameters[index];
-                    if (parameter == nullptr)
-                        continue;
+                    auto pluginParameters = pluginInstance->getParameters();
+                    for (int index = 0; index < pluginParameters.size(); ++index)
+                    {
+                        auto* parameter = pluginParameters[index];
+                        if (parameter == nullptr)
+                            continue;
 
-                    auto parameterName = parameter->getName(256).trim();
-                    if (parameterName.isEmpty())
-                        parameterName = "Param " + juce::String(index + 1);
+                        auto parameterName = parameter->getName(256).trim();
+                        if (parameterName.isEmpty())
+                            parameterName = "Param " + juce::String(index + 1);
 
-                    auto* parameterObject = new juce::DynamicObject();
-                    parameterObject->setProperty("index", index);
-                    parameterObject->setProperty("name", parameterName);
-                    parameterObject->setProperty("label", parameter->getLabel().trim());
-                    parameterObject->setProperty("normalized_value", parameter->getValue());
-                    parameters.add(juce::var(parameterObject));
-                    parameterNames.addIfNotAlreadyThere(parameterName);
+                        auto* parameterObject = new juce::DynamicObject();
+                        parameterObject->setProperty("index", index);
+                        parameterObject->setProperty("name", parameterName);
+                        parameterObject->setProperty("label", parameter->getLabel().trim());
+                        parameterObject->setProperty("normalized_value", parameter->getValue());
+                        parameters.add(juce::var(parameterObject));
+                        parameterNames.addIfNotAlreadyThere(parameterName);
+                    }
                 }
             }
             for (int index = 0; index < static_cast<int>(persistentGraphSlots.size()); ++index)
@@ -1967,13 +1985,16 @@ private:
                     continue;
                 auto* slotObject = new juce::DynamicObject();
                 slotObject->setProperty("slot_index", index);
-                slotObject->setProperty("name", slot.name);
-                slotObject->setProperty("plugin_path", slot.pluginPath);
-                slotObject->setProperty("state_path", slot.statePath);
-                slotObject->setProperty("gain", slot.gain);
-                slotObject->setProperty("pan", slot.pan);
                 slotObject->setProperty("peak_level", slot.peakLevel);
-                slotObject->setProperty("fx_count", static_cast<int>(slot.fxChain.size()));
+                if (!lightweight)
+                {
+                    slotObject->setProperty("name", slot.name);
+                    slotObject->setProperty("plugin_path", slot.pluginPath);
+                    slotObject->setProperty("state_path", slot.statePath);
+                    slotObject->setProperty("gain", slot.gain);
+                    slotObject->setProperty("pan", slot.pan);
+                    slotObject->setProperty("fx_count", static_cast<int>(slot.fxChain.size()));
+                }
                 graphSlots.add(juce::var(slotObject));
             }
         }
@@ -1984,37 +2005,52 @@ private:
             if (auto* device = deviceManager.getCurrentAudioDevice())
             {
                 audioDeviceName = device->getName();
-                for (const auto rate : device->getAvailableSampleRates())
-                    availableAudioSampleRates.add(static_cast<int>(std::round(rate)));
-                for (const auto size : device->getAvailableBufferSizes())
-                    availableAudioBufferSizes.add(size);
+                if (!lightweight)
+                {
+                    for (const auto rate : device->getAvailableSampleRates())
+                        availableAudioSampleRates.add(static_cast<int>(std::round(rate)));
+                    for (const auto size : device->getAvailableBufferSizes())
+                        availableAudioBufferSizes.add(size);
+                }
             }
-            for (auto* type : const_cast<juce::AudioDeviceManager&>(deviceManager).getAvailableDeviceTypes())
+            if (!lightweight)
             {
-                if (type == nullptr || ! isUsableAudioDeviceType(*type))
-                    continue;
-                availableAudioDeviceTypes.addIfNotAlreadyThere(type->getTypeName());
+                for (auto* type : const_cast<juce::AudioDeviceManager&>(deviceManager).getAvailableDeviceTypes())
+                {
+                    if (type == nullptr || ! isUsableAudioDeviceType(*type))
+                        continue;
+                    availableAudioDeviceTypes.addIfNotAlreadyThere(type->getTypeName());
+                }
+                if (auto* type = deviceManager.getCurrentDeviceTypeObject())
+                    availableAudioOutputDevices = type->getDeviceNames(false);
             }
-            if (auto* type = deviceManager.getCurrentDeviceTypeObject())
-                availableAudioOutputDevices = type->getDeviceNames(false);
         }
 
         setResponseField(response, "plugin_loaded", pluginInstance != nullptr);
         setResponseField(response, "plugin_name", pluginDescription.name);
         setResponseField(response, "plugin_path",
                          normaliseVst3PathForSettings(pathEditor.getText().trim()));
-        setResponseField(response, "plugin_is_instrument", pluginIsInstrument);
-        setResponseField(response, "plugin_is_effect", pluginIsEffect);
-        setResponseField(response, "plugin_category", pluginCategory);
-        setResponseField(response, "parameter_names", juce::var(parameterNames));
-        setResponseField(response, "plugin_parameters", juce::var(parameters));
+        if (!lightweight)
+        {
+            setResponseField(response, "plugin_is_instrument", pluginIsInstrument);
+            setResponseField(response, "plugin_is_effect", pluginIsEffect);
+            setResponseField(response, "plugin_category", pluginCategory);
+        }
+        if (!lightweight || includePluginParameters)
+        {
+            setResponseField(response, "parameter_names", juce::var(parameterNames));
+            setResponseField(response, "plugin_parameters", juce::var(parameters));
+        }
         setResponseField(response, "editor_open", editorWindow != nullptr);
 
         // Detect plugin state changes that don't fire audioProcessorChanged
         // by checksumming the actual state blob on each status poll.
-        // Only check when editor is open to avoid false positives from
-        // plugins that embed playback-related data in their state.
-        if (pluginInstance != nullptr && editorWindow != nullptr)
+        // Skip this while a realtime transport is running because
+        // getStateInformation can be expensive enough to glitch live audio.
+        const bool realtimeTransportActive = inProcessTransport.running
+            || static_cast<bool>(graphTransportEnabled.load())
+            || audioEngine.running;
+        if (pluginInstance != nullptr && editorWindow != nullptr && !realtimeTransportActive)
         {
             juce::MemoryBlock stateBlock;
             pluginInstance->getStateInformation(stateBlock);
@@ -2040,9 +2076,10 @@ private:
         setResponseField(response, "plugin_output_peak_level", currentPluginOutputPeakLevel);
         setResponseField(response, "graph_slot_count", static_cast<int>(graphSlots.size()));
         setResponseField(response, "graph_slots", juce::var(graphSlots));
-        setResponseField(response, "graph_editor_open", graphEditorWindow != nullptr);
         setResponseField(response, "graph_editor_slot", graphEditorSlotIndex);
         setResponseField(response, "graph_transport_enabled", static_cast<bool>(graphTransportEnabled.load()));
+        if (!lightweight)
+            setResponseField(response, "graph_editor_open", graphEditorWindow != nullptr);
         setResponseField(response, "inprocess_transport_running", inProcessTransport.running);
         setResponseField(response, "inprocess_transport_position_frame",
                          static_cast<double>(inProcessTransport.positionFrame));
@@ -2052,34 +2089,41 @@ private:
             const auto& track = audioEngine.tracks[static_cast<size_t>(trackIndex)];
             auto* trackObject = new juce::DynamicObject();
             trackObject->setProperty("track_index", trackIndex);
-            trackObject->setProperty("name", track.name);
-            trackObject->setProperty("track_type",
-                track.kind == AudioEngineTrackKind::audio ? "audio" : "instrument");
-            trackObject->setProperty("plugin_path", track.pluginPath);
-            trackObject->setProperty("note_count", static_cast<int>(track.notes.size()));
-            trackObject->setProperty("clip_count", static_cast<int>(track.audioClips.size()));
             trackObject->setProperty("peak_level", track.peakLevel);
+            if (!lightweight)
+            {
+                trackObject->setProperty("name", track.name);
+                trackObject->setProperty("track_type",
+                    track.kind == AudioEngineTrackKind::audio ? "audio" : "instrument");
+                trackObject->setProperty("plugin_path", track.pluginPath);
+                trackObject->setProperty("note_count", static_cast<int>(track.notes.size()));
+                trackObject->setProperty("clip_count", static_cast<int>(track.audioClips.size()));
+            }
             audioEngineTracks.add(juce::var(trackObject));
         }
         setResponseField(response, "audio_engine_track_count", static_cast<int>(audioEngine.tracks.size()));
         setResponseField(response, "audio_engine_running", audioEngine.running);
         setResponseField(response, "audio_engine_position_frame", static_cast<double>(audioEngine.positionFrame));
-        setResponseField(response, "audio_engine_metronome_enabled", audioEngine.metronomeEnabled);
         setResponseField(response, "audio_engine_tracks", juce::var(audioEngineTracks));
-        setResponseField(response, "graph_scheduled_event_count", totalPersistentGraphScheduledEventCount());
-        setResponseField(response, "input_buses", describeBuses(true));
-        setResponseField(response, "output_buses", describeBuses(false));
-        setResponseField(response, "audio_device_type", audioDeviceType);
-        setResponseField(response, "audio_device_name", audioDeviceName);
-        setResponseField(response, "available_audio_device_types", juce::var(availableAudioDeviceTypes));
-        setResponseField(response, "available_audio_output_devices", juce::var(availableAudioOutputDevices));
-        setResponseField(response, "available_audio_sample_rates", juce::var(availableAudioSampleRates));
-        setResponseField(response, "available_audio_buffer_sizes", juce::var(availableAudioBufferSizes));
+        if (!lightweight)
+        {
+            setResponseField(response, "audio_engine_metronome_enabled", audioEngine.metronomeEnabled);
+            setResponseField(response, "graph_scheduled_event_count", totalPersistentGraphScheduledEventCount());
+            setResponseField(response, "input_buses", describeBuses(true));
+            setResponseField(response, "output_buses", describeBuses(false));
+            setResponseField(response, "audio_device_type", audioDeviceType);
+            setResponseField(response, "audio_device_name", audioDeviceName);
+            setResponseField(response, "available_audio_device_types", juce::var(availableAudioDeviceTypes));
+            setResponseField(response, "available_audio_output_devices", juce::var(availableAudioOutputDevices));
+            setResponseField(response, "available_audio_sample_rates", juce::var(availableAudioSampleRates));
+            setResponseField(response, "available_audio_buffer_sizes", juce::var(availableAudioBufferSizes));
+        }
         setResponseField(response, "audio_stream_enabled", static_cast<bool>(audioStreamEnabled.load()));
         setResponseField(response, "queued_audio_frames", queuedStreamAudioFrames(kMainAudioStreamId));
         setResponseField(response, "queued_audio_channels", queuedStreamAudioChannels(kMainAudioStreamId));
         setResponseField(response, "audio_queue_underruns", static_cast<double>(queuedStreamAudioUnderruns(kMainAudioStreamId)));
-        setResponseField(response, "audio_streams", describeQueuedAudioStreams());
+        if (!lightweight)
+            setResponseField(response, "audio_streams", describeQueuedAudioStreams());
     }
 
     void configureButton(juce::TextButton& button, const juce::String& text)
@@ -3577,10 +3621,9 @@ private:
         return -1;
     }
 
-    bool applyRequestedParameterValues(const juce::var& parametersVar,
-                                       juce::String& error,
-                                       int& appliedCount,
-                                       juce::StringArray& unmatchedParameters)
+    static bool parseRequestedParameterValues(const juce::var& parametersVar,
+                                              std::vector<ParameterValueUpdate>& parameterUpdates,
+                                              juce::String& error)
     {
         auto* parameterObject = parametersVar.getDynamicObject();
         if (parameterObject == nullptr)
@@ -3588,6 +3631,35 @@ private:
             error = "set_parameters requires an object payload";
             return false;
         }
+
+        parameterUpdates.clear();
+        parameterUpdates.reserve(static_cast<size_t>(parameterObject->getProperties().size()));
+        for (const auto& property : parameterObject->getProperties())
+        {
+            const auto parameterName = property.name.toString().trim();
+            if (parameterName.isEmpty())
+                continue;
+
+            parameterUpdates.push_back({
+                parameterName,
+                juce::jlimit(
+                    0.0f,
+                    100.0f,
+                    static_cast<float>(static_cast<double>(property.value))
+                ),
+            });
+        }
+        return true;
+    }
+
+    bool applyRequestedParameterValues(const juce::var& parametersVar,
+                                       juce::String& error,
+                                       int& appliedCount,
+                                       juce::StringArray& unmatchedParameters)
+    {
+        std::vector<ParameterValueUpdate> parameterUpdates;
+        if (!parseRequestedParameterValues(parametersVar, parameterUpdates, error))
+            return false;
 
         juce::ScopedLock lock(pluginLock);
         if (pluginInstance == nullptr)
@@ -3598,7 +3670,7 @@ private:
 
         return applyRequestedParameterValuesToPlugin(
             *pluginInstance,
-            parametersVar,
+            parameterUpdates,
             error,
             appliedCount,
             unmatchedParameters
@@ -3611,18 +3683,31 @@ private:
                                                       int& appliedCount,
                                                       juce::StringArray& unmatchedParameters)
     {
-        auto* parameterObject = parametersVar.getDynamicObject();
-        if (parameterObject == nullptr)
-        {
-            error = "set_parameters requires an object payload";
+        std::vector<ParameterValueUpdate> parameterUpdates;
+        if (!parseRequestedParameterValues(parametersVar, parameterUpdates, error))
             return false;
-        }
 
+        return applyRequestedParameterValuesToPlugin(
+            plugin,
+            parameterUpdates,
+            error,
+            appliedCount,
+            unmatchedParameters
+        );
+    }
+
+    static bool applyRequestedParameterValuesToPlugin(juce::AudioPluginInstance& plugin,
+                                                      const std::vector<ParameterValueUpdate>& parameterUpdates,
+                                                      juce::String& error,
+                                                      int& appliedCount,
+                                                      juce::StringArray& unmatchedParameters)
+    {
+        juce::ignoreUnused(error);
         auto parameters = plugin.getParameters();
 
-        for (const auto& property : parameterObject->getProperties())
+        for (const auto& parameterUpdate : parameterUpdates)
         {
-            const auto parameterName = property.name.toString();
+            const auto parameterName = parameterUpdate.name;
             const auto parameterIndex = resolvePluginParameterIndex(plugin, parameterName);
             if (!juce::isPositiveAndBelow(parameterIndex, parameters.size()))
             {
@@ -3640,7 +3725,7 @@ private:
             const auto normalizedValue = juce::jlimit(
                 0.0f,
                 1.0f,
-                static_cast<float>(static_cast<double>(property.value)) / 100.0f
+                parameterUpdate.value / 100.0f
             );
             parameter->beginChangeGesture();
             parameter->setValueNotifyingHost(normalizedValue);
@@ -3651,6 +3736,109 @@ private:
         if (appliedCount > 0)
             plugin.updateHostDisplay();
         return true;
+    }
+
+    void queueAudioEngineTrackParameterUpdate(
+        int trackIndex,
+        const std::vector<ParameterValueUpdate>& parameterUpdates,
+        std::optional<juce::String> parameterSignature = std::nullopt)
+    {
+        if (trackIndex < 0 || parameterUpdates.empty())
+            return;
+
+        const juce::SpinLock::ScopedLockType lock(pendingAudioEngineTrackParameterLock);
+        auto existing = std::find_if(
+            pendingAudioEngineTrackParameterUpdates.begin(),
+            pendingAudioEngineTrackParameterUpdates.end(),
+            [trackIndex](const auto& update) { return update.trackIndex == trackIndex; }
+        );
+
+        if (existing == pendingAudioEngineTrackParameterUpdates.end())
+        {
+            QueuedAudioEngineTrackParameterUpdate update;
+            update.trackIndex = trackIndex;
+            update.parameters = parameterUpdates;
+            if (parameterSignature.has_value())
+                update.parameterSignature = *parameterSignature;
+            pendingAudioEngineTrackParameterUpdates.push_back(std::move(update));
+            return;
+        }
+
+        for (const auto& parameterUpdate : parameterUpdates)
+        {
+            auto valueIt = std::find_if(
+                existing->parameters.begin(),
+                existing->parameters.end(),
+                [&parameterUpdate](const auto& current)
+                {
+                    return current.name.equalsIgnoreCase(parameterUpdate.name);
+                }
+            );
+            if (valueIt == existing->parameters.end())
+                existing->parameters.push_back(parameterUpdate);
+            else
+                valueIt->value = parameterUpdate.value;
+        }
+
+        if (parameterSignature.has_value())
+            existing->parameterSignature = *parameterSignature;
+    }
+
+    void discardQueuedAudioEngineTrackParameterUpdate(int trackIndex)
+    {
+        if (trackIndex < 0)
+            return;
+
+        const juce::SpinLock::ScopedLockType lock(pendingAudioEngineTrackParameterLock);
+        pendingAudioEngineTrackParameterUpdates.erase(
+            std::remove_if(
+                pendingAudioEngineTrackParameterUpdates.begin(),
+                pendingAudioEngineTrackParameterUpdates.end(),
+                [trackIndex](const auto& update) { return update.trackIndex == trackIndex; }
+            ),
+            pendingAudioEngineTrackParameterUpdates.end()
+        );
+    }
+
+    void clearQueuedAudioEngineTrackParameterUpdates()
+    {
+        const juce::SpinLock::ScopedLockType lock(pendingAudioEngineTrackParameterLock);
+        pendingAudioEngineTrackParameterUpdates.clear();
+    }
+
+    void applyQueuedAudioEngineTrackParameterUpdates()
+    {
+        std::vector<QueuedAudioEngineTrackParameterUpdate> queuedUpdates;
+        {
+            const juce::SpinLock::ScopedTryLockType lock(pendingAudioEngineTrackParameterLock);
+            if (!lock.isLocked() || pendingAudioEngineTrackParameterUpdates.empty())
+                return;
+            queuedUpdates.swap(pendingAudioEngineTrackParameterUpdates);
+        }
+
+        for (const auto& update : queuedUpdates)
+        {
+            if (!juce::isPositiveAndBelow(update.trackIndex, static_cast<int>(audioEngine.tracks.size())))
+                continue;
+
+            auto& track = audioEngine.tracks[static_cast<size_t>(update.trackIndex)];
+            if (track.plugin == nullptr)
+                continue;
+
+            juce::String error;
+            int appliedCount = 0;
+            juce::StringArray unmatchedParameters;
+            if (applyRequestedParameterValuesToPlugin(
+                    *track.plugin,
+                    update.parameters,
+                    error,
+                    appliedCount,
+                    unmatchedParameters)
+                && update.parameterSignature.isNotEmpty())
+            {
+                track.parameterSignature = update.parameterSignature;
+            }
+        }
     }
 
     static juce::String parameterPayloadSignature(const juce::var& parametersVar)
@@ -4753,9 +4941,11 @@ private:
     {
         audioEngine.running = false;
         audioEngine.bootstrapPending = false;
+        clearQueuedAudioEngineTrackParameterUpdates();
         for (auto& track : audioEngine.tracks)
             releaseAudioEngineTrack(track);
         audioEngine.tracks.clear();
+        audioEngineTrackCount.store(0, std::memory_order_release);
         audioEngine.positionFrame = 0;
         audioEngine.metronomeEnabled = false;
         audioEngine.metronomeClickBuffer.setSize(0, 0);
@@ -5087,6 +5277,8 @@ private:
             return false;
         }
 
+        clearQueuedAudioEngineTrackParameterUpdates();
+
         const auto shouldPrepare = currentSampleRate > 0.0 && currentBlockSize > 0;
         if (shouldPrepare)
             releaseAudioEngineResources();
@@ -5101,6 +5293,7 @@ private:
         {
             audioEngine.tracks.resize(static_cast<size_t>(requestedTrackCount));
         }
+        audioEngineTrackCount.store(requestedTrackCount, std::memory_order_release);
 
         int loadedCount = 0;
         for (int trackIndex = 0; trackIndex < requestedTrackCount; ++trackIndex)
@@ -5516,6 +5709,8 @@ private:
         if (!audioEngine.running || numSamples <= 0)
             return;
 
+        applyQueuedAudioEngineTrackParameterUpdates();
+
         const auto sampleRate = juce::jmax(1.0, currentSampleRate);
         const auto loopStartFrame = audioEngine.tickToFrame(audioEngine.loopStartTick, sampleRate);
         const auto loopEndFrame = audioEngine.tickToFrame(audioEngine.loopEndTick, sampleRate);
@@ -5725,6 +5920,7 @@ private:
     juce::AudioDeviceManager deviceManager;
     juce::MidiKeyboardState keyboardState;
     juce::CriticalSection pluginLock;
+    juce::SpinLock pendingAudioEngineTrackParameterLock;
     juce::CriticalSection pendingMidiLock;
     juce::MidiBuffer pendingMidiMessages;
     juce::CriticalSection scheduledMidiLock;
@@ -5739,10 +5935,12 @@ private:
     std::atomic<float> pluginOutputGain { 1.0f };
     std::atomic<float> pluginOutputPan { 0.0f };
     std::atomic<bool> graphTransportEnabled { false };
+    std::atomic<int> audioEngineTrackCount { 0 };
     std::atomic<int64_t> renderedSampleFrames { 0 };
     std::atomic<int64_t> scheduledMidiSequence { 0 };
     InProcessTransport inProcessTransport;
     AudioEngineState audioEngine;
+    std::vector<QueuedAudioEngineTrackParameterUpdate> pendingAudioEngineTrackParameterUpdates;
 
     juce::Label pathLabel;
     juce::TextEditor pathEditor;

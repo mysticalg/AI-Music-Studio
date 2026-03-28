@@ -6,6 +6,7 @@ import json
 import os
 import socket
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -301,7 +302,13 @@ class _SubprocessHostBackend:
                 self._last_command_at = time.monotonic()
                 return data
             except (ConnectionError, OSError, TimeoutError, json.JSONDecodeError) as exc:
-                last_transport_error = exc
+                process = self.process
+                if process is not None and process.poll() is not None:
+                    last_transport_error = RuntimeError(
+                        f"Native host exited with code {process.returncode} during '{command}': {exc}"
+                    )
+                else:
+                    last_transport_error = exc
                 self._close_socket()
                 if attempt + 1 >= attempts:
                     break
@@ -358,6 +365,7 @@ class NativeVstHostBridge:
         self.audio_output_device_name = str(audio_output_device_name or "").strip()
         self.prefer_in_process = None if prefer_in_process is None else bool(prefer_in_process)
         self._backend: _InProcessHostBackend | _SubprocessHostBackend | None = None
+        self._command_lock = threading.RLock()
         self.process: Any = None
         self.in_process = False
 
@@ -408,14 +416,16 @@ class NativeVstHostBridge:
         self.in_process = isinstance(backend, _InProcessHostBackend)
 
     def wait_until_ready(self, timeout: float = 10.0) -> dict[str, Any]:
-        if self._backend is None:
-            raise RuntimeError("Native VST host is not started")
-        return self._backend.wait_until_ready(timeout=timeout)
+        with self._command_lock:
+            if self._backend is None:
+                raise RuntimeError("Native VST host is not started")
+            return self._backend.wait_until_ready(timeout=timeout)
 
     def command(self, command: str, **payload: Any) -> dict[str, Any]:
-        if self._backend is None:
-            raise RuntimeError("Native VST host is not started")
-        return self._backend.command(command, **payload)
+        with self._command_lock:
+            if self._backend is None:
+                raise RuntimeError("Native VST host is not started")
+            return self._backend.command(command, **payload)
 
     def queue_audio(self, audio_f32le: bytes, *, channels: int = 2, stream_id: str = "main") -> dict[str, Any]:
         if not audio_f32le:

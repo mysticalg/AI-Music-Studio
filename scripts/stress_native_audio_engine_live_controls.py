@@ -157,6 +157,34 @@ def main() -> int:
                     f"Tempo change did not update engine loop duration on iteration {iteration}: frame={tempo_frame} loop_end={loop_end_frame_after_tempo}"
                 )
 
+            parameter_keys = [str(key) for key in track.vsti_parameters.keys()]
+            if not parameter_keys:
+                raise RuntimeError(f"No live VST parameters available on iteration {iteration} for {synth_name}")
+            parameter_frame_before = tempo_frame
+            parameter_rendered_before = int(tempo_status.get("rendered_sample_frames", 0) or 0)
+            parameter_snapshot = dict(track.vsti_parameters)
+            for step in range(18):
+                key = parameter_keys[step % len(parameter_keys)]
+                current_value = float(parameter_snapshot.get(key, 0.0) or 0.0)
+                parameter_snapshot[key] = (current_value + 7.0 + (step * 3.0)) % 100.0
+                window._apply_track_vsti_parameters_live(track, parameter_snapshot)
+                pump_events(qt_app, 0.02)
+            pump_events(qt_app, 0.12)
+            parameter_status = wait_for_engine(window, qt_app, timeout=1.5)
+            if not (
+                isinstance(parameter_status, dict)
+                and window._native_audio_engine_active()
+                and bool(parameter_status.get("audio_engine_running", False))
+            ):
+                raise RuntimeError(f"Playback did not recover after live parameter changes on iteration {iteration}: {parameter_status}")
+            parameter_frame_after = int(parameter_status.get("audio_engine_position_frame", 0) or 0)
+            parameter_rendered_after = int(parameter_status.get("rendered_sample_frames", 0) or 0)
+            if parameter_rendered_after <= parameter_rendered_before:
+                raise RuntimeError(
+                    f"Rendered sample frames did not advance after live parameter changes on iteration {iteration}: "
+                    f"before={parameter_rendered_before} after={parameter_rendered_after}"
+                )
+
             results.append(
                 {
                     "iteration": iteration,
@@ -170,6 +198,11 @@ def main() -> int:
                     "new_bpm": new_bpm,
                     "tempo_frame": tempo_frame,
                     "tempo_loop_end_frame": loop_end_frame_after_tempo,
+                    "parameter_frame_before": parameter_frame_before,
+                    "parameter_frame_after": parameter_frame_after,
+                    "parameter_rendered_before": parameter_rendered_before,
+                    "parameter_rendered_after": parameter_rendered_after,
+                    "parameter_change_count": 18,
                 }
             )
 

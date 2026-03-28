@@ -6513,7 +6513,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self._native_output_status_cache: dict[str, object] | None = None
         self._native_output_status_cache_at = 0.0
         self._native_output_status_cache_bridge_id = 0
+        self._native_output_transport_status_cache: dict[str, object] | None = None
+        self._native_output_transport_status_cache_at = 0.0
+        self._native_output_transport_status_cache_bridge_id = 0
+        self._pending_native_vst_editor_close_syncs: dict[int, tuple[object, float]] = {}
         self._pending_native_vst_parameter_updates: dict[int, tuple[object, dict[str, float], dict[str, float], int | None]] = {}
+        self._pending_native_vst_state_syncs: dict[int, tuple[object, str, float]] = {}
+        self._pending_native_graph_parameter_updates: dict[
+            tuple[int, int],
+            tuple[object, int, dict[str, float], str],
+        ] = {}
+        self._pending_native_audio_engine_parameter_updates: dict[
+            tuple[int, int],
+            tuple[object, int, dict[str, float], dict[str, float], str, str],
+        ] = {}
         self._realtime_mix_cache: object | None = None
         self._realtime_mix_cache_start_frame = 0
         self._realtime_mix_cache_frame_count = 0
@@ -6581,6 +6594,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self._native_vst_parameter_flush_timer.setSingleShot(True)
         self._native_vst_parameter_flush_timer.setInterval(24)
         self._native_vst_parameter_flush_timer.timeout.connect(self._flush_native_vst_parameter_updates)
+        self._native_vst_state_sync_timer = QtCore.QTimer(self)
+        self._native_vst_state_sync_timer.setSingleShot(True)
+        self._native_vst_state_sync_timer.timeout.connect(self._flush_deferred_native_vst_state_syncs)
+        self._native_vst_parameter_dispatch_lock = threading.Lock()
+        self._native_vst_parameter_dispatch_event = threading.Event()
+        self._native_vst_parameter_dispatch_pending: tuple[
+            dict[int, tuple[object, dict[str, float], dict[str, float], int | None]],
+            dict[tuple[int, int], tuple[object, int, dict[str, float], str]],
+            dict[tuple[int, int], tuple[object, int, dict[str, float], dict[str, float], str, str]],
+        ] | None = None
+        self._native_vst_parameter_dispatch_thread = threading.Thread(
+            target=self._native_vst_parameter_dispatch_worker,
+            name='native-vst-parameter-dispatch',
+            daemon=True,
+        )
+        self._native_vst_parameter_dispatch_thread.start()
         self._prerender_mix_refresh_timer = QtCore.QTimer(self)
         self._prerender_mix_refresh_timer.setSingleShot(True)
         self._prerender_mix_refresh_timer.setInterval(90)
@@ -6635,6 +6664,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._native_vst_editor_sync_timer = QtCore.QTimer(self)
         self._native_vst_editor_sync_timer.setInterval(240)
         self._native_vst_editor_sync_timer.timeout.connect(self._poll_native_vst_editor_state)
+        self._native_vst_editor_close_sync_timer = QtCore.QTimer(self)
+        self._native_vst_editor_close_sync_timer.setSingleShot(True)
+        self._native_vst_editor_close_sync_timer.timeout.connect(self._flush_deferred_native_vst_editor_close_syncs)
         self._realtime_pump_generation = 0
         self.current_project_path: Path | None = None
         self.setWindowTitle(APP_NAME)
@@ -8647,13 +8679,17 @@ class MainWindow(QtWidgets.QMainWindow):
     def _buffer_choice_values_for_sample_rate(sample_rate: int, *, include_value: int = 0) -> list[int]:
         rate = max(1, int(sample_rate))
         max_frames = max(64, min(192000, int(round(float(rate)))))
-        # Standard power-of-2 buffer sizes used by most DAWs and audio drivers.
+        # Keep common power-of-2 sizes, but also include the "odd" hardware
+        # blocks many Windows drivers expose in practice. Some setups are more
+        # stable on 96/192/384/960-style sizes than the nearest power-of-2.
         values = {
-            32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384,
+            32, 64, 96, 128, 192, 240, 256, 384, 480, 512, 768, 960, 1024,
+            1536, 1920, 2048, 3072, 4096, 6144, 8192, 12288, 16384,
         }
         values = {int(v) for v in values if 64 <= int(v) <= max_frames}
         if int(include_value) > 0:
             values.add(int(include_value))
+        values.add(max_frames)
         return sorted(v for v in values if 64 <= int(v) <= max_frames)
 
     def _native_vst_host_target_buffer_size(self) -> int:
@@ -8667,10 +8703,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # from the main output.
         output_latency_ms = self._buffer_frames_latency_ms(self._desired_audio_buffer_frames())
         auto_frames = int(round((float(self._native_vst_host_target_sample_rate()) * float(output_latency_ms)) / 1000.0))
-        # Match the JUCE host buffer to the user's chosen latency target instead
-        # of clamping to a 512-sample floor.  The previous 512 floor forced
-        # unnecessary latency even when the user explicitly chose a low buffer.
-        return int(clamp(max(64, auto_frames), 64, self._maximum_native_vst_host_buffer_size()))
+        # Preserve the more stable 512-frame minimum in auto mode. Users can
+        # still explicitly choose smaller buffers, but the default/follow mode
+        # should favor glitch resistance during live parameter tweaks.
+        return int(clamp(max(512, auto_frames), 512, self._maximum_native_vst_host_buffer_size()))
 
     def _buffer_frames_latency_ms(self, frame_count: int) -> float:
         return self._buffer_frames_duration_ms(frame_count, self._playback_sample_rate)
@@ -9156,6 +9192,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         try:
             bridge.command('open_graph_slot_editor', slot_index=int(slot_index))
+            setattr(bridge, '_aims_graph_editor_slot', int(slot_index))
             return True
         except Exception:
             _APP_LOGGER.exception("Failed opening native graph editor row=%s rack=%s", row, entry.name)
@@ -9357,8 +9394,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 bridge.audio_device_type = str(status.get('audio_device_type') or signature[2] or '')
                 bridge.audio_output_device_name = str(status.get('audio_device_name') or signature[3] or '')
                 self._native_output_bridge = bridge
-                self._native_output_status_cache = None
-                self._native_output_status_cache_at = 0.0
+                self._clear_native_output_status_caches()
                 pending_tick = self._pending_playback_start_tick
                 if pending_tick is not None and not bool(getattr(self, '_playback_active', False)):
                     QtCore.QTimer.singleShot(
@@ -9429,10 +9465,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if bridge is not None:
             self._capture_shared_native_output_bridge_state()
             self._discard_pending_native_vst_bridge_parameter_updates(bridge)
+            self._discard_pending_native_vst_state_syncs(bridge=bridge)
+            self._discard_pending_native_vst_editor_close_syncs(bridge=bridge)
+            self._discard_pending_native_graph_parameter_updates(bridge)
+            self._discard_pending_native_audio_engine_parameter_updates(bridge)
         self._native_output_bridge = None
-        self._native_output_status_cache = None
-        self._native_output_status_cache_at = 0.0
-        self._native_output_status_cache_bridge_id = 0
+        self._clear_native_output_status_caches()
         self._native_output_queued_frames = 0
         self._native_output_underruns = 0
         self._transport_uses_native_output_bridge = False
@@ -9445,6 +9483,36 @@ class MainWindow(QtWidgets.QMainWindow):
             bridge.stop()
         except Exception:
             _APP_LOGGER.exception("Failed stopping native realtime output bridge")
+
+    def _clear_native_output_bridge_streams(
+        self,
+        bridge: object | None,
+        *,
+        reset_counters: bool = True,
+        stream_ids: tuple[str, ...] = ('main', 'preview', 'live_midi'),
+    ) -> bool:
+        if bridge is None:
+            return False
+        streams: list[str] = []
+        seen_streams: set[str] = set()
+        for raw_stream_id in stream_ids:
+            stream_id = str(raw_stream_id or '').strip() or 'main'
+            key = stream_id.casefold()
+            if key in seen_streams:
+                continue
+            seen_streams.add(key)
+            streams.append(stream_id)
+        try:
+            for stream_id in streams:
+                bridge.clear_audio_queue(reset_counters=bool(reset_counters), stream_id=stream_id)
+            return True
+        except Exception:
+            _APP_LOGGER.exception(
+                "Failed clearing native output bridge streams reset=%s streams=%s",
+                bool(reset_counters),
+                streams,
+            )
+            return False
 
     def _stop_native_vst_graph_render_bridge(self) -> None:
         bridge = getattr(self, '_native_vst_graph_render_bridge', None)
@@ -9601,65 +9669,97 @@ class MainWindow(QtWidgets.QMainWindow):
                 existing = None
 
         self._stop_native_output_bridge()
-        bridge = NativeVstHostBridge(
-            direct_entry.path if direct_entry is not None else None,
-            restore_last_plugin_on_startup=direct_entry is not None,
-            bridge_mode=False,
-            hidden=True,
-            sample_rate=target_sample_rate,
-            buffer_size=target_buffer_size,
-            audio_device_type=target_audio_device_type or None,
-            audio_output_device_name=target_audio_output_device_name or None,
-        )
-        if direct_entry is not None:
-            setattr(bridge, '_aims_rack_name', str(direct_entry.name))
-        bridge.requested_sample_rate = target_sample_rate
-        bridge.requested_buffer_size = target_buffer_size
-        bridge.requested_audio_device_type = target_audio_device_type
-        bridge.requested_audio_output_device_name = target_audio_output_device_name
-        bridge.start(startup_timeout=8.0)
-        status = bridge.wait_until_ready(timeout=8.0)
-        if direct_entry is not None and not bool(status.get('plugin_loaded', False)):
-            raise RuntimeError(f'Could not load direct native output plugin: {direct_entry.name}')
-        bridge.sample_rate = int(status.get('sample_rate') or target_sample_rate)
-        bridge.buffer_size = int(status.get('buffer_size') or target_buffer_size)
-        bridge.audio_device_type = str(status.get('audio_device_type') or target_audio_device_type or '')
-        bridge.audio_output_device_name = str(status.get('audio_device_name') or target_audio_output_device_name or '')
-        if direct_track is not None and direct_entry is not None:
-            self._prime_native_vst_host_bridge_state(bridge, direct_track, direct_entry)
-            ok, status = self._configure_native_vst_host_bridge_buses(bridge, direct_track, direct_entry)
-            if not ok:
-                try:
-                    bridge.stop()
-                except Exception:
-                    pass
-                raise RuntimeError(f'Could not configure direct native output buses for {direct_entry.name}')
-            if not self._configure_direct_native_output_mix(bridge, direct_track):
-                try:
-                    bridge.stop()
-                except Exception:
-                    pass
-                raise RuntimeError(f'Could not configure direct native output mix for {direct_entry.name}')
-            setattr(bridge, '_aims_direct_output_row', direct_row)
-            self._apply_native_vst_bridge_parameter_values(
-                bridge,
-                direct_track.vsti_parameters,
-                generation=self._track_vsti_parameter_generation(direct_track),
+        last_error: Exception | None = None
+        for attempt in range(2):
+            bridge = NativeVstHostBridge(
+                direct_entry.path if direct_entry is not None else None,
+                restore_last_plugin_on_startup=direct_entry is not None,
+                bridge_mode=False,
+                hidden=True,
+                sample_rate=target_sample_rate,
+                buffer_size=target_buffer_size,
+                audio_device_type=target_audio_device_type or None,
+                audio_output_device_name=target_audio_output_device_name or None,
             )
-        bridge.clear_audio_queue(reset_counters=True, stream_id='main')
-        bridge.clear_audio_queue(reset_counters=True, stream_id='preview')
-        bridge.clear_audio_queue(reset_counters=True, stream_id='live_midi')
-        self._native_output_bridge = bridge
-        self._cache_native_output_status(bridge, status)
-        self._apply_audio_buffer_preference()
-        return bridge
+            if direct_entry is not None:
+                setattr(bridge, '_aims_rack_name', str(direct_entry.name))
+            bridge.requested_sample_rate = target_sample_rate
+            bridge.requested_buffer_size = target_buffer_size
+            bridge.requested_audio_device_type = target_audio_device_type
+            bridge.requested_audio_output_device_name = target_audio_output_device_name
+            try:
+                bridge.start(startup_timeout=8.0)
+                status = bridge.wait_until_ready(timeout=8.0)
+                if direct_entry is not None and not bool(status.get('plugin_loaded', False)):
+                    raise RuntimeError(f'Could not load direct native output plugin: {direct_entry.name}')
+                bridge.sample_rate = int(status.get('sample_rate') or target_sample_rate)
+                bridge.buffer_size = int(status.get('buffer_size') or target_buffer_size)
+                bridge.audio_device_type = str(status.get('audio_device_type') or target_audio_device_type or '')
+                bridge.audio_output_device_name = str(status.get('audio_device_name') or target_audio_output_device_name or '')
+                if direct_track is not None and direct_entry is not None:
+                    self._prime_native_vst_host_bridge_state(bridge, direct_track, direct_entry)
+                    ok, status = self._configure_native_vst_host_bridge_buses(bridge, direct_track, direct_entry)
+                    if not ok:
+                        raise RuntimeError(f'Could not configure direct native output buses for {direct_entry.name}')
+                    if not self._configure_direct_native_output_mix(bridge, direct_track):
+                        raise RuntimeError(f'Could not configure direct native output mix for {direct_entry.name}')
+                    setattr(bridge, '_aims_direct_output_row', direct_row)
+                    self._apply_native_vst_bridge_parameter_values(
+                        bridge,
+                        direct_track.vsti_parameters,
+                        generation=self._track_vsti_parameter_generation(direct_track),
+                    )
+                if not self._clear_native_output_bridge_streams(bridge, reset_counters=True):
+                    raise RuntimeError('Could not initialize native output bridge audio queues')
+                self._native_output_bridge = bridge
+                self._cache_native_output_status(bridge, status)
+                self._apply_audio_buffer_preference()
+                return bridge
+            except Exception as exc:
+                last_error = exc
+                try:
+                    bridge.stop()
+                except Exception:
+                    pass
+                if attempt == 0:
+                    _APP_LOGGER.warning(
+                        "Retrying native output bridge startup after initialization failure"
+                    )
+                    continue
+                raise
+        if last_error is not None:
+            raise last_error
+        return None
 
-    def _cache_native_output_status(self, bridge: object, status: dict[str, object] | None) -> dict[str, object] | None:
+    def _clear_native_output_status_caches(self) -> None:
+        self._native_output_status_cache = None
+        self._native_output_status_cache_at = 0.0
+        self._native_output_status_cache_bridge_id = 0
+        self._native_output_transport_status_cache = None
+        self._native_output_transport_status_cache_at = 0.0
+        self._native_output_transport_status_cache_bridge_id = 0
+
+    def _cache_native_output_status(
+        self,
+        bridge: object,
+        status: dict[str, object] | None,
+        *,
+        lightweight: bool = False,
+    ) -> dict[str, object] | None:
         if not isinstance(status, dict):
             return status
-        self._native_output_status_cache = status
-        self._native_output_status_cache_at = time.perf_counter()
-        self._native_output_status_cache_bridge_id = id(bridge)
+        now = time.perf_counter()
+        if lightweight:
+            self._native_output_transport_status_cache = status
+            self._native_output_transport_status_cache_at = now
+            self._native_output_transport_status_cache_bridge_id = id(bridge)
+        else:
+            self._native_output_status_cache = status
+            self._native_output_status_cache_at = now
+            self._native_output_status_cache_bridge_id = id(bridge)
+            self._native_output_transport_status_cache = status
+            self._native_output_transport_status_cache_at = now
+            self._native_output_transport_status_cache_bridge_id = id(bridge)
         self._native_output_queued_frames = int(status.get('queued_audio_frames') or 0)
         self._native_output_underruns = int(status.get('audio_queue_underruns') or 0)
         return status
@@ -9669,16 +9769,28 @@ class MainWindow(QtWidgets.QMainWindow):
         bridge: object | None = None,
         *,
         max_age_sec: float = 0.0,
+        lightweight: bool = False,
     ) -> dict[str, object] | None:
         target = bridge or getattr(self, '_native_output_bridge', None)
         if target is None:
             return None
-        cached = getattr(self, '_native_output_status_cache', None)
+        if lightweight:
+            cached = getattr(self, '_native_output_transport_status_cache', None)
+            cache_bridge_id = int(getattr(self, '_native_output_transport_status_cache_bridge_id', 0) or 0)
+            cache_at = float(getattr(self, '_native_output_transport_status_cache_at', 0.0) or 0.0)
+            if not isinstance(cached, dict):
+                cached = getattr(self, '_native_output_status_cache', None)
+                cache_bridge_id = int(getattr(self, '_native_output_status_cache_bridge_id', 0) or 0)
+                cache_at = float(getattr(self, '_native_output_status_cache_at', 0.0) or 0.0)
+        else:
+            cached = getattr(self, '_native_output_status_cache', None)
+            cache_bridge_id = int(getattr(self, '_native_output_status_cache_bridge_id', 0) or 0)
+            cache_at = float(getattr(self, '_native_output_status_cache_at', 0.0) or 0.0)
         if not isinstance(cached, dict):
             return None
-        if int(getattr(self, '_native_output_status_cache_bridge_id', 0) or 0) != id(target):
+        if cache_bridge_id != id(target):
             return None
-        age = time.perf_counter() - float(getattr(self, '_native_output_status_cache_at', 0.0) or 0.0)
+        age = time.perf_counter() - cache_at
         if age > max(0.0, float(max_age_sec)):
             return None
         return cached
@@ -9689,28 +9801,32 @@ class MainWindow(QtWidgets.QMainWindow):
         *,
         allow_cached: bool = False,
         max_age_sec: float = 0.0,
+        lightweight: bool = False,
     ) -> dict[str, object] | None:
         target = bridge or getattr(self, '_native_output_bridge', None)
         if target is None:
             return None
         if allow_cached:
-            cached = self._cached_native_output_status(target, max_age_sec=max_age_sec)
+            cached = self._cached_native_output_status(target, max_age_sec=max_age_sec, lightweight=lightweight)
             if cached is not None:
                 return cached
         try:
-            status = target.command('status')
+            if lightweight:
+                status = target.command('status', lightweight=True)
+            else:
+                status = target.command('status')
         except Exception:
             _APP_LOGGER.exception("Failed reading native realtime output bridge status")
             self._stop_native_output_bridge()
             return None
-        return self._cache_native_output_status(target, status)
+        return self._cache_native_output_status(target, status, lightweight=lightweight)
 
     def _native_output_rendered_sample_frames(self, status: dict[str, object] | None = None) -> int:
         source = status
         if source is None and self._native_output_bridge_alive():
-            source = self._cached_native_output_status(max_age_sec=0.25)
+            source = self._cached_native_output_status(max_age_sec=0.25, lightweight=True)
             if source is None:
-                source = self._native_output_status()
+                source = self._native_output_status(lightweight=True)
         if not isinstance(source, dict):
             return 0
         return max(0, int(source.get('rendered_sample_frames') or 0))
@@ -9793,7 +9909,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _native_output_stream_queued_frames(self, stream_id: str, status: dict[str, object] | None = None) -> int:
         if str(stream_id).strip().lower() == 'main':
-            source = status if status is not None else self._native_output_status(allow_cached=True, max_age_sec=0.25)
+            source = (
+                status
+                if status is not None
+                else self._native_output_status(allow_cached=True, max_age_sec=0.25, lightweight=True)
+            )
             return int(source.get('queued_audio_frames') or 0) if isinstance(source, dict) else 0
         source = status if status is not None else self._native_output_status(allow_cached=True, max_age_sec=0.25)
         stream = self._native_output_stream_entry(source, stream_id)
@@ -9894,12 +10014,24 @@ class MainWindow(QtWidgets.QMainWindow):
             return "", 0
         return str(state_path), int(self._path_mtime_ns(state_path))
 
+    @staticmethod
+    def _native_vst_host_bridge_state_dirty(bridge: object | None) -> bool:
+        return bool(bridge is not None and getattr(bridge, '_aims_state_capture_dirty', False))
+
+    @staticmethod
+    def _set_native_vst_host_bridge_state_dirty(bridge: object | None, dirty: bool) -> None:
+        if bridge is None:
+            return
+        setattr(bridge, '_aims_state_capture_dirty', bool(dirty))
+
     def _capture_native_vst_host_bridge_state(
         self,
         row: int,
         bridge: object | None = None,
         track: TrackState | None = None,
         entry: VSTInstrument | None = None,
+        *,
+        force: bool = False,
     ) -> bool:
         if bridge is None:
             bridge = self._track_native_vst_host_bridges.get(int(row))
@@ -9914,6 +10046,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if entry is None:
             return False
         if getattr(bridge, '_aims_supports_save_state', True) is False:
+            return False
+        if not bool(force) and not self._native_vst_host_bridge_state_dirty(bridge):
             return False
         state_path = self._effective_vsti_state_path(track, entry)
         if state_path is None:
@@ -9936,12 +10070,14 @@ class MainWindow(QtWidgets.QMainWindow):
         state_mtime_ns = int(self._path_mtime_ns(state_path))
         setattr(bridge, '_aims_loaded_state_path', str(state_path))
         setattr(bridge, '_aims_loaded_state_mtime_ns', state_mtime_ns)
+        self._set_native_vst_host_bridge_state_dirty(bridge, False)
         return True
 
     def _prime_native_vst_host_bridge_state(self, bridge: object, track: TrackState | None, entry: VSTInstrument | None) -> bool:
         state_path, state_mtime_ns = self._native_vst_host_state_signature(track, entry)
         setattr(bridge, '_aims_loaded_state_path', state_path)
         setattr(bridge, '_aims_loaded_state_mtime_ns', state_mtime_ns)
+        self._set_native_vst_host_bridge_state_dirty(bridge, False)
         setattr(bridge, '_aims_live_parameter_signature', None)
         setattr(bridge, '_aims_live_parameter_values', None)
         setattr(bridge, '_aims_live_parameter_generation', None)
@@ -10501,10 +10637,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 if not self._native_output_bridge_alive():
                     self._schedule_native_output_bridge_warm(delay_ms=0, force=True)
                     return False
-                bridge = self._ensure_native_output_bridge(direct_plugin=direct_candidate)
-                if bridge is None:
-                    return False
                 try:
+                    bridge = self._ensure_native_output_bridge(direct_plugin=direct_candidate)
+                    if bridge is None:
+                        return False
                     if msg_type == 'note_on':
                         velocity = int(getattr(msg, 'velocity', 100) or 0)
                         if velocity <= 0:
@@ -10542,14 +10678,16 @@ class MainWindow(QtWidgets.QMainWindow):
                     if previous_direct_row != int(direct_idx):
                         self.statusBar().showMessage(f'Live monitoring routed directly through JUCE for {direct_entry.name}')
                     return True
-                except Exception:
+                except Exception as exc:
                     self._live_midi_direct_output_row = None
+                    self._stop_native_output_bridge()
                     _APP_LOGGER.exception(
                         "Direct live MIDI output failed row=%s rack=%s type=%s",
                         direct_idx,
                         direct_entry.name,
                         msg_type,
                     )
+                    self.statusBar().showMessage(f'Live monitoring unavailable: {exc}')
                     return False
         self._panic_live_midi_direct_output(exhaustive=True)
         if not self._can_use_native_vst_host(entry):
@@ -11707,6 +11845,7 @@ class MainWindow(QtWidgets.QMainWindow):
         reschedule: bool = True,
     ) -> bool:
         previous_rows = {int(row) for row in getattr(self, '_graph_native_transport_rows', []) or []}
+        self._discard_pending_native_graph_parameter_updates(bridge)
         try:
             bridge.command(
                 'configure_plugin_graph',
@@ -11727,8 +11866,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for row, track, _entry in candidate_tracks:
             self._mark_active_native_transport_track_reset_pending(int(row), track)
         bridge._aims_graph_config_signature = target_signature
-        self._native_output_status_cache = None
-        self._native_output_status_cache_at = 0.0
+        self._clear_native_output_status_caches()
         self._cancel_pending_transport_reprepare()
         if reschedule:
             self._reschedule_active_native_transport_for_edit()
@@ -11780,8 +11918,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._playback_logical_origin_frame = int(logical_frame)
         self._playback_frame_position = int(logical_frame)
         self._transport_uses_native_output_bridge = True
-        self._native_output_status_cache = None
-        self._native_output_status_cache_at = 0.0
+        self._clear_native_output_status_caches()
         self._cancel_pending_transport_reprepare()
         self._reschedule_active_native_transport_for_edit()
         return True
@@ -11844,8 +11981,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         setattr(bridge, '_aims_direct_output_row', int(row))
         self._mark_active_native_transport_track_reset_pending(int(row), track)
-        self._native_output_status_cache = None
-        self._native_output_status_cache_at = 0.0
+        self._clear_native_output_status_caches()
         self._cancel_pending_transport_reprepare()
         self._reschedule_active_native_transport_for_edit()
         return True
@@ -14776,7 +14912,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._audio_pump_in_progress = True
         try:
-            status = status if isinstance(status, dict) else self._native_output_status(bridge)
+            status = status if isinstance(status, dict) else self._native_output_status(bridge, lightweight=True)
             if status is None:
                 raise RuntimeError('Native audio engine bridge is unavailable')
             had_native_audio_engine_running = bool(getattr(self, '_native_audio_engine_running', False))
@@ -14810,7 +14946,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._audio_pump_in_progress = True
         try:
-            status = self._native_output_status(bridge)
+            status = self._native_output_status(bridge, lightweight=True)
             if status is None:
                 raise RuntimeError('Direct native transport bridge is unavailable')
             direct_level = max(0.0, min(1.0, float(status.get('plugin_output_peak_level', 0.0) or 0.0)))
@@ -14934,7 +15070,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._audio_pump_in_progress = True
         try:
-            status = self._native_output_status(bridge)
+            status = self._native_output_status(bridge, lightweight=True)
             if status is None:
                 raise RuntimeError('Native output bridge is unavailable')
             if self._graph_native_transport_active():
@@ -16415,6 +16551,27 @@ class MainWindow(QtWidgets.QMainWindow):
         ]
         return "|".join(entries)
 
+    def _native_vst_parameter_alias_payload(
+        self,
+        rack_name: str,
+        values: dict[str, float] | None,
+    ) -> dict[str, float]:
+        payload = self._sanitize_native_vst_bridge_parameter_values(values)
+        if not payload:
+            return {}
+        normalized_rack_name = str(rack_name or '').strip()
+        if not normalized_rack_name:
+            return dict(payload)
+        parameter_names = [str(name) for name in self.vsti_parameter_names_for_rack(normalized_rack_name)]
+        parameter_index_by_name = {name: idx for idx, name in enumerate(parameter_names, start=1)}
+        alias_payload: dict[str, float] = {}
+        for key, value in list(payload.items()):
+            parameter_index = parameter_index_by_name.get(str(key))
+            if parameter_index is not None:
+                alias_payload.setdefault(f'Param {parameter_index}', float(value))
+        payload.update(alias_payload)
+        return payload
+
     def _remember_native_vst_bridge_parameter_values(
         self,
         bridge: object | None,
@@ -16439,6 +16596,261 @@ class MainWindow(QtWidgets.QMainWindow):
             pending.pop(id(bridge), None)
         setattr(bridge, '_aims_pending_parameter_signature', None)
         setattr(bridge, '_aims_pending_parameter_generation', None)
+
+    def _discard_pending_native_vst_state_syncs(
+        self,
+        *,
+        row: int | None = None,
+        bridge: object | None = None,
+    ) -> None:
+        pending = getattr(self, '_pending_native_vst_state_syncs', None)
+        if not isinstance(pending, dict) or not pending:
+            return
+        rows_to_remove: list[int] = []
+        for pending_row, pending_entry in list(pending.items()):
+            if not isinstance(pending_entry, tuple) or not pending_entry:
+                rows_to_remove.append(int(pending_row))
+                continue
+            if row is not None and int(pending_row) != int(row):
+                continue
+            if bridge is not None and pending_entry[0] is not bridge:
+                continue
+            rows_to_remove.append(int(pending_row))
+        for pending_row in rows_to_remove:
+            pending.pop(int(pending_row), None)
+        if not pending and hasattr(self, '_native_vst_state_sync_timer'):
+            self._native_vst_state_sync_timer.stop()
+
+    def _discard_pending_native_vst_editor_close_syncs(
+        self,
+        *,
+        row: int | None = None,
+        bridge: object | None = None,
+    ) -> None:
+        pending = getattr(self, '_pending_native_vst_editor_close_syncs', None)
+        if not isinstance(pending, dict) or not pending:
+            return
+        rows_to_remove: list[int] = []
+        for pending_row, pending_entry in list(pending.items()):
+            if not isinstance(pending_entry, tuple) or not pending_entry:
+                rows_to_remove.append(int(pending_row))
+                continue
+            if row is not None and int(pending_row) != int(row):
+                continue
+            if bridge is not None and pending_entry[0] is not bridge:
+                continue
+            rows_to_remove.append(int(pending_row))
+        for pending_row in rows_to_remove:
+            pending.pop(int(pending_row), None)
+        if not pending and hasattr(self, '_native_vst_editor_close_sync_timer'):
+            self._native_vst_editor_close_sync_timer.stop()
+
+    def _schedule_deferred_native_vst_editor_close_sync_flush(self) -> None:
+        pending = getattr(self, '_pending_native_vst_editor_close_syncs', None)
+        if not isinstance(pending, dict) or not pending or not hasattr(self, '_native_vst_editor_close_sync_timer'):
+            return
+        now = time.monotonic()
+        next_due = min(
+            float(entry[1])
+            for entry in pending.values()
+            if isinstance(entry, tuple) and len(entry) >= 2
+        )
+        delay_ms = max(1, int(round(max(0.0, next_due - now) * 1000.0)))
+        self._native_vst_editor_close_sync_timer.start(delay_ms)
+
+    def _queue_deferred_native_vst_editor_close_sync(
+        self,
+        row: int,
+        bridge: object | None,
+        *,
+        delay_ms: int = 140,
+    ) -> None:
+        if bridge is None:
+            return
+        pending = getattr(self, '_pending_native_vst_editor_close_syncs', None)
+        if not isinstance(pending, dict):
+            self._pending_native_vst_editor_close_syncs = {}
+            pending = self._pending_native_vst_editor_close_syncs
+        pending[int(row)] = (
+            bridge,
+            time.monotonic() + max(0.05, float(max(1, int(delay_ms))) / 1000.0),
+        )
+        self._schedule_deferred_native_vst_editor_close_sync_flush()
+
+    def _flush_deferred_native_vst_editor_close_syncs(self) -> None:
+        pending = getattr(self, '_pending_native_vst_editor_close_syncs', None)
+        if not isinstance(pending, dict) or not pending:
+            return
+        now = time.monotonic()
+        due_rows: list[tuple[int, object]] = []
+        remaining: dict[int, tuple[object, float]] = {}
+        for row, entry in list(pending.items()):
+            if (
+                isinstance(entry, tuple)
+                and len(entry) >= 2
+                and float(entry[1]) <= now
+            ):
+                due_rows.append((int(row), entry[0]))
+            else:
+                remaining[int(row)] = entry
+        self._pending_native_vst_editor_close_syncs = remaining
+        for row, bridge in due_rows:
+            if bridge is None or self._track_native_vst_host_bridges.get(int(row)) is not bridge:
+                continue
+            if not self._native_vst_host_bridge_alive(int(row)):
+                continue
+            if bool(getattr(bridge, '_aims_editor_open', False)):
+                continue
+            if row < 0 or row >= len(self.project.tracks):
+                continue
+            track = self.project.tracks[int(row)]
+            entry = self._native_instrument_entry_for_track(track)
+            if entry is None:
+                continue
+            try:
+                status = bridge.command('status', lightweight=True, include_plugin_parameters=True)
+            except Exception:
+                continue
+            force_save = bool(
+                (not self._native_vst_parameter_change_is_live_safe(track))
+                and self._native_vst_host_bridge_state_dirty(bridge)
+            )
+            try:
+                self._sync_track_native_vst_editor_bridge_state(
+                    int(row),
+                    bridge,
+                    track,
+                    entry,
+                    status=status,
+                    force_save=force_save,
+                )
+            except Exception:
+                _APP_LOGGER.exception(
+                    "Deferred native VST editor close sync failed row=%s rack=%s",
+                    row,
+                    entry.name,
+                )
+            self._update_track_list_item(int(row))
+            if int(row) == self.current_track_index():
+                self._schedule_selected_track_panel_refresh(int(row))
+        if self._pending_native_vst_editor_close_syncs:
+            self._schedule_deferred_native_vst_editor_close_sync_flush()
+
+    def _schedule_deferred_native_vst_state_sync_flush(self) -> None:
+        pending = getattr(self, '_pending_native_vst_state_syncs', None)
+        if not isinstance(pending, dict) or not pending or not hasattr(self, '_native_vst_state_sync_timer'):
+            return
+        now = time.monotonic()
+        next_due = min(
+            float(entry[2])
+            for entry in pending.values()
+            if isinstance(entry, tuple) and len(entry) >= 3
+        )
+        delay_ms = max(1, int(round(max(0.0, next_due - now) * 1000.0)))
+        self._native_vst_state_sync_timer.start(delay_ms)
+
+    def _queue_deferred_native_vst_state_sync(
+        self,
+        row: int,
+        bridge: object | None,
+        track: TrackState,
+        entry: VSTInstrument,
+        *,
+        delay_ms: int = 420,
+    ) -> None:
+        _ = track
+        if bridge is None:
+            return
+        pending = getattr(self, '_pending_native_vst_state_syncs', None)
+        if not isinstance(pending, dict):
+            self._pending_native_vst_state_syncs = {}
+            pending = self._pending_native_vst_state_syncs
+        pending[int(row)] = (
+            bridge,
+            self._normalized_vsti_path(str(getattr(entry, 'path', '') or '')),
+            time.monotonic() + max(0.05, float(max(1, int(delay_ms))) / 1000.0),
+        )
+        self._set_native_vst_host_bridge_state_dirty(bridge, True)
+        self._schedule_deferred_native_vst_state_sync_flush()
+
+    def _flush_deferred_native_vst_state_syncs(self) -> None:
+        pending = getattr(self, '_pending_native_vst_state_syncs', None)
+        if not isinstance(pending, dict) or not pending:
+            return
+        now = time.monotonic()
+        remaining: dict[int, tuple[object, str, float]] = {}
+        due_rows: list[tuple[int, object, str]] = []
+        for raw_row, pending_entry in list(pending.items()):
+            if not isinstance(pending_entry, tuple) or len(pending_entry) < 3:
+                continue
+            bridge, entry_path, due_at = pending_entry
+            row = int(raw_row)
+            if float(due_at) > now:
+                remaining[row] = (bridge, str(entry_path), float(due_at))
+                continue
+            due_rows.append((row, bridge, str(entry_path)))
+        self._pending_native_vst_state_syncs = remaining
+        for row, bridge, entry_path in due_rows:
+            if bridge is None or self._track_native_vst_host_bridges.get(int(row)) is not bridge:
+                continue
+            if not self._native_vst_host_bridge_alive(int(row)):
+                continue
+            if row < 0 or row >= len(self.project.tracks):
+                continue
+            track = self.project.tracks[int(row)]
+            entry = self._rack_vsti_entry(track.rack_vsti) if track.rack_vsti else None
+            if entry is None:
+                continue
+            if self._normalized_vsti_path(str(entry.path)) != self._normalized_vsti_path(entry_path):
+                continue
+            if self._capture_native_vst_host_bridge_state(int(row), bridge=bridge, track=track, entry=entry):
+                self._sync_native_vst_state_to_active_hosts(int(row), track, entry, source_bridge=bridge)
+        if self._pending_native_vst_state_syncs:
+            self._schedule_deferred_native_vst_state_sync_flush()
+
+    def _discard_pending_native_audio_engine_parameter_updates(
+        self,
+        bridge: object | None,
+        *,
+        engine_track_index: int | None = None,
+    ) -> None:
+        if bridge is None:
+            return
+        pending = getattr(self, '_pending_native_audio_engine_parameter_updates', None)
+        if not isinstance(pending, dict):
+            return
+        bridge_id = id(bridge)
+        if engine_track_index is None:
+            keys_to_remove = [
+                key for key in list(pending.keys())
+                if isinstance(key, tuple) and len(key) >= 2 and int(key[0]) == bridge_id
+            ]
+        else:
+            keys_to_remove = [(bridge_id, int(engine_track_index))]
+        for key in keys_to_remove:
+            pending.pop(key, None)
+
+    def _discard_pending_native_graph_parameter_updates(
+        self,
+        bridge: object | None,
+        *,
+        slot_index: int | None = None,
+    ) -> None:
+        if bridge is None:
+            return
+        pending = getattr(self, '_pending_native_graph_parameter_updates', None)
+        if not isinstance(pending, dict):
+            return
+        bridge_id = id(bridge)
+        if slot_index is None:
+            keys_to_remove = [
+                key for key in list(pending.keys())
+                if isinstance(key, tuple) and len(key) >= 2 and int(key[0]) == bridge_id
+            ]
+        else:
+            keys_to_remove = [(bridge_id, int(slot_index))]
+        for key in keys_to_remove:
+            pending.pop(key, None)
 
     def _load_native_vst_state_into_bridge(
         self,
@@ -16466,6 +16878,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         setattr(bridge, '_aims_loaded_state_path', str(state_file))
         setattr(bridge, '_aims_loaded_state_mtime_ns', int(self._path_mtime_ns(state_file)))
+        self._set_native_vst_host_bridge_state_dirty(bridge, False)
         if parameter_values is not None:
             self._remember_native_vst_bridge_parameter_values(
                 bridge,
@@ -16489,6 +16902,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         if getattr(bridge, '_aims_supports_load_graph_slot_state', True) is False:
             return False
+        self._discard_pending_native_graph_parameter_updates(bridge, slot_index=int(slot_index))
         payload = {
             'slot_index': int(slot_index),
             'path': str(state_file),
@@ -16575,6 +16989,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 engine_track_index = engine_rows.index(int(track_index))
                 engine_bridge = getattr(self, '_native_output_bridge', None)
                 if engine_bridge is not None:
+                    self._discard_pending_native_audio_engine_parameter_updates(
+                        engine_bridge,
+                        engine_track_index=engine_track_index,
+                    )
                     try:
                         engine_bridge.command(
                             'set_audio_engine_track_state',
@@ -16601,7 +17019,7 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> bool:
         if status is None:
             try:
-                status = bridge.command('status')
+                status = bridge.command('status', lightweight=True, include_plugin_parameters=True)
             except Exception:
                 return False
         if not isinstance(status, dict):
@@ -16641,12 +17059,33 @@ class MainWindow(QtWidgets.QMainWindow):
         state_generation_changed = current_state_gen != previous_state_gen
         setattr(bridge, '_aims_last_state_generation', current_state_gen)
 
-        # Detect large parameter changes (>16 deltas) which typically
-        # indicate a preset/program change rather than individual knob tweaks.
-        likely_preset_change = (bool(delta_values) and len(delta_values) > 16) or state_generation_changed
+        # Treat large delta bursts as probable preset/program changes.
+        # During live playback, debounce those full-state syncs so a preset
+        # load settles before the active transport host is reloaded.
+        likely_preset_parameter_change = bool(delta_values) and len(delta_values) > 16
+        pending_state_syncs = getattr(self, '_pending_native_vst_state_syncs', None)
+        existing_deferred_state_sync = (
+            isinstance(pending_state_syncs, dict)
+            and int(row) in pending_state_syncs
+            and isinstance(pending_state_syncs[int(row)], tuple)
+            and pending_state_syncs[int(row)][0] is bridge
+        )
+        state_capture_needed = bool(
+            state_generation_changed
+            or likely_preset_parameter_change
+            or (not live_native_playback_safe and parameter_changed)
+        )
+        if state_capture_needed:
+            self._set_native_vst_host_bridge_state_dirty(bridge, True)
+        defer_state_sync = bool(
+            (not force_save)
+            and live_native_playback_safe
+            and (likely_preset_parameter_change or (state_generation_changed and existing_deferred_state_sync))
+        )
 
         state_captured = False
-        if force_save or (parameter_changed and not live_native_playback_safe) or (parameter_changed and likely_preset_change) or state_generation_changed:
+        if force_save or (not live_native_playback_safe and (parameter_changed or state_generation_changed)):
+            self._discard_pending_native_vst_state_syncs(row=int(row), bridge=bridge)
             state_captured = self._capture_native_vst_host_bridge_state(
                 row,
                 bridge=bridge,
@@ -16659,13 +17098,15 @@ class MainWindow(QtWidgets.QMainWindow):
             sync_hosts = True
             payload_values: dict[str, float] | None = None
             if live_native_playback_safe:
-                if not delta_values and not state_generation_changed:
+                if not delta_values:
                     sync_hosts = False
-                elif len(delta_values) <= 16 and not state_generation_changed:
+                elif len(delta_values) <= 16 and not likely_preset_parameter_change:
                     payload_values = dict(delta_values)
-                # When >16 parameters changed or state generation changed
-                # (preset change), keep sync_hosts=True and
-                # payload_values=None so the full parameter set is sent.
+                else:
+                    # When a likely preset/program change happened, send the
+                    # full set explicitly so active hosts do not miss
+                    # non-delta state changes.
+                    payload_values = dict(status_values)
             if live_native_playback_safe:
                 self._apply_track_vsti_parameters_live(
                     track,
@@ -16681,6 +17122,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 generation=self._track_vsti_parameter_generation(track),
             )
 
+        if defer_state_sync:
+            self._queue_deferred_native_vst_state_sync(
+                int(row),
+                bridge,
+                track,
+                entry,
+            )
         if state_captured:
             self._sync_native_vst_state_to_active_hosts(int(row), track, entry, source_bridge=bridge)
 
@@ -16719,7 +17167,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 continue
 
             try:
-                status = bridge.command('status')
+                status = bridge.command('status', lightweight=True)
             except Exception:
                 keep_polling = keep_polling or was_open or poll_requested
                 continue
@@ -16732,13 +17180,32 @@ class MainWindow(QtWidgets.QMainWindow):
                 setattr(bridge, '_aims_editor_poll_requested', False)
                 setattr(bridge, '_aims_editor_poll_until', 0.0)
             keep_polling = keep_polling or editor_open or was_open or bool(getattr(bridge, '_aims_editor_poll_requested', False))
+            live_close_sync_safe = bool(
+                was_open
+                and not editor_open
+                and self._native_vst_parameter_change_is_live_safe(track)
+            )
+            if live_close_sync_safe:
+                setattr(bridge, '_aims_editor_open', False)
+                self._track_native_vsti_hwnds.pop(int(row), None)
+                self._track_native_vsti_close_events.pop(int(row), None)
+                self._discard_pending_native_vst_editor_close_syncs(row=row, bridge=bridge)
+                self._queue_deferred_native_vst_editor_close_sync(row, bridge)
+                self._update_track_list_item(row)
+                if row == self.current_track_index():
+                    self._schedule_selected_track_panel_refresh(row)
+                continue
+            try:
+                detailed_status = bridge.command('status', lightweight=True, include_plugin_parameters=True)
+            except Exception:
+                detailed_status = status
             try:
                 self._sync_track_native_vst_editor_bridge_state(
                     row,
                     bridge,
                     track,
                     entry,
-                    status=status,
+                    status=detailed_status,
                     force_save=was_open and not editor_open,
                 )
             except Exception:
@@ -16755,6 +17222,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if row is not None:
             bridge = self._track_native_vst_host_bridges.get(int(row))
             if bridge is not None:
+                self._discard_pending_native_vst_editor_close_syncs(row=int(row), bridge=bridge)
                 setattr(bridge, '_aims_editor_poll_requested', True)
                 setattr(bridge, '_aims_editor_poll_until', time.monotonic() + 4.0)
         if hasattr(self, '_native_vst_editor_sync_timer') and not self._native_vst_editor_sync_timer.isActive():
@@ -16771,6 +17239,7 @@ class MainWindow(QtWidgets.QMainWindow):
             bridge = self._track_native_vst_host_bridges.get(row)
             if bridge is None or not self._native_vst_host_bridge_alive(row):
                 continue
+            self._discard_pending_native_vst_editor_close_syncs(row=row, bridge=bridge)
             if row < 0 or row >= len(self.project.tracks):
                 continue
             track = self.project.tracks[row]
@@ -16778,7 +17247,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if entry is None:
                 continue
             try:
-                status = bridge.command('status')
+                status = bridge.command('status', lightweight=True, include_plugin_parameters=True)
             except Exception:
                 continue
             self._sync_track_native_vst_editor_bridge_state(
@@ -16806,22 +17275,160 @@ class MainWindow(QtWidgets.QMainWindow):
         if graph_bridge is None or graph_slot_index < 0:
             return
         try:
-            status = graph_bridge.command('status')
-            if int(status.get('graph_editor_slot', -1) or -1) == int(graph_slot_index):
+            active_graph_editor_slot = int(getattr(graph_bridge, '_aims_graph_editor_slot', -1) or -1)
+            if active_graph_editor_slot != int(graph_slot_index):
+                status = graph_bridge.command('status', lightweight=True)
+                active_graph_editor_slot = int(status.get('graph_editor_slot', -1) or -1)
+            if active_graph_editor_slot == int(graph_slot_index):
                 graph_bridge.command('close_graph_editor')
+                setattr(graph_bridge, '_aims_graph_editor_slot', -1)
         except Exception:
             _APP_LOGGER.exception("Failed closing graph playback editor row=%s slot=%s", row, graph_slot_index)
 
     def _flush_native_vst_parameter_updates(self) -> None:
         pending = dict(getattr(self, '_pending_native_vst_parameter_updates', {}) or {})
         self._pending_native_vst_parameter_updates = {}
+        pending_graph = dict(getattr(self, '_pending_native_graph_parameter_updates', {}) or {})
+        self._pending_native_graph_parameter_updates = {}
+        pending_engine = dict(getattr(self, '_pending_native_audio_engine_parameter_updates', {}) or {})
+        self._pending_native_audio_engine_parameter_updates = {}
+        if not pending and not pending_graph and not pending_engine:
+            return
+        dispatch_lock = getattr(self, '_native_vst_parameter_dispatch_lock', None)
+        dispatch_event = getattr(self, '_native_vst_parameter_dispatch_event', None)
+        if dispatch_lock is None or dispatch_event is None:
+            self._dispatch_native_vst_parameter_updates(pending, pending_graph, pending_engine)
+            return
+        self._schedule_native_vst_parameter_dispatch(pending, pending_graph, pending_engine)
+
+    def _dispatch_native_vst_parameter_updates(
+        self,
+        pending: dict[int, tuple[object, dict[str, float], dict[str, float], int | None]],
+        pending_graph: dict[tuple[int, int], tuple[object, int, dict[str, float], str]],
+        pending_engine: dict[tuple[int, int], tuple[object, int, dict[str, float], dict[str, float], str, str]],
+    ) -> None:
         for bridge, values, payload_values, generation in pending.values():
             self._apply_native_vst_bridge_parameter_values(
                 bridge,
                 values,
                 payload_values=payload_values,
                 generation=generation,
+                clear_pending=False,
             )
+        for bridge, slot_index, values, parameter_signature in pending_graph.values():
+            if bridge is None or not self._native_bridge_process_alive(bridge):
+                continue
+            try:
+                bridge.command(
+                    'set_graph_slot_parameters',
+                    slot_index=int(slot_index),
+                    parameters=dict(values),
+                    parameter_signature=str(parameter_signature or ''),
+                )
+            except Exception:
+                _APP_LOGGER.exception(
+                    "Failed syncing queued graph transport parameters slot=%s",
+                    slot_index,
+                )
+        for bridge, engine_track_index, values, payload_values, parameter_signature, rack_name in pending_engine.values():
+            if bridge is None or not self._native_bridge_process_alive(bridge):
+                continue
+            payload = self._native_vst_parameter_alias_payload(rack_name, payload_values or values)
+            if not payload:
+                continue
+            try:
+                bridge.command(
+                    'set_audio_engine_track_parameters',
+                    track_index=int(engine_track_index),
+                    parameters=dict(payload),
+                    parameter_signature=str(parameter_signature or ''),
+                )
+            except Exception:
+                _APP_LOGGER.exception(
+                    "Failed syncing queued audio engine track parameters engine_track=%s rack=%s",
+                    engine_track_index,
+                    rack_name,
+                )
+
+    def _schedule_native_vst_parameter_dispatch(
+        self,
+        pending: dict[int, tuple[object, dict[str, float], dict[str, float], int | None]],
+        pending_graph: dict[tuple[int, int], tuple[object, int, dict[str, float], str]],
+        pending_engine: dict[tuple[int, int], tuple[object, int, dict[str, float], dict[str, float], str, str]],
+    ) -> None:
+        if not pending and not pending_graph and not pending_engine:
+            return
+        dispatch_lock = getattr(self, '_native_vst_parameter_dispatch_lock', None)
+        dispatch_event = getattr(self, '_native_vst_parameter_dispatch_event', None)
+        if dispatch_lock is None or dispatch_event is None:
+            self._dispatch_native_vst_parameter_updates(pending, pending_graph, pending_engine)
+            return
+        with dispatch_lock:
+            current = getattr(self, '_native_vst_parameter_dispatch_pending', None)
+            if current is None:
+                merged_pending = dict(pending)
+                merged_graph = dict(pending_graph)
+                merged_engine = dict(pending_engine)
+            else:
+                merged_pending = dict(current[0])
+                merged_graph = dict(current[1])
+                merged_engine = dict(current[2])
+                merged_pending.update(pending)
+                merged_graph.update(pending_graph)
+                merged_engine.update(pending_engine)
+            self._native_vst_parameter_dispatch_pending = (merged_pending, merged_graph, merged_engine)
+        dispatch_event.set()
+
+    def _native_vst_parameter_dispatch_worker(self) -> None:
+        while True:
+            dispatch_event = getattr(self, '_native_vst_parameter_dispatch_event', None)
+            dispatch_lock = getattr(self, '_native_vst_parameter_dispatch_lock', None)
+            if dispatch_event is None or dispatch_lock is None:
+                return
+            dispatch_event.wait(0.25)
+            if not dispatch_event.is_set():
+                if bool(getattr(self, '_shutdown_complete', False)):
+                    return
+                continue
+            while True:
+                with dispatch_lock:
+                    pending_batch = getattr(self, '_native_vst_parameter_dispatch_pending', None)
+                    self._native_vst_parameter_dispatch_pending = None
+                    dispatch_event.clear()
+                if pending_batch is None:
+                    break
+                self._dispatch_native_vst_parameter_updates(*pending_batch)
+            if bool(getattr(self, '_shutdown_complete', False)):
+                with dispatch_lock:
+                    if getattr(self, '_native_vst_parameter_dispatch_pending', None) is None:
+                        return
+
+    def _queue_native_graph_parameter_values(
+        self,
+        bridge: object | None,
+        slot_index: int,
+        values: dict[str, float],
+        *,
+        parameter_signature: str = '',
+    ) -> bool:
+        if bridge is None or int(slot_index) < 0 or not self._native_bridge_process_alive(bridge):
+            return False
+        sanitized = self._sanitize_native_vst_bridge_parameter_values(values)
+        if not sanitized:
+            return True
+        pending = getattr(self, '_pending_native_graph_parameter_updates', None)
+        if not isinstance(pending, dict):
+            self._pending_native_graph_parameter_updates = {}
+            pending = self._pending_native_graph_parameter_updates
+        pending[(id(bridge), int(slot_index))] = (
+            bridge,
+            int(slot_index),
+            dict(sanitized),
+            str(parameter_signature or self._native_vst_host_parameter_payload_signature_string(sanitized)),
+        )
+        if hasattr(self, '_native_vst_parameter_flush_timer') and not self._native_vst_parameter_flush_timer.isActive():
+            self._native_vst_parameter_flush_timer.start()
+        return True
 
     def _queue_native_vst_bridge_parameter_values(
         self,
@@ -16887,6 +17494,49 @@ class MainWindow(QtWidgets.QMainWindow):
             self._native_vst_parameter_flush_timer.start()
         return True
 
+    def _queue_native_audio_engine_parameter_values(
+        self,
+        bridge: object | None,
+        engine_track_index: int,
+        values: dict[str, float],
+        *,
+        payload_values: dict[str, float] | None = None,
+        rack_name: str = '',
+    ) -> bool:
+        if bridge is None or not self._native_bridge_process_alive(bridge):
+            return False
+        sanitized = self._sanitize_native_vst_bridge_parameter_values(values)
+        if not sanitized:
+            return True
+        sanitized_payload = self._sanitize_native_vst_bridge_parameter_values(
+            payload_values if payload_values is not None else values
+        )
+        if payload_values is not None and not sanitized_payload:
+            return True
+        pending = getattr(self, '_pending_native_audio_engine_parameter_updates', None)
+        if not isinstance(pending, dict):
+            self._pending_native_audio_engine_parameter_updates = {}
+            pending = self._pending_native_audio_engine_parameter_updates
+        key = (id(bridge), int(engine_track_index))
+        parameter_signature = self._native_vst_host_parameter_payload_signature_string(sanitized)
+        existing = pending.get(key)
+        if existing is None or payload_values is None:
+            merged_payload = dict(sanitized if payload_values is None else sanitized_payload)
+        else:
+            merged_payload = dict(existing[3])
+            merged_payload.update(sanitized_payload)
+        pending[key] = (
+            bridge,
+            int(engine_track_index),
+            dict(sanitized),
+            merged_payload,
+            parameter_signature,
+            str(rack_name or (existing[5] if existing is not None else '')).strip(),
+        )
+        if hasattr(self, '_native_vst_parameter_flush_timer') and not self._native_vst_parameter_flush_timer.isActive():
+            self._native_vst_parameter_flush_timer.start()
+        return True
+
     def _apply_native_vst_bridge_parameter_values(
         self,
         bridge: object | None,
@@ -16894,6 +17544,7 @@ class MainWindow(QtWidgets.QMainWindow):
         *,
         payload_values: dict[str, float] | None = None,
         generation: int | None = None,
+        clear_pending: bool = True,
     ) -> bool:
         if bridge is None:
             return False
@@ -16905,21 +17556,24 @@ class MainWindow(QtWidgets.QMainWindow):
         if getattr(bridge, '_aims_live_parameter_signature', None) == signature:
             if generation is not None:
                 setattr(bridge, '_aims_live_parameter_generation', int(generation))
-            self._discard_pending_native_vst_bridge_parameter_updates(bridge)
+            if clear_pending:
+                self._discard_pending_native_vst_bridge_parameter_updates(bridge)
             return True
         if not sanitized:
             setattr(bridge, '_aims_live_parameter_signature', signature)
             setattr(bridge, '_aims_live_parameter_values', {})
             if generation is not None:
                 setattr(bridge, '_aims_live_parameter_generation', int(generation))
-            self._discard_pending_native_vst_bridge_parameter_updates(bridge)
+            if clear_pending:
+                self._discard_pending_native_vst_bridge_parameter_updates(bridge)
             return True
         if payload_values is not None and not sanitized_payload:
             setattr(bridge, '_aims_live_parameter_signature', signature)
             setattr(bridge, '_aims_live_parameter_values', dict(sanitized))
             if generation is not None:
                 setattr(bridge, '_aims_live_parameter_generation', int(generation))
-            self._discard_pending_native_vst_bridge_parameter_updates(bridge)
+            if clear_pending:
+                self._discard_pending_native_vst_bridge_parameter_updates(bridge)
             return True
         if getattr(bridge, '_aims_supports_set_parameters', True) is False:
             return False
@@ -16939,20 +17593,15 @@ class MainWindow(QtWidgets.QMainWindow):
             setattr(bridge, '_aims_live_parameter_values', dict(sanitized))
             if generation is not None:
                 setattr(bridge, '_aims_live_parameter_generation', int(generation))
-            self._discard_pending_native_vst_bridge_parameter_updates(bridge)
+            if clear_pending:
+                self._discard_pending_native_vst_bridge_parameter_updates(bridge)
             return True
 
-        payload = dict(changed_values or sanitized_payload or sanitized)
         rack_name = str(getattr(bridge, '_aims_rack_name', '') or '')
-        if rack_name:
-            parameter_names = [str(name) for name in self.vsti_parameter_names_for_rack(rack_name)]
-            parameter_index_by_name = {name: idx for idx, name in enumerate(parameter_names, start=1)}
-            alias_payload: dict[str, float] = {}
-            for key, value in list(payload.items()):
-                parameter_index = parameter_index_by_name.get(str(key))
-                if parameter_index is not None:
-                    alias_payload.setdefault(f'Param {parameter_index}', float(value))
-            payload.update(alias_payload)
+        payload = self._native_vst_parameter_alias_payload(
+            rack_name,
+            changed_values or sanitized_payload or sanitized,
+        )
 
         try:
             response = bridge.command('set_parameters', parameters=payload)
@@ -16963,7 +17612,8 @@ class MainWindow(QtWidgets.QMainWindow):
             setattr(bridge, '_aims_live_parameter_values', dict(sanitized))
             if generation is not None:
                 setattr(bridge, '_aims_live_parameter_generation', int(generation))
-            self._discard_pending_native_vst_bridge_parameter_updates(bridge)
+            if clear_pending:
+                self._discard_pending_native_vst_bridge_parameter_updates(bridge)
             return True
         except Exception as exc:
             if 'Unknown command: set_parameters' in str(exc):
@@ -17028,21 +17678,14 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             if not graph_payload:
                 return
-            try:
-                graph_bridge.command(
-                    'set_graph_slot_parameters',
-                    slot_index=int(graph_slot_index),
-                    parameters=dict(graph_payload),
-                    parameter_signature=self._native_vst_host_parameter_payload_signature_string(
-                        self._sanitize_native_vst_bridge_parameter_values(values)
-                    ),
-                )
-            except Exception:
-                _APP_LOGGER.exception(
-                    "Failed syncing active graph transport parameters row=%s rack=%s",
-                    track_index,
-                    track.rack_vsti,
-                )
+            self._queue_native_graph_parameter_values(
+                graph_bridge,
+                int(graph_slot_index),
+                graph_payload,
+                parameter_signature=self._native_vst_host_parameter_payload_signature_string(
+                    self._sanitize_native_vst_bridge_parameter_values(values)
+                ),
+            )
 
         if self._native_audio_engine_active():
             engine_track_rows = list(getattr(self, '_native_audio_engine_track_rows', []) or [])
@@ -17054,27 +17697,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 if engine_payload:
                     engine_bridge = getattr(self, '_native_output_bridge', None)
                     if engine_bridge is not None:
-                        rack_name = str(getattr(bridge, '_aims_rack_name', '') or '') if bridge is not None else ''
-                        if rack_name:
-                            parameter_names = [str(name) for name in self.vsti_parameter_names_for_rack(rack_name)]
-                            parameter_index_by_name = {name: idx for idx, name in enumerate(parameter_names, start=1)}
-                            for key, value in list(engine_payload.items()):
-                                parameter_index = parameter_index_by_name.get(str(key))
-                                if parameter_index is not None:
-                                    engine_payload.setdefault(f'Param {parameter_index}', float(value))
-                        try:
-                            engine_bridge.command(
-                                'set_audio_engine_track_parameters',
-                                track_index=int(engine_track_index),
-                                parameters=dict(engine_payload),
-                            )
-                        except Exception:
-                            _APP_LOGGER.exception(
-                                "Failed syncing audio engine track parameters row=%s engine_track=%s rack=%s",
-                                track_index,
-                                engine_track_index,
-                                track.rack_vsti,
-                            )
+                        self._queue_native_audio_engine_parameter_values(
+                            engine_bridge,
+                            engine_track_index,
+                            values,
+                            payload_values=engine_payload,
+                            rack_name=str(track.rack_vsti or ''),
+                        )
 
     def _native_vst_parameter_change_is_live_safe(self, track: TrackState) -> bool:
         if not bool(getattr(self, '_playback_active', False)):
@@ -17124,12 +17753,18 @@ class MainWindow(QtWidgets.QMainWindow):
         editor_plugin=None,
     ) -> None:
         sanitized = self._sanitize_native_vst_bridge_parameter_values(values)
+        previous_values = self._sanitize_native_vst_bridge_parameter_values(track.vsti_parameters)
+        effective_payload = self._sanitize_native_vst_bridge_parameter_values(payload_values) if payload_values is not None else {
+            key: value
+            for key, value in sanitized.items()
+            if round(float(previous_values.get(key, float('nan'))), 4) != round(float(value), 4)
+        }
         prerender_playback_active = bool(getattr(self, '_playback_active', False)) and bool(
             getattr(self, '_use_prerendered_transport_mix', False)
         )
         live_native_playback_safe = self._native_vst_parameter_change_is_live_safe(track)
         previous_signature = self._native_vst_bridge_parameter_signature(
-            self._sanitize_native_vst_bridge_parameter_values(track.vsti_parameters)
+            previous_values
         )
         current_signature = self._native_vst_bridge_parameter_signature(sanitized)
         track.vsti_parameters = sanitized
@@ -17139,7 +17774,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._sync_native_vst_host_parameters(
                 track,
                 sanitized,
-                payload_values=payload_values,
+                payload_values=effective_payload,
                 include_output_bridge=not prerender_playback_active,
             )
         if editor_plugin is not None:
@@ -18297,6 +18932,8 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 self._capture_native_vst_host_bridge_state(row, bridge=bridge, track=track, entry=entry)
         self._discard_pending_native_vst_bridge_parameter_updates(bridge)
+        self._discard_pending_native_vst_state_syncs(row=row, bridge=bridge)
+        self._discard_pending_native_vst_editor_close_syncs(row=row, bridge=bridge)
         self._track_native_vst_host_bridges.pop(row, None)
         try:
             bridge.stop()
@@ -21084,6 +21721,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._shutdown_complete:
             return
         self._shutdown_complete = True
+        if hasattr(self, '_native_vst_parameter_dispatch_event'):
+            self._native_vst_parameter_dispatch_event.set()
         _APP_LOGGER.info("Shutting down audio and VST resources")
         try:
             if hasattr(self, 'playback_timer'):
