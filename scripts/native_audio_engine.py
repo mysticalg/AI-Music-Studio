@@ -31,6 +31,17 @@ class NativeAudioEngineClient:
             preserve_transport=bool(preserve_transport),
         )
 
+    def set_track_notes(
+        self,
+        track_index: int,
+        notes: list[dict[str, object]],
+    ) -> dict[str, Any]:
+        return self.bridge.command(
+            "set_audio_engine_track_notes",
+            track_index=int(track_index),
+            notes=list(notes),
+        )
+
     def play(self, start_tick: int = 0) -> dict[str, Any]:
         return self.bridge.command("start_audio_engine", start_tick=int(start_tick))
 

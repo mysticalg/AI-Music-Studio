@@ -11896,11 +11896,16 @@ class MainWindow(QtWidgets.QMainWindow):
         wraps = int(total // loop_length)
         return loop_start + (total % loop_length), loop_start, loop_end, wraps
 
-    def _prioritize_note_offs_for_edit(self) -> None:
+    def _prioritize_note_offs_for_edit(self, target_rows: set[int] | None = None) -> None:
         if not bool(hasattr(self, 'playback_timer') and self.playback_timer.isActive()):
             return
+        if self._native_audio_engine_active():
+            return
         current_generation = int(self._realtime_pump_generation)
+        row_filter = {int(row) for row in (target_rows or set()) if int(row) >= 0}
         for row in list(getattr(self, '_track_native_vst_host_bridges', {}).keys()):
+            if row_filter and int(row) not in row_filter:
+                continue
             track = self.project.tracks[int(row)] if 0 <= int(row) < len(self.project.tracks) else None
             self._panic_native_vst_host_track(int(row), track, exhaustive=True, generation=current_generation)
         self._mark_realtime_track_states_for_reset()
@@ -13148,7 +13153,7 @@ class MainWindow(QtWidgets.QMainWindow):
         current_row = self.current_track_index()
         changed_rows = {int(current_row)} if 0 <= int(current_row) < len(self.project.tracks) else set()
         live_safe_native_edit = self._note_edit_is_live_safe_for_native_transport(changed_rows)
-        self._prioritize_note_offs_for_edit()
+        self._prioritize_note_offs_for_edit(changed_rows)
         self._invalidate_playback_caches(reset_realtime=not live_safe_native_edit)
         if 0 <= current_row < len(self.project.tracks):
             track = self.project.tracks[current_row]
@@ -13408,6 +13413,52 @@ class MainWindow(QtWidgets.QMainWindow):
         self._cancel_pending_transport_reprepare()
         return True
 
+    def _try_live_safe_active_native_audio_engine_note_refresh(
+        self,
+        bridge: object,
+        client: object,
+        candidate_tracks: list[tuple[int, TrackState, VSTInstrument | None]],
+        changed_rows: set[int],
+    ) -> bool:
+        if not changed_rows:
+            return False
+        active_rows = [int(row) for row in (getattr(self, '_native_audio_engine_track_rows', []) or []) if int(row) >= 0]
+        candidate_rows = [int(row) for row, _track, _entry in candidate_tracks]
+        if active_rows != candidate_rows:
+            return False
+
+        row_to_engine_index: dict[int, int] = {}
+        row_to_track: dict[int, TrackState] = {}
+        for engine_index, (row, track, entry) in enumerate(candidate_tracks):
+            row = int(row)
+            if entry is None or not self._track_can_use_native_audio_engine(track, entry):
+                return False
+            row_to_engine_index[row] = int(engine_index)
+            row_to_track[row] = track
+
+        if not changed_rows.issubset(row_to_engine_index):
+            return False
+
+        try:
+            for row in sorted(changed_rows):
+                client.set_track_notes(
+                    int(row_to_engine_index[int(row)]),
+                    self._native_audio_engine_track_notes_payload(row_to_track[int(row)]),
+                )
+        except Exception:
+            _APP_LOGGER.exception("Failed fast live-refreshing native audio engine track notes")
+            return False
+
+        request_signature = self._native_audio_engine_request_signature(
+            self._native_audio_engine_request_payload(candidate_tracks)
+        )
+        setattr(bridge, '_aims_audio_engine_config_signature', request_signature)
+        self._native_audio_engine_track_rows = list(candidate_rows)
+        self._transport_uses_native_output_bridge = True
+        self._playback_active = bool(self._native_audio_engine_running)
+        self._cancel_pending_transport_reprepare()
+        return True
+
     def _try_live_safe_active_native_audio_engine_refresh(
         self,
         changed_rows: set[int] | None = None,
@@ -13434,6 +13485,14 @@ class MainWindow(QtWidgets.QMainWindow):
         candidate_row_set = {int(row) for row, _track, _entry in candidate_tracks}
         if changed_row_set and not (changed_row_set & (active_row_set | candidate_row_set)):
             return False
+
+        if self._try_live_safe_active_native_audio_engine_note_refresh(
+            bridge,
+            client,
+            candidate_tracks,
+            changed_row_set,
+        ):
+            return True
 
         request_payload = self._native_audio_engine_request_payload(candidate_tracks)
         request_signature = self._native_audio_engine_request_signature(request_payload)
@@ -19885,6 +19944,22 @@ class MainWindow(QtWidgets.QMainWindow):
             payload_tracks.append(payload_track)
         return payload_tracks
 
+    def _native_audio_engine_track_notes_payload(self, track: TrackState) -> list[dict[str, object]]:
+        midi_channel = int(clamp(track.midi_channel, 0, 15)) + 1
+        return [
+            {
+                'start_tick': int(note.start_tick),
+                'end_tick': int(self._playback_note_end_tick(note)),
+                'pitch': int(clamp(note.pitch, 0, 127)),
+                'velocity': int(clamp(note.velocity, 1, 127)),
+                'channel': midi_channel,
+            }
+            for note in sorted(
+                track.notes,
+                key=lambda current: (int(current.start_tick), int(current.duration_tick), int(current.pitch)),
+            )
+        ]
+
     def _native_vst_graph_config_signature(
         self,
         tracks: list[tuple[int, TrackState, VSTInstrument]],
@@ -23759,7 +23834,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._deferred_refresh_arrangement = False
         self._deferred_arrangement_rows = set()
         self._deferred_reload_mix = False
-        self._prioritize_note_offs_for_edit()
+        self._prioritize_note_offs_for_edit(changed_rows)
         self._invalidate_playback_caches(reset_realtime=not live_safe_native_edit)
         self.piano_roll.refresh()
         self.velocity_editor.refresh()

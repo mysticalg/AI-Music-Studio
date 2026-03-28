@@ -1643,6 +1643,25 @@ private:
             return response;
         }
 
+        if (command == "set_audio_engine_track_notes")
+        {
+            const auto trackIndex = static_cast<int>(object->hasProperty("track_index")
+                ? object->getProperty("track_index") : juce::var(-1));
+
+            juce::String error;
+            int noteCount = 0;
+            {
+                juce::ScopedLock lock(pluginLock);
+                if (!updateAudioEngineTrackNotes(trackIndex, object->getProperty("notes"), error, noteCount))
+                    return makeResponse(false, error.isNotEmpty() ? error : "Could not update audio engine track notes");
+            }
+
+            auto response = makeResponse(true, "Audio engine track notes updated");
+            setResponseField(response, "track_index", trackIndex);
+            setResponseField(response, "note_count", noteCount);
+            return response;
+        }
+
         if (command == "set_audio_engine_track_state")
         {
             const auto trackIndex = static_cast<int>(object->hasProperty("track_index")
@@ -5361,6 +5380,52 @@ private:
         return true;
     }
 
+    std::vector<AudioEngineTrackNote> parseAudioEngineTrackNotes(const juce::var& notesVar) const
+    {
+        std::vector<AudioEngineTrackNote> notes;
+        if (auto* notesArray = notesVar.getArray())
+        {
+            notes.reserve(static_cast<size_t>(notesArray->size()));
+            for (const auto& noteVar : *notesArray)
+            {
+                auto* noteObject = noteVar.getDynamicObject();
+                if (noteObject == nullptr)
+                    continue;
+
+                AudioEngineTrackNote note;
+                note.startTick = static_cast<int>(noteObject->hasProperty("start_tick")
+                    ? noteObject->getProperty("start_tick")
+                    : juce::var(0));
+                note.endTick = static_cast<int>(noteObject->hasProperty("end_tick")
+                    ? noteObject->getProperty("end_tick")
+                    : juce::var(note.startTick + 1));
+                note.pitch = clampMidiNote(static_cast<int>(noteObject->hasProperty("pitch")
+                    ? noteObject->getProperty("pitch")
+                    : juce::var(60)));
+                note.velocity = juce::jlimit(1, 127, static_cast<int>(noteObject->hasProperty("velocity")
+                    ? noteObject->getProperty("velocity")
+                    : juce::var(100)));
+                note.channel = clampMidiChannel(static_cast<int>(noteObject->hasProperty("channel")
+                    ? noteObject->getProperty("channel")
+                    : juce::var(kDefaultMidiChannel)));
+                note.endTick = juce::jmax(note.startTick + 1, note.endTick);
+                notes.push_back(note);
+            }
+        }
+
+        std::sort(notes.begin(), notes.end(), [](const AudioEngineTrackNote& a, const AudioEngineTrackNote& b)
+        {
+            if (a.startTick != b.startTick)
+                return a.startTick < b.startTick;
+            if (a.endTick != b.endTick)
+                return a.endTick < b.endTick;
+            if (a.channel != b.channel)
+                return a.channel < b.channel;
+            return a.pitch < b.pitch;
+        });
+        return notes;
+    }
+
     bool configureAudioEngine(const juce::var& tracksVar,
                               double bpm,
                               int ticksPerBeat,
@@ -5447,46 +5512,7 @@ private:
                 ? static_cast<float>(static_cast<double>(trackObject->getProperty("output_gain_db")))
                 : 0.0f;
 
-            std::vector<AudioEngineTrackNote> notes;
-            if (auto* notesArray = trackObject->getProperty("notes").getArray())
-            {
-                notes.reserve(static_cast<size_t>(notesArray->size()));
-                for (const auto& noteVar : *notesArray)
-                {
-                    auto* noteObject = noteVar.getDynamicObject();
-                    if (noteObject == nullptr)
-                        continue;
-
-                    AudioEngineTrackNote note;
-                    note.startTick = static_cast<int>(noteObject->hasProperty("start_tick")
-                        ? noteObject->getProperty("start_tick")
-                        : juce::var(0));
-                    note.endTick = static_cast<int>(noteObject->hasProperty("end_tick")
-                        ? noteObject->getProperty("end_tick")
-                        : juce::var(note.startTick + 1));
-                    note.pitch = clampMidiNote(static_cast<int>(noteObject->hasProperty("pitch")
-                        ? noteObject->getProperty("pitch")
-                        : juce::var(60)));
-                    note.velocity = juce::jlimit(1, 127, static_cast<int>(noteObject->hasProperty("velocity")
-                        ? noteObject->getProperty("velocity")
-                        : juce::var(100)));
-                    note.channel = clampMidiChannel(static_cast<int>(noteObject->hasProperty("channel")
-                        ? noteObject->getProperty("channel")
-                        : juce::var(kDefaultMidiChannel)));
-                    note.endTick = juce::jmax(note.startTick + 1, note.endTick);
-                    notes.push_back(note);
-                }
-            }
-            std::sort(notes.begin(), notes.end(), [](const AudioEngineTrackNote& a, const AudioEngineTrackNote& b)
-            {
-                if (a.startTick != b.startTick)
-                    return a.startTick < b.startTick;
-                if (a.endTick != b.endTick)
-                    return a.endTick < b.endTick;
-                if (a.channel != b.channel)
-                    return a.channel < b.channel;
-                return a.pitch < b.pitch;
-            });
+            auto notes = parseAudioEngineTrackNotes(trackObject->getProperty("notes"));
 
             std::vector<AudioEngineAudioClip> audioClips;
             if (requestedKind == AudioEngineTrackKind::audio)
@@ -5790,6 +5816,29 @@ private:
                 audioEngine.positionFrame = 0;
         }
 
+        return true;
+    }
+
+    bool updateAudioEngineTrackNotes(int trackIndex,
+                                     const juce::var& notesVar,
+                                     juce::String& error,
+                                     int& noteCount)
+    {
+        if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(audioEngine.tracks.size())))
+        {
+            error = "Invalid audio engine track index";
+            return false;
+        }
+
+        auto& track = audioEngine.tracks[static_cast<size_t>(trackIndex)];
+        if (track.kind != AudioEngineTrackKind::instrument)
+        {
+            error = "Audio engine track does not accept MIDI notes";
+            return false;
+        }
+
+        track.notes = parseAudioEngineTrackNotes(notesVar);
+        noteCount = static_cast<int>(track.notes.size());
         return true;
     }
 
