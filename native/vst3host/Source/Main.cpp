@@ -759,6 +759,11 @@ private:
         bool loopEnabled = false;
         bool running = false;
         bool bootstrapPending = false;
+        bool tailStopping = false;
+        bool tailReleasePending = false;
+        int tailSilentBlocks = 0;
+        int64_t tailFramesProcessed = 0;
+        int64_t tailMaxFrames = 0;
         bool metronomeEnabled = false;
         juce::AudioBuffer<float> metronomeClickBuffer;
         juce::AudioBuffer<float> metronomeAccentBuffer;
@@ -1518,6 +1523,8 @@ private:
                 ? static_cast<int64_t>(static_cast<double>(object->getProperty("loop_end_tick"))) : int64_t(0);
             const auto metronomeEnabled = object->hasProperty("metronome_enabled")
                 ? static_cast<bool>(object->getProperty("metronome_enabled")) : false;
+            const auto preserveTransport = object->hasProperty("preserve_transport")
+                ? static_cast<bool>(object->getProperty("preserve_transport")) : false;
 
             juce::Array<juce::var> trackErrors;
             juce::String error;
@@ -1531,6 +1538,7 @@ private:
                         loopStartTick,
                         loopEndTick,
                         metronomeEnabled,
+                        preserveTransport,
                         trackErrors,
                         error))
                 {
@@ -1589,6 +1597,7 @@ private:
                 }
 
                 audioEngine.positionFrame = juce::jmax<int64_t>(0, targetFrame);
+                clearAudioEngineTailState();
                 if (audioEngine.running)
                 {
                     resetAudioEngineProcessingState();
@@ -1696,6 +1705,7 @@ private:
 
                 audioEngine.positionFrame = juce::jmax<int64_t>(0, targetFrame);
                 resetAudioEngineProcessingState();
+                clearAudioEngineTailState();
                 audioEngine.bootstrapPending = audioEngine.running;
             }
 
@@ -1732,6 +1742,7 @@ private:
                 inProcessTransport.running = false;
                 clearScheduledMidiEvents();
                 resetAudioEngineProcessingState();
+                clearAudioEngineTailState();
                 audioEngine.positionFrame = juce::jmax<int64_t>(0, targetFrame);
                 audioEngine.running = true;
                 audioEngine.bootstrapPending = true;
@@ -1747,11 +1758,28 @@ private:
 
         if (command == "stop_audio_engine")
         {
+            const auto allowTail = object->hasProperty("allow_tail")
+                ? static_cast<bool>(object->getProperty("allow_tail"))
+                : false;
             {
                 juce::ScopedLock lock(pluginLock);
-                audioEngine.running = false;
-                audioEngine.bootstrapPending = false;
-                resetAudioEngineProcessingState();
+                if (allowTail)
+                {
+                    audioEngine.running = false;
+                    audioEngine.bootstrapPending = false;
+                    audioEngine.tailStopping = true;
+                    audioEngine.tailReleasePending = true;
+                    audioEngine.tailSilentBlocks = 0;
+                    audioEngine.tailFramesProcessed = 0;
+                    audioEngine.tailMaxFrames = audioEngineStopTailMaxFrames();
+                }
+                else
+                {
+                    audioEngine.running = false;
+                    audioEngine.bootstrapPending = false;
+                    clearAudioEngineTailState();
+                    resetAudioEngineProcessingState();
+                }
             }
 
             auto response = makeResponse(true, "Audio engine stopped");
@@ -2103,6 +2131,7 @@ private:
         }
         setResponseField(response, "audio_engine_track_count", static_cast<int>(audioEngine.tracks.size()));
         setResponseField(response, "audio_engine_running", audioEngine.running);
+        setResponseField(response, "audio_engine_tailing", audioEngine.tailStopping);
         setResponseField(response, "audio_engine_position_frame", static_cast<double>(audioEngine.positionFrame));
         setResponseField(response, "audio_engine_tracks", juce::var(audioEngineTracks));
         if (!lightweight)
@@ -2612,7 +2641,7 @@ private:
             }
             if (graphTransportEnabled.load())
                 processPersistentPluginGraphTransport(buffer, numSamples, renderedSampleFrames.load());
-            if (audioEngine.running)
+            if (audioEngine.running || audioEngine.tailStopping)
                 processAudioEngine(buffer, numSamples);
         }
 
@@ -4950,6 +4979,7 @@ private:
         audioEngine.metronomeEnabled = false;
         audioEngine.metronomeClickBuffer.setSize(0, 0);
         audioEngine.metronomeAccentBuffer.setSize(0, 0);
+        clearAudioEngineTailState();
     }
 
     void resetAudioEngineTrackProcessingState(AudioEngineTrack& track)
@@ -4964,6 +4994,44 @@ private:
         for (auto& lane : track.automationLanes)
             lane.lastAppliedValue = std::numeric_limits<float>::quiet_NaN();
         track.peakLevel = 0.0f;
+    }
+
+    void clearAudioEngineTailState()
+    {
+        audioEngine.tailStopping = false;
+        audioEngine.tailReleasePending = false;
+        audioEngine.tailSilentBlocks = 0;
+        audioEngine.tailFramesProcessed = 0;
+        audioEngine.tailMaxFrames = 0;
+    }
+
+    int64_t audioEngineStopTailMaxFrames() const
+    {
+        constexpr double defaultTailSeconds = 6.0;
+        constexpr double maxTailSeconds = 12.0;
+        double requestedTailSeconds = 0.0;
+        auto accumulateTailSeconds = [&requestedTailSeconds](const auto* plugin)
+        {
+            if (plugin == nullptr)
+                return;
+            const auto tailSeconds = plugin->getTailLengthSeconds();
+            if (std::isfinite(tailSeconds) && tailSeconds > 0.0)
+                requestedTailSeconds = juce::jmax(requestedTailSeconds, tailSeconds);
+        };
+
+        for (const auto& track : audioEngine.tracks)
+        {
+            accumulateTailSeconds(track.plugin.get());
+            for (const auto& effectSlot : track.fxChain)
+                accumulateTailSeconds(effectSlot.plugin.get());
+        }
+
+        const auto sampleRate = juce::jmax(1.0, currentSampleRate);
+        const auto cappedTailSeconds = juce::jlimit(
+            0.25,
+            maxTailSeconds,
+            requestedTailSeconds > 0.0 ? requestedTailSeconds : defaultTailSeconds);
+        return juce::jmax<int64_t>(1, static_cast<int64_t>(std::llround(cappedTailSeconds * sampleRate)));
     }
 
     void resetAudioEngineProcessingState()
@@ -5134,31 +5202,34 @@ private:
         }
     }
 
+    void prepareAudioEngineTrackForPlayback(AudioEngineTrack& track)
+    {
+        if (track.plugin == nullptr)
+        {
+            track.processBuffer.setSize(0, 0);
+        }
+        else
+        {
+            track.plugin->setRateAndBufferSizeDetails(currentSampleRate, currentBlockSize);
+            track.plugin->prepareToPlay(currentSampleRate, currentBlockSize);
+            track.plugin->suspendProcessing(false);
+        }
+        for (auto& effectSlot : track.fxChain)
+        {
+            if (effectSlot.plugin == nullptr)
+                continue;
+            effectSlot.plugin->setRateAndBufferSizeDetails(currentSampleRate, currentBlockSize);
+            effectSlot.plugin->prepareToPlay(currentSampleRate, currentBlockSize);
+            effectSlot.plugin->suspendProcessing(false);
+        }
+        resetAudioEngineTrackProcessingState(track);
+    }
+
     void prepareAudioEngineForPlayback()
     {
         prepareAudioEngineMetronome();
         for (auto& track : audioEngine.tracks)
-        {
-            if (track.plugin == nullptr)
-            {
-                track.processBuffer.setSize(0, 0);
-            }
-            else
-            {
-                track.plugin->setRateAndBufferSizeDetails(currentSampleRate, currentBlockSize);
-                track.plugin->prepareToPlay(currentSampleRate, currentBlockSize);
-                track.plugin->suspendProcessing(false);
-            }
-            for (auto& effectSlot : track.fxChain)
-            {
-                if (effectSlot.plugin == nullptr)
-                    continue;
-                effectSlot.plugin->setRateAndBufferSizeDetails(currentSampleRate, currentBlockSize);
-                effectSlot.plugin->prepareToPlay(currentSampleRate, currentBlockSize);
-                effectSlot.plugin->suspendProcessing(false);
-            }
-            resetAudioEngineTrackProcessingState(track);
-        }
+            prepareAudioEngineTrackForPlayback(track);
     }
 
     void releaseAudioEngineResources()
@@ -5181,6 +5252,7 @@ private:
         }
         audioEngine.metronomeClickBuffer.setSize(0, 0);
         audioEngine.metronomeAccentBuffer.setSize(0, 0);
+        clearAudioEngineTailState();
     }
 
     bool configureAudioEngineTrackEffectChain(AudioEngineTrack& track,
@@ -5266,6 +5338,7 @@ private:
                               int64_t loopStartTick,
                               int64_t loopEndTick,
                               bool metronomeEnabled,
+                              bool preserveTransport,
                               juce::Array<juce::var>& trackErrors,
                               juce::String& error)
     {
@@ -5280,18 +5353,24 @@ private:
         clearQueuedAudioEngineTrackParameterUpdates();
 
         const auto shouldPrepare = currentSampleRate > 0.0 && currentBlockSize > 0;
-        if (shouldPrepare)
-            releaseAudioEngineResources();
+        const auto keepTransportRunning = preserveTransport && shouldPrepare && audioEngine.running;
+        const auto preservedTick = keepTransportRunning
+            ? audioEngine.frameToTickDouble(audioEngine.positionFrame, juce::jmax(1.0, currentSampleRate))
+            : 0.0;
+        bool structuralChange = false;
+        const auto previousTrackCount = static_cast<int>(audioEngine.tracks.size());
 
         if (audioEngine.tracks.size() > static_cast<size_t>(requestedTrackCount))
         {
             for (size_t index = static_cast<size_t>(requestedTrackCount); index < audioEngine.tracks.size(); ++index)
                 releaseAudioEngineTrack(audioEngine.tracks[index]);
             audioEngine.tracks.resize(static_cast<size_t>(requestedTrackCount));
+            structuralChange = true;
         }
         else if (audioEngine.tracks.size() < static_cast<size_t>(requestedTrackCount))
         {
             audioEngine.tracks.resize(static_cast<size_t>(requestedTrackCount));
+            structuralChange = true;
         }
         audioEngineTrackCount.store(requestedTrackCount, std::memory_order_release);
 
@@ -5453,6 +5532,7 @@ private:
 
             if (!canReuse)
             {
+                structuralChange = true;
                 releaseAudioEngineTrack(track);
                 track.kind = requestedKind;
 
@@ -5607,6 +5687,8 @@ private:
             track.basePan = pan;
             track.baseOutputGainDb = outputGainDb;
             track.peakLevel = 0.0f;
+            if (shouldPrepare && !canReuse)
+                prepareAudioEngineTrackForPlayback(track);
             if (requestedKind == AudioEngineTrackKind::instrument)
             {
                 if (track.plugin != nullptr)
@@ -5631,12 +5713,46 @@ private:
         audioEngine.loopStartTick = loopStartTick;
         audioEngine.loopEndTick = loopEndTick;
         audioEngine.metronomeEnabled = metronomeEnabled;
-        audioEngine.running = false;
-        audioEngine.bootstrapPending = false;
-        audioEngine.positionFrame = 0;
+        const auto preserveTail = !keepTransportRunning
+            && audioEngine.tailStopping
+            && !structuralChange;
+        if (!preserveTail)
+            clearAudioEngineTailState();
 
         if (shouldPrepare)
-            prepareAudioEngineForPlayback();
+        {
+            prepareAudioEngineMetronome();
+            if (!structuralChange && requestedTrackCount != previousTrackCount)
+                structuralChange = true;
+        }
+
+        if (keepTransportRunning)
+        {
+            auto targetFrame = audioEngine.tickToFrame(
+                static_cast<int64_t>(std::llround(preservedTick)),
+                juce::jmax(1.0, currentSampleRate));
+            const auto loopStartFrame = audioEngine.tickToFrame(audioEngine.loopStartTick, juce::jmax(1.0, currentSampleRate));
+            const auto loopEndFrame = audioEngine.tickToFrame(audioEngine.loopEndTick, juce::jmax(1.0, currentSampleRate));
+            if (audioEngine.loopEnabled && loopEndFrame > loopStartFrame
+                && (targetFrame < loopStartFrame || targetFrame >= loopEndFrame))
+            {
+                targetFrame = loopStartFrame;
+            }
+            audioEngine.positionFrame = juce::jmax<int64_t>(0, targetFrame);
+            audioEngine.running = true;
+            if (structuralChange)
+            {
+                resetAudioEngineProcessingState();
+                audioEngine.bootstrapPending = true;
+            }
+        }
+        else
+        {
+            audioEngine.running = false;
+            audioEngine.bootstrapPending = false;
+            if (!preserveTail)
+                audioEngine.positionFrame = 0;
+        }
 
         return true;
     }
@@ -5704,9 +5820,28 @@ private:
         }
     }
 
+    void appendAudioEngineTailReleaseEvents(const AudioEngineTrack& track, juce::MidiBuffer& midi) const
+    {
+        juce::Array<int> channels;
+        for (const auto& note : track.notes)
+            channels.addIfNotAlreadyThere(clampMidiChannel(note.channel));
+        if (channels.isEmpty())
+            channels.add(kDefaultMidiChannel);
+
+        for (const auto channel : channels)
+        {
+            midi.addEvent(juce::MidiMessage::controllerEvent(channel, 64, 0), 0);
+            midi.addEvent(juce::MidiMessage::allNotesOff(channel), 0);
+            for (int note = 0; note < 128; ++note)
+                midi.addEvent(juce::MidiMessage::noteOff(channel, note, 0.0f), 0);
+        }
+    }
+
     void processAudioEngine(juce::AudioBuffer<float>& buffer, int numSamples)
     {
-        if (!audioEngine.running || numSamples <= 0)
+        const bool transportRunning = audioEngine.running;
+        const bool tailStopping = audioEngine.tailStopping;
+        if ((!transportRunning && !tailStopping) || numSamples <= 0)
             return;
 
         applyQueuedAudioEngineTrackParameterUpdates();
@@ -5714,7 +5849,8 @@ private:
         const auto sampleRate = juce::jmax(1.0, currentSampleRate);
         const auto loopStartFrame = audioEngine.tickToFrame(audioEngine.loopStartTick, sampleRate);
         const auto loopEndFrame = audioEngine.tickToFrame(audioEngine.loopEndTick, sampleRate);
-        const auto looping = audioEngine.loopEnabled && loopEndFrame > loopStartFrame;
+        const auto looping = transportRunning && audioEngine.loopEnabled && loopEndFrame > loopStartFrame;
+        float tailPeakLevel = 0.0f;
 
         int samplesRemaining = numSamples;
         int sampleOffset = 0;
@@ -5731,7 +5867,7 @@ private:
 
             const auto chunkStartFrame = audioEngine.positionFrame;
             const auto wrapAfterChunk = looping && (chunkStartFrame + chunkSamples) >= loopEndFrame;
-            const auto bootstrapActive = audioEngine.bootstrapPending;
+            const auto bootstrapActive = transportRunning && audioEngine.bootstrapPending;
 
             for (auto& track : audioEngine.tracks)
             {
@@ -5751,16 +5887,23 @@ private:
                     track.processBuffer.clear();
 
                     juce::MidiBuffer midi;
-                    appendAudioEngineNoteEvents(
-                        track,
-                        midi,
-                        chunkStartFrame,
-                        chunkSamples,
-                        sampleRate,
-                        bootstrapActive,
-                        wrapAfterChunk,
-                        loopEndFrame
-                    );
+                    if (transportRunning)
+                    {
+                        appendAudioEngineNoteEvents(
+                            track,
+                            midi,
+                            chunkStartFrame,
+                            chunkSamples,
+                            sampleRate,
+                            bootstrapActive,
+                            wrapAfterChunk,
+                            loopEndFrame
+                        );
+                    }
+                    else if (audioEngine.tailReleasePending)
+                    {
+                        appendAudioEngineTailReleaseEvents(track, midi);
+                    }
 
                     applyAudioEngineTrackParameterAutomation(
                         track,
@@ -5771,28 +5914,50 @@ private:
                 }
                 else
                 {
-                    renderAudioEngineTrackClips(track, chunkStartFrame, chunkSamples);
+                    if (transportRunning)
+                        renderAudioEngineTrackClips(track, chunkStartFrame, chunkSamples);
                 }
 
                 processAudioEngineEffectChain(track, track.stereoBuffer);
                 applyAudioEngineTrackMixAutomation(audioEngine, track, track.stereoBuffer, chunkStartFrame, sampleRate);
                 track.peakLevel = peakLevelForBuffer(track.stereoBuffer);
+                tailPeakLevel = juce::jmax(tailPeakLevel, track.peakLevel);
                 buffer.addFrom(0, sampleOffset, track.stereoBuffer, 0, 0, chunkSamples);
                 buffer.addFrom(1, sampleOffset, track.stereoBuffer, 1, 0, chunkSamples);
             }
 
-            if (audioEngine.metronomeEnabled)
+            if (transportRunning && audioEngine.metronomeEnabled)
                 mixAudioEngineMetronomeChunk(buffer, sampleOffset, chunkStartFrame, chunkSamples, sampleRate);
 
-            audioEngine.positionFrame += chunkSamples;
-            audioEngine.bootstrapPending = false;
+            if (transportRunning)
+            {
+                audioEngine.positionFrame += chunkSamples;
+                audioEngine.bootstrapPending = false;
+            }
             sampleOffset += chunkSamples;
             samplesRemaining -= chunkSamples;
 
-            if (wrapAfterChunk)
+            if (transportRunning && wrapAfterChunk)
             {
                 audioEngine.positionFrame = loopStartFrame;
                 audioEngine.bootstrapPending = true;
+            }
+        }
+
+        if (tailStopping)
+        {
+            audioEngine.tailReleasePending = false;
+            audioEngine.tailFramesProcessed += numSamples;
+            if (tailPeakLevel <= 1.0e-4f)
+                ++audioEngine.tailSilentBlocks;
+            else
+                audioEngine.tailSilentBlocks = 0;
+
+            if (audioEngine.tailSilentBlocks >= 6
+                || (audioEngine.tailMaxFrames > 0 && audioEngine.tailFramesProcessed >= audioEngine.tailMaxFrames))
+            {
+                clearAudioEngineTailState();
+                resetAudioEngineProcessingState();
             }
         }
     }

@@ -8043,6 +8043,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.show_virtual_piano_window_action.blockSignals(False)
             self.toggle_virtual_piano_window(piano_visible)
 
+        QtCore.QTimer.singleShot(0, self._start_vsti_background_warmup)
         self._update_window_title()
 
     def on_quantize_changed(self, text: str) -> None:
@@ -8993,6 +8994,42 @@ class MainWindow(QtWidgets.QMainWindow):
             candidates.append((idx, track, None))
         return candidates
 
+    def _native_audio_engine_request_payload(
+        self,
+        tracks: list[tuple[int, TrackState, VSTInstrument | None]],
+    ) -> dict[str, object]:
+        loop_start_tick, loop_end_tick = self._loop_tick_bounds() if self.project.loop_enabled else (0, 0)
+        return {
+            'tracks': self._build_native_audio_engine_payload_tracks(tracks),
+            'bpm': float(max(1, self.project.bpm)),
+            'ticks_per_beat': int(TICKS_PER_BEAT),
+            'loop_enabled': bool(self.project.loop_enabled),
+            'loop_start_tick': int(loop_start_tick),
+            'loop_end_tick': int(loop_end_tick),
+            'metronome_enabled': bool(getattr(self.project, 'metronome_enabled', False)),
+        }
+
+    @staticmethod
+    def _native_audio_engine_request_signature(request: dict[str, object] | None) -> str:
+        if not isinstance(request, dict) or not request:
+            return ''
+        try:
+            return json.dumps(request, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
+        except Exception:
+            return ''
+
+    def _native_audio_engine_warm_request(self) -> tuple[dict[str, object], str] | None:
+        if not self._should_use_native_audio_engine_transport():
+            return None
+        candidate_tracks = self._native_audio_engine_candidates()
+        if not candidate_tracks and not bool(getattr(self.project, 'metronome_enabled', False)):
+            return None
+        request = self._native_audio_engine_request_payload(candidate_tracks)
+        signature = self._native_audio_engine_request_signature(request)
+        if not signature:
+            return None
+        return request, signature
+
     def _should_use_native_audio_engine_transport(self) -> bool:
         if not self._native_output_bridge_supported():
             return False
@@ -9299,34 +9336,87 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self._native_output_bridge_supported() or bool(getattr(self, '_shutdown_complete', False)):
             return False
         signature = self._native_output_bridge_target_signature(direct_plugin)
+        audio_engine_warm_request = None
+        audio_engine_warm_signature = ''
+        if direct_plugin is None:
+            audio_engine_warm_request = self._native_audio_engine_warm_request()
+            if audio_engine_warm_request is not None:
+                audio_engine_warm_signature = str(audio_engine_warm_request[1] or '')
+        warm_signature = tuple(signature) + (str(audio_engine_warm_signature or ''),)
         if self._native_output_bridge_matches_signature(signature):
-            return True
+            existing_bridge = getattr(self, '_native_output_bridge', None)
+            if (
+                direct_plugin is None
+                and audio_engine_warm_signature
+                and existing_bridge is not None
+                and str(getattr(existing_bridge, '_aims_audio_engine_config_signature', '') or '') != audio_engine_warm_signature
+            ):
+                pass
+            else:
+                return True
         existing_thread = getattr(self, '_native_output_async_warm_thread', None)
         if existing_thread is not None and existing_thread.is_alive():
-            if tuple(getattr(self, '_native_output_async_warm_signature', ()) or ()) != tuple(signature):
+            if tuple(getattr(self, '_native_output_async_warm_signature', ()) or ()) != tuple(warm_signature):
                 return True
             if hasattr(self, '_native_output_async_warm_poll_timer'):
                 self._native_output_async_warm_poll_timer.start()
             return True
 
+        existing_bridge = getattr(self, '_native_output_bridge', None)
+        reuse_existing_bridge_for_audio_engine_warm = (
+            direct_plugin is None
+            and existing_bridge is not None
+            and self._native_output_bridge_alive()
+            and not bool(getattr(self, '_playback_active', False))
+            and not bool(hasattr(self, 'playback_timer') and self.playback_timer.isActive())
+            and audio_engine_warm_request is not None
+            and NativeAudioEngineClient is not None
+            and self._native_output_bridge_matches_audio_signature(signature, bridge=existing_bridge)
+        )
         if self._native_output_bridge_alive():
             if bool(getattr(self, '_playback_active', False)) or bool(hasattr(self, 'playback_timer') and self.playback_timer.isActive()):
                 return False
-            self._stop_native_output_bridge()
+            if not reuse_existing_bridge_for_audio_engine_warm:
+                self._stop_native_output_bridge()
 
         token = int(getattr(self, '_native_output_async_warm_token', 0) or 0) + 1
         self._native_output_async_warm_token = token
-        self._native_output_async_warm_signature = tuple(signature)
+        self._native_output_async_warm_signature = tuple(warm_signature)
 
         target_sample_rate = int(signature[0])
         target_buffer_size = int(signature[1])
         target_audio_device_type = str(signature[2] or '')
         target_audio_output_device_name = str(signature[3] or '')
         target_plugin_path = str(signature[4] or '')
+        audio_engine_request_payload = (
+            dict(audio_engine_warm_request[0])
+            if audio_engine_warm_request is not None and isinstance(audio_engine_warm_request[0], dict)
+            else None
+        )
 
         def worker() -> None:
             bridge = None
             try:
+                if reuse_existing_bridge_for_audio_engine_warm:
+                    bridge = existing_bridge
+                    assert bridge is not None
+                    status = bridge.command('status')
+                    client = NativeAudioEngineClient(bridge)
+                    status = client.set_tracks(
+                        list(audio_engine_request_payload.get('tracks', []) or []),
+                        bpm=float(audio_engine_request_payload.get('bpm', 120.0) or 120.0),
+                        ticks_per_beat=int(audio_engine_request_payload.get('ticks_per_beat', TICKS_PER_BEAT) or TICKS_PER_BEAT),
+                        loop_enabled=bool(audio_engine_request_payload.get('loop_enabled', False)),
+                        loop_start_tick=int(audio_engine_request_payload.get('loop_start_tick', 0) or 0),
+                        loop_end_tick=int(audio_engine_request_payload.get('loop_end_tick', 0) or 0),
+                        metronome_enabled=bool(audio_engine_request_payload.get('metronome_enabled', False)),
+                        preserve_transport=False,
+                    )
+                    setattr(bridge, '_aims_audio_engine_config_signature', audio_engine_warm_signature)
+                    self._native_output_async_warm_results.put(
+                        ('ready_existing', token, tuple(warm_signature), bridge, status)
+                    )
+                    return
                 bridge = NativeVstHostBridge(
                     target_plugin_path or None,
                     restore_last_plugin_on_startup=False,
@@ -9343,17 +9433,37 @@ class MainWindow(QtWidgets.QMainWindow):
                 bridge.requested_audio_output_device_name = target_audio_output_device_name
                 bridge.start(startup_timeout=8.0)
                 status = bridge.command('status')
+                if audio_engine_request_payload is not None and NativeAudioEngineClient is not None:
+                    client = NativeAudioEngineClient(bridge)
+                    status = client.set_tracks(
+                        list(audio_engine_request_payload.get('tracks', []) or []),
+                        bpm=float(audio_engine_request_payload.get('bpm', 120.0) or 120.0),
+                        ticks_per_beat=int(audio_engine_request_payload.get('ticks_per_beat', TICKS_PER_BEAT) or TICKS_PER_BEAT),
+                        loop_enabled=bool(audio_engine_request_payload.get('loop_enabled', False)),
+                        loop_start_tick=int(audio_engine_request_payload.get('loop_start_tick', 0) or 0),
+                        loop_end_tick=int(audio_engine_request_payload.get('loop_end_tick', 0) or 0),
+                        metronome_enabled=bool(audio_engine_request_payload.get('metronome_enabled', False)),
+                        preserve_transport=False,
+                    )
+                    setattr(bridge, '_aims_audio_engine_config_signature', audio_engine_warm_signature)
+                else:
+                    setattr(bridge, '_aims_audio_engine_config_signature', '')
                 self._native_output_async_warm_results.put(
-                    ('ready', token, tuple(signature), bridge, status)
+                    ('ready', token, tuple(warm_signature), bridge, status)
                 )
             except Exception as exc:
-                if bridge is not None:
+                if bridge is not None and not reuse_existing_bridge_for_audio_engine_warm:
                     try:
                         bridge.stop()
                     except Exception:
                         pass
                 self._native_output_async_warm_results.put(
-                    ('error', token, tuple(signature), str(exc))
+                    (
+                        'error_existing' if reuse_existing_bridge_for_audio_engine_warm else 'error',
+                        token,
+                        tuple(warm_signature),
+                        str(exc),
+                    )
                 )
 
         self._native_output_async_warm_thread = threading.Thread(
@@ -9401,9 +9511,28 @@ class MainWindow(QtWidgets.QMainWindow):
                         0,
                         lambda tick=int(pending_tick): self._flush_queued_playback_start(tick),
                     )
+            elif kind == 'ready_existing':
+                bridge = result[3]
+                status = result[4]
+                if not is_current or bridge is not getattr(self, '_native_output_bridge', None):
+                    continue
+                bridge.sample_rate = int(status.get('sample_rate') or signature[0])
+                bridge.buffer_size = int(status.get('buffer_size') or signature[1])
+                bridge.audio_device_type = str(status.get('audio_device_type') or signature[2] or '')
+                bridge.audio_output_device_name = str(status.get('audio_device_name') or signature[3] or '')
+                self._clear_native_output_status_caches()
+                pending_tick = self._pending_playback_start_tick
+                if pending_tick is not None and not bool(getattr(self, '_playback_active', False)):
+                    QtCore.QTimer.singleShot(
+                        0,
+                        lambda tick=int(pending_tick): self._flush_queued_playback_start(tick),
+                    )
             elif kind == 'error':
                 if is_current and self._pending_playback_start_tick is not None:
                     self.statusBar().showMessage(f'Audio engine startup failed: {result[3]}')
+            elif kind == 'error_existing':
+                if is_current and self._pending_playback_start_tick is not None:
+                    self.statusBar().showMessage(f'Audio engine warmup failed: {result[3]}')
 
         current_thread = getattr(self, '_native_output_async_warm_thread', None)
         if drained and (current_thread is None or not current_thread.is_alive()):
@@ -10896,9 +11025,15 @@ class MainWindow(QtWidgets.QMainWindow):
             timer.timeout.connect(lambda target_row=row: self._finish_warm_native_vst_host_for_track(target_row))
             self._native_vst_host_warm_timers[row] = timer
         requested_delay = max(0, int(delay_ms))
-        timer.start(max(180, requested_delay))
+        timer.start(0 if requested_delay <= 0 else max(180, requested_delay))
 
-    def _schedule_native_vst_host_warm_for_row(self, row: int, *, delay_ms: int = 220) -> None:
+    def _schedule_native_vst_host_warm_for_row(
+        self,
+        row: int,
+        *,
+        delay_ms: int = 220,
+        allow_empty: bool = False,
+    ) -> None:
         row = int(row)
         if row < 0 or row >= len(self.project.tracks):
             return
@@ -10909,7 +11044,7 @@ class MainWindow(QtWidgets.QMainWindow):
         entry = self._native_instrument_entry_for_track(track)
         if (
             track.track_type == 'instrument'
-            and (bool(track.notes) or bool(track.live_armed))
+            and (bool(track.notes) or bool(track.live_armed) or bool(allow_empty))
             and entry is not None
             and entry.is_instrument
             and entry.host_supported
@@ -11815,7 +11950,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _reload_playback_after_note_edit(self, changed_rows: set[int] | None = None) -> None:
         if self._note_edit_is_live_safe_for_native_transport(changed_rows):
             return
-        self._reload_playback_mix_if_running()
+        self._reload_playback_mix_if_running(changed_rows)
 
     def _mark_active_native_transport_track_reset_pending(
         self,
@@ -12835,10 +12970,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self._pending_playback_start_retry_timer.stop()
         self._resume_pending_playback_start(requested_tick)
 
-    def _reload_playback_mix_if_running(self) -> None:
+    def _reload_playback_mix_if_running(self, changed_rows: set[int] | None = None) -> None:
         if not hasattr(self, 'playback_timer') or not self.playback_timer.isActive():
             return
-        if self._native_audio_engine_active() or self._should_use_native_audio_engine_transport():
+        if self._native_audio_engine_active():
+            if self._try_live_safe_active_native_audio_engine_refresh(changed_rows):
+                return
+            self._schedule_transport_reprepare(reason='transport edit', delay_ms=90)
+            return
+        if self._should_use_native_audio_engine_transport():
             self._schedule_transport_reprepare(reason='transport edit', delay_ms=90)
             return
         if self._graph_native_transport_active() or self._direct_native_transport_active():
@@ -13002,7 +13142,7 @@ class MainWindow(QtWidgets.QMainWindow):
             else:
                 self.arrangement_overview.refresh_sections(arrangement_rows)
         if reload_mix:
-            self._reload_playback_mix_if_running()
+            self._reload_playback_mix_if_running(timeline_rows)
 
     def on_piano_roll_notes_committed(self) -> None:
         current_row = self.current_track_index()
@@ -13011,7 +13151,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._prioritize_note_offs_for_edit()
         self._invalidate_playback_caches(reset_realtime=not live_safe_native_edit)
         if 0 <= current_row < len(self.project.tracks):
-            self._schedule_native_vst_host_warm_for_row(current_row)
+            track = self.project.tracks[current_row]
+            keep_track_host_warm = not self._should_use_native_audio_engine_transport()
+            if not keep_track_host_warm:
+                keep_track_host_warm = bool(getattr(track, 'live_armed', False))
+            if not keep_track_host_warm:
+                try:
+                    keep_track_host_warm = self._native_vst_host_editor_visible(int(current_row))
+                except Exception:
+                    keep_track_host_warm = False
+            if keep_track_host_warm:
+                self._schedule_native_vst_host_warm_for_row(current_row)
+        QtCore.QTimer.singleShot(0, self._start_vsti_background_warmup)
         self._schedule_deferred_note_refresh(
             refresh_velocity=True,
             refresh_timeline=True,
@@ -13199,13 +13350,13 @@ class MainWindow(QtWidgets.QMainWindow):
         response = bridge.queue_audio(payload, channels=2, stream_id=str(stream_id))
         return bool(response.get('ok', True))
 
-    def _stop_native_audio_engine(self, bridge: object | None = None) -> None:
+    def _stop_native_audio_engine(self, bridge: object | None = None, *, allow_tail: bool = False) -> None:
         target = bridge or getattr(self, '_native_output_bridge', None)
         client = self._native_audio_engine_client(target)
         if client is None:
             return
         try:
-            client.stop()
+            client.stop(allow_tail=bool(allow_tail))
             self._native_audio_engine_running = False
         except Exception:
             _APP_LOGGER.debug("stop_audio_engine failed (bridge may be closed)")
@@ -13257,6 +13408,68 @@ class MainWindow(QtWidgets.QMainWindow):
         self._cancel_pending_transport_reprepare()
         return True
 
+    def _try_live_safe_active_native_audio_engine_refresh(
+        self,
+        changed_rows: set[int] | None = None,
+    ) -> bool:
+        if not bool(hasattr(self, 'playback_timer') and self.playback_timer.isActive()):
+            return False
+        if not self._native_audio_engine_active():
+            return False
+        bridge = getattr(self, '_native_output_bridge', None)
+        client = self._native_audio_engine_client(bridge)
+        if bridge is None or client is None:
+            return False
+
+        candidate_tracks = self._native_audio_engine_candidates()
+        if not candidate_tracks and not bool(getattr(self.project, 'metronome_enabled', False)):
+            return False
+
+        changed_row_set = {int(row) for row in (changed_rows or set()) if int(row) >= 0}
+        active_row_set = {
+            int(row)
+            for row in (getattr(self, '_native_audio_engine_track_rows', []) or [])
+            if int(row) >= 0
+        }
+        candidate_row_set = {int(row) for row, _track, _entry in candidate_tracks}
+        if changed_row_set and not (changed_row_set & (active_row_set | candidate_row_set)):
+            return False
+
+        request_payload = self._native_audio_engine_request_payload(candidate_tracks)
+        request_signature = self._native_audio_engine_request_signature(request_payload)
+        try:
+            status = client.set_tracks(
+                list(request_payload.get('tracks', []) or []),
+                bpm=float(request_payload.get('bpm', max(1, self.project.bpm)) or max(1, self.project.bpm)),
+                ticks_per_beat=int(request_payload.get('ticks_per_beat', TICKS_PER_BEAT) or TICKS_PER_BEAT),
+                loop_enabled=bool(request_payload.get('loop_enabled', self.project.loop_enabled)),
+                loop_start_tick=int(request_payload.get('loop_start_tick', 0) or 0),
+                loop_end_tick=int(request_payload.get('loop_end_tick', 0) or 0),
+                metronome_enabled=bool(request_payload.get('metronome_enabled', getattr(self.project, 'metronome_enabled', False))),
+                preserve_transport=True,
+            )
+        except Exception:
+            _APP_LOGGER.exception("Failed live-refreshing active native audio engine")
+            return False
+        if not isinstance(status, dict):
+            return False
+
+        setattr(bridge, '_aims_audio_engine_config_signature', request_signature)
+        self._native_audio_engine_track_rows = [int(row) for row, _track, _entry in candidate_tracks]
+        self._native_audio_engine_running = bool(status.get('audio_engine_running', self._native_audio_engine_running))
+        self._native_audio_engine_position_frame = int(
+            status.get('audio_engine_position_frame', self._native_audio_engine_position_frame) or 0
+        )
+        self._playback_frame_position = int(self._native_audio_engine_position_frame)
+        self._playback_logical_origin_frame = int(self._native_audio_engine_position_frame)
+        self._transport_uses_native_output_bridge = True
+        self._playback_active = bool(self._native_audio_engine_running)
+        self._cache_native_output_status(bridge, status)
+        self._set_native_track_meter_levels(self._native_audio_engine_track_peak_levels(status))
+        self._update_track_meter_levels(self._native_track_meter_levels)
+        self._cancel_pending_transport_reprepare()
+        return bool(self._native_audio_engine_running)
+
     def _prepare_native_audio_engine_playback(
         self,
         start_tick: int,
@@ -13269,8 +13482,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if client is None:
             return False
 
-        payload_tracks = self._build_native_audio_engine_payload_tracks(candidate_tracks)
-        loop_start_tick, loop_end_tick = self._loop_tick_bounds() if self.project.loop_enabled else (0, 0)
+        request_payload = self._native_audio_engine_request_payload(candidate_tracks)
+        request_signature = self._native_audio_engine_request_signature(request_payload)
 
         try:
             bridge.clear_audio_queue(reset_counters=True, stream_id='main')
@@ -13281,15 +13494,18 @@ class MainWindow(QtWidgets.QMainWindow):
                 bridge.command('stop_graph_transport', panic=True)
             except Exception:
                 _APP_LOGGER.debug("stop_graph_transport failed before audio engine start")
-            client.set_tracks(
-                payload_tracks,
-                bpm=float(max(1, self.project.bpm)),
-                ticks_per_beat=TICKS_PER_BEAT,
-                loop_enabled=bool(self.project.loop_enabled),
-                loop_start_tick=int(loop_start_tick),
-                loop_end_tick=int(loop_end_tick),
-                metronome_enabled=bool(getattr(self.project, 'metronome_enabled', False)),
-            )
+            if str(getattr(bridge, '_aims_audio_engine_config_signature', '') or '') != request_signature:
+                client.set_tracks(
+                    list(request_payload.get('tracks', []) or []),
+                    bpm=float(request_payload.get('bpm', max(1, self.project.bpm)) or max(1, self.project.bpm)),
+                    ticks_per_beat=int(request_payload.get('ticks_per_beat', TICKS_PER_BEAT) or TICKS_PER_BEAT),
+                    loop_enabled=bool(request_payload.get('loop_enabled', self.project.loop_enabled)),
+                    loop_start_tick=int(request_payload.get('loop_start_tick', 0) or 0),
+                    loop_end_tick=int(request_payload.get('loop_end_tick', 0) or 0),
+                    metronome_enabled=bool(request_payload.get('metronome_enabled', getattr(self.project, 'metronome_enabled', False))),
+                    preserve_transport=False,
+                )
+                setattr(bridge, '_aims_audio_engine_config_signature', request_signature)
             status = client.play(int(start_tick))
         except Exception:
             _APP_LOGGER.exception("Failed starting native audio engine transport")
@@ -15156,7 +15372,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._stop_inprocess_transport()
             self._use_inprocess_transport = False
         if native_audio_engine_active:
-            self._stop_native_audio_engine()
+            self._stop_native_audio_engine(allow_tail=True)
         if hasattr(self, 'playback_timer'):
             self.playback_timer.stop()
         self._stop_realtime_audio_sink(cleanup_bridge=False)
@@ -20679,7 +20895,24 @@ class MainWindow(QtWidgets.QMainWindow):
         return
 
     def _start_vsti_background_warmup(self) -> None:
-        return
+        if not self._native_output_bridge_supported():
+            return
+        if bool(getattr(self, '_shutdown_complete', False)):
+            return
+        if bool(hasattr(self, 'playback_timer') and self.playback_timer.isActive()):
+            return
+        if self._pending_playback_start_tick is not None:
+            return
+        direct_candidate = None
+        if not self._should_use_native_audio_engine_transport():
+            direct_candidate = self._direct_native_transport_candidate()
+        try:
+            if direct_candidate is not None:
+                self._begin_async_native_output_bridge_warm(direct_candidate)
+            else:
+                self._begin_async_native_output_bridge_warm()
+        except Exception:
+            _APP_LOGGER.exception("Failed starting background native bridge warmup")
 
     def _load_vsti_binary_path(self, path: str, show_message: bool = True) -> bool:
         normalized = self._normalized_vsti_path(path)
@@ -21267,14 +21500,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._invalidate_playback_caches(clear_track_audio=False, reset_realtime=True)
         target_names = {str(target) for target in (changed_targets or set()) if str(target)}
         if hasattr(self, 'playback_timer') and self.playback_timer.isActive():
-            if self._native_audio_engine_active() or self._graph_native_transport_active() or self._direct_native_transport_active():
-                self._schedule_transport_reprepare(reason='automation edit', delay_ms=0)
-            elif bool(getattr(self, '_use_prerendered_transport_mix', False)):
-                self._schedule_prerendered_playback_mix_refresh(reason='automation edit')
-            else:
-                self._clear_realtime_mix_cache()
+            self._reload_playback_mix_if_running({int(track_row)})
         else:
-            self._reload_playback_mix_if_running()
+            self._reload_playback_mix_if_running({int(track_row)})
         if track_row == self.current_track_index() and target_names:
             readable = ', '.join(sorted(target_names))
             self.statusBar().showMessage(f'Updated automation for {track.name}: {readable}')
@@ -22229,10 +22457,25 @@ class MainWindow(QtWidgets.QMainWindow):
             and entry.host_supported
             and self._can_use_native_vst_host(entry)
         ):
+            existing_bridge = getattr(self, '_native_output_bridge', None)
+            shared_direct_ready = (
+                existing_bridge is not None
+                and self._native_output_bridge_alive()
+                and self._normalized_vsti_path(str(getattr(existing_bridge, 'plugin_path', '') or ''))
+                == self._normalized_vsti_path(str(entry.path))
+            )
+            direct_preview_candidate = (
+                int(track_index),
+                track,
+                entry,
+            ) if (
+                not (hasattr(self, 'playback_timer') and self.playback_timer.isActive())
+                and self._track_can_use_direct_native_transport(track, entry)
+                and shared_direct_ready
+            ) else None
             try:
                 if (
-                    not (hasattr(self, 'playback_timer') and self.playback_timer.isActive())
-                    and self._track_can_use_direct_native_transport(track, entry)
+                    direct_preview_candidate is not None
                     and self._trigger_live_track_note_preview(
                         pitch,
                         velocity,
@@ -22243,7 +22486,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     return True
             except Exception:
                 _APP_LOGGER.debug("Live track note preview failed, falling back to per-track bridge")
-            return self._preview_note_with_native_vst_host(
+            previewed = self._preview_note_with_native_vst_host(
                 int(track_index),
                 track,
                 entry,
@@ -22251,6 +22494,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 velocity,
                 duration_tick,
             )
+            if not previewed:
+                self._schedule_native_vst_host_warm_for_row(int(track_index), delay_ms=0, allow_empty=True)
+                self._queue_parameter_change_audition(int(track_index))
+            return previewed
         try:
             preview_note = MidiNote(start_tick=0, duration_tick=duration_tick, pitch=pitch, velocity=velocity)
             preview_track = dataclasses.replace(
@@ -23178,7 +23425,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.piano_roll.refresh()
         self.velocity_editor.refresh()
         self._schedule_selected_track_panel_refresh(row)
-        if bool(track.live_armed):
+        if not bool(hasattr(self, 'playback_timer') and self.playback_timer.isActive()):
+            self._schedule_native_vst_host_warm_for_row(
+                row,
+                delay_ms=0,
+                allow_empty=True,
+            )
+        elif bool(track.live_armed):
             self._schedule_native_vst_host_warm_for_row(row, delay_ms=220)
         QtCore.QTimer.singleShot(0, self._refresh_live_midi_host)
         rows_to_refresh = {int(row)}
@@ -23208,6 +23461,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         changed_row_set = {int(row) for row in (changed_rows or set()) if int(row) >= 0}
         if self._native_audio_engine_active():
+            if self._try_live_safe_active_native_audio_engine_refresh(changed_row_set):
+                return
             self._schedule_transport_reprepare(reason='audibility change', delay_ms=0)
             return
         if self._graph_native_transport_active():
@@ -23477,6 +23732,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.refresh_vsti_rack_ui()
         self.scan_sample_paths()
         self.on_notes_changed()
+        QtCore.QTimer.singleShot(0, self._start_vsti_background_warmup)
         self._update_window_title()
 
     def on_notes_changed(self) -> None:

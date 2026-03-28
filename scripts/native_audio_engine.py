@@ -17,6 +17,7 @@ class NativeAudioEngineClient:
         loop_start_tick: int,
         loop_end_tick: int,
         metronome_enabled: bool = False,
+        preserve_transport: bool = False,
     ) -> dict[str, Any]:
         return self.bridge.command(
             "set_audio_engine_state",
@@ -27,6 +28,7 @@ class NativeAudioEngineClient:
             loop_start_tick=int(loop_start_tick),
             loop_end_tick=int(loop_end_tick),
             metronome_enabled=bool(metronome_enabled),
+            preserve_transport=bool(preserve_transport),
         )
 
     def play(self, start_tick: int = 0) -> dict[str, Any]:
@@ -55,8 +57,8 @@ class NativeAudioEngineClient:
             metronome_enabled=bool(metronome_enabled),
         )
 
-    def stop(self) -> dict[str, Any]:
-        return self.bridge.command("stop_audio_engine")
+    def stop(self, *, allow_tail: bool = False) -> dict[str, Any]:
+        return self.bridge.command("stop_audio_engine", allow_tail=bool(allow_tail))
 
     def status(self) -> dict[str, Any]:
         return self.bridge.command("status")
