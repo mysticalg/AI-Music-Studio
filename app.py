@@ -10498,6 +10498,9 @@ class MainWindow(QtWidgets.QMainWindow):
             direct_candidate = self._direct_live_midi_candidate(row)
             if direct_candidate is not None:
                 direct_idx, direct_track, direct_entry = direct_candidate
+                if not self._native_output_bridge_alive():
+                    self._schedule_native_output_bridge_warm(delay_ms=0, force=True)
+                    return False
                 bridge = self._ensure_native_output_bridge(direct_plugin=direct_candidate)
                 if bridge is None:
                     return False
@@ -21587,17 +21590,20 @@ class MainWindow(QtWidgets.QMainWindow):
             and entry.host_supported
             and self._can_use_native_vst_host(entry)
         ):
-            if (
-                not (hasattr(self, 'playback_timer') and self.playback_timer.isActive())
-                and self._track_can_use_direct_native_transport(track, entry)
-                and self._trigger_live_track_note_preview(
-                    pitch,
-                    velocity,
-                    duration_tick,
-                    row=int(track_index),
-                )
-            ):
-                return True
+            try:
+                if (
+                    not (hasattr(self, 'playback_timer') and self.playback_timer.isActive())
+                    and self._track_can_use_direct_native_transport(track, entry)
+                    and self._trigger_live_track_note_preview(
+                        pitch,
+                        velocity,
+                        duration_tick,
+                        row=int(track_index),
+                    )
+                ):
+                    return True
+            except Exception:
+                _APP_LOGGER.debug("Live track note preview failed, falling back to per-track bridge")
             return self._preview_note_with_native_vst_host(
                 int(track_index),
                 track,
