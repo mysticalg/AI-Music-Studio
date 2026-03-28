@@ -8488,13 +8488,14 @@ class MainWindow(QtWidgets.QMainWindow):
             values.add(selected)
         if effective > 0:
             values.add(effective)
-        if not values:
-            values.update(
-                self._buffer_choice_values_for_sample_rate(
-                    self._native_vst_host_target_sample_rate(),
-                    include_value=effective,
-                )
+        # Always include standard power-of-2 sizes so the user can request
+        # different buffer sizes even when the driver reports very few.
+        values.update(
+            self._buffer_choice_values_for_sample_rate(
+                self._native_vst_host_target_sample_rate(),
+                include_value=effective,
             )
+        )
         return sorted(size for size in values if int(size) > 0)
 
     def _available_native_vst_host_audio_device_types(self) -> list[str]:
