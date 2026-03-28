@@ -9824,7 +9824,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if force:
                 self._native_output_warm_for_preview = True
             requested_delay = max(0, int(delay_ms))
-            self._native_output_warm_timer.start(max(180, requested_delay))
+            self._native_output_warm_timer.start(requested_delay)
 
     def _close_preview_audio(self) -> None:
         bridge = getattr(self, '_native_output_bridge', None)
@@ -10755,7 +10755,7 @@ class MainWindow(QtWidgets.QMainWindow):
             timer.timeout.connect(lambda target_row=row: self._finish_warm_native_vst_host_for_track(target_row))
             self._native_vst_host_warm_timers[row] = timer
         requested_delay = max(0, int(delay_ms))
-        timer.start(max(180, requested_delay))
+        timer.start(requested_delay)
 
     def _schedule_native_vst_host_warm_for_row(self, row: int, *, delay_ms: int = 220) -> None:
         row = int(row)
@@ -10768,14 +10768,13 @@ class MainWindow(QtWidgets.QMainWindow):
         entry = self._native_instrument_entry_for_track(track)
         if (
             track.track_type == 'instrument'
-            and (bool(track.notes) or bool(track.live_armed))
             and entry is not None
             and entry.is_instrument
             and entry.host_supported
             and self._can_use_native_vst_host(entry)
         ):
             self._warm_native_vst_host_for_track(row, delay_ms=delay_ms)
-            self._schedule_native_output_bridge_warm(delay_ms=delay_ms)
+            self._schedule_native_output_bridge_warm(delay_ms=delay_ms, force=True)
 
     def _suspend_track_native_vst_hosts_for_transport(self) -> None:
         for timer in list(getattr(self, '_native_vst_host_warm_timers', {}).values()):
@@ -20665,7 +20664,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._invalidate_playback_caches()
         self._reload_playback_mix_if_running()
         if not bool(hasattr(self, 'playback_timer') and self.playback_timer.isActive()):
-            self._schedule_native_vst_host_warm_for_row(row, delay_ms=220)
+            self._schedule_native_vst_host_warm_for_row(row, delay_ms=0)
         QtCore.QTimer.singleShot(0, self._refresh_live_midi_host)
 
     def _assign_general_midi_to_track(self, row: int, instrument_name: str) -> bool:
