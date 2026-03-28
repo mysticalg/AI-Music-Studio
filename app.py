@@ -5792,7 +5792,7 @@ class AudioSettingsDialog(QtWidgets.QDialog):
         body_layout.setContentsMargins(4, 4, 4, 4)
         body_layout.setSpacing(12)
 
-        output_group = QtWidgets.QGroupBox('JUCE Output')
+        output_group = QtWidgets.QGroupBox('Audio Output')
         output_form = QtWidgets.QFormLayout(output_group)
         output_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.output_device_combo = QtWidgets.QComboBox()
@@ -5804,20 +5804,20 @@ class AudioSettingsDialog(QtWidgets.QDialog):
         device_widget = QtWidgets.QWidget()
         device_widget.setLayout(device_row)
         self.output_sample_rate_combo = QtWidgets.QComboBox()
-        self.output_sample_format_combo = QtWidgets.QComboBox()
-        self.output_latency_label = QtWidgets.QLabel()
+        self.native_host_device_type_combo = QtWidgets.QComboBox()
+        self.native_host_buffer_combo = QtWidgets.QComboBox()
         self.output_buffer_frames_label = QtWidgets.QLabel()
-        self.output_driver_block_label = QtWidgets.QLabel()
-        self.output_queued_ahead_label = QtWidgets.QLabel()
         output_form.addRow('Device', device_widget)
+        output_form.addRow('Driver backend', self.native_host_device_type_combo)
         output_form.addRow('Sample rate', self.output_sample_rate_combo)
-        output_form.addRow('Bit depth / format', self.output_sample_format_combo)
-        self.audio_buffer_combo = QtWidgets.QComboBox()
-        output_form.addRow('Queue target', self.audio_buffer_combo)
-        output_form.addRow('Queue latency', self.output_latency_label)
+        output_form.addRow('Buffer size', self.native_host_buffer_combo)
         output_form.addRow('Actual device buffer', self.output_buffer_frames_label)
-        output_form.addRow('Reported device block', self.output_driver_block_label)
-        output_form.addRow('Output queued ahead', self.output_queued_ahead_label)
+        self.native_host_device_type_combo.setToolTip(
+            'Choose the audio backend: Windows Audio, Windows Audio (Exclusive Mode), or ASIO when available.'
+        )
+        self.native_host_buffer_combo.setToolTip(
+            'Buffer size in samples. Lower values reduce latency but increase CPU load and risk of audio dropouts.'
+        )
         body_layout.addWidget(output_group)
 
         playback_group = QtWidgets.QGroupBox('Transport UI')
@@ -5832,31 +5832,31 @@ class AudioSettingsDialog(QtWidgets.QDialog):
         playback_form.addRow('Note length offset', self.note_length_offset_spin)
         body_layout.addWidget(playback_group)
 
-        native_group = QtWidgets.QGroupBox('JUCE Host')
-        native_form = QtWidgets.QFormLayout(native_group)
-        native_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        advanced_group = QtWidgets.QGroupBox('Advanced')
+        advanced_form = QtWidgets.QFormLayout(advanced_group)
+        advanced_form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        self.output_sample_format_combo = QtWidgets.QComboBox()
+        self.output_latency_label = QtWidgets.QLabel()
+        self.output_driver_block_label = QtWidgets.QLabel()
+        self.output_queued_ahead_label = QtWidgets.QLabel()
+        self.audio_buffer_combo = QtWidgets.QComboBox()
         self.native_host_summary_label = QtWidgets.QLabel()
         self.native_host_summary_label.setWordWrap(True)
         self.native_host_timing_label = QtWidgets.QLabel()
         self.native_host_timing_label.setWordWrap(True)
-        self.native_host_device_type_combo = QtWidgets.QComboBox()
-        self.native_host_buffer_combo = QtWidgets.QComboBox()
         self.prerender_vst_playback_check = QtWidgets.QCheckBox('Use prerendered VST playback for transport')
         self.prerender_vst_playback_check.setToolTip(
             'Render VST transport audio to PCM ahead of playback instead of using the direct JUCE callback transport path.'
         )
-        native_form.addRow('Startup format', self.native_host_summary_label)
-        native_form.addRow('Shared timing', self.native_host_timing_label)
-        native_form.addRow('Driver backend', self.native_host_device_type_combo)
-        native_form.addRow('Device buffer request', self.native_host_buffer_combo)
-        native_form.addRow('Playback mode', self.prerender_vst_playback_check)
-        self.native_host_device_type_combo.setToolTip(
-            'Choose the JUCE audio backend used by native VST hosting, including ASIO when it is available on this machine.'
-        )
-        self.native_host_buffer_combo.setToolTip(
-            'Request the actual JUCE device block size. If left following the queue target, the host will request the same size as the output queue target.'
-        )
-        body_layout.addWidget(native_group)
+        advanced_form.addRow('Bit depth / format', self.output_sample_format_combo)
+        advanced_form.addRow('Queue target', self.audio_buffer_combo)
+        advanced_form.addRow('Queue latency', self.output_latency_label)
+        advanced_form.addRow('Reported device block', self.output_driver_block_label)
+        advanced_form.addRow('Output queued ahead', self.output_queued_ahead_label)
+        advanced_form.addRow('Startup format', self.native_host_summary_label)
+        advanced_form.addRow('Shared timing', self.native_host_timing_label)
+        advanced_form.addRow('Playback mode', self.prerender_vst_playback_check)
+        body_layout.addWidget(advanced_group)
         body_layout.addStretch(1)
 
         buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Close)
@@ -5975,7 +5975,7 @@ class AudioSettingsDialog(QtWidgets.QDialog):
         effective_native_rate = int(main_window._native_vst_host_target_sample_rate())
         native_buffer_items: list[tuple[str, object]] = [
             (
-                f'Follow queue target ({main_window._output_queue_target_summary()})',
+                f'Auto ({main_window._output_queue_target_summary()})',
                 0,
             )
         ]
