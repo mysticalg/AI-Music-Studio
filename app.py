@@ -6622,6 +6622,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._native_output_status_cache_at = 0.0
         self._native_output_status_cache_bridge_id = 0
         self._pending_native_vst_parameter_updates: dict[int, tuple[object, dict[str, float], dict[str, float], int | None]] = {}
+        self._pending_native_audio_engine_parameter_updates: dict[int, tuple[int, dict[str, float]]] = {}
+        self._pending_native_audio_engine_note_updates: dict[int, tuple[int, list[dict[str, object]], bool, bool]] = {}
         self._realtime_mix_cache: object | None = None
         self._realtime_mix_cache_start_frame = 0
         self._realtime_mix_cache_frame_count = 0
@@ -6689,6 +6691,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._native_vst_parameter_flush_timer.setSingleShot(True)
         self._native_vst_parameter_flush_timer.setInterval(24)
         self._native_vst_parameter_flush_timer.timeout.connect(self._flush_native_vst_parameter_updates)
+        self._native_audio_engine_live_update_timer = QtCore.QTimer(self)
+        self._native_audio_engine_live_update_timer.setSingleShot(True)
+        self._native_audio_engine_live_update_timer.setInterval(16)
+        self._native_audio_engine_live_update_timer.timeout.connect(self._flush_native_audio_engine_live_updates)
         self._prerender_mix_refresh_timer = QtCore.QTimer(self)
         self._prerender_mix_refresh_timer.setSingleShot(True)
         self._prerender_mix_refresh_timer.setInterval(90)
@@ -8935,6 +8941,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _clear_native_audio_engine_state(self) -> None:
         for row in list(getattr(self, '_native_audio_engine_track_rows', []) or []):
             self._native_track_meter_levels.pop(int(row), None)
+        self._clear_pending_native_audio_engine_live_updates()
         self._native_audio_engine_track_rows = []
         self._native_audio_engine_running = False
         self._native_audio_engine_position_frame = 0
@@ -8954,6 +8961,134 @@ class MainWindow(QtWidgets.QMainWindow):
             client = NativeAudioEngineClient(bridge)
             setattr(bridge, '_aims_native_audio_engine_client', client)
         return client
+
+    def _clear_pending_native_audio_engine_live_updates(self) -> None:
+        self._pending_native_audio_engine_parameter_updates = {}
+        self._pending_native_audio_engine_note_updates = {}
+        if hasattr(self, '_native_audio_engine_live_update_timer'):
+            self._native_audio_engine_live_update_timer.stop()
+
+    def _queue_native_audio_engine_track_parameter_update(
+        self,
+        row: int,
+        parameters: dict[str, float] | None,
+    ) -> bool:
+        if not self._native_audio_engine_active():
+            return False
+        sanitized = self._sanitize_native_vst_bridge_parameter_values(parameters)
+        pending = getattr(self, '_pending_native_audio_engine_parameter_updates', None)
+        if not isinstance(pending, dict):
+            self._pending_native_audio_engine_parameter_updates = {}
+            pending = self._pending_native_audio_engine_parameter_updates
+        pending[int(row)] = (int(row), dict(sanitized))
+        if hasattr(self, '_native_audio_engine_live_update_timer') and not self._native_audio_engine_live_update_timer.isActive():
+            self._native_audio_engine_live_update_timer.start()
+        return True
+
+    def _queue_native_audio_engine_track_notes_update(
+        self,
+        row: int,
+        track: TrackState,
+        *,
+        note_change_context: dict[str, object] | None = None,
+    ) -> bool:
+        if not self._native_audio_engine_active():
+            return False
+        affects_current_playback = False
+        removed_count = 0
+        if isinstance(note_change_context, dict):
+            context_row = int(note_change_context.get('track_index', row) or row)
+            if context_row == int(row):
+                affects_current_playback = bool(note_change_context.get('affects_current_playback', False))
+                removed_count = max(0, int(note_change_context.get('removed_count', 0) or 0))
+        bootstrap_active = bool(affects_current_playback)
+        reset_processing = bool(affects_current_playback and removed_count > 0)
+        pending = getattr(self, '_pending_native_audio_engine_note_updates', None)
+        if not isinstance(pending, dict):
+            self._pending_native_audio_engine_note_updates = {}
+            pending = self._pending_native_audio_engine_note_updates
+        existing = pending.get(int(row))
+        if existing is not None:
+            _existing_row, _existing_notes, existing_bootstrap, existing_reset = existing
+            bootstrap_active = bool(existing_bootstrap or bootstrap_active)
+            reset_processing = bool(existing_reset or reset_processing)
+        pending[int(row)] = (
+            int(row),
+            self._native_audio_engine_track_notes_payload(track),
+            bootstrap_active,
+            reset_processing,
+        )
+        if hasattr(self, '_native_audio_engine_live_update_timer') and not self._native_audio_engine_live_update_timer.isActive():
+            self._native_audio_engine_live_update_timer.start()
+        self._cancel_pending_transport_reprepare()
+        return True
+
+    def _flush_native_audio_engine_live_updates(self) -> None:
+        pending_parameters = dict(getattr(self, '_pending_native_audio_engine_parameter_updates', {}) or {})
+        pending_notes = dict(getattr(self, '_pending_native_audio_engine_note_updates', {}) or {})
+        self._pending_native_audio_engine_parameter_updates = {}
+        self._pending_native_audio_engine_note_updates = {}
+        if not pending_parameters and not pending_notes:
+            return
+        if not self._native_audio_engine_active():
+            return
+        bridge = getattr(self, '_native_output_bridge', None)
+        client = self._native_audio_engine_client(bridge)
+        if bridge is None or client is None:
+            return
+
+        engine_rows = list(getattr(self, '_native_audio_engine_track_rows', []) or [])
+        latest_status: dict[str, object] | None = None
+
+        for row, parameters in pending_parameters.values():
+            if int(row) not in engine_rows or not parameters:
+                continue
+            engine_track_index = engine_rows.index(int(row))
+            try:
+                status = bridge.command(
+                    'set_audio_engine_track_parameters',
+                    track_index=int(engine_track_index),
+                    parameters=dict(parameters),
+                )
+            except Exception:
+                _APP_LOGGER.exception(
+                    "Failed flushing audio engine track parameters row=%s engine_track=%s",
+                    row,
+                    engine_track_index,
+                )
+                continue
+            if isinstance(status, dict):
+                latest_status = status
+
+        for row, notes, bootstrap_active, reset_processing in pending_notes.values():
+            if int(row) not in engine_rows:
+                continue
+            engine_track_index = engine_rows.index(int(row))
+            try:
+                status = client.update_track_notes(
+                    engine_track_index,
+                    list(notes),
+                    bootstrap_active=bool(bootstrap_active),
+                    reset_processing=bool(reset_processing),
+                )
+            except Exception:
+                _APP_LOGGER.exception(
+                    "Failed flushing audio engine track notes row=%s engine_track=%s",
+                    row,
+                    engine_track_index,
+                )
+                continue
+            if isinstance(status, dict):
+                latest_status = status
+
+        if latest_status is not None:
+            self._cache_native_output_status(bridge, latest_status)
+            self._native_audio_engine_running = bool(
+                latest_status.get('audio_engine_running', self._native_audio_engine_running)
+            )
+            self._native_audio_engine_position_frame = int(
+                latest_status.get('audio_engine_position_frame', self._native_audio_engine_position_frame) or 0
+            )
 
     def _track_can_use_native_audio_engine(self, track: TrackState, entry: VSTInstrument | None) -> bool:
         if track.track_type != 'instrument':
@@ -11774,8 +11909,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         if not isinstance(note_change_context, dict):
             return False
-        if bool(note_change_context.get('affects_current_playback', False)):
-            return False
         row_set = {int(row) for row in (changed_rows or set()) if int(row) >= 0}
         if not row_set:
             return False
@@ -11803,42 +11936,19 @@ class MainWindow(QtWidgets.QMainWindow):
         ):
             return False
         bridge = getattr(self, '_native_output_bridge', None)
-        client = self._native_audio_engine_client(bridge)
-        if bridge is None or client is None:
+        if bridge is None or self._native_audio_engine_client(bridge) is None:
             return False
         row_set = sorted({int(row) for row in (changed_rows or set()) if int(row) >= 0})
-        engine_rows = list(getattr(self, '_native_audio_engine_track_rows', []) or [])
-        latest_status: dict[str, object] | None = None
         for row in row_set:
             track = self.project.tracks[int(row)] if 0 <= int(row) < len(self.project.tracks) else None
             if track is None:
                 return False
-            try:
-                status = client.update_track_notes(
-                    engine_rows.index(int(row)),
-                    self._native_audio_engine_track_notes_payload(track),
-                )
-            except Exception:
-                _APP_LOGGER.exception(
-                    "Failed live-updating native audio engine notes row=%s engine_rows=%s",
-                    row,
-                    engine_rows,
-                )
+            if not self._queue_native_audio_engine_track_notes_update(
+                int(row),
+                track,
+                note_change_context=note_change_context,
+            ):
                 return False
-            if isinstance(status, dict):
-                latest_status = status
-
-        if latest_status is not None:
-            self._cache_native_output_status(bridge, latest_status)
-            self._native_audio_engine_running = bool(
-                latest_status.get('audio_engine_running', self._native_audio_engine_running)
-            )
-            self._native_audio_engine_position_frame = int(
-                latest_status.get('audio_engine_position_frame', self._native_audio_engine_position_frame) or 0
-            )
-        else:
-            self._native_output_status_cache = None
-            self._native_output_status_cache_at = 0.0
         self._cancel_pending_transport_reprepare()
         return True
 
@@ -16867,6 +16977,13 @@ class MainWindow(QtWidgets.QMainWindow):
             and self._native_vst_bridge_parameter_signature(current_values)
             != self._native_vst_bridge_parameter_signature(status_values)
         )
+        now_monotonic = time.monotonic()
+        last_editor_parameter_activity_at = float(
+            getattr(bridge, '_aims_last_editor_parameter_activity_at', 0.0) or 0.0
+        )
+        if parameter_changed or bool(delta_values):
+            last_editor_parameter_activity_at = now_monotonic
+            setattr(bridge, '_aims_last_editor_parameter_activity_at', last_editor_parameter_activity_at)
 
         # Detect plugin state changes (preset/program change) via the
         # state_generation counter reported by the bridge.  This catches
@@ -16876,8 +16993,15 @@ class MainWindow(QtWidgets.QMainWindow):
         state_generation_changed = current_state_gen != previous_state_gen
         setattr(bridge, '_aims_last_state_generation', current_state_gen)
         state_generation_only_change = state_generation_changed and not parameter_changed
+        recent_editor_parameter_activity = (
+            last_editor_parameter_activity_at > 0.0
+            and (now_monotonic - last_editor_parameter_activity_at) <= 0.75
+        )
+        state_generation_companion_change = (
+            state_generation_only_change and recent_editor_parameter_activity
+        )
 
-        # Detect large parameter fan-outs (>16 deltas), explicit preset-style
+        # Detect large parameter fan-outs (>48 deltas), explicit preset-style
         # parameter deltas, or pure non-parameter state changes.  Do not treat
         # every state_generation bump as a preset change because some plugins
         # also emit host state notifications for ordinary knob edits.
@@ -16892,10 +17016,11 @@ class MainWindow(QtWidgets.QMainWindow):
             }
             for name in delta_values
         )
+        large_fanout_delta = bool(delta_values) and len(delta_values) > 48
         likely_preset_change = (
-            (bool(delta_values) and len(delta_values) > 16)
+            large_fanout_delta
             or preset_named_delta
-            or state_generation_only_change
+            or (state_generation_only_change and not state_generation_companion_change)
         )
 
         state_captured = False
@@ -16907,10 +17032,11 @@ class MainWindow(QtWidgets.QMainWindow):
             or likely_preset_change
         ):
             _APP_LOGGER.info(
-                "VSTi state capture triggered row=%s force=%s param_changed=%s live_safe=%s likely_preset=%s preset_named_delta=%s state_gen_changed=%s state_gen_only=%s deltas=%s state_gen=%s/%s",
+                "VSTi state capture triggered row=%s force=%s param_changed=%s live_safe=%s likely_preset=%s preset_named_delta=%s large_fanout=%s state_gen_changed=%s state_gen_only=%s state_gen_companion=%s deltas=%s state_gen=%s/%s",
                 row, force_save, parameter_changed, live_native_playback_safe,
-                likely_preset_change, preset_named_delta, state_generation_changed,
-                state_generation_only_change, len(delta_values),
+                likely_preset_change, preset_named_delta, large_fanout_delta,
+                state_generation_changed, state_generation_only_change,
+                state_generation_companion_change, len(delta_values),
                 current_state_gen, previous_state_gen,
             )
             state_captured = self._capture_native_vst_host_bridge_state(
@@ -16965,7 +17091,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     # transport restart from the captured state instead of
                     # pushing parameters/state into the active host.
                     sync_hosts = False
-                if not delta_values and not state_generation_only_change:
+                if state_generation_companion_change and not delta_values:
+                    sync_hosts = False
+                elif not delta_values and not state_generation_only_change:
                     sync_hosts = False
                 elif not preset_change_requires_transport_reprepare and len(delta_values) <= 16:
                     payload_values = dict(delta_values)
@@ -17436,34 +17564,19 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._native_audio_engine_active():
             engine_track_rows = list(getattr(self, '_native_audio_engine_track_rows', []) or [])
             if track_index in engine_track_rows:
-                engine_track_index = engine_track_rows.index(track_index)
                 engine_payload = self._sanitize_native_vst_bridge_parameter_values(
                     payload_values if payload_values is not None else values
                 )
                 if engine_payload:
-                    engine_bridge = getattr(self, '_native_output_bridge', None)
-                    if engine_bridge is not None:
-                        rack_name = str(getattr(bridge, '_aims_rack_name', '') or '') if bridge is not None else ''
-                        if rack_name:
-                            parameter_names = [str(name) for name in self.vsti_parameter_names_for_rack(rack_name)]
-                            parameter_index_by_name = {name: idx for idx, name in enumerate(parameter_names, start=1)}
-                            for key, value in list(engine_payload.items()):
-                                parameter_index = parameter_index_by_name.get(str(key))
-                                if parameter_index is not None:
-                                    engine_payload.setdefault(f'Param {parameter_index}', float(value))
-                        try:
-                            engine_bridge.command(
-                                'set_audio_engine_track_parameters',
-                                track_index=int(engine_track_index),
-                                parameters=dict(engine_payload),
-                            )
-                        except Exception:
-                            _APP_LOGGER.exception(
-                                "Failed syncing audio engine track parameters row=%s engine_track=%s rack=%s",
-                                track_index,
-                                engine_track_index,
-                                track.rack_vsti,
-                            )
+                    rack_name = str(getattr(bridge, '_aims_rack_name', '') or '') if bridge is not None else ''
+                    if rack_name:
+                        parameter_names = [str(name) for name in self.vsti_parameter_names_for_rack(rack_name)]
+                        parameter_index_by_name = {name: idx for idx, name in enumerate(parameter_names, start=1)}
+                        for key, value in list(engine_payload.items()):
+                            parameter_index = parameter_index_by_name.get(str(key))
+                            if parameter_index is not None:
+                                engine_payload.setdefault(f'Param {parameter_index}', float(value))
+                    self._queue_native_audio_engine_track_parameter_update(track_index, engine_payload)
 
     def _native_vst_parameter_change_is_live_safe(self, track: TrackState) -> bool:
         if not bool(getattr(self, '_playback_active', False)):

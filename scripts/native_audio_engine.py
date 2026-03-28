@@ -59,11 +59,16 @@ class NativeAudioEngineClient:
         self,
         track_index: int,
         notes: list[dict[str, object]],
+        *,
+        bootstrap_active: bool = False,
+        reset_processing: bool = False,
     ) -> dict[str, Any]:
         return self.bridge.command(
             "set_audio_engine_track_notes",
             track_index=int(track_index),
             notes=list(notes),
+            bootstrap_active=bool(bootstrap_active),
+            reset_processing=bool(reset_processing),
         )
 
     def stop(self) -> dict[str, Any]:

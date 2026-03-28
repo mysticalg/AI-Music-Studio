@@ -1678,6 +1678,8 @@ private:
                 ? object->getProperty("track_index") : juce::var(-1));
             const auto bootstrapActive = object->hasProperty("bootstrap_active")
                 ? static_cast<bool>(object->getProperty("bootstrap_active")) : false;
+            const auto resetProcessing = object->hasProperty("reset_processing")
+                ? static_cast<bool>(object->getProperty("reset_processing")) : false;
 
             juce::ScopedLock lock(pluginLock);
             if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(audioEngine.tracks.size())))
@@ -1688,6 +1690,8 @@ private:
                 return makeResponse(false, "Audio engine track has no instrument loaded");
 
             track.notes = parseAudioEngineTrackNotes(object->getProperty("notes"));
+            if (resetProcessing && audioEngine.running)
+                resetAudioEngineTrackProcessingState(track);
             track.noteBootstrapPending = bootstrapActive && audioEngine.running;
 
             auto response = makeResponse(true, "Audio engine track notes updated");
