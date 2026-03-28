@@ -24,8 +24,16 @@ The shared source now builds ten VST3 products:
 - `AI Pad Synth`
 - `AI Pluck Synth`
 - `AI Sampler`
+- `AI Piano`
+- `AI Guitar`
+- `AI Violin`
+- `AI Flute`
+- `AI Saxophone`
+- `AI Bass Guitar`
+- `AI Harp`
+- `AI Organ`
 
-The packaged variants use flavor-specific defaults. `AI Drum Machine` is now voiced as a punchier 909-style kit, `AI 808 Machine` adds longer analogue-style low-end drums, and `AI TB303` adds a more resonant acid-bass flavor. The sampler variant adds internal sample-bank playback with loop-window controls, so it behaves like a compact ROMpler/sampler without depending on external content.
+The packaged variants use flavor-specific defaults. `AI Drum Machine` is now voiced as a punchier 909-style kit, `AI 808 Machine` adds longer analogue-style low-end drums, and `AI TB303` adds a more resonant acid-bass flavor. The sampler variant adds internal sample-bank playback with loop-window controls, so it behaves like a compact ROMpler/sampler without depending on external content. The acoustic suite (`AI Piano`, `AI Guitar`, `AI Violin`, `AI Flute`, `AI Saxophone`, `AI Bass Guitar`, `AI Harp`, `AI Organ`) uses instrument-specific playback: `AI Piano` bundles a real multisampled piano library, while the rest of the suite uses generated sample banks plus articulation layers for more realistic attacks, sustain behavior, and body resonance.
 
 ## Automated GitHub build + download
 

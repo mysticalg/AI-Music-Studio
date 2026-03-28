@@ -3991,7 +3991,7 @@ std::vector<AdvancedVSTiAudioProcessorEditor::ChoiceSpec> AdvancedVSTiAudioProce
     if (name.contains ("piano"))
     {
         specs.push_back ({ "SAMPLEBANK", "Source", "Acoustic piano body model", { "Concert Grand", "Felt Upright", "Pop Piano", "Cinematic Hall" }, {}, false, 0 });
-        specs.push_back ({ "FILTERTYPE", "Filter", "Tonal contour", { "LP", "BP", "HP", "Notch" }, {}, false, 0 });
+        specs.push_back ({ "FILTERTYPE", "Filter", "Tonal contour", { "Off", "LP", "BP", "HP", "Notch" }, {}, false, 0 });
         specs.push_back ({ "FILTERSLOPE", "Slope", "Brightness roll-off", { "12 dB", "16 dB", "24 dB" }, {}, false, 0 });
         return specs;
     }
@@ -3999,7 +3999,7 @@ std::vector<AdvancedVSTiAudioProcessorEditor::ChoiceSpec> AdvancedVSTiAudioProce
     if (name.contains ("bass guitar"))
     {
         specs.push_back ({ "SAMPLEBANK", "Source", "Bass pickup and playing style", { "Finger Bass", "Pick Bass", "Muted Bass", "Round Bass" }, {}, false, 0 });
-        specs.push_back ({ "FILTERTYPE", "Filter", "Low-end contour", { "LP", "BP", "HP", "Notch" }, {}, false, 0 });
+        specs.push_back ({ "FILTERTYPE", "Filter", "Low-end contour", { "Off", "LP", "BP", "HP", "Notch" }, {}, false, 0 });
         specs.push_back ({ "FILTERSLOPE", "Slope", "Top-end roll-off", { "12 dB", "16 dB", "24 dB" }, {}, false, 0 });
         return specs;
     }
@@ -4007,7 +4007,7 @@ std::vector<AdvancedVSTiAudioProcessorEditor::ChoiceSpec> AdvancedVSTiAudioProce
     if (name.contains ("guitar"))
     {
         specs.push_back ({ "SAMPLEBANK", "Source", "String and picking model", { "Steel Finger", "Steel Pick", "Nylon Warm", "Muted Clean" }, {}, false, 0 });
-        specs.push_back ({ "FILTERTYPE", "Filter", "Body / bite contour", { "LP", "BP", "HP", "Notch" }, {}, false, 0 });
+        specs.push_back ({ "FILTERTYPE", "Filter", "Body / bite contour", { "Off", "LP", "BP", "HP", "Notch" }, {}, false, 0 });
         specs.push_back ({ "FILTERSLOPE", "Slope", "Attack roll-off", { "12 dB", "16 dB", "24 dB" }, {}, false, 0 });
         return specs;
     }
@@ -4015,7 +4015,7 @@ std::vector<AdvancedVSTiAudioProcessorEditor::ChoiceSpec> AdvancedVSTiAudioProce
     if (name.contains ("violin"))
     {
         specs.push_back ({ "SAMPLEBANK", "Source", "Bow and ensemble profile", { "Solo Legato", "Expressive Vib", "Studio Section", "Rosin Accent" }, {}, false, 0 });
-        specs.push_back ({ "FILTERTYPE", "Filter", "Body contour", { "LP", "BP", "HP", "Notch" }, {}, false, 0 });
+        specs.push_back ({ "FILTERTYPE", "Filter", "Body contour", { "Off", "LP", "BP", "HP", "Notch" }, {}, false, 0 });
         specs.push_back ({ "FILTERSLOPE", "Slope", "Upper-harmonic roll-off", { "12 dB", "16 dB", "24 dB" }, {}, false, 0 });
         return specs;
     }
@@ -4023,7 +4023,7 @@ std::vector<AdvancedVSTiAudioProcessorEditor::ChoiceSpec> AdvancedVSTiAudioProce
     if (name.contains ("flute"))
     {
         specs.push_back ({ "SAMPLEBANK", "Source", "Breath and register model", { "Concert Flute", "Breathy Alto", "Whistle Air", "Warm Low Flute" }, {}, false, 0 });
-        specs.push_back ({ "FILTERTYPE", "Filter", "Air / body contour", { "LP", "BP", "HP", "Notch" }, {}, false, 0 });
+        specs.push_back ({ "FILTERTYPE", "Filter", "Air / body contour", { "Off", "LP", "BP", "HP", "Notch" }, {}, false, 0 });
         specs.push_back ({ "FILTERSLOPE", "Slope", "Top-end shape", { "12 dB", "16 dB", "24 dB" }, {}, false, 0 });
         return specs;
     }
@@ -4031,7 +4031,7 @@ std::vector<AdvancedVSTiAudioProcessorEditor::ChoiceSpec> AdvancedVSTiAudioProce
     if (name.contains ("sax"))
     {
         specs.push_back ({ "SAMPLEBANK", "Source", "Reed and horn profile", { "Alto Solo", "Tenor Warm", "Baritone Air", "Jazz Bite" }, {}, false, 0 });
-        specs.push_back ({ "FILTERTYPE", "Filter", "Reed contour", { "LP", "BP", "HP", "Notch" }, {}, false, 0 });
+        specs.push_back ({ "FILTERTYPE", "Filter", "Reed contour", { "Off", "LP", "BP", "HP", "Notch" }, {}, false, 0 });
         specs.push_back ({ "FILTERSLOPE", "Slope", "Top-edge focus", { "12 dB", "16 dB", "24 dB" }, {}, false, 0 });
         return specs;
     }
@@ -4039,7 +4039,7 @@ std::vector<AdvancedVSTiAudioProcessorEditor::ChoiceSpec> AdvancedVSTiAudioProce
     if (name.contains ("harp"))
     {
         specs.push_back ({ "SAMPLEBANK", "Source", "String-bed and room model", { "Concert Harp", "Close Mic", "Ambient Harp", "Muted Harmonics" }, {}, false, 0 });
-        specs.push_back ({ "FILTERTYPE", "Filter", "String sheen contour", { "LP", "BP", "HP", "Notch" }, {}, false, 0 });
+        specs.push_back ({ "FILTERTYPE", "Filter", "String sheen contour", { "Off", "LP", "BP", "HP", "Notch" }, {}, false, 0 });
         specs.push_back ({ "FILTERSLOPE", "Slope", "Brightness shape", { "12 dB", "16 dB", "24 dB" }, {}, false, 0 });
         return specs;
     }
@@ -4047,7 +4047,7 @@ std::vector<AdvancedVSTiAudioProcessorEditor::ChoiceSpec> AdvancedVSTiAudioProce
     if (name.contains ("organ"))
     {
         specs.push_back ({ "SAMPLEBANK", "Source", "Drawbar and room profile", { "Tonewheel Full", "Jazz Drawbars", "Cathedral Pipes", "Warm Gospel" }, {}, false, 0 });
-        specs.push_back ({ "FILTERTYPE", "Filter", "Upper harmonic contour", { "LP", "BP", "HP", "Notch" }, {}, false, 0 });
+        specs.push_back ({ "FILTERTYPE", "Filter", "Upper harmonic contour", { "Off", "LP", "BP", "HP", "Notch" }, {}, false, 0 });
         specs.push_back ({ "FILTERSLOPE", "Slope", "Brightness roll-off", { "12 dB", "16 dB", "24 dB" }, {}, false, 0 });
         return specs;
     }

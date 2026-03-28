@@ -4,6 +4,12 @@
 #if JUCE_WINDOWS
 #include <windows.h>
 #endif
+#include <limits>
+#include <mutex>
+
+#ifndef AIMS_REPO_ROOT_PATH
+#define AIMS_REPO_ROOT_PATH "."
+#endif
 
 namespace
 {
@@ -684,6 +690,11 @@ constexpr WavetableFrameSet kVirusVocalFrames { {
     { { 0.76f, 0.18f, 0.06f, 0.14f, 0.08f, 0.04f, 0.02f, 0.00f },  0.10f,  0.10f, 0.12f }
 } };
 
+juce::File bundledInstrumentResourceRoot (const juce::String& folderName);
+juce::String regionAttributeValue (const juce::String& line, const juce::String& key);
+int regionAttributeInt (const juce::String& line, const juce::String& key, int defaultValue);
+float regionAttributeFloat (const juce::String& line, const juce::String& key, float defaultValue);
+
 const WavetableFrameSet& virusWavetableFramesForVariant (int variant)
 {
     switch (variant)
@@ -731,35 +742,25 @@ float sampleVirusWavetableFrame (float phase,
 
 juce::File vecPadLibraryRoot()
 {
-   #if JUCE_WINDOWS
-    HMODULE moduleHandle = nullptr;
-    if (GetModuleHandleExW (GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                            reinterpret_cast<LPCWSTR> (&vecPadLibraryRoot),
-                            &moduleHandle) != 0)
-    {
-        wchar_t modulePath[MAX_PATH] {};
-        if (GetModuleFileNameW (moduleHandle, modulePath, MAX_PATH) > 0)
-        {
-            auto moduleFile = juce::File (juce::String (modulePath));
-            auto contentsDir = moduleFile.getParentDirectory();
-            if (contentsDir.getFileName().equalsIgnoreCase ("x86_64-win"))
-                contentsDir = contentsDir.getParentDirectory();
-
-            if (contentsDir.getFileName().equalsIgnoreCase ("Contents"))
-            {
-                const auto bundledRoot = contentsDir.getChildFile ("Resources").getChildFile ("VEC1");
-                if (bundledRoot.isDirectory())
-                    return bundledRoot;
-
-                const auto legacyBundledRoot = contentsDir.getParentDirectory().getChildFile ("Resources").getChildFile ("VEC1");
-                if (legacyBundledRoot.isDirectory())
-                    return legacyBundledRoot;
-            }
-        }
-    }
-   #endif
+    const auto bundledRoot = bundledInstrumentResourceRoot ("VEC1");
+    if (bundledRoot.isDirectory())
+        return bundledRoot;
 
     return juce::File::createFileWithoutCheckingPath (R"(D:\OneDrive\Music\Sound Design\Sample Library\sample library\VEC1)");
+}
+
+juce::File pianoLibraryRoot()
+{
+    const auto bundledRoot = bundledInstrumentResourceRoot ("Piano");
+    if (bundledRoot.isDirectory())
+        return bundledRoot;
+
+    const auto repoRoot = juce::File::createFileWithoutCheckingPath (juce::String (AIMS_REPO_ROOT_PATH));
+    const auto cachedRoot = repoRoot.getChildFile (".cache").getChildFile ("SplendidGrandPiano");
+    if (cachedRoot.isDirectory())
+        return cachedRoot;
+
+    return {};
 }
 
 bool isSupportedExternalSampleFile (const juce::File& file)
@@ -1108,7 +1109,109 @@ bool migrateLegacyDrumFilterChoice (juce::ValueTree state)
 
     return false;
 }
+
+juce::File bundledInstrumentResourceRoot (const juce::String& folderName)
+{
+   #if JUCE_WINDOWS
+    HMODULE moduleHandle = nullptr;
+    if (GetModuleHandleExW (GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR> (&bundledInstrumentResourceRoot),
+                            &moduleHandle) != 0)
+    {
+        wchar_t modulePath[MAX_PATH] {};
+        if (GetModuleFileNameW (moduleHandle, modulePath, MAX_PATH) > 0)
+        {
+            auto moduleFile = juce::File (juce::String (modulePath));
+            auto contentsDir = moduleFile.getParentDirectory();
+            if (contentsDir.getFileName().equalsIgnoreCase ("x86_64-win"))
+                contentsDir = contentsDir.getParentDirectory();
+
+            if (contentsDir.getFileName().equalsIgnoreCase ("Contents"))
+            {
+                const auto bundledRoot = contentsDir.getChildFile ("Resources").getChildFile (folderName);
+                if (bundledRoot.isDirectory())
+                    return bundledRoot;
+
+                const auto legacyBundledRoot = contentsDir.getParentDirectory().getChildFile ("Resources").getChildFile (folderName);
+                if (legacyBundledRoot.isDirectory())
+                    return legacyBundledRoot;
+            }
+        }
+    }
+   #endif
+
+    return {};
+}
+
+juce::String regionAttributeValue (const juce::String& line, const juce::String& key)
+{
+    const auto token = key + "=";
+    const auto start = line.indexOfIgnoreCase (0, token);
+    if (start < 0)
+        return {};
+
+    const auto valueStart = start + token.length();
+    auto valueEnd = line.length();
+    for (int index = valueStart; index < line.length(); ++index)
+    {
+        if (! juce::CharacterFunctions::isWhitespace (line[index]))
+            continue;
+
+        auto probe = index + 1;
+        while (probe < line.length() && juce::CharacterFunctions::isWhitespace (line[probe]))
+            ++probe;
+
+        if (probe >= line.length())
+        {
+            valueEnd = index;
+            break;
+        }
+
+        const auto nextEquals = line.indexOfChar (probe, '=');
+        const auto nextBreak = line.indexOfAnyOf (" \t\r\n", probe);
+        if (nextEquals > probe && (nextBreak < 0 || nextEquals < nextBreak))
+        {
+            valueEnd = index;
+            break;
+        }
+    }
+
+    return line.substring (valueStart, valueEnd).trim();
+}
+
+int regionAttributeInt (const juce::String& line, const juce::String& key, int defaultValue)
+{
+    const auto value = regionAttributeValue (line, key);
+    return value.isNotEmpty() ? value.getIntValue() : defaultValue;
+}
+
+float regionAttributeFloat (const juce::String& line, const juce::String& key, float defaultValue)
+{
+    const auto value = regionAttributeValue (line, key);
+    return value.isNotEmpty() ? value.getFloatValue() : defaultValue;
+}
 } // namespace
+
+struct AdvancedVSTiAudioProcessor::PianoSampleLibrary
+{
+    struct Region
+    {
+        int lowNote = 21;
+        int highNote = 108;
+        int lowVelocity = 1;
+        int highVelocity = 127;
+        int rootMidi = 60;
+        int startOffset = 0;
+        float gain = 1.0f;
+        juce::String layerName;
+        std::shared_ptr<const ExternalSampleData> sample;
+    };
+
+    juce::String displayName;
+    juce::String sourcePath;
+    std::vector<Region> regions;
+    bool available = false;
+};
 
 AdvancedVSTiAudioProcessor::AdvancedVSTiAudioProcessor()
     : AudioProcessor (BusesProperties().withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
@@ -1264,6 +1367,7 @@ void AdvancedVSTiAudioProcessor::prepareToPlay (double sampleRate, int samplesPe
 {
     currentSampleRate = sampleRate;
     loadedSampleBank = -1;
+    initializePianoSampleLibrary();
 
     juce::dsp::ProcessSpec spec { sampleRate, static_cast<juce::uint32> (samplesPerBlock), 1 };
     leftFilter.prepare (spec);
@@ -1578,6 +1682,133 @@ void AdvancedVSTiAudioProcessor::refreshExternalPadSamples()
         loadExternalPadSample (padIndex);
 }
 
+std::shared_ptr<const AdvancedVSTiAudioProcessor::ExternalSampleData> AdvancedVSTiAudioProcessor::loadExternalSampleData (const juce::File& sourceFile,
+                                                                                                                             const juce::String& displayName,
+                                                                                                                             const juce::String& presetName)
+{
+    std::unique_ptr<juce::AudioFormatReader> reader (audioFormatManager.createReaderFor (sourceFile));
+    if (reader == nullptr || reader->lengthInSamples <= 0)
+        return {};
+
+    auto sampleData = std::make_shared<ExternalSampleData>();
+    sampleData->sampleRate = reader->sampleRate;
+    sampleData->displayName = displayName;
+    sampleData->presetName = presetName;
+    sampleData->audio.setSize (1, static_cast<int> (reader->lengthInSamples));
+    sampleData->audio.clear();
+
+    juce::AudioBuffer<float> sourceBuffer (juce::jmax (1, static_cast<int> (reader->numChannels)),
+                                           static_cast<int> (reader->lengthInSamples));
+    reader->read (&sourceBuffer, 0, static_cast<int> (reader->lengthInSamples), 0, true, true);
+
+    auto* destination = sampleData->audio.getWritePointer (0);
+    for (int sample = 0; sample < sourceBuffer.getNumSamples(); ++sample)
+    {
+        float mixedSample = 0.0f;
+        for (int channel = 0; channel < sourceBuffer.getNumChannels(); ++channel)
+            mixedSample += sourceBuffer.getSample (channel, sample);
+
+        destination[sample] = mixedSample / static_cast<float> (juce::jmax (1, sourceBuffer.getNumChannels()));
+    }
+
+    return std::shared_ptr<const ExternalSampleData> (sampleData);
+}
+
+void AdvancedVSTiAudioProcessor::initializePianoSampleLibrary()
+{
+    if constexpr (buildFlavor() != InstrumentFlavor::piano)
+        return;
+
+    if (pianoSampleLibrary != nullptr)
+        return;
+
+    static std::mutex cacheMutex;
+    static std::weak_ptr<const PianoSampleLibrary> cachedLibrary;
+
+    const std::lock_guard<std::mutex> lock (cacheMutex);
+    if (auto shared = cachedLibrary.lock())
+    {
+        pianoSampleLibrary = std::move (shared);
+        return;
+    }
+
+    auto library = std::make_shared<PianoSampleLibrary>();
+    library->displayName = "Splendid Grand Piano";
+
+    const auto libraryRoot = pianoLibraryRoot();
+    library->sourcePath = libraryRoot.getFullPathName();
+    if (! libraryRoot.isDirectory())
+    {
+        pianoSampleLibrary = library;
+        cachedLibrary = library;
+        return;
+    }
+
+    struct LayerConfig
+    {
+        const char* regionFile;
+        const char* layerName;
+        int lowVelocity = 1;
+        int highVelocity = 127;
+    };
+
+    constexpr std::array<LayerConfig, 4> layers {
+        LayerConfig { "PP.txt", "PP", 1, 67 },
+        LayerConfig { "MP.txt", "MP", 68, 84 },
+        LayerConfig { "MF.txt", "MF", 85, 100 },
+        LayerConfig { "FF.txt", "FF", 101, 127 }
+    };
+
+    const auto dataDir = libraryRoot.getChildFile ("Data");
+    const auto sampleDir = libraryRoot.getChildFile ("Samples");
+
+    for (const auto& layer : layers)
+    {
+        const auto regionFile = dataDir.getChildFile (layer.regionFile);
+        if (! regionFile.existsAsFile())
+            continue;
+
+        juce::StringArray lines;
+        lines.addLines (regionFile.loadFileAsString());
+
+        for (const auto& rawLine : lines)
+        {
+            const auto line = rawLine.trim();
+            if (! line.startsWithIgnoreCase ("<region>"))
+                continue;
+
+            auto sampleName = regionAttributeValue (line, "sample");
+            if (sampleName.isEmpty())
+                continue;
+
+            sampleName = sampleName.replace ("$EXT", "flac");
+            const auto sampleFile = sampleDir.getChildFile (sampleName);
+            if (! sampleFile.existsAsFile())
+                continue;
+
+            const auto sampleData = loadExternalSampleData (sampleFile, sampleFile.getFileNameWithoutExtension(), layer.layerName);
+            if (sampleData == nullptr)
+                continue;
+
+            PianoSampleLibrary::Region region;
+            region.lowNote = juce::jlimit (0, 127, regionAttributeInt (line, "lokey", 21));
+            region.highNote = juce::jlimit (region.lowNote, 127, regionAttributeInt (line, "hikey", region.lowNote));
+            region.lowVelocity = layer.lowVelocity;
+            region.highVelocity = layer.highVelocity;
+            region.rootMidi = juce::jlimit (0, 127, regionAttributeInt (line, "pitch_keycenter", region.lowNote));
+            region.startOffset = juce::jmax (0, regionAttributeInt (line, "offset", 0));
+            region.gain = juce::Decibels::decibelsToGain (regionAttributeFloat (line, "volume", 0.0f));
+            region.layerName = layer.layerName;
+            region.sample = sampleData;
+            library->regions.push_back (std::move (region));
+        }
+    }
+
+    library->available = ! library->regions.empty();
+    pianoSampleLibrary = library;
+    cachedLibrary = library;
+}
+
 void AdvancedVSTiAudioProcessor::loadExternalPadSample (int padIndex)
 {
     if constexpr (buildFlavor() != InstrumentFlavor::vec1DrumPad)
@@ -1602,36 +1833,17 @@ void AdvancedVSTiAudioProcessor::loadExternalPadSample (int padIndex)
         return;
 
     const auto sourceFile = juce::File::createFileWithoutCheckingPath (pad.samples[static_cast<size_t> (desiredIndex)].filePath);
-    std::unique_ptr<juce::AudioFormatReader> reader (audioFormatManager.createReaderFor (sourceFile));
-    if (reader == nullptr || reader->lengthInSamples <= 0)
+    const auto sampleData = loadExternalSampleData (sourceFile,
+                                                    pad.samples[static_cast<size_t> (desiredIndex)].displayName,
+                                                    pad.samples[static_cast<size_t> (desiredIndex)].presetName);
+    if (sampleData == nullptr)
     {
         std::atomic_store (&externalPadSamples[static_cast<size_t> (padIndex)], std::shared_ptr<const ExternalSampleData> {});
         loadedExternalPadIndices[static_cast<size_t> (padIndex)] = -1;
         return;
     }
 
-    auto sampleData = std::make_shared<ExternalSampleData>();
-    sampleData->sampleRate = reader->sampleRate;
-    sampleData->displayName = pad.samples[static_cast<size_t> (desiredIndex)].displayName;
-    sampleData->presetName = pad.samples[static_cast<size_t> (desiredIndex)].presetName;
-    sampleData->audio.setSize (1, static_cast<int> (reader->lengthInSamples));
-    sampleData->audio.clear();
-
-    juce::AudioBuffer<float> sourceBuffer (juce::jmax (1, static_cast<int> (reader->numChannels)),
-                                           static_cast<int> (reader->lengthInSamples));
-    reader->read (&sourceBuffer, 0, static_cast<int> (reader->lengthInSamples), 0, true, true);
-
-    auto* destination = sampleData->audio.getWritePointer (0);
-    for (int sample = 0; sample < sourceBuffer.getNumSamples(); ++sample)
-    {
-        float mixedSample = 0.0f;
-        for (int channel = 0; channel < sourceBuffer.getNumChannels(); ++channel)
-            mixedSample += sourceBuffer.getSample (channel, sample);
-
-        destination[sample] = mixedSample / static_cast<float> (juce::jmax (1, sourceBuffer.getNumChannels()));
-    }
-
-    std::atomic_store (&externalPadSamples[static_cast<size_t> (padIndex)], std::shared_ptr<const ExternalSampleData> (sampleData));
+    std::atomic_store (&externalPadSamples[static_cast<size_t> (padIndex)], sampleData);
     loadedExternalPadIndices[static_cast<size_t> (padIndex)] = desiredIndex;
 }
 
@@ -1642,6 +1854,56 @@ int AdvancedVSTiAudioProcessor::externalPadIndexForMidi (int midiNote) const noe
 
     const auto index = midiNote - vecPadMidiStart;
     return juce::isPositiveAndBelow (index, vecPadCount) ? index : -1;
+}
+
+void AdvancedVSTiAudioProcessor::assignPianoSampleToVoice (VoiceState& voice, int midiNote, float velocity)
+{
+    if constexpr (buildFlavor() != InstrumentFlavor::piano)
+        return;
+
+    voice.externalSample = {};
+    voice.externalSamplePosition = 0.0;
+    voice.externalSampleRootMidi = midiNote;
+    voice.externalSampleGain = 1.0f;
+
+    const auto library = pianoSampleLibrary;
+    if (library == nullptr || ! library->available)
+        return;
+
+    const auto velocityMidi = juce::jlimit (1, 127, juce::roundToInt (juce::jlimit (0.0f, 1.0f, velocity) * 127.0f));
+    const PianoSampleLibrary::Region* bestRegion = nullptr;
+    auto bestScore = (std::numeric_limits<int>::max)();
+
+    for (const auto& region : library->regions)
+    {
+        if (region.sample == nullptr || midiNote < region.lowNote || midiNote > region.highNote)
+            continue;
+
+        auto score = std::abs (region.rootMidi - midiNote);
+        if (velocityMidi >= region.lowVelocity && velocityMidi <= region.highVelocity)
+            score -= 512;
+        else if (velocityMidi < region.lowVelocity)
+            score += (region.lowVelocity - velocityMidi) * 8;
+        else
+            score += (velocityMidi - region.highVelocity) * 8;
+
+        if (score < bestScore)
+        {
+            bestScore = score;
+            bestRegion = &region;
+        }
+    }
+
+    if (bestRegion == nullptr || bestRegion->sample == nullptr)
+        return;
+
+    voice.externalSample = bestRegion->sample;
+    voice.externalSampleRootMidi = bestRegion->rootMidi;
+    voice.externalSampleGain = bestRegion->gain;
+    const auto startOffset = juce::jlimit (0,
+                                           juce::jmax (0, bestRegion->sample->audio.getNumSamples() - 1),
+                                           bestRegion->startOffset);
+    voice.externalSamplePosition = static_cast<double> (startOffset);
 }
 
 juce::StringArray AdvancedVSTiAudioProcessor::presetNames() const
@@ -2493,10 +2755,14 @@ void AdvancedVSTiAudioProcessor::startVoiceForMidiNote (int midiNote, float velo
     voice.toneState = 0.0f;
     voice.colourState = 0.0f;
     voice.externalPadIndex = externalPadIndex;
+    voice.externalSampleRootMidi = midiNote;
     voice.externalSamplePosition = 0.0;
+    voice.externalSampleGain = 1.0f;
     voice.externalSample = (externalPadIndex >= 0 && juce::isPositiveAndBelow (externalPadIndex, vecPadCount))
                                ? std::atomic_load (&externalPadSamples[static_cast<size_t> (externalPadIndex)])
                                : std::shared_ptr<const ExternalSampleData> {};
+    if constexpr (buildFlavor() == InstrumentFlavor::piano)
+        assignPianoSampleToVoice (voice, midiNote, velocity);
     voice.unisonPhases.fill (0.0f);
     voice.unisonSyncPhases.fill (0.0f);
     voice.unisonSamplePositions.fill (0.0f);
@@ -3414,6 +3680,36 @@ float AdvancedVSTiAudioProcessor::renderExternalPadVoiceSample (VoiceState& voic
     return output * envelope * voice.velocity * padLevel * renderParams.drumMasterLevel;
 }
 
+float AdvancedVSTiAudioProcessor::renderInstrumentMultisampleVoice (VoiceState& voice, float soundingMidiNote)
+{
+    if (voice.externalSample == nullptr || voice.externalSample->audio.getNumSamples() <= 0)
+        return 0.0f;
+
+    const auto totalSamples = voice.externalSample->audio.getNumSamples();
+    if (voice.externalSamplePosition >= static_cast<double> (totalSamples))
+    {
+        voice.active = false;
+        return 0.0f;
+    }
+
+    const auto indexA = juce::jlimit (0, totalSamples - 1, static_cast<int> (voice.externalSamplePosition));
+    const auto indexB = juce::jmin (totalSamples - 1, indexA + 1);
+    const auto alpha = static_cast<float> (voice.externalSamplePosition - static_cast<double> (indexA));
+    const auto sampleA = voice.externalSample->audio.getSample (0, indexA);
+    const auto sampleB = voice.externalSample->audio.getSample (0, indexB);
+    const auto output = juce::jmap (alpha, sampleA, sampleB);
+    const auto pitchRatio = std::pow (2.0, (static_cast<double> (soundingMidiNote - static_cast<float> (voice.externalSampleRootMidi))) / 12.0);
+    const auto increment = juce::jlimit (0.125,
+                                         8.0,
+                                         (voice.externalSample->sampleRate / juce::jmax (1.0, currentSampleRate)) * pitchRatio);
+
+    voice.externalSamplePosition += increment;
+    if (voice.externalSamplePosition >= static_cast<double> (totalSamples))
+        voice.active = false;
+
+    return output * voice.externalSampleGain;
+}
+
 float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice, SampleModulationSums& sampleModSums)
 {
     if (! voice.active)
@@ -3587,29 +3883,40 @@ float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice, SampleMo
 
     auto baseHz = midiToHzFloat (soundingMidiNote);
     baseHz *= std::pow (2.0f, voiceMod.osc1Pitch / 12.0f);
-
-    const auto fm = fmOperator (voice, baseHz, juce::jmax (0.0f, params.fmAmount + voiceMod.fmAmount));
-
-    const auto osc1Shape = juce::jlimit (0.05f, 0.95f, params.osc1PulseWidth + voiceMod.pulseWidth + voiceMod.shape);
-
+    const auto usePianoMultisample = buildFlavor() == InstrumentFlavor::piano && voice.externalSample != nullptr;
     float s = 0.0f;
-    for (int i = 0; i < params.unisonVoices; ++i)
+
+    if (usePianoMultisample)
     {
-        const auto spread = (static_cast<float> (i) - (params.unisonVoices - 1) * 0.5f)
-                            * juce::jlimit (0.0f, 0.25f, params.detune + voiceMod.detune);
-        const auto osc1Pitch = params.osc1Semitone + params.osc1Detune + spread;
-        s += oscSampleForState (voice.unisonPhases[static_cast<size_t> (i)],
-                                voice.unisonSyncPhases[static_cast<size_t> (i)],
-                                voice.unisonSamplePositions[static_cast<size_t> (i)],
-                                baseHz * std::pow (2.0f, osc1Pitch / 12.0f) + fm,
-                                params.oscType,
-                                juce::jlimit (0.0f, 4.0f, params.syncAmount + voiceMod.syncAmount),
-                                osc1Shape);
+        voice.phase = std::fmod (voice.phase + (baseHz / static_cast<float> (currentSampleRate)), 1.0f);
+        s = renderInstrumentMultisampleVoice (voice, soundingMidiNote);
+        if (! voice.active)
+            return 0.0f;
     }
-    s /= static_cast<float> (params.unisonVoices);
-    voice.phase = voice.unisonPhases[0];
-    voice.syncPhase = voice.unisonSyncPhases[0];
-    voice.samplePos = voice.unisonSamplePositions[0];
+    else
+    {
+        const auto fm = fmOperator (voice, baseHz, juce::jmax (0.0f, params.fmAmount + voiceMod.fmAmount));
+        const auto osc1Shape = juce::jlimit (0.05f, 0.95f, params.osc1PulseWidth + voiceMod.pulseWidth + voiceMod.shape);
+
+        for (int i = 0; i < params.unisonVoices; ++i)
+        {
+            const auto spread = (static_cast<float> (i) - (params.unisonVoices - 1) * 0.5f)
+                                * juce::jlimit (0.0f, 0.25f, params.detune + voiceMod.detune);
+            const auto osc1Pitch = params.osc1Semitone + params.osc1Detune + spread;
+            s += oscSampleForState (voice.unisonPhases[static_cast<size_t> (i)],
+                                    voice.unisonSyncPhases[static_cast<size_t> (i)],
+                                    voice.unisonSamplePositions[static_cast<size_t> (i)],
+                                    baseHz * std::pow (2.0f, osc1Pitch / 12.0f) + fm,
+                                    params.oscType,
+                                    juce::jlimit (0.0f, 4.0f, params.syncAmount + voiceMod.syncAmount),
+                                    osc1Shape);
+        }
+
+        s /= static_cast<float> (params.unisonVoices);
+        voice.phase = voice.unisonPhases[0];
+        voice.syncPhase = voice.unisonSyncPhases[0];
+        voice.samplePos = voice.unisonSamplePositions[0];
+    }
 
     if constexpr (buildFlavor() == InstrumentFlavor::bassSynth)
     {
@@ -3669,11 +3976,22 @@ float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice, SampleMo
     else if constexpr (buildFlavor() == InstrumentFlavor::piano)
     {
         voice.auxPhase = std::fmod (voice.auxPhase + (5.2f / static_cast<float> (currentSampleRate)), 1.0f);
-        const auto hammer = (random.nextFloat() * 2.0f - 1.0f) * 0.06f * std::exp (-voice.noteAge * 72.0f);
-        const auto body = std::sin (twoPi * std::fmod ((voice.phase * 0.5f) + (voice.auxPhase * 0.03f), 1.0f))
-                          * (0.08f + voice.velocity * 0.04f) * std::exp (-voice.noteAge * 1.9f);
-        s = smoothTowards ((s * 0.9f) + body + hammer, 0.055f, voice.toneState);
-        s = softSaturate (s * (1.04f + voice.velocity * 0.12f)) * 0.94f;
+        if (usePianoMultisample)
+        {
+            const auto body = std::sin (twoPi * std::fmod ((voice.phase * 0.5f) + (voice.auxPhase * 0.02f), 1.0f))
+                              * (0.018f + voice.velocity * 0.01f) * std::exp (-voice.noteAge * 1.6f);
+            const auto air = smoothTowards (s, 0.015f, voice.colourState) * 0.04f;
+            s = smoothTowards ((s * 0.98f) + body + air, 0.02f, voice.toneState);
+            s = softSaturate (s * (1.0f + voice.velocity * 0.04f)) * 0.985f;
+        }
+        else
+        {
+            const auto hammer = (random.nextFloat() * 2.0f - 1.0f) * 0.06f * std::exp (-voice.noteAge * 72.0f);
+            const auto body = std::sin (twoPi * std::fmod ((voice.phase * 0.5f) + (voice.auxPhase * 0.03f), 1.0f))
+                              * (0.08f + voice.velocity * 0.04f) * std::exp (-voice.noteAge * 1.9f);
+            s = smoothTowards ((s * 0.9f) + body + hammer, 0.055f, voice.toneState);
+            s = softSaturate (s * (1.04f + voice.velocity * 0.12f)) * 0.94f;
+        }
     }
     else if constexpr (buildFlavor() == InstrumentFlavor::guitar)
     {
@@ -3816,7 +4134,9 @@ float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice, SampleMo
         voice.arpControlled = false;
     }
 
-    return s * ampEnv * juce::jlimit (0.0f, 2.0f, 1.0f + voiceMod.ampLevel) * gatePass * rhythmGate * voice.velocity;
+    const auto velocityGain = usePianoMultisample ? juce::jlimit (0.72f, 1.1f, 0.72f + (voice.velocity * 0.38f))
+                                                  : voice.velocity;
+    return s * ampEnv * juce::jlimit (0.0f, 2.0f, 1.0f + voiceMod.ampLevel) * gatePass * rhythmGate * velocityGain;
 }
 
 void AdvancedVSTiAudioProcessor::updateRenderParameters()
@@ -3841,7 +4161,7 @@ void AdvancedVSTiAudioProcessor::updateRenderParameters()
     renderParams.lfo2EnvMode = false;
     renderParams.lfo3EnvMode = true;
     renderParams.filter1Enabled = true;
-    renderParams.filter2Enabled = true;
+    renderParams.filter2Enabled = buildFlavor() == InstrumentFlavor::advanced;
     renderParams.filterSlope = juce::jlimit (0, 2, paramIndex (apvts, "FILTERSLOPE"));
     renderParams.osc2Type = paramIndex (apvts, "OSC2TYPE");
     renderParams.filter2Type = paramIndex (apvts, "FILTER2TYPE");
@@ -3849,7 +4169,7 @@ void AdvancedVSTiAudioProcessor::updateRenderParameters()
     renderParams.fxType = paramIndex (apvts, "FXTYPE");
     renderParams.osc3Type = static_cast<int> (OscType::square);
     renderParams.masterLevel = 1.0f;
-    if constexpr (isDrumFlavor())
+    if constexpr (supportsOffFilterChoice())
         renderParams.filterType = juce::jlimit (0, 4, paramIndex (apvts, "FILTERTYPE"));
     else
         renderParams.filterType = juce::jlimit (0, 3, paramIndex (apvts, "FILTERTYPE"));
@@ -4146,7 +4466,7 @@ void AdvancedVSTiAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer,
     reverb.setParameters (reverbParams);
 
     bool bypassFilter = false;
-    if constexpr (isDrumFlavor())
+    if constexpr (supportsOffFilterChoice())
     {
         bypassFilter = renderParams.filterType == 0;
         if (! bypassFilter)
@@ -5046,25 +5366,25 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
         detuneDefault = 0.0f;
         fmDefault = 0.0f;
         syncDefault = 0.0f;
-        gateDefault = 6.0f;
+        gateDefault = 8.0f;
         ampAttackDefault = 0.001f;
-        ampDecayDefault = 1.1f;
-        ampSustainDefault = 0.58f;
-        ampReleaseDefault = 0.72f;
+        ampDecayDefault = 0.04f;
+        ampSustainDefault = 1.0f;
+        ampReleaseDefault = 0.12f;
         filtAttackDefault = 0.001f;
-        filtDecayDefault = 0.32f;
-        filtSustainDefault = 0.84f;
-        filtReleaseDefault = 0.5f;
-        envCurveDefault = 0.06f;
-        cutoffDefault = 5600.0f;
-        resonanceDefault = 0.12f;
-        filterEnvAmountDefault = 0.12f;
+        filtDecayDefault = 0.08f;
+        filtSustainDefault = 1.0f;
+        filtReleaseDefault = 0.12f;
+        envCurveDefault = 0.02f;
+        cutoffDefault = 14800.0f;
+        resonanceDefault = 0.04f;
+        filterEnvAmountDefault = 0.02f;
         sampleEndDefault = 0.98f;
         fxTypeDefault = 2;
-        fxMixDefault = 0.06f;
-        fxIntensityDefault = 0.18f;
-        reverbMixDefault = 0.12f;
-        delaySendDefault = 0.02f;
+        fxMixDefault = 0.02f;
+        fxIntensityDefault = 0.08f;
+        reverbMixDefault = 0.06f;
+        delaySendDefault = 0.0f;
         lfo1RateDefault = 0.08f;
         lfo2RateDefault = 0.05f;
     }
@@ -5439,7 +5759,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout AdvancedVSTiAudioProcessor::
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("FILTRELEASE", "Filter Release", 0.001f, 10.0f, filtReleaseDefault));
     params.push_back (std::make_unique<juce::AudioParameterFloat> ("ENVCURVE", "Envelope Curve", -1.0f, 1.0f, envCurveDefault));
 
-    if constexpr (isDrumFlavor())
+    if constexpr (supportsOffFilterChoice())
         params.push_back (std::make_unique<juce::AudioParameterChoice> ("FILTERTYPE", "Filter Type", juce::StringArray { "Off", "LP", "BP", "HP", "Notch" }, filterTypeDefault));
     else
         params.push_back (std::make_unique<juce::AudioParameterChoice> ("FILTERTYPE", "Filter Type", juce::StringArray { "LP", "BP", "HP", "Notch" }, filterTypeDefault));
@@ -6134,36 +6454,45 @@ void AdvancedVSTiAudioProcessor::applyPresetByIndex (int presetIndex)
     else if constexpr (buildFlavor() == InstrumentFlavor::piano)
     {
         setParameterActual ("SAMPLEBANK", static_cast<float> (juce::jlimit (0, juce::jmax (0, sampleBankChoices().size() - 1), presetIndex)));
+        setParameterActual ("AMPDECAY", 0.04f);
+        setParameterActual ("AMPSUSTAIN", 1.0f);
         switch (presetIndex)
         {
             case 1:
-                setParameterActual ("CUTOFF", 3600.0f);
-                setParameterActual ("AMPRELEASE", 0.58f);
-                setParameterActual ("FILTERENVAMOUNT", 0.08f);
-                setParameterActual ("REVERBMIX", 0.08f);
-                setParameterActual ("FXMIX", 0.04f);
+                setParameterActual ("CUTOFF", 6400.0f);
+                setParameterActual ("AMPATTACK", 0.001f);
+                setParameterActual ("AMPRELEASE", 0.08f);
+                setParameterActual ("FILTERENVAMOUNT", 0.0f);
+                setParameterActual ("REVERBMIX", 0.03f);
+                setParameterActual ("DELAYSEND", 0.0f);
+                setParameterActual ("FXMIX", 0.0f);
                 break;
             case 2:
-                setParameterActual ("CUTOFF", 6200.0f);
-                setParameterActual ("AMPRELEASE", 0.48f);
-                setParameterActual ("FILTERENVAMOUNT", 0.18f);
-                setParameterActual ("REVERBMIX", 0.1f);
-                setParameterActual ("FXMIX", 0.1f);
+                setParameterActual ("CUTOFF", 12200.0f);
+                setParameterActual ("AMPATTACK", 0.001f);
+                setParameterActual ("AMPRELEASE", 0.1f);
+                setParameterActual ("FILTERENVAMOUNT", 0.03f);
+                setParameterActual ("REVERBMIX", 0.04f);
+                setParameterActual ("DELAYSEND", 0.0f);
+                setParameterActual ("FXMIX", 0.02f);
                 break;
             case 3:
-                setParameterActual ("CUTOFF", 4600.0f);
-                setParameterActual ("AMPATTACK", 0.006f);
-                setParameterActual ("AMPRELEASE", 1.2f);
-                setParameterActual ("FILTERENVAMOUNT", 0.16f);
-                setParameterActual ("REVERBMIX", 0.26f);
-                setParameterActual ("DELAYSEND", 0.08f);
-                setParameterActual ("FXMIX", 0.08f);
+                setParameterActual ("CUTOFF", 9800.0f);
+                setParameterActual ("AMPATTACK", 0.001f);
+                setParameterActual ("AMPRELEASE", 0.18f);
+                setParameterActual ("FILTERENVAMOUNT", 0.02f);
+                setParameterActual ("REVERBMIX", 0.22f);
+                setParameterActual ("DELAYSEND", 0.03f);
+                setParameterActual ("FXMIX", 0.03f);
                 break;
             default:
-                setParameterActual ("CUTOFF", 5400.0f);
-                setParameterActual ("AMPRELEASE", 0.78f);
-                setParameterActual ("FILTERENVAMOUNT", 0.12f);
-                setParameterActual ("REVERBMIX", 0.14f);
+                setParameterActual ("CUTOFF", 14800.0f);
+                setParameterActual ("AMPATTACK", 0.001f);
+                setParameterActual ("AMPRELEASE", 0.12f);
+                setParameterActual ("FILTERENVAMOUNT", 0.02f);
+                setParameterActual ("REVERBMIX", 0.06f);
+                setParameterActual ("DELAYSEND", 0.0f);
+                setParameterActual ("FXMIX", 0.02f);
                 break;
         }
     }

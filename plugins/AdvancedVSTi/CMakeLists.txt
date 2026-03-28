@@ -22,6 +22,7 @@ endif()
 set(AIMS_ASSET_SOURCES "${AIMS_VIRUS_IMAGE}")
 set(AIMS_HAS_TR909_IMAGE 0)
 set(AIMS_VEC1_LIBRARY_DIR "D:/OneDrive/Music/Sound Design/Sample Library/sample library/VEC1")
+set(AIMS_PIANO_LIBRARY_DIR "${AIMS_REPO_ROOT}/.cache/SplendidGrandPiano")
 set(AIMS_TR909_IMAGE "${AIMS_REPO_ROOT}/tr9092.jpg")
 if(EXISTS "${AIMS_TR909_IMAGE}")
   list(APPEND AIMS_ASSET_SOURCES "${AIMS_TR909_IMAGE}")
@@ -57,6 +58,7 @@ function(add_ai_music_vst3 target_name product_name plugin_code flavor_code bund
     PRIVATE
       AIMS_INSTRUMENT_FLAVOR=${flavor_code}
       AIMS_HAS_TR909_IMAGE=${AIMS_HAS_TR909_IMAGE}
+      AIMS_REPO_ROOT_PATH="${AIMS_REPO_ROOT}"
     PUBLIC
       JUCE_WEB_BROWSER=0
       JUCE_USE_CURL=0
@@ -101,5 +103,15 @@ if(EXISTS "${AIMS_VEC1_LIBRARY_DIR}")
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${AIMS_VEC1_LIBRARY_DIR}"
             "$<TARGET_FILE_DIR:AIVEC1DrumPads_VST3>/../Resources/VEC1"
+    VERBATIM)
+endif()
+
+if(EXISTS "${AIMS_PIANO_LIBRARY_DIR}")
+  add_custom_command(TARGET AIPiano_VST3 POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E echo "Bundling Splendid Grand Piano into AI Piano.vst3"
+    COMMAND ${CMAKE_COMMAND} -E rm -rf "$<TARGET_FILE_DIR:AIPiano_VST3>/../Resources/Piano"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${AIMS_PIANO_LIBRARY_DIR}"
+            "$<TARGET_FILE_DIR:AIPiano_VST3>/../Resources/Piano"
     VERBATIM)
 endif()

@@ -179,6 +179,7 @@ private:
     };
 
     struct ExternalSampleData;
+    struct PianoSampleLibrary;
 
     static constexpr int maxVoices = 256;
     static constexpr int maxUnisonOscillators = 8;
@@ -202,7 +203,9 @@ private:
         float toneState = 0.0f;
         float colourState = 0.0f;
         int externalPadIndex = -1;
+        int externalSampleRootMidi = 60;
         double externalSamplePosition = 0.0;
+        float externalSampleGain = 1.0f;
         std::shared_ptr<const ExternalSampleData> externalSample;
         std::array<float, maxUnisonOscillators> unisonPhases {};
         std::array<float, maxUnisonOscillators> unisonSyncPhases {};
@@ -433,6 +436,7 @@ private:
     juce::AudioFormatManager audioFormatManager;
     std::vector<ExternalPadDefinition> externalPads;
     std::array<std::shared_ptr<const ExternalSampleData>, vecPadCount> externalPadSamples {};
+    std::shared_ptr<const PianoSampleLibrary> pianoSampleLibrary;
     std::array<int, vecPadCount> loadedExternalPadIndices = []
     {
         std::array<int, vecPadCount> values {};
@@ -548,6 +552,23 @@ private:
         return buildFlavor() == InstrumentFlavor::drumMachine || buildFlavor() == InstrumentFlavor::drum808;
     }
 
+    [[nodiscard]] static constexpr bool isAcousticFlavor() noexcept
+    {
+        return buildFlavor() == InstrumentFlavor::piano
+               || buildFlavor() == InstrumentFlavor::guitar
+               || buildFlavor() == InstrumentFlavor::violin
+               || buildFlavor() == InstrumentFlavor::flute
+               || buildFlavor() == InstrumentFlavor::saxophone
+               || buildFlavor() == InstrumentFlavor::bassGuitar
+               || buildFlavor() == InstrumentFlavor::harp
+               || buildFlavor() == InstrumentFlavor::organ;
+    }
+
+    [[nodiscard]] static constexpr bool supportsOffFilterChoice() noexcept
+    {
+        return isDrumFlavor() || isAcousticFlavor();
+    }
+
     [[nodiscard]] static constexpr bool isMonophonicFlavor() noexcept
     {
         return buildFlavor() == InstrumentFlavor::bassSynth
@@ -645,8 +666,13 @@ private:
     [[nodiscard]] static juce::StringArray sampleBankChoices();
     [[nodiscard]] static juce::StringArray presetChoicesForFlavor();
     void initializeExternalPadLibrary();
+    void initializePianoSampleLibrary();
     void refreshExternalPadSamples();
+    void assignPianoSampleToVoice (VoiceState& voice, int midiNote, float velocity);
     void loadExternalPadSample (int padIndex);
+    [[nodiscard]] std::shared_ptr<const ExternalSampleData> loadExternalSampleData (const juce::File& sourceFile,
+                                                                                    const juce::String& displayName,
+                                                                                    const juce::String& presetName);
     [[nodiscard]] int externalPadIndexForMidi (int midiNote) const noexcept;
     [[nodiscard]] static juce::String externalPadSampleParameterIdForIndex (int padIndex);
     [[nodiscard]] static juce::String externalPadLevelParameterIdForIndex (int padIndex);
@@ -665,6 +691,7 @@ private:
     void setParameterActual (const char* paramId, float value);
     void parameterChanged (const juce::String& parameterID, float newValue) override;
     void handleAsyncUpdate() override;
+    float renderInstrumentMultisampleVoice (VoiceState& voice, float soundingMidiNote);
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AdvancedVSTiAudioProcessor)
 };

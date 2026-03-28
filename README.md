@@ -211,6 +211,16 @@ A JUCE-based instrument scaffold is available in `plugins/AdvancedVSTi` with cor
 - `AI Pad Synth`
 - `AI Pluck Synth`
 - `AI Sampler`
+- `AI Piano`
+- `AI Guitar`
+- `AI Violin`
+- `AI Flute`
+- `AI Saxophone`
+- `AI Bass Guitar`
+- `AI Harp`
+- `AI Organ`
+
+The acoustic suite keeps ADSR, filters, and onboard FX, but now leans on more instrument-specific playback: `AI Piano` uses a bundled multisample piano library, while the other acoustic instruments use generated sample banks plus flavor-specific articulation layers.
 
 See `plugins/AdvancedVSTi/README.md` for build steps. The GitHub Actions workflow (`.github/workflows/build-vsti.yml`) packages the built `.vst3` bundles into a downloadable ZIP. If those bundles are copied into the app's local `vsti/` folder, AI Music Studio now auto-discovers and adds them to the VST rack on startup.
 
