@@ -351,6 +351,7 @@ class NativeVstHostBridge:
         buffer_size: int | None = None,
         audio_device_type: str | None = None,
         audio_output_device_name: str | None = None,
+        shortcut_callback_port: int | None = None,
         prefer_in_process: bool | None = None,
     ) -> None:
         self.plugin_path = plugin_path
@@ -363,6 +364,7 @@ class NativeVstHostBridge:
         self.buffer_size = int(buffer_size) if buffer_size else 0
         self.audio_device_type = str(audio_device_type or "").strip()
         self.audio_output_device_name = str(audio_output_device_name or "").strip()
+        self.shortcut_callback_port = int(shortcut_callback_port) if shortcut_callback_port else 0
         self.prefer_in_process = None if prefer_in_process is None else bool(prefer_in_process)
         self._backend: _InProcessHostBackend | _SubprocessHostBackend | None = None
         self._command_lock = threading.RLock()
@@ -412,6 +414,11 @@ class NativeVstHostBridge:
             backend = subprocess_backend
             backend.start(startup_timeout=startup_timeout)
         self._backend = backend
+        if self.shortcut_callback_port > 0:
+            try:
+                backend.command("set_shortcut_callback", port=self.shortcut_callback_port)
+            except Exception:
+                pass
         self.process = getattr(backend, "process", None)
         self.in_process = isinstance(backend, _InProcessHostBackend)
 

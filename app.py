@@ -14,6 +14,7 @@ import os
 import queue
 import secrets
 import shutil
+import socket
 import struct
 import subprocess
 import sys
@@ -1863,13 +1864,22 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
     horizontalZoomChanged = QtCore.Signal(int)
     rulerDisplayModeChanged = QtCore.Signal(str)
 
-    def __init__(self, project: ProjectState, get_track_index_callable, set_playhead_callable=None, set_left_locator_callable=None, set_right_locator_callable=None) -> None:
+    def __init__(
+        self,
+        project: ProjectState,
+        get_track_index_callable,
+        set_playhead_callable=None,
+        set_left_locator_callable=None,
+        set_right_locator_callable=None,
+        toggle_playback_callable=None,
+    ) -> None:
         super().__init__()
         self.project = project
         self.get_track_index = get_track_index_callable
         self.set_playhead = set_playhead_callable or (lambda sec: setattr(self.project, 'playhead_sec', max(0.0, float(sec))))
         self.set_left_locator = set_left_locator_callable or (lambda sec: setattr(self.project, 'left_locator_sec', max(0.0, float(sec))))
         self.set_right_locator = set_right_locator_callable or (lambda sec: setattr(self.project, 'right_locator_sec', max(0.0, float(sec))))
+        self.toggle_playback = toggle_playback_callable or (lambda: None)
         self.scene_obj = QtWidgets.QGraphicsScene(self)
         self.scene_obj.setItemIndexMethod(QtWidgets.QGraphicsScene.ItemIndexMethod.NoIndex)
         self.setScene(self.scene_obj)
@@ -3146,6 +3156,10 @@ class PianoRollWidget(QtWidgets.QGraphicsView):
         self.noteChanged.emit()
 
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:
+        if event.key() == QtCore.Qt.Key.Key_Space and event.modifiers() == QtCore.Qt.KeyboardModifier.NoModifier:
+            self.toggle_playback()
+            event.accept()
+            return
         if event.matches(QtGui.QKeySequence.StandardKey.Copy):
             if self.copy_selected():
                 event.accept()
@@ -6456,7 +6470,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._virtual_piano_window_geometry_b64 = ''
         self._native_vsti_window_bounds: dict[str, list[int]] = {}
         self._virtual_piano_key_scale_percent = 50
+        self._main_window_shortcuts: list[QtGui.QShortcut] = []
         self._virtual_piano_shortcuts: list[QtGui.QShortcut] = []
+        self._shortcut_callback_queue: queue.SimpleQueue[tuple[str, float]] = queue.SimpleQueue()
+        self._shortcut_callback_stop_event = threading.Event()
+        self._shortcut_callback_thread: threading.Thread | None = None
+        self._shortcut_callback_server: socket.socket | None = None
+        self._shortcut_callback_port = 0
+        self._last_external_shortcut_command = ''
+        self._last_external_shortcut_command_at = 0.0
         self._shutdown_complete = False
         self._transport_cpu_last_wall: float | None = None
         self._transport_cpu_last_process: float | None = None
@@ -6672,10 +6694,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self._ai_compose_poll_timer = QtCore.QTimer(self)
         self._ai_compose_poll_timer.setInterval(40)
         self._ai_compose_poll_timer.timeout.connect(self._poll_ai_compose_results)
+        self._shortcut_callback_timer = QtCore.QTimer(self)
+        self._shortcut_callback_timer.setInterval(30)
+        self._shortcut_callback_timer.timeout.connect(self._drain_shortcut_callback_queue)
         self._pending_playback_start_retry_timer = QtCore.QTimer(self)
         self._pending_playback_start_retry_timer.setSingleShot(True)
         self._pending_playback_start_retry_timer.setInterval(40)
         self._pending_playback_start_retry_timer.timeout.connect(self._flush_pending_playback_start_retry)
+        self._start_shortcut_callback_server()
         if self._native_output_bridge_supported():
             self._begin_async_native_output_bridge_warm()
         self._deferred_playback_stop_cleanup: dict[str, object] | None = None
@@ -6715,7 +6741,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.last_added_track_type = 'instrument'
 
         self.timeline = TimelineWidget(self.project)
-        self.piano_roll = PianoRollWidget(self.project, self.current_track_index, self.set_playhead_position, self.set_left_locator_position, self.set_right_locator_position)
+        self.piano_roll = PianoRollWidget(
+            self.project,
+            self.current_track_index,
+            self.set_playhead_position,
+            self.set_left_locator_position,
+            self.set_right_locator_position,
+            self.toggle_playback,
+        )
         self.piano_roll.noteChanged.connect(self.on_piano_roll_notes_committed)
         self.piano_roll.notePreviewRequested.connect(self.preview_current_track_note)
         self.piano_roll.horizontalZoomChanged.connect(self.set_note_editor_zoom)
@@ -8479,6 +8512,7 @@ class MainWindow(QtWidgets.QMainWindow):
             buffer_size=max(64, int(self._native_vst_host_target_buffer_size())),
             audio_device_type=requested or None,
             audio_output_device_name=requested_output_name or None,
+            shortcut_callback_port=self._native_shortcut_callback_port(),
         )
         try:
             bridge.start(startup_timeout=8.0)
@@ -9458,6 +9492,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     buffer_size=target_buffer_size,
                     audio_device_type=target_audio_device_type or None,
                     audio_output_device_name=target_audio_output_device_name or None,
+                    shortcut_callback_port=self._native_shortcut_callback_port(),
                 )
                 bridge.requested_sample_rate = target_sample_rate
                 bridge.requested_buffer_size = target_buffer_size
@@ -9715,6 +9750,7 @@ class MainWindow(QtWidgets.QMainWindow):
             buffer_size=target_buffer_size,
             audio_device_type=target_audio_device_type or None,
             audio_output_device_name=target_audio_output_device_name or None,
+            shortcut_callback_port=self._native_shortcut_callback_port(),
         )
         bridge.requested_sample_rate = target_sample_rate
         bridge.requested_buffer_size = target_buffer_size
@@ -16514,6 +16550,7 @@ class MainWindow(QtWidgets.QMainWindow):
             buffer_size=max(64, int(self._native_vst_host_target_buffer_size())),
             audio_device_type=target_audio_device_type or None,
             audio_output_device_name=target_audio_output_device_name or None,
+            shortcut_callback_port=self._native_shortcut_callback_port(),
         )
         try:
             bridge.start(startup_timeout=8.0)
@@ -19365,6 +19402,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     buffer_size=desired_buffer_size,
                     audio_device_type=desired_audio_device_type or None,
                     audio_output_device_name=desired_audio_output_device_name or None,
+                    shortcut_callback_port=self._native_shortcut_callback_port(),
                 )
                 setattr(bridge, '_aims_rack_name', str(entry.name))
                 bridge.requested_audio_device_type = desired_audio_device_type
@@ -21982,28 +22020,185 @@ class MainWindow(QtWidgets.QMainWindow):
         self._reload_playback_mix_if_running()
 
     def _setup_shortcuts(self) -> None:
-        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+N"), self, self.new_project)
-        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+O"), self, self.load_project)
-        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+S"), self, self.save_project)
-        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Shift+S"), self, self.save_project_as)
-        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Shift+I"), self, self.import_midi)
-        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Shift+O"), self, self.import_sample)
-        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+E"), self, self.export_sequence_wav)
-        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Alt+E"), self, self.export_sample_timeline_audio)
-        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+R"), self, self.render_all_tracks)
-        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Q"), self, self.piano_roll.quantize_selected)
-        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+D"), self, self.piano_roll.duplicate_selected_by_grid)
-        QtGui.QShortcut(QtGui.QKeySequence.StandardKey.Copy, self, self.piano_roll.copy_selected)
-        QtGui.QShortcut(QtGui.QKeySequence.StandardKey.Paste, self, self.piano_roll.paste_copied)
-        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+G"), self, self.compose_with_ai)
-        QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Delete), self, self.piano_roll.delete_selected)
-        QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key.Key_Space), self, lambda: self.stop_playback() if self.playback_timer.isActive() else self.start_playback())
-        left_locator_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+1"), self)
-        left_locator_shortcut.setContext(QtCore.Qt.ShortcutContext.ApplicationShortcut)
-        left_locator_shortcut.activated.connect(self.set_left_locator_from_mouse)
-        right_locator_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+2"), self)
-        right_locator_shortcut.setContext(QtCore.Qt.ShortcutContext.ApplicationShortcut)
-        right_locator_shortcut.activated.connect(self.set_right_locator_from_mouse)
+        self._main_window_shortcuts.clear()
+        self._register_main_window_shortcut("Ctrl+N", self.new_project)
+        self._register_main_window_shortcut("Ctrl+O", self.load_project)
+        self._register_main_window_shortcut("Ctrl+S", self.save_project)
+        self._register_main_window_shortcut("Ctrl+Shift+S", self.save_project_as)
+        self._register_main_window_shortcut("Ctrl+Shift+I", self.import_midi)
+        self._register_main_window_shortcut("Ctrl+Shift+O", self.import_sample)
+        self._register_main_window_shortcut("Ctrl+E", self.export_sequence_wav)
+        self._register_main_window_shortcut("Ctrl+Alt+E", self.export_sample_timeline_audio)
+        self._register_main_window_shortcut("Ctrl+R", self.render_all_tracks)
+        self._register_main_window_shortcut("Ctrl+Q", self.piano_roll.quantize_selected)
+        self._register_main_window_shortcut("Ctrl+D", self.piano_roll.duplicate_selected_by_grid)
+        self._register_main_window_shortcut(QtGui.QKeySequence.StandardKey.Copy, self.piano_roll.copy_selected)
+        self._register_main_window_shortcut(QtGui.QKeySequence.StandardKey.Paste, self.piano_roll.paste_copied)
+        self._register_main_window_shortcut("Ctrl+G", self.compose_with_ai)
+        self._register_main_window_shortcut(QtCore.Qt.Key.Key_Delete, self.piano_roll.delete_selected)
+        self._register_main_window_shortcut(
+            QtCore.Qt.Key.Key_Space,
+            self._toggle_playback_shortcut,
+            context=QtCore.Qt.ShortcutContext.ApplicationShortcut,
+        )
+        self._register_main_window_shortcut(
+            "Ctrl+1",
+            self.set_left_locator_from_mouse,
+            context=QtCore.Qt.ShortcutContext.ApplicationShortcut,
+        )
+        self._register_main_window_shortcut(
+            "Ctrl+2",
+            self.set_right_locator_from_mouse,
+            context=QtCore.Qt.ShortcutContext.ApplicationShortcut,
+        )
+
+    def _register_main_window_shortcut(
+        self,
+        sequence,
+        handler,
+        *,
+        context: QtCore.Qt.ShortcutContext = QtCore.Qt.ShortcutContext.WindowShortcut,
+    ) -> QtGui.QShortcut:
+        key_sequence = sequence if isinstance(sequence, QtGui.QKeySequence) else QtGui.QKeySequence(sequence)
+        shortcut = QtGui.QShortcut(key_sequence, self)
+        shortcut.setContext(context)
+        shortcut.activated.connect(handler)
+        self._main_window_shortcuts.append(shortcut)
+        return shortcut
+
+    def _playback_shortcuts_enabled(self) -> bool:
+        if QtWidgets.QApplication.activePopupWidget() is not None:
+            return False
+        widget = QtWidgets.QApplication.focusWidget()
+        while isinstance(widget, QtWidgets.QWidget):
+            if isinstance(
+                widget,
+                (
+                    QtWidgets.QLineEdit,
+                    QtWidgets.QTextEdit,
+                    QtWidgets.QPlainTextEdit,
+                    QtWidgets.QAbstractSpinBox,
+                    QtWidgets.QComboBox,
+                ),
+            ):
+                return False
+            widget = widget.parentWidget()
+        return True
+
+    def toggle_playback(self) -> None:
+        if bool(getattr(self, '_playback_active', False)) or bool(hasattr(self, 'playback_timer') and self.playback_timer.isActive()):
+            self.stop_playback()
+        else:
+            self.start_playback()
+
+    def _toggle_playback_shortcut(self) -> None:
+        if not self._playback_shortcuts_enabled():
+            return
+        self.toggle_playback()
+
+    def _native_shortcut_callback_port(self) -> int:
+        return max(0, int(getattr(self, '_shortcut_callback_port', 0) or 0))
+
+    def _start_shortcut_callback_server(self) -> None:
+        if self._shortcut_callback_server is not None:
+            return
+        try:
+            server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind(("127.0.0.1", 0))
+            server.listen(4)
+            server.settimeout(0.25)
+        except Exception:
+            _APP_LOGGER.exception("Failed starting VST shortcut callback server")
+            return
+
+        self._shortcut_callback_server = server
+        self._shortcut_callback_port = int(server.getsockname()[1])
+        self._shortcut_callback_stop_event.clear()
+
+        def worker() -> None:
+            while not self._shortcut_callback_stop_event.is_set():
+                try:
+                    client, _address = server.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+
+                with client:
+                    try:
+                        client.settimeout(0.25)
+                    except Exception:
+                        pass
+                    chunks: list[bytes] = []
+                    while not self._shortcut_callback_stop_event.is_set():
+                        try:
+                            chunk = client.recv(4096)
+                        except socket.timeout:
+                            continue
+                        except OSError:
+                            break
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        if b"\n" in chunk:
+                            break
+                    if not chunks:
+                        continue
+
+                    raw_line = b"".join(chunks).split(b"\n", 1)[0].decode("utf-8", errors="replace").strip()
+                    if not raw_line:
+                        continue
+                    try:
+                        payload = json.loads(raw_line)
+                    except json.JSONDecodeError:
+                        continue
+                    command = str(payload.get("command", "") or "").strip()
+                    if command:
+                        self._shortcut_callback_queue.put((command, time.monotonic()))
+
+        self._shortcut_callback_thread = threading.Thread(
+            target=worker,
+            name='vst-shortcut-callback',
+            daemon=True,
+        )
+        self._shortcut_callback_thread.start()
+        self._shortcut_callback_timer.start()
+
+    def _stop_shortcut_callback_server(self) -> None:
+        if hasattr(self, '_shortcut_callback_timer'):
+            self._shortcut_callback_timer.stop()
+        self._shortcut_callback_stop_event.set()
+        server = self._shortcut_callback_server
+        self._shortcut_callback_server = None
+        if server is not None:
+            try:
+                server.close()
+            except Exception:
+                pass
+        thread = self._shortcut_callback_thread
+        self._shortcut_callback_thread = None
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=0.5)
+        self._shortcut_callback_port = 0
+
+    def _drain_shortcut_callback_queue(self) -> None:
+        for _ in range(12):
+            try:
+                command, queued_at = self._shortcut_callback_queue.get_nowait()
+            except queue.Empty:
+                return
+            del queued_at
+            now = time.monotonic()
+            if (
+                command == self._last_external_shortcut_command
+                and (now - self._last_external_shortcut_command_at) < 0.12
+            ):
+                continue
+            self._last_external_shortcut_command = command
+            self._last_external_shortcut_command_at = now
+            if command == 'toggle_playback':
+                self.toggle_playback()
 
     def _virtual_piano_key_specs(self) -> list[tuple[int, str, list[str]]]:
         return [
@@ -22167,6 +22362,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._ai_compose_poll_timer.stop()
         except Exception:
             pass
+        try:
+            self._stop_shortcut_callback_server()
+        except Exception:
+            _APP_LOGGER.exception("Failed to stop VST shortcut callback server during shutdown")
         try:
             self._stop_realtime_audio_sink()
         except Exception:

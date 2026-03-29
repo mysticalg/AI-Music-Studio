@@ -13,6 +13,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -113,12 +114,14 @@ class PluginEditorWindow final : public juce::DocumentWindow,
 public:
     PluginEditorWindow(juce::AudioProcessor& processor,
                        const juce::String& key,
-                       juce::PropertiesFile& settings)
+                       juce::PropertiesFile& settings,
+                       std::function<void(const juce::String&)> shortcutCallback = {})
         : juce::DocumentWindow("VST3 Editor",
                                juce::Colours::black,
                                juce::DocumentWindow::allButtons),
           editorKey(key),
-          appSettings(settings)
+          appSettings(settings),
+          onShortcutCommand(std::move(shortcutCallback))
     {
         setUsingNativeTitleBar(true);
         setResizable(true, true);
@@ -173,6 +176,18 @@ public:
     }
 
 private:
+    bool keyPressed(const juce::KeyPress& key) override
+    {
+        if (key.getKeyCode() == juce::KeyPress::spaceKey
+            && ! key.getModifiers().isAnyModifierKeyDown())
+        {
+            dispatchShortcutCommand("toggle_playback");
+            return true;
+        }
+
+        return juce::DocumentWindow::keyPressed(key);
+    }
+
     void closeButtonPressed() override
     {
         saveBounds();
@@ -207,6 +222,19 @@ private:
         stopTimer();
     }
 
+    void dispatchShortcutCommand(const juce::String& command)
+    {
+        if (command.isEmpty() || onShortcutCommand == nullptr)
+            return;
+
+        const auto nowMs = juce::Time::getMillisecondCounterHiRes();
+        if ((nowMs - lastShortcutDispatchMs) < 120.0)
+            return;
+
+        lastShortcutDispatchMs = nowMs;
+        onShortcutCommand(command);
+    }
+
     void restoreBounds()
     {
         const auto saved = appSettings.getValue(editorKey + "_bounds");
@@ -234,6 +262,8 @@ private:
 
     juce::String editorKey;
     juce::PropertiesFile& appSettings;
+    std::function<void(const juce::String&)> onShortcutCommand;
+    double lastShortcutDispatchMs = 0.0;
     int topmostWarmupPassesRemaining = 0;
 };
 
@@ -449,6 +479,7 @@ public:
                 || command == "status" || command == "ping"
                 || command == "note_on" || command == "note_off"
                 || command == "all_notes_off" || command == "panic"
+                || command == "set_shortcut_callback"
                 || command == "start_graph_transport"
                 || command == "stop_graph_transport"
                 || command == "set_graph_slot_mix"
@@ -930,6 +961,19 @@ private:
             closeEditorWindow();
             auto response = makeResponse(true, "Editor closed");
             appendStatusFields(response, true);
+            return response;
+        }
+
+        if (command == "set_shortcut_callback")
+        {
+            const auto callbackPort = juce::jlimit(
+                0,
+                65535,
+                static_cast<int>(object->hasProperty("port") ? object->getProperty("port") : juce::var(0)));
+            shortcutCallbackPort.store(callbackPort);
+            auto response = makeResponse(true, callbackPort > 0 ? "Shortcut callback updated" : "Shortcut callback cleared");
+            appendStatusFields(response, true);
+            setResponseField(response, "shortcut_callback_port", callbackPort);
             return response;
         }
 
@@ -6123,7 +6167,14 @@ private:
 
         key = normaliseVst3PathForSettings(key);
 
-        editorWindow = std::make_unique<PluginEditorWindow>(*pluginInstance, "editor_" + key, appSettings);
+        editorWindow = std::make_unique<PluginEditorWindow>(
+            *pluginInstance,
+            "editor_" + key,
+            appSettings,
+            [this](const juce::String& command)
+            {
+                dispatchShortcutCallback(command);
+            });
         editorWindow->onWindowClosed = [this]
         {
             editorWindow.reset();
@@ -6169,7 +6220,14 @@ private:
         if (key.isEmpty())
             key = "graph_slot_" + juce::String(slotIndex + 1);
 
-        graphEditorWindow = std::make_unique<PluginEditorWindow>(*slot.plugin, "graph_editor_" + key + "_" + juce::String(slotIndex + 1), appSettings);
+        graphEditorWindow = std::make_unique<PluginEditorWindow>(
+            *slot.plugin,
+            "graph_editor_" + key + "_" + juce::String(slotIndex + 1),
+            appSettings,
+            [this](const juce::String& command)
+            {
+                dispatchShortcutCallback(command);
+            });
         graphEditorSlotIndex = slotIndex;
         graphEditorWindow->onWindowClosed = [this]
         {
@@ -6209,6 +6267,22 @@ private:
         graphEditorSlotIndex = -1;
     }
 
+    void dispatchShortcutCallback(const juce::String& command) const
+    {
+        const auto port = juce::jlimit(0, 65535, shortcutCallbackPort.load());
+        if (port <= 0 || command.isEmpty())
+            return;
+
+        const auto payload = "{\"command\":" + juce::JSON::toString(juce::var(command), false) + "}\n";
+        std::thread([port, payload]
+        {
+            juce::StreamingSocket socket;
+            if (!socket.connect("127.0.0.1", port, 75))
+                return;
+            socket.write(payload.toRawUTF8(), static_cast<int>(payload.getNumBytesAsUTF8()));
+        }).detach();
+    }
+
     juce::OwnedArray<juce::PluginDescription> describePlugin(const juce::File& pluginFile)
     {
         juce::OwnedArray<juce::PluginDescription> results;
@@ -6244,6 +6318,7 @@ private:
     std::atomic<float> pluginOutputGain { 1.0f };
     std::atomic<float> pluginOutputPan { 0.0f };
     std::atomic<bool> graphTransportEnabled { false };
+    std::atomic<int> shortcutCallbackPort { 0 };
     std::atomic<int> audioEngineTrackCount { 0 };
     std::atomic<int64_t> renderedSampleFrames { 0 };
     std::atomic<int64_t> scheduledMidiSequence { 0 };
