@@ -47,10 +47,32 @@ jobs:
           Set-Content -Path $checksumPath -Value "$($hash.Hash.ToLower())  $(Split-Path $env:ARCHIVE_PATH -Leaf)" -Encoding ASCII
           "CHECKSUM_PATH=$checksumPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Install Inno Setup
+      - name: Ensure Inno Setup
         shell: pwsh
         run: |
-          winget install --id JRSoftware.InnoSetup -e --accept-package-agreements --accept-source-agreements
+          $candidates = @(
+            "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+            "C:\Program Files\Inno Setup 6\ISCC.exe",
+            (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe")
+          ) | Where-Object { $_ }
+
+          $isccPath = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($isccPath) {
+            Write-Host "Found Inno Setup at $isccPath"
+            exit 0
+          }
+
+          winget install --id JRSoftware.InnoSetup -e --accept-package-agreements --accept-source-agreements --silent
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "winget returned exit code $LASTEXITCODE. Re-checking install paths before failing."
+          }
+
+          $isccPath = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $isccPath) {
+            throw "Inno Setup compiler not found after installation attempt."
+          }
+
+          Write-Host "Installed Inno Setup at $isccPath"
 
       - name: Build Windows installer
         shell: pwsh
