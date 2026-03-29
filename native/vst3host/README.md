@@ -1,6 +1,6 @@
-# AI Music Studio VST Host
+# Mutagen VST Host
 
-This is the native JUCE host that powers AI Music Studio's VST playback and editor path.
+This is the native JUCE host and shared live engine layer that powers Mutagen's playback and editor path.
 
 Current scope:
 
@@ -11,7 +11,8 @@ Current scope:
 - Lets you choose the JUCE backend and output device in the host window
 - Provides a built-in MIDI keyboard for live testing
 - Remembers the last plugin path, host window bounds, and editor window bounds
-- Exposes an optional localhost JSON command bridge for load/editor/MIDI control
+- Direct in-process C exports for the Mutagen app runtime
+- Optional legacy JSON command surface retained only for low-level diagnostics
 
 Build:
 
@@ -45,14 +46,10 @@ Run with the native editor opened immediately:
 .\build\native-vst3host\AIMusicStudioVSTHost_artefacts\Release\AI Music Studio VST Host.exe --plugin "C:\Users\drhoo\AppData\Local\Programs\Common\VST3\Dexed.vst3" --open-editor
 ```
 
-Run with the localhost command bridge enabled:
+Run with a plugin preloaded and the editor opened immediately:
 
 ```powershell
-.\build\native-vst3host\AIMusicStudioVSTHost_artefacts\Release\AI Music Studio VST Host.exe --plugin "C:\Users\drhoo\AppData\Local\Programs\Common\VST3\Dexed.vst3" --port 47653
-py .\scripts\native_vst_host_client.py --port 47653 --command status
-py .\scripts\native_vst_host_client.py --port 47653 --command open_editor
-py .\scripts\native_vst_host_client.py --port 47653 --command note_on --note 60 --velocity 0.8
-py .\scripts\native_vst_host_client.py --port 47653 --command note_off --note 60
+.\build\native-vst3host\AIMusicStudioVSTHost_artefacts\Release\AI Music Studio VST Host.exe --plugin "C:\Users\drhoo\AppData\Local\Programs\Common\VST3\Dexed.vst3" --open-editor
 ```
 
 You can also request a backend on startup:
@@ -61,25 +58,11 @@ You can also request a backend on startup:
 .\build\native-vst3host\AIMusicStudioVSTHost_artefacts\Release\AI Music Studio VST Host.exe --audio-device-type "Windows Audio (Exclusive Mode)"
 ```
 
-Or use the Python bridge helper directly:
-
-```python
-from scripts.native_vst_host_bridge import NativeVstHostBridge
-
-bridge = NativeVstHostBridge(plugin_path=r"C:\Users\drhoo\AppData\Local\Programs\Common\VST3\Dexed.vst3")
-bridge.start()
-bridge.command("open_editor")
-bridge.command("note_on", note=60, velocity=0.8)
-bridge.command("note_off", note=60)
-bridge.stop()
-```
-
 Smoke test multiple installed synths:
 
 ```powershell
 .\scripts\smoke_test_native_vst_host.ps1
 .\scripts\smoke_test_native_vst_host.ps1 -OpenEditor
-.\scripts\smoke_test_native_vst_bridge.ps1
 ```
 
 Output target:
@@ -94,10 +77,4 @@ Smoke-tested locally against:
 - `TAL-NoiseMaker.vst3`
 - `Helm`
 
-Planned follow-up work:
-
-- multi-plugin graph/rack
-- per-track state and IPC bridge back to `app.py`
-- real MIDI input devices
-- plugin scan/cache database
-- better audio device setup UI
+Mutagen uses the host through direct in-process exports. The Python bridge helpers and Python shell are no longer part of the supported repo workflow.

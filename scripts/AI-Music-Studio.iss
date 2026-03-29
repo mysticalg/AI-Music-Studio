@@ -1,4 +1,4 @@
-#define MyAppName "AI Music Studio"
+#define MyAppName "Mutagen"
 #ifndef MyAppVersion
   #define MyAppVersion "dev"
 #endif
@@ -9,7 +9,7 @@
   #define MyAppURL "https://mysticalg.github.io/AI-Music-Studio/"
 #endif
 #ifndef MyAppExeName
-  #define MyAppExeName "AI Music Studio.exe"
+  #define MyAppExeName "Mutagen.exe"
 #endif
 #ifndef SourceRoot
   #error SourceRoot must be defined on the command line.
@@ -37,7 +37,7 @@ SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=admin
 OutputDir={#OutputRoot}
-OutputBaseFilename=AI-Music-Studio-{#MyAppVersion}-setup
+OutputBaseFilename=Mutagen-{#MyAppVersion}-setup
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"

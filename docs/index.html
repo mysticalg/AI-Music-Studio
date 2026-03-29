@@ -3,10 +3,10 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>AI Music Studio</title>
+    <title>Mutagen</title>
     <meta
       name="description"
-      content="AI Music Studio is a desktop MIDI editor with piano-roll editing, bundled VST3 instruments, live rack assignment, a unified audio settings window, and AI-assisted composition."
+      content="Mutagen is a native C++ desktop music workstation with a sequencer, piano roll, shared live VST3 engine, bundled instruments, automation, samples, and AI-assisted composition."
     />
     <link rel="stylesheet" href="styles.css" />
   </head>
@@ -14,21 +14,28 @@
     <div class="page-shell">
       <header class="hero">
         <div class="hero-copy">
-          <p class="eyebrow">Desktop MIDI + VST3 workstation</p>
-          <h1>AI Music Studio</h1>
+          <div class="hero-brand">
+            <img class="hero-logo" src="assets/mutagen-logo.png" alt="Mutagen logo" />
+            <div class="hero-brand-copy">
+              <p class="eyebrow">Native JUCE workstation</p>
+              <h1>Mutagen</h1>
+            </div>
+          </div>
           <p class="lede">
-            Build songs with a fast piano roll, bundled synths, per-track VST3 instruments, realtime playback,
-            and AI-assisted composition in one desktop app.
+            A native C++ desktop music workstation with a pattern sequencer, dedicated piano roll,
+            shared live VST3 playback and editor instances, bundled instruments, samples, automation,
+            AI composition, and release-ready Windows packaging.
           </p>
           <div class="hero-actions">
             <a class="button button-primary" href="https://github.com/mysticalg/AI-Music-Studio/releases">Download latest release</a>
             <a class="button button-secondary" href="https://github.com/mysticalg/AI-Music-Studio">View source on GitHub</a>
+            <a class="button button-secondary" href="https://github.com/mysticalg/AI-Music-Studio/blob/main/GUIDE.md">Open workflow guide</a>
             <a class="button button-secondary" href="virus-synth.html">Open Virus Synth manual</a>
           </div>
           <ul class="hero-points">
-            <li>Portable Windows release with bundled VST3 instruments</li>
-            <li>Piano roll note editing, locators, mixer, samples, track colors, and floating panels</li>
-            <li>Bundled VST editors plus one unified audio settings window for output and playback tuning</li>
+            <li>Native app path only. The old Python shell is no longer the supported workflow.</li>
+            <li>Sequencer, piano roll, controller lane, mixer, automation, samples, themes, and floating windows.</li>
+            <li>Shared live engine so VST editor moves affect playback immediately.</li>
           </ul>
         </div>
         <div class="hero-card">
@@ -36,8 +43,8 @@
           <ol>
             <li>Push changes to <code>main</code></li>
             <li>Create and push a <code>v*</code> tag</li>
-            <li>GitHub Actions builds the Windows package and publishes the release</li>
-            <li>GitHub Pages updates the site from <code>/docs</code></li>
+            <li>GitHub Actions builds the native Windows ZIP and installer</li>
+            <li>GitHub Pages republishes from <code>/docs</code></li>
           </ol>
         </div>
       </header>
@@ -46,24 +53,24 @@
         <section class="section">
           <div class="section-heading">
             <p class="eyebrow">Screenshots</p>
-            <h2>What the app looks like</h2>
+            <h2>What Mutagen looks like</h2>
           </div>
           <div class="shot-grid">
             <figure class="shot shot-wide">
-              <img src="assets/screenshots/main-window.png" alt="AI Music Studio main editor window" />
-              <figcaption>Main editor with a bundled VST loaded on the selected track, loop locators, piano roll, and velocity lane.</figcaption>
+              <img src="assets/screenshots/main-window.png" alt="Mutagen main editor window" />
+              <figcaption>Main editor with tracks, sequencer, live transport, and native instrument workflow.</figcaption>
             </figure>
             <figure class="shot">
-              <img src="assets/screenshots/instrument-panel.png" alt="Panels window showing the Instruments and FX tab with a loaded rack VST" />
-              <figcaption>Instruments and FX panel with the track switched to VSTI Rack and a bundled synth selected from the rack.</figcaption>
+              <img src="assets/screenshots/instrument-panel.png" alt="Track workspace and instrument lanes in Mutagen" />
+              <figcaption>Track workspace with mute, solo, VST visibility, per-track volume strips, and the current rack-driven instrument list.</figcaption>
             </figure>
             <figure class="shot">
-              <img src="assets/screenshots/vst-editor.png" alt="Bundled AI Bass Synth editor window inside AI Music Studio" />
-              <figcaption>Bundled VST editor window for AI Bass Synth with preset, oscillator, filter, and envelope controls ready for live tweaking.</figcaption>
+              <img src="assets/screenshots/vst-editor.png" alt="AI TB303 editor window in Mutagen" />
+              <figcaption>Bundled AI TB303 editor window on the live playback path, with parameter changes applied directly to the running engine.</figcaption>
             </figure>
             <figure class="shot">
-              <img src="assets/screenshots/audio-settings.png" alt="Audio settings window for playback output and native host configuration" />
-              <figcaption>Unified audio settings window for output device, sample format, playback buffer, refresh timing, and native VST host startup options.</figcaption>
+              <img src="assets/screenshots/audio-settings.png" alt="Native audio settings window" />
+              <figcaption>Native audio settings for backend, output device, sample rate, and buffer size.</figcaption>
             </figure>
           </div>
         </section>
@@ -71,32 +78,32 @@
         <section class="section">
           <div class="section-heading">
             <p class="eyebrow">Guide</p>
-            <h2>How to use AI Music Studio</h2>
+            <h2>Core workflow</h2>
           </div>
           <div class="guide-grid">
             <article class="guide-card">
-              <h3>1. Create a track</h3>
-              <p>Use <strong>+ Track</strong> to add an instrument or sample track. Right-click a track to assign a bundled or third-party rack instrument.</p>
+              <h3>1. Add or select a track</h3>
+              <p>Create an instrument or sample track, then assign a bundled or third-party VST3 when needed.</p>
             </article>
             <article class="guide-card">
-              <h3>2. Draw in the piano roll</h3>
-              <p>Choose the pencil tool, draw notes, and click existing notes to select, move, or resize them. Mouse wheel zoom works across editor views.</p>
+              <h3>2. Draw pattern clips</h3>
+              <p>Use the sequencer to draw pattern blocks at the current pattern size. Double-click a block to edit it in the piano roll.</p>
             </article>
             <article class="guide-card">
-              <h3>3. Pick a sound</h3>
-              <p>Set <strong>Instrument type</strong> to <strong>VSTI Rack</strong>, choose a supported VST3, then open the bundled editor or wrapper to shape the patch live.</p>
+              <h3>3. Edit notes and controllers</h3>
+              <p>Use the piano roll for notes, and the always-visible lower pane for velocity, MIDI CC, or automation-style controller drawing.</p>
             </article>
             <article class="guide-card">
-              <h3>4. Loop and play</h3>
-              <p>Use the left and right locators to define the loop range, then hit <strong>Play</strong>. Synth playback stays realtime instead of going through temp WAV files.</p>
+              <h3>4. Open the live VST</h3>
+              <p>Use <strong>Edit VST</strong> or the track <strong>V</strong> toggle to open the live editor. Parameter moves apply straight to the running engine.</p>
             </article>
             <article class="guide-card">
-              <h3>5. Shape the mix</h3>
-              <p>Open the Mixer tab to adjust volume, pan, mute, solo, and insert VST FX. Track colors carry across the arranger and editors.</p>
+              <h3>5. Mix and arrange</h3>
+              <p>Use the mixer, locator handles, pattern tools, and floating windows to build the arrangement and balance the session.</p>
             </article>
             <article class="guide-card">
-              <h3>6. Render or export</h3>
-              <p>Export MIDI, render audio stems, or package the app using the release process below.</p>
+              <h3>6. Export and inspect logs</h3>
+              <p>Export stems or track renders, and use the activity log plus AI HTTP debug log when diagnosing model responses.</p>
             </article>
           </div>
         </section>
@@ -104,26 +111,26 @@
         <section class="section">
           <div class="section-heading">
             <p class="eyebrow">Flagship Instrument</p>
-            <h2>Virus Synth user manual</h2>
+            <h2>Virus Synth manual</h2>
           </div>
           <div class="feature-split">
             <figure class="shot">
-              <img src="assets/screenshots/virus/virus-synth-overview.png" alt="Virus Synth editor overview with Access-style panel and LCD display" />
-              <figcaption>Virus Synth ships with a TI-style panel, LCD / OSD workflow, background toggle, preview keyboard toggle, and step-through preset browsing.</figcaption>
+              <img src="assets/screenshots/virus/virus-synth-overview.png" alt="Virus Synth editor overview" />
+              <figcaption>Virus Synth ships with a TI-style panel, LCD workflow, preview keyboard, and hardware-inspired modulation pages.</figcaption>
             </figure>
             <div class="feature-copy">
               <p>
-                The bundled Virus Synth is the most detailed instrument in the rack right now. It includes shared oscillator controls,
-                LFO and matrix pages, dual-filter editing, upper and lower FX pages, a shift layer, and a playable preview keyboard.
+                Virus Synth is the most detailed bundled instrument in the rack. It includes shared oscillator controls,
+                modulation and matrix pages, dual filters, FX pages, a shift layer, and preset browsing through the LCD/OSD workflow.
               </p>
               <ul class="feature-list">
-                <li>Preset LCD with bank, slot, and category-style fields</li>
-                <li>Shared oscillator editing with selectable OSC 1 / 2 / 3 focus</li>
-                <li>LFO, filter, matrix, FX, and arp editing through the OSD value knobs</li>
-                <li>Background-image and preview-keyboard toggles inside the editor</li>
+                <li>LCD-based preset browsing and page navigation</li>
+                <li>Shared oscillator editing with per-oscillator focus</li>
+                <li>Filter, FX, LFO, and matrix pages through the value controls</li>
+                <li>Preview keyboard and background toggle inside the editor</li>
               </ul>
               <div class="hero-actions">
-                <a class="button button-primary" href="virus-synth.html">Read the full step-by-step manual</a>
+                <a class="button button-primary" href="virus-synth.html">Read the full manual</a>
               </div>
             </div>
           </div>
@@ -138,13 +145,13 @@
             <div class="release-card">
               <h3>Local Windows package</h3>
               <pre><code>powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_release.ps1 -ReleaseVersion v0.1.0</code></pre>
-              <p>The script installs build dependencies, packages the desktop app with PyInstaller, and creates a portable ZIP containing <code>AI Music Studio.exe</code>.</p>
+              <p>The packaging script builds the native app, copies the bundled VST3 instruments, and creates a portable ZIP containing <code>Mutagen.exe</code>.</p>
             </div>
             <div class="release-card">
               <h3>GitHub release automation</h3>
               <pre><code>git tag v0.1.0
 git push origin main --tags</code></pre>
-              <p>Pushing a <code>v*</code> tag triggers the release workflow, which rebuilds the bundled VST3 instruments, packages the Windows app, and publishes the ZIP plus SHA256 checksum to GitHub Releases.</p>
+              <p>Pushing a <code>v*</code> tag triggers the native Windows release workflow and publishes the ZIP, installer, and SHA256 checksums to GitHub Releases.</p>
             </div>
           </div>
         </section>
@@ -152,24 +159,24 @@ git push origin main --tags</code></pre>
         <section class="section">
           <div class="section-heading">
             <p class="eyebrow">Notes</p>
-            <h2>Compatibility</h2>
+            <h2>Current packaging and compatibility</h2>
           </div>
           <div class="note-grid">
             <div class="note-card">
-              <h3>Supported plugins</h3>
-              <p>The shipping host path targets <strong>VST3</strong>. Unsupported plugins are filtered out of the rack UI so the playable list stays clean.</p>
+              <h3>Plugin support</h3>
+              <p>Mutagen targets <strong>VST3</strong> plugin hosting for the current native workflow.</p>
             </div>
             <div class="note-card">
-              <h3>Audio control</h3>
-              <p>The new <strong>Audio Settings</strong> window keeps output selection, buffer length, sample format, and native VST host startup settings together in one place.</p>
+              <h3>Release target</h3>
+              <p>The automated release pipeline currently ships the native Windows build and installer.</p>
             </div>
             <div class="note-card">
               <h3>Bundled instruments</h3>
-              <p>The portable build includes bundled <strong>AI Bass Synth</strong>, <strong>AI Drum Machine</strong>, and <strong>AI String Synth</strong> VST3 instruments with themed in-app editors.</p>
+              <p>The portable package includes the bundled VST3 instrument set from the <code>plugins/AdvancedVSTi</code> submodule.</p>
             </div>
             <div class="note-card">
               <h3>More docs</h3>
-              <p>For setup details, packaging notes, and development guidance, check the <a href="https://github.com/mysticalg/AI-Music-Studio/blob/main/README.md">README</a>.</p>
+              <p>For build steps, packaging notes, and workflow details, read the <a href="https://github.com/mysticalg/AI-Music-Studio/blob/main/README.md">README</a> and <a href="https://github.com/mysticalg/AI-Music-Studio/blob/main/GUIDE.md">guide</a>.</p>
             </div>
           </div>
         </section>

@@ -53,6 +53,32 @@ pre {
   box-shadow: var(--shadow);
 }
 
+.hero-brand {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  margin-bottom: 18px;
+}
+
+.hero-logo {
+  width: clamp(96px, 14vw, 144px);
+  height: auto;
+  display: block;
+  filter: drop-shadow(0 16px 30px rgba(0, 0, 0, 0.28));
+}
+
+.hero-brand-copy {
+  min-width: 0;
+}
+
+.hero-brand-copy .eyebrow {
+  margin-bottom: 8px;
+}
+
+.hero-brand-copy h1 {
+  margin-bottom: 0;
+}
+
 .eyebrow {
   margin: 0 0 10px;
   font-size: 0.78rem;
@@ -281,5 +307,9 @@ a {
 
   .hero {
     padding: 20px;
+  }
+
+  .hero-brand {
+    align-items: flex-start;
   }
 }

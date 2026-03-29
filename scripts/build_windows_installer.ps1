@@ -14,7 +14,7 @@ if (-not $RepoRoot) {
 }
 
 if (-not $SourceDir) {
-    $SourceDir = Join-Path $RepoRoot "dist\\AI Music Studio"
+    $SourceDir = Join-Path $RepoRoot "dist\\Mutagen"
 }
 $SourceDir = (Resolve-Path $SourceDir).Path
 
@@ -49,7 +49,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "Inno Setup build failed."
 }
 
-$installerPath = Join-Path $OutputDir ("AI-Music-Studio-{0}-setup.exe" -f $ReleaseVersion)
+$installerPath = Join-Path $OutputDir ("Mutagen-{0}-setup.exe" -f $ReleaseVersion)
 if (-not (Test-Path $installerPath)) {
     throw "Expected installer not found: $installerPath"
 }

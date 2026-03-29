@@ -13,7 +13,7 @@ from pywinauto.keyboard import send_keys
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_EXE = ROOT / "build" / "native-app" / "AIMusicStudioNative_artefacts" / "Release" / "AI Music Studio Native.exe"
+DEFAULT_EXE = ROOT / "build" / "native-app" / "AIMusicStudioNative_artefacts" / "Release" / "Mutagen.exe"
 PROFILE_DIR = ROOT / "dist" / "native-profile"
 
 RACK_NAMES = [
@@ -159,7 +159,7 @@ def wait_for_window(process: subprocess.Popen[str], timeout: float = 30.0):
         for backend in ("win32", "uia"):
             try:
                 app = Application(backend=backend).connect(process=process.pid)
-                window = app.window(title_re="AI Music Studio Native.*")
+                window = app.window(title_re="Mutagen.*")
                 window.wait("visible ready", timeout=1.5)
                 return window
             except Exception as exc:  # noqa: PERF203
@@ -230,7 +230,7 @@ def parse_profile_log(log_path: Path) -> list[str]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Run a native AI Music Studio stress profile.")
+    parser = argparse.ArgumentParser(description="Run a native Mutagen stress profile.")
     parser.add_argument("--exe", type=Path, default=DEFAULT_EXE)
     parser.add_argument("--tracks", type=int, default=20)
     parser.add_argument("--bars", type=int, default=8)

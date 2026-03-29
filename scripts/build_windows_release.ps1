@@ -1,8 +1,8 @@
 param(
     [string]$RepoRoot = "",
-    [string]$PythonExecutable = "",
-    [string]$PythonVersion = "3.13",
     [string]$ReleaseVersion = "dev",
+    [string]$Configuration = "Release",
+    [string]$OutputDir = "",
     [switch]$SkipBundledVstBuild
 )
 
@@ -14,43 +14,30 @@ if (-not $RepoRoot) {
     $RepoRoot = (Resolve-Path $RepoRoot).Path
 }
 
-if (-not $PythonExecutable) {
-    $venvRoot = Join-Path $RepoRoot ".venv-release"
-    $venvPython = Join-Path $venvRoot "Scripts\\python.exe"
-    if (-not (Test-Path $venvPython)) {
-        py -$PythonVersion -m venv $venvRoot
-        if ($LASTEXITCODE -ne 0) {
-            throw "Failed to create the release virtual environment with Python $PythonVersion."
-        }
-    }
-    $PythonExecutable = $venvPython
+if (-not $OutputDir) {
+    $OutputDir = Join-Path $RepoRoot "dist"
 }
-
-& $PythonExecutable -m pip install --upgrade pip
-if ($LASTEXITCODE -ne 0) {
-    throw "Failed to upgrade pip in the release environment."
-}
-
-& $PythonExecutable -m pip install -r (Join-Path $RepoRoot "requirements.txt") "pyinstaller>=6.11"
-if ($LASTEXITCODE -ne 0) {
-    throw "Failed to install packaging dependencies."
-}
+New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+$OutputDir = (Resolve-Path $OutputDir).Path
 
 $bundledVstDir = Join-Path $RepoRoot "vsti"
-if (-not $SkipBundledVstBuild -and -not (Test-Path $bundledVstDir)) {
-    & (Join-Path $RepoRoot "scripts\\build_bundled_vsti_windows.ps1") -RepoRoot $RepoRoot -OutputDir $bundledVstDir
+if (-not $SkipBundledVstBuild) {
+    & (Join-Path $RepoRoot "scripts\\build_bundled_vsti_windows.ps1") -RepoRoot $RepoRoot -OutputDir $bundledVstDir | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Bundled VST build failed."
+    }
 }
 
-$pyiRoot = Join-Path $RepoRoot "build\\pyinstaller"
-$pyiBuild = Join-Path $pyiRoot "build"
-$pyiDist = Join-Path $pyiRoot "dist"
-$releaseRoot = Join-Path $RepoRoot "dist"
-$portableRoot = Join-Path $releaseRoot "AI Music Studio"
+$releaseRoot = $OutputDir
+$portableRoot = Join-Path $releaseRoot "Mutagen"
 $releaseLabel = ($ReleaseVersion -replace '[^A-Za-z0-9._-]', '-')
-$archivePath = Join-Path $releaseRoot "AI-Music-Studio-$releaseLabel-windows-x64.zip"
+$archivePath = Join-Path $releaseRoot "Mutagen-$releaseLabel-windows-x64.zip"
 $versionPath = Join-Path $portableRoot "VERSION.txt"
+$guidePath = Join-Path $portableRoot "GUIDE.md"
+$readmePath = Join-Path $portableRoot "README.md"
+$builtExe = Join-Path $RepoRoot ("build\\native-app\\AIMusicStudioNative_artefacts\\{0}\\Mutagen.exe" -f $Configuration)
 
-foreach ($path in @($pyiBuild, $pyiDist, $portableRoot, $archivePath)) {
+foreach ($path in @($portableRoot, $archivePath)) {
     if (Test-Path $path) {
         Remove-Item $path -Recurse -Force
     }
@@ -58,28 +45,26 @@ foreach ($path in @($pyiBuild, $pyiDist, $portableRoot, $archivePath)) {
 
 New-Item -ItemType Directory -Path $releaseRoot -Force | Out-Null
 
-& $PythonExecutable -m PyInstaller `
-    --noconfirm `
-    --clean `
-    --distpath $pyiDist `
-    --workpath $pyiBuild `
-    (Join-Path $RepoRoot "AI-Music-Studio.spec")
+& (Join-Path $RepoRoot "scripts\\build_native_app.ps1") -Configuration $Configuration
 if ($LASTEXITCODE -ne 0) {
-    throw "PyInstaller packaging failed."
+    throw "Native app build failed."
 }
 
-$builtAppRoot = Join-Path $pyiDist "AI Music Studio"
-if (-not (Test-Path $builtAppRoot)) {
-    throw "Expected PyInstaller output folder not found: $builtAppRoot"
+if (-not (Test-Path $builtExe)) {
+    throw "Expected native build output not found: $builtExe"
 }
 
-Copy-Item $builtAppRoot -Destination $portableRoot -Recurse -Force
+New-Item -ItemType Directory -Path $portableRoot -Force | Out-Null
+Copy-Item $builtExe -Destination (Join-Path $portableRoot "Mutagen.exe") -Force
 
 if (Test-Path $bundledVstDir) {
     Copy-Item $bundledVstDir -Destination (Join-Path $portableRoot "vsti") -Recurse -Force
 }
 
-Copy-Item (Join-Path $RepoRoot "README.md") -Destination (Join-Path $portableRoot "README.md") -Force
+Copy-Item (Join-Path $RepoRoot "README.md") -Destination $readmePath -Force
+if (Test-Path (Join-Path $RepoRoot "GUIDE.md")) {
+    Copy-Item (Join-Path $RepoRoot "GUIDE.md") -Destination $guidePath -Force
+}
 Set-Content -Path $versionPath -Value $ReleaseVersion -Encoding ASCII
 
 Compress-Archive -Path (Join-Path $portableRoot "*") -DestinationPath $archivePath

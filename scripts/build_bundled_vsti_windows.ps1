@@ -23,7 +23,7 @@ if (-not $OutputDir) {
     $OutputDir = Join-Path $RepoRoot "vsti"
 }
 
-$distOutputDir = Join-Path $RepoRoot "dist\\AI Music Studio\\vsti"
+$distOutputDir = Join-Path $RepoRoot "dist\\Mutagen\\vsti"
 
 if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
     throw "cmake is required to build the bundled VST3 instruments."

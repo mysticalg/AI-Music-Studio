@@ -11,6 +11,11 @@ dist/
 .venv-release/
 .cache/
 _site/
+tmp/
+editor_*.png
+tmp_*.png
+glyphs.png
+tumblr_*.png
 plugins/AdvancedVSTi/build*/
 plugins/AdvancedVSTi/dist/
 vsti/
