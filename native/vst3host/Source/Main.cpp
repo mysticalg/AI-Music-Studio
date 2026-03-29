@@ -7,13 +7,17 @@
 #include <windows.h>
 #include <crtdbg.h>
 #endif
+#include <array>
+#include <atomic>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -84,6 +88,177 @@ void suppressWindowsCrashDialogs()
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
 }
 #endif
+
+enum class HostProfileSection
+{
+    audioCallback,
+    audioCallbackLockWait,
+    processAudioEngine,
+    processAudioEnginePluginBlock,
+    processAudioEngineFxChain,
+    processAudioEngineMixAutomation,
+    applyQueuedTrackParameterUpdates,
+    applyTrackParameterAutomation,
+    transportSnapshot,
+    transportSnapshotLockWait,
+    parameterSnapshot,
+    parameterSnapshotLockWait,
+    pluginSnapshot,
+    pluginSnapshotLockWait,
+    count
+};
+
+constexpr auto kHostProfileSectionCount = static_cast<size_t>(HostProfileSection::count);
+
+const char* hostProfileSectionName(HostProfileSection section)
+{
+    switch (section)
+    {
+        case HostProfileSection::audioCallback: return "audio_callback";
+        case HostProfileSection::audioCallbackLockWait: return "audio_callback_lock_wait";
+        case HostProfileSection::processAudioEngine: return "process_audio_engine";
+        case HostProfileSection::processAudioEnginePluginBlock: return "process_audio_engine_plugin_block";
+        case HostProfileSection::processAudioEngineFxChain: return "process_audio_engine_fx_chain";
+        case HostProfileSection::processAudioEngineMixAutomation: return "process_audio_engine_mix_automation";
+        case HostProfileSection::applyQueuedTrackParameterUpdates: return "apply_queued_track_parameter_updates";
+        case HostProfileSection::applyTrackParameterAutomation: return "apply_track_parameter_automation";
+        case HostProfileSection::transportSnapshot: return "transport_snapshot";
+        case HostProfileSection::transportSnapshotLockWait: return "transport_snapshot_lock_wait";
+        case HostProfileSection::parameterSnapshot: return "parameter_snapshot";
+        case HostProfileSection::parameterSnapshotLockWait: return "parameter_snapshot_lock_wait";
+        case HostProfileSection::pluginSnapshot: return "plugin_snapshot";
+        case HostProfileSection::pluginSnapshotLockWait: return "plugin_snapshot_lock_wait";
+        case HostProfileSection::count: break;
+    }
+
+    return "unknown";
+}
+
+int64_t profileNowMicroseconds() noexcept
+{
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()
+    ).count();
+}
+
+struct ProfileCounter
+{
+    std::atomic<int64_t> count{0};
+    std::atomic<int64_t> totalMicros{0};
+    std::atomic<int64_t> maxMicros{0};
+
+    void addSample(int64_t durationMicros) noexcept
+    {
+        count.fetch_add(1, std::memory_order_relaxed);
+        totalMicros.fetch_add(durationMicros, std::memory_order_relaxed);
+
+        auto currentMax = maxMicros.load(std::memory_order_relaxed);
+        while (durationMicros > currentMax
+               && !maxMicros.compare_exchange_weak(currentMax, durationMicros, std::memory_order_relaxed))
+        {
+        }
+    }
+};
+
+class RuntimeProfiler final
+{
+public:
+    RuntimeProfiler()
+    {
+        const auto logPath = juce::SystemStats::getEnvironmentVariable("AIMS_NATIVE_PROFILE_LOG", {}).trim();
+        enabled = logPath.isNotEmpty();
+        if (enabled)
+            logFile = juce::File(logPath);
+    }
+
+    bool isEnabled() const noexcept
+    {
+        return enabled;
+    }
+
+    void addSample(HostProfileSection section, int64_t durationMicros) noexcept
+    {
+        if (!enabled)
+            return;
+
+        counters[static_cast<size_t>(section)].addSample(durationMicros);
+    }
+
+    void dump(const juce::String& sectionTitle)
+    {
+        if (!enabled)
+            return;
+
+        bool expected = false;
+        if (!dumped.compare_exchange_strong(expected, true, std::memory_order_relaxed))
+            return;
+
+        if (logFile == juce::File())
+            return;
+
+        logFile.getParentDirectory().createDirectory();
+        juce::FileOutputStream output(logFile);
+        if (!output.openedOk())
+            return;
+
+        output.setPosition(output.getFile().getSize());
+
+        juce::StringArray lines;
+        lines.add("[" + sectionTitle + "] time=" + juce::Time::getCurrentTime().toString(true, true));
+        for (size_t index = 0; index < counters.size(); ++index)
+        {
+            const auto count = counters[index].count.load(std::memory_order_relaxed);
+            if (count <= 0)
+                continue;
+
+            const auto totalMicros = counters[index].totalMicros.load(std::memory_order_relaxed);
+            const auto maxMicros = counters[index].maxMicros.load(std::memory_order_relaxed);
+            const auto averageMicros = static_cast<double>(totalMicros) / static_cast<double>(count);
+            lines.add(juce::String(hostProfileSectionName(static_cast<HostProfileSection>(index)))
+                      + ": count=" + juce::String(count)
+                      + " avg_us=" + juce::String(averageMicros, 2)
+                      + " max_us=" + juce::String(maxMicros)
+                      + " total_ms=" + juce::String(static_cast<double>(totalMicros) / 1000.0, 2));
+        }
+        lines.add({});
+
+        output.writeText(lines.joinIntoString("\n"), false, false, nullptr);
+    }
+
+private:
+    bool enabled = false;
+    std::atomic<bool> dumped{false};
+    juce::File logFile;
+    std::array<ProfileCounter, kHostProfileSectionCount> counters;
+};
+
+RuntimeProfiler& runtimeProfiler()
+{
+    static RuntimeProfiler profiler;
+    return profiler;
+}
+
+class ScopedProfileSample final
+{
+public:
+    explicit ScopedProfileSample(HostProfileSection sectionIn) noexcept
+        : section(sectionIn),
+          startMicros(runtimeProfiler().isEnabled() ? profileNowMicroseconds() : 0)
+    {
+    }
+
+    ~ScopedProfileSample()
+    {
+        if (startMicros <= 0)
+            return;
+
+        runtimeProfiler().addSample(section, profileNowMicroseconds() - startMicros);
+    }
+
+private:
+    HostProfileSection section;
+    int64_t startMicros = 0;
+};
 }
 
 class HostComponent;
@@ -124,11 +299,12 @@ public:
           onShortcutCommand(std::move(shortcutCallback))
     {
         setUsingNativeTitleBar(true);
-        setResizable(true, true);
+        setResizable(false, false);
         setAlwaysOnTop(true);
 
         if (auto* editor = processor.createEditorIfNeeded())
         {
+            setResizeLimits(editor->getWidth(), editor->getHeight(), editor->getWidth(), editor->getHeight());
             setContentOwned(editor, true);
             setName(processor.getName());
             centreAroundComponent(nullptr, editor->getWidth(), editor->getHeight());
@@ -154,20 +330,16 @@ public:
 
     void forceTopmostFront()
     {
-        setAlwaysOnTop(true);
         setMinimised(false);
         setVisible(true);
-        toFront(true);
-        grabKeyboardFocus();
+        toFront(false);
     }
 
     void showBridgeEditorWindow()
     {
-        setAlwaysOnTop(true);
         setMinimised(false);
         setVisible(true);
-        toFront(true);
-        grabKeyboardFocus();
+        toFront(false);
     }
 
     void beginTopmostWarmup()
@@ -178,13 +350,6 @@ public:
 private:
     bool keyPressed(const juce::KeyPress& key) override
     {
-        if (key.getKeyCode() == juce::KeyPress::spaceKey
-            && ! key.getModifiers().isAnyModifierKeyDown())
-        {
-            dispatchShortcutCommand("toggle_playback");
-            return true;
-        }
-
         return juce::DocumentWindow::keyPressed(key);
     }
 
@@ -192,12 +357,12 @@ private:
     {
         saveBounds();
         setVisible(false);
-        auto safeThis = juce::Component::SafePointer<PluginEditorWindow>(this);
-        juce::MessageManager::callAsync([safeThis]
-        {
-            if (safeThis != nullptr && safeThis->onWindowClosed != nullptr)
-                safeThis->onWindowClosed();
-        });
+        if (onWindowClosed != nullptr)
+            juce::MessageManager::callAsync([safeThis = juce::Component::SafePointer<PluginEditorWindow>(this)]
+            {
+                if (safeThis != nullptr && safeThis->onWindowClosed != nullptr)
+                    safeThis->onWindowClosed();
+            });
     }
 
     void moved() override
@@ -265,6 +430,82 @@ private:
     std::function<void(const juce::String&)> onShortcutCommand;
     double lastShortcutDispatchMs = 0.0;
     int topmostWarmupPassesRemaining = 0;
+};
+
+using EditorStateCallback = void (*)(int isOpen, void* userData);
+
+struct AimsVstHostTransportSnapshot
+{
+    double sampleRate = 0.0;
+    double cpuUsage = 0.0;
+    double inprocessTransportPositionFrame = 0.0;
+    double audioEnginePositionFrame = 0.0;
+    float pluginOutputPeakLevel = 0.0f;
+    float masterPeakLeft = 0.0f;
+    float masterPeakRight = 0.0f;
+    int inprocessTransportRunning = 0;
+    int audioEngineRunning = 0;
+    int audioEngineTailing = 0;
+    int editorOpen = 0;
+    int stateGeneration = 0;
+    int audioEngineTrackCount = 0;
+};
+
+struct AimsVstHostParameterSnapshot
+{
+    int editorOpen = 0;
+    int stateGeneration = 0;
+    int parameterCount = 0;
+};
+
+struct AimsVstHostParameterSnapshotEntry
+{
+    char name[256] = {};
+    float normalizedValue = 0.0f;
+};
+
+struct AimsVstHostTrackNoteEntry
+{
+    int startTick = 0;
+    int endTick = 0;
+    int pitch = 60;
+    int velocity = 100;
+    int channel = 1;
+};
+
+struct AimsVstHostTrackControllerEventEntry
+{
+    int tick = 0;
+    int control = 0;
+    int value = 0;
+    int channel = 1;
+};
+
+struct AimsVstHostStringEntry
+{
+    char value[256] = {};
+};
+
+struct AimsVstHostPluginSnapshot
+{
+    int pluginLoaded = 0;
+    int editorOpen = 0;
+    int stateGeneration = 0;
+    double sampleRate = 0.0;
+    int bufferSize = 0;
+    char pluginPath[1024] = {};
+};
+
+struct AimsVstHostAudioDeviceSnapshot
+{
+    char audioDeviceType[256] = {};
+    char audioDeviceName[256] = {};
+    double sampleRate = 0.0;
+    int bufferSize = 0;
+    int availableAudioDeviceTypeCount = 0;
+    int availableAudioOutputDeviceCount = 0;
+    int availableAudioSampleRateCount = 0;
+    int availableAudioBufferSizeCount = 0;
 };
 
 class HostComponent final : public juce::Component,
@@ -379,6 +620,8 @@ public:
             else
                 statusLabel.setText("Ready  |  Command server failed", juce::dontSendNotification);
         }
+
+        refreshRealtimeTransportSnapshot();
     }
 
     ~HostComponent() override
@@ -391,10 +634,12 @@ public:
             deviceManager.closeAudioDevice();
         }
         closeGraphEditorWindow();
+        closeAllAudioEngineTrackEditorWindows();
         clearPersistentPluginGraph();
         clearAudioEngine();
         closeEditorWindow();
         unloadPlugin();
+        runtimeProfiler().dump("native_host_profile");
     }
 
     void paint(juce::Graphics& g) override
@@ -473,13 +718,14 @@ public:
         {
             const auto command = requestObject->getProperty("command")
                                      .toString().trim().toLowerCase();
-            if (command == "render_audio" || command == "render_plugin_graph"
-                || command == "schedule_midi"
-                || command == "schedule_graph_midi"
-                || command == "status" || command == "ping"
-                || command == "note_on" || command == "note_off"
-                || command == "all_notes_off" || command == "panic"
-                || command == "set_shortcut_callback"
+        if (command == "render_audio" || command == "render_plugin_graph"
+            || command == "schedule_midi"
+            || command == "schedule_graph_midi"
+            || command == "status" || command == "ping"
+            || command == "editor_state"
+            || command == "note_on" || command == "note_off"
+            || command == "all_notes_off" || command == "panic"
+            || command == "set_shortcut_callback"
                 || command == "start_graph_transport"
                 || command == "stop_graph_transport"
                 || command == "set_graph_slot_mix"
@@ -521,6 +767,648 @@ public:
         return commandServer != nullptr ? commandServer->getBoundPort() : 0;
     }
 
+    void setEditorStateCallback(EditorStateCallback callback, void* userData)
+    {
+        editorStateCallback = callback;
+        editorStateUserData = userData;
+        notifyEditorStateChanged(editorWindow != nullptr && editorWindow->isVisible());
+    }
+
+    juce::Result getTransportSnapshot(AimsVstHostTransportSnapshot& snapshot,
+                                      float* trackPeakLevels,
+                                      int trackPeakLevelCapacity) const
+    {
+        const ScopedProfileSample profileSample(HostProfileSection::transportSnapshot);
+        snapshot = {};
+
+        snapshot.sampleRate = transportSnapshotSampleRate.load(std::memory_order_acquire);
+        snapshot.cpuUsage = transportSnapshotCpuUsage.load(std::memory_order_acquire);
+        snapshot.inprocessTransportRunning = transportSnapshotInProcessRunning.load(std::memory_order_acquire);
+        snapshot.inprocessTransportPositionFrame = transportSnapshotInProcessPositionFrame.load(std::memory_order_acquire);
+        snapshot.audioEngineRunning = transportSnapshotAudioEngineRunning.load(std::memory_order_acquire);
+        snapshot.audioEngineTailing = transportSnapshotAudioEngineTailing.load(std::memory_order_acquire);
+        snapshot.audioEnginePositionFrame = transportSnapshotAudioEnginePositionFrame.load(std::memory_order_acquire);
+        snapshot.pluginOutputPeakLevel = juce::jlimit(0.0f, 1.0f,
+                                                      transportSnapshotPluginOutputPeakLevel.load(std::memory_order_acquire));
+        snapshot.masterPeakLeft = juce::jlimit(0.0f, 1.0f,
+                                               transportSnapshotMasterPeakLeft.load(std::memory_order_acquire));
+        snapshot.masterPeakRight = juce::jlimit(0.0f, 1.0f,
+                                                transportSnapshotMasterPeakRight.load(std::memory_order_acquire));
+        snapshot.editorOpen = transportSnapshotEditorOpen.load(std::memory_order_acquire);
+        snapshot.stateGeneration = pluginStateGeneration.load(std::memory_order_relaxed);
+        snapshot.audioEngineTrackCount = audioEngineTrackCount.load(std::memory_order_acquire);
+
+        if (trackPeakLevels != nullptr && trackPeakLevelCapacity > 0)
+        {
+            const juce::SpinLock::ScopedLockType peakLock(transportSnapshotTrackPeaksLock);
+            const auto count = juce::jmin(trackPeakLevelCapacity, static_cast<int>(transportSnapshotTrackPeaks.size()));
+            for (int index = 0; index < count; ++index)
+                trackPeakLevels[index] = juce::jlimit(0.0f, 1.0f, transportSnapshotTrackPeaks[static_cast<size_t>(index)]);
+        }
+
+        return juce::Result::ok();
+    }
+
+    juce::Result getParameterSnapshot(AimsVstHostParameterSnapshot& snapshot,
+                                      AimsVstHostParameterSnapshotEntry* parameterEntries,
+                                      int parameterEntryCapacity) const
+    {
+        const ScopedProfileSample profileSample(HostProfileSection::parameterSnapshot);
+        snapshot = {};
+
+        const auto lockStartMicros = runtimeProfiler().isEnabled() ? profileNowMicroseconds() : 0;
+        const juce::ScopedLock lock(pluginLock);
+        if (lockStartMicros > 0)
+            runtimeProfiler().addSample(HostProfileSection::parameterSnapshotLockWait,
+                                        profileNowMicroseconds() - lockStartMicros);
+        snapshot.editorOpen = (editorWindow != nullptr && editorWindow->isVisible()) ? 1 : 0;
+        snapshot.stateGeneration = pluginStateGeneration.load(std::memory_order_relaxed);
+
+        if (pluginInstance == nullptr || parameterEntries == nullptr || parameterEntryCapacity <= 0)
+            return juce::Result::ok();
+
+        auto pluginParameters = pluginInstance->getParameters();
+        const auto count = juce::jmin(parameterEntryCapacity, pluginParameters.size());
+        for (int index = 0; index < count; ++index)
+        {
+            auto* parameter = pluginParameters[index];
+            if (parameter == nullptr)
+                continue;
+
+            auto parameterName = parameter->getName(256).trim();
+            if (parameterName.isEmpty())
+                parameterName = "Param " + juce::String(index + 1);
+
+            std::memset(parameterEntries[index].name, 0, sizeof(parameterEntries[index].name));
+            parameterName.copyToUTF8(parameterEntries[index].name,
+                                     static_cast<int>(sizeof(parameterEntries[index].name)));
+            parameterEntries[index].normalizedValue = juce::jlimit(0.0f, 1.0f, parameter->getValue());
+            snapshot.parameterCount = index + 1;
+        }
+
+        return juce::Result::ok();
+    }
+
+    juce::Result getPluginSnapshot(AimsVstHostPluginSnapshot& snapshot) const
+    {
+        const ScopedProfileSample profileSample(HostProfileSection::pluginSnapshot);
+        snapshot = {};
+
+        const auto lockStartMicros = runtimeProfiler().isEnabled() ? profileNowMicroseconds() : 0;
+        const juce::ScopedLock lock(pluginLock);
+        if (lockStartMicros > 0)
+            runtimeProfiler().addSample(HostProfileSection::pluginSnapshotLockWait,
+                                        profileNowMicroseconds() - lockStartMicros);
+        snapshot.pluginLoaded = pluginInstance != nullptr ? 1 : 0;
+        snapshot.editorOpen = (editorWindow != nullptr && editorWindow->isVisible()) ? 1 : 0;
+        snapshot.stateGeneration = pluginStateGeneration.load(std::memory_order_relaxed);
+        snapshot.sampleRate = currentSampleRate;
+        snapshot.bufferSize = currentBlockSize;
+        if (loadedPluginPath.isNotEmpty())
+            loadedPluginPath.copyToUTF8(snapshot.pluginPath, static_cast<int>(sizeof(snapshot.pluginPath)));
+
+        return juce::Result::ok();
+    }
+
+    juce::Result getAudioDeviceSnapshot(AimsVstHostAudioDeviceSnapshot& snapshot,
+                                        AimsVstHostStringEntry* availableDeviceTypes,
+                                        int availableDeviceTypeCapacity,
+                                        AimsVstHostStringEntry* availableOutputDevices,
+                                        int availableOutputDeviceCapacity,
+                                        double* availableSampleRates,
+                                        int availableSampleRateCapacity,
+                                        int* availableBufferSizes,
+                                        int availableBufferSizeCapacity) const
+    {
+        snapshot = {};
+
+        juce::String audioDeviceType;
+        juce::String audioDeviceName;
+        juce::StringArray deviceTypes;
+        juce::StringArray outputDevices;
+        juce::Array<juce::var> sampleRates;
+        juce::Array<juce::var> bufferSizes;
+
+        {
+            const juce::ScopedLock lock(statusSnapshotLock);
+            audioDeviceType = cachedAudioDeviceType;
+            audioDeviceName = cachedAudioDeviceName;
+            deviceTypes = cachedAvailableAudioDeviceTypes;
+            outputDevices = cachedAvailableAudioOutputDevices;
+            sampleRates = cachedAvailableAudioSampleRates;
+            bufferSizes = cachedAvailableAudioBufferSizes;
+        }
+
+        audioDeviceType.copyToUTF8(snapshot.audioDeviceType, static_cast<int>(sizeof(snapshot.audioDeviceType)));
+        audioDeviceName.copyToUTF8(snapshot.audioDeviceName, static_cast<int>(sizeof(snapshot.audioDeviceName)));
+        snapshot.sampleRate = currentSampleRate;
+        snapshot.bufferSize = currentBlockSize;
+
+        if (availableDeviceTypes != nullptr && availableDeviceTypeCapacity > 0)
+        {
+            const auto count = juce::jmin(availableDeviceTypeCapacity, deviceTypes.size());
+            for (int index = 0; index < count; ++index)
+            {
+                std::memset(availableDeviceTypes[index].value, 0, sizeof(availableDeviceTypes[index].value));
+                deviceTypes[index].copyToUTF8(availableDeviceTypes[index].value,
+                                              static_cast<int>(sizeof(availableDeviceTypes[index].value)));
+            }
+            snapshot.availableAudioDeviceTypeCount = count;
+        }
+
+        if (availableOutputDevices != nullptr && availableOutputDeviceCapacity > 0)
+        {
+            const auto count = juce::jmin(availableOutputDeviceCapacity, outputDevices.size());
+            for (int index = 0; index < count; ++index)
+            {
+                std::memset(availableOutputDevices[index].value, 0, sizeof(availableOutputDevices[index].value));
+                outputDevices[index].copyToUTF8(availableOutputDevices[index].value,
+                                                static_cast<int>(sizeof(availableOutputDevices[index].value)));
+            }
+            snapshot.availableAudioOutputDeviceCount = count;
+        }
+
+        if (availableSampleRates != nullptr && availableSampleRateCapacity > 0)
+        {
+            const auto count = juce::jmin(availableSampleRateCapacity, sampleRates.size());
+            for (int index = 0; index < count; ++index)
+                availableSampleRates[index] = static_cast<double>(sampleRates.getReference(index));
+            snapshot.availableAudioSampleRateCount = count;
+        }
+
+        if (availableBufferSizes != nullptr && availableBufferSizeCapacity > 0)
+        {
+            const auto count = juce::jmin(availableBufferSizeCapacity, bufferSizes.size());
+            for (int index = 0; index < count; ++index)
+                availableBufferSizes[index] = static_cast<int>(bufferSizes.getReference(index));
+            snapshot.availableAudioBufferSizeCount = count;
+        }
+
+        return juce::Result::ok();
+    }
+
+    juce::Result noteOn(int note, int channel, float velocity)
+    {
+        enqueueMidiMessage(juce::MidiMessage::noteOn(clampMidiChannel(channel),
+                                                     clampMidiNote(note),
+                                                     clampMidiVelocity(velocity)));
+        return juce::Result::ok();
+    }
+
+    juce::Result noteOff(int note, int channel, float velocity)
+    {
+        enqueueMidiMessage(juce::MidiMessage::noteOff(clampMidiChannel(channel),
+                                                      clampMidiNote(note),
+                                                      clampMidiVelocity(velocity)));
+        return juce::Result::ok();
+    }
+
+    juce::Result allNotesOff(int channel)
+    {
+        clearScheduledMidiEvents(channel);
+        enqueuePanicMessages(channel);
+        return juce::Result::ok();
+    }
+
+    juce::Result loadPluginDirect(const juce::String& pluginPath)
+    {
+        loadPlugin(pluginPath);
+        if (pluginInstance != nullptr)
+            return juce::Result::ok();
+
+        const auto error = statusLabel.getText().trim();
+        return juce::Result::fail(error.isNotEmpty() ? error : "Could not load plugin.");
+    }
+
+    juce::Result loadPluginStateDirect(const juce::String& statePath)
+    {
+        if (pluginInstance == nullptr)
+            return juce::Result::fail("No plugin loaded");
+
+        const auto stateFile = juce::File(statePath);
+        if (!stateFile.existsAsFile())
+            return juce::Result::fail("State file not found");
+
+        if (loadPluginStateFromFile(stateFile))
+            return juce::Result::ok();
+
+        return juce::Result::fail("Could not load plugin state");
+    }
+
+    juce::Result savePluginStateDirect(const juce::String& statePath)
+    {
+        if (pluginInstance == nullptr)
+            return juce::Result::fail("No plugin loaded");
+
+        const auto stateFile = juce::File(statePath);
+        if (savePluginStateToFile(stateFile))
+            return juce::Result::ok();
+
+        return juce::Result::fail("Could not save plugin state");
+    }
+
+    juce::Result openEditorDirect()
+    {
+        if (pluginInstance == nullptr)
+            return juce::Result::fail("No plugin loaded");
+
+        openEditorWindow();
+        if (editorWindow != nullptr && editorWindow->isVisible())
+            return juce::Result::ok();
+
+        return juce::Result::fail("Could not open plugin editor");
+    }
+
+    juce::Result closeEditorDirect()
+    {
+        closeEditorWindow();
+        return juce::Result::ok();
+    }
+
+    juce::Result openAudioEngineTrackEditorDirect(int trackIndex)
+    {
+        return openAudioEngineTrackEditorWindow(trackIndex);
+    }
+
+    juce::Result closeAudioEngineTrackEditorDirect(int trackIndex)
+    {
+        closeAudioEngineTrackEditorWindow(trackIndex);
+        return juce::Result::ok();
+    }
+
+    juce::Result queryAudioEngineTrackEditorOpenDirect(int trackIndex, bool& isOpen) const
+    {
+        return queryAudioEngineTrackEditorOpen(trackIndex, isOpen);
+    }
+
+    juce::Result getAudioEngineTrackParameterSnapshotDirect(int trackIndex,
+                                                            AimsVstHostParameterSnapshot& snapshot,
+                                                            AimsVstHostParameterSnapshotEntry* parameterEntries,
+                                                            int parameterEntryCapacity) const
+    {
+        return getAudioEngineTrackParameterSnapshot(trackIndex, snapshot, parameterEntries, parameterEntryCapacity);
+    }
+
+    juce::Result saveAudioEngineTrackPluginStateDirect(int trackIndex, const juce::String& statePath)
+    {
+        return saveAudioEngineTrackPluginStateToFile(trackIndex, juce::File(statePath));
+    }
+
+    juce::Result noteOnAudioEngineTrackDirect(int trackIndex, int note, int channel, float velocity)
+    {
+        return noteOnAudioEngineTrack(trackIndex, note, channel, velocity);
+    }
+
+    juce::Result noteOffAudioEngineTrackDirect(int trackIndex, int note, int channel, float velocity)
+    {
+        return noteOffAudioEngineTrack(trackIndex, note, channel, velocity);
+    }
+
+    juce::Result allNotesOffAudioEngineTrackDirect(int trackIndex, int channel)
+    {
+        return allNotesOffAudioEngineTrack(trackIndex, channel);
+    }
+
+    juce::Result setAudioEngineStateDirect(const juce::String& tracksJson,
+                                           double bpm,
+                                           int ticksPerBeat,
+                                           bool loopEnabled,
+                                           int64_t loopStartTick,
+                                           int64_t loopEndTick,
+                                           bool metronomeEnabled,
+                                           bool preserveTransport)
+    {
+        const auto tracksVar = juce::JSON::parse(tracksJson);
+        if (tracksVar.isVoid())
+            return juce::Result::fail("Invalid audio engine track payload");
+
+        juce::Array<juce::var> trackErrors;
+        juce::String error;
+        {
+            const juce::ScopedLock lock(pluginLock);
+            if (!configureAudioEngine(tracksVar,
+                                      bpm,
+                                      ticksPerBeat,
+                                      loopEnabled,
+                                      loopStartTick,
+                                      loopEndTick,
+                                      metronomeEnabled,
+                                      preserveTransport,
+                                      trackErrors,
+                                      error))
+            {
+                if (error.isNotEmpty())
+                    return juce::Result::fail(error);
+
+                if (!trackErrors.isEmpty())
+                {
+                    if (auto* firstError = trackErrors.getReference(0).getDynamicObject())
+                    {
+                        const auto message = firstError->getProperty("message").toString().trim();
+                        if (message.isNotEmpty())
+                            return juce::Result::fail(message);
+                    }
+                }
+
+                return juce::Result::fail("Could not configure audio engine");
+            }
+        }
+
+        return juce::Result::ok();
+    }
+
+    juce::Result updateAudioEngineTransportDirect(double bpm,
+                                                  int ticksPerBeat,
+                                                  bool loopEnabled,
+                                                  int64_t loopStartTick,
+                                                  int64_t loopEndTick,
+                                                  bool metronomeEnabled)
+    {
+        const juce::ScopedLock lock(pluginLock);
+        const auto sampleRate = juce::jmax(1.0, currentSampleRate);
+        const auto preservedTick = audioEngine.frameToTickDouble(audioEngine.positionFrame, sampleRate);
+
+        audioEngine.bpm = juce::jmax(1.0, bpm);
+        audioEngine.ticksPerBeat = juce::jmax(1, ticksPerBeat);
+        audioEngine.loopEnabled = loopEnabled;
+        audioEngine.loopStartTick = loopStartTick;
+        audioEngine.loopEndTick = loopEndTick;
+        audioEngine.metronomeEnabled = metronomeEnabled;
+
+        if (currentSampleRate > 0.0 && currentBlockSize > 0)
+            prepareAudioEngineMetronome();
+
+        auto targetFrame = audioEngine.tickToFrame(static_cast<int64_t>(std::llround(preservedTick)), sampleRate);
+        const auto loopStartFrame = audioEngine.tickToFrame(audioEngine.loopStartTick, sampleRate);
+        const auto loopEndFrame = audioEngine.tickToFrame(audioEngine.loopEndTick, sampleRate);
+        if (audioEngine.loopEnabled && loopEndFrame > loopStartFrame
+            && (targetFrame < loopStartFrame || targetFrame >= loopEndFrame))
+        {
+            targetFrame = loopStartFrame;
+        }
+
+        audioEngine.positionFrame = juce::jmax<int64_t>(0, targetFrame);
+        clearAudioEngineTailState();
+        if (audioEngine.running)
+        {
+            resetAudioEngineProcessingState();
+            audioEngine.bootstrapPending = true;
+        }
+
+        return juce::Result::ok();
+    }
+
+    juce::Result queueAudioEngineTrackParametersDirect(int trackIndex,
+                                                       const AimsVstHostParameterSnapshotEntry* parameterEntries,
+                                                       int parameterCount,
+                                                       const juce::String& parameterSignature)
+    {
+        if (!juce::isPositiveAndBelow(trackIndex, audioEngineTrackCount.load(std::memory_order_acquire)))
+            return juce::Result::fail("Invalid audio engine track index");
+
+        std::vector<ParameterValueUpdate> parameterUpdates;
+        if (parameterEntries != nullptr && parameterCount > 0)
+        {
+            parameterUpdates.reserve(static_cast<size_t>(parameterCount));
+            for (int index = 0; index < parameterCount; ++index)
+            {
+                const auto name = juce::String::fromUTF8(parameterEntries[index].name).trim();
+                if (name.isEmpty())
+                    continue;
+
+                ParameterValueUpdate update;
+                update.name = name;
+                update.value = static_cast<float>(
+                    juce::jlimit(0.0, 100.0, static_cast<double>(parameterEntries[index].normalizedValue) * 100.0));
+                parameterUpdates.push_back(std::move(update));
+            }
+        }
+
+        if (parameterUpdates.empty())
+            return juce::Result::ok();
+
+        queueAudioEngineTrackParameterUpdate(trackIndex,
+                                             parameterUpdates,
+                                             parameterSignature.isNotEmpty()
+                                                 ? std::optional<juce::String>(parameterSignature)
+                                                 : std::nullopt);
+        return juce::Result::ok();
+    }
+
+    juce::Result setAudioEngineTrackNotesDirect(int trackIndex,
+                                                const AimsVstHostTrackNoteEntry* noteEntries,
+                                                int noteCount,
+                                                const AimsVstHostTrackControllerEventEntry* controllerEntries,
+                                                int controllerCount,
+                                                int* appliedNoteCount)
+    {
+        juce::Array<juce::var> notesVar;
+        if (noteEntries != nullptr && noteCount > 0)
+        {
+            for (int index = 0; index < noteCount; ++index)
+            {
+                auto* noteObject = new juce::DynamicObject();
+                noteObject->setProperty("start_tick", noteEntries[index].startTick);
+                noteObject->setProperty("end_tick", noteEntries[index].endTick);
+                noteObject->setProperty("pitch", noteEntries[index].pitch);
+                noteObject->setProperty("velocity", noteEntries[index].velocity);
+                noteObject->setProperty("channel", noteEntries[index].channel);
+                notesVar.add(juce::var(noteObject));
+            }
+        }
+
+        juce::Array<juce::var> controllerEventsVar;
+        if (controllerEntries != nullptr && controllerCount > 0)
+        {
+            for (int index = 0; index < controllerCount; ++index)
+            {
+                auto* eventObject = new juce::DynamicObject();
+                eventObject->setProperty("tick", controllerEntries[index].tick);
+                eventObject->setProperty("control", controllerEntries[index].control);
+                eventObject->setProperty("value", controllerEntries[index].value);
+                eventObject->setProperty("channel", controllerEntries[index].channel);
+                controllerEventsVar.add(juce::var(eventObject));
+            }
+        }
+
+        juce::String error;
+        int updatedNoteCount = 0;
+        {
+            const juce::ScopedLock lock(pluginLock);
+            if (!updateAudioEngineTrackNotes(trackIndex,
+                                             juce::var(notesVar),
+                                             juce::var(controllerEventsVar),
+                                             error,
+                                             updatedNoteCount))
+            {
+                return juce::Result::fail(error.isNotEmpty() ? error : "Could not update audio engine track notes");
+            }
+        }
+
+        if (appliedNoteCount != nullptr)
+            *appliedNoteCount = updatedNoteCount;
+        return juce::Result::ok();
+    }
+
+    juce::Result setAudioEngineTrackMixStateDirect(int trackIndex,
+                                                   float volume,
+                                                   float outputGainDb,
+                                                   float pan,
+                                                   bool audible)
+    {
+        juce::String error;
+        {
+            const juce::ScopedLock lock(pluginLock);
+            if (!updateAudioEngineTrackMixState(trackIndex, volume, outputGainDb, pan, audible, error))
+                return juce::Result::fail(error.isNotEmpty() ? error : "Could not update audio engine track mix");
+        }
+
+        return juce::Result::ok();
+    }
+
+    juce::Result startAudioEngineDirect(int64_t startTick)
+    {
+        const juce::ScopedLock lock(pluginLock);
+        if (audioEngine.tracks.empty() && !audioEngine.metronomeEnabled)
+            return juce::Result::fail("Audio engine has no tracks");
+        if (currentSampleRate <= 0.0 || currentBlockSize <= 0)
+            return juce::Result::fail("Audio device is not ready");
+
+        const auto loopStartFrame = audioEngine.tickToFrame(audioEngine.loopStartTick, currentSampleRate);
+        const auto loopEndFrame = audioEngine.tickToFrame(audioEngine.loopEndTick, currentSampleRate);
+        auto targetFrame = audioEngine.tickToFrame(startTick, currentSampleRate);
+        if (audioEngine.loopEnabled && loopEndFrame > loopStartFrame
+            && (targetFrame < loopStartFrame || targetFrame >= loopEndFrame))
+        {
+            targetFrame = loopStartFrame;
+        }
+
+        graphTransportEnabled.store(false);
+        inProcessTransport.running = false;
+        clearScheduledMidiEvents();
+        resetAudioEngineProcessingState();
+        clearAudioEngineTailState();
+        audioEngine.positionFrame = juce::jmax<int64_t>(0, targetFrame);
+        audioEngine.running = true;
+        audioEngine.bootstrapPending = true;
+        renderedSampleFrames.store(0);
+        return juce::Result::ok();
+    }
+
+    juce::Result stopAudioEngineDirect(bool allowTail)
+    {
+        const juce::ScopedLock lock(pluginLock);
+        if (allowTail)
+        {
+            audioEngine.running = false;
+            audioEngine.bootstrapPending = false;
+            audioEngine.tailStopping = true;
+            audioEngine.tailReleasePending = true;
+            audioEngine.tailSilentBlocks = 0;
+            audioEngine.tailFramesProcessed = 0;
+            audioEngine.tailMaxFrames = audioEngineStopTailMaxFrames();
+        }
+        else
+        {
+            audioEngine.running = false;
+            audioEngine.bootstrapPending = false;
+            clearAudioEngineTailState();
+            resetAudioEngineProcessingState();
+        }
+
+        return juce::Result::ok();
+    }
+
+    juce::Result configureAudioDeviceDirect(const juce::String& requestedType,
+                                            const juce::String& requestedOutputName,
+                                            double requestedSampleRate,
+                                            int requestedBufferSize)
+    {
+        if (!audioInitialised)
+            return juce::Result::fail("Audio device is not ready");
+
+        if (requestedType.isNotEmpty() && !applyAudioDeviceType(requestedType, true))
+            return juce::Result::fail("Could not switch audio driver backend to \"" + requestedType + "\"");
+
+        auto* device = deviceManager.getCurrentAudioDevice();
+        if (device == nullptr)
+            return juce::Result::fail("Audio device is not ready");
+
+        auto setup = deviceManager.getAudioDeviceSetup();
+        bool changed = false;
+
+        if (requestedOutputName.isNotEmpty())
+        {
+            const auto canonicalName = canonicalAudioOutputDeviceName(requestedOutputName);
+            if (canonicalName.isEmpty())
+                return juce::Result::fail("Could not resolve audio output device \"" + requestedOutputName + "\"");
+
+            if (!setup.outputDeviceName.equalsIgnoreCase(canonicalName))
+            {
+                setup.outputDeviceName = canonicalName;
+                appSettings.setValue("audio_output_device_name", canonicalName);
+                changed = true;
+            }
+        }
+
+        if (requestedSampleRate > 0.0)
+        {
+            bool matched = false;
+            for (const auto rate : device->getAvailableSampleRates())
+            {
+                if (std::abs(rate - requestedSampleRate) < 0.1)
+                {
+                    if (std::abs(setup.sampleRate - rate) >= 0.1)
+                    {
+                        setup.sampleRate = rate;
+                        appSettings.setValue("audio_sample_rate", rate);
+                        changed = true;
+                    }
+                    matched = true;
+                    break;
+                }
+            }
+
+            if (!matched)
+                return juce::Result::fail("Unsupported sample rate requested.");
+        }
+
+        if (requestedBufferSize > 0)
+        {
+            bool matched = false;
+            for (const auto size : device->getAvailableBufferSizes())
+            {
+                if (size == requestedBufferSize)
+                {
+                    if (setup.bufferSize != size)
+                    {
+                        setup.bufferSize = size;
+                        appSettings.setValue("audio_buffer_size", size);
+                        changed = true;
+                    }
+                    matched = true;
+                    break;
+                }
+            }
+
+            if (!matched)
+                return juce::Result::fail("Unsupported audio buffer size requested.");
+        }
+
+        if (changed)
+        {
+            const auto error = deviceManager.setAudioDeviceSetup(setup, true);
+            if (error.isNotEmpty())
+                return juce::Result::fail(error);
+
+            preparePluginForPlayback();
+        }
+
+        updateDeviceBoxes();
+        updateDeviceLabel();
+        return juce::Result::ok();
+    }
+
 private:
     struct ScheduledMidiEvent
     {
@@ -529,6 +1417,12 @@ private:
         int64_t sequence = 0;
         int64_t loopEpoch = 0;
         juce::MidiMessage message;
+    };
+
+    struct AudioEngineTrackEditorWindowEntry
+    {
+        int trackIndex = -1;
+        std::unique_ptr<PluginEditorWindow> window;
     };
 
     // In-process transport: the host owns the note list and generates MIDI
@@ -542,9 +1436,18 @@ private:
         int channel = 1;
     };
 
+    struct TransportControllerEvent
+    {
+        int tick = 0;
+        int controller = 0;
+        int value = 0;
+        int channel = 1;
+    };
+
     struct InProcessTransport
     {
         std::vector<TransportNote> notes;
+        std::vector<TransportControllerEvent> controllerEvents;
         double bpm = 120.0;
         int ticksPerBeat = 480;
         int64_t positionFrame = 0;      // current playback position in samples
@@ -630,6 +1533,19 @@ private:
                     }
                 }
 
+                for (const auto& controllerEvent : controllerEvents)
+                {
+                    const auto eventFrame = tickToFrame(controllerEvent.tick, sampleRate);
+                    if (eventFrame >= chunkStart && eventFrame < chunkEnd)
+                    {
+                        midi.addEvent(
+                            juce::MidiMessage::controllerEvent(controllerEvent.channel,
+                                                               controllerEvent.controller,
+                                                               controllerEvent.value),
+                            sampleOffset + static_cast<int>(eventFrame - chunkStart));
+                    }
+                }
+
                 positionFrame += chunkSamples;
                 sampleOffset += chunkSamples;
                 samplesRemaining -= chunkSamples;
@@ -707,6 +1623,14 @@ private:
         int channel = 1;
     };
 
+    struct AudioEngineTrackControllerEvent
+    {
+        int tick = 0;
+        int controller = 0;
+        int value = 0;
+        int channel = 1;
+    };
+
     struct ParameterValueUpdate
     {
         juce::String name;
@@ -746,6 +1670,7 @@ private:
         juce::String target;
         juce::String parameterName;
         int parameterIndex = -1;
+        juce::AudioProcessorParameter* parameter = nullptr;
         float defaultValue = 0.0f;
         float lastAppliedValue = std::numeric_limits<float>::quiet_NaN();
         std::vector<AudioEngineAutomationPoint> points;
@@ -771,8 +1696,10 @@ private:
         juce::String parameterSignature;
         juce::String fxChainSignature;
         std::unique_ptr<juce::AudioPluginInstance> plugin;
+        std::unordered_map<std::string, int> parameterIndexLookup;
         std::vector<EffectSlot> fxChain;
         std::vector<AudioEngineTrackNote> notes;
+        std::vector<AudioEngineTrackControllerEvent> controllerEvents;
         std::vector<AudioEngineAudioClip> audioClips;
         std::vector<AudioEngineAutomationLane> automationLanes;
         float baseVolume = 1.0f;
@@ -782,6 +1709,10 @@ private:
         float peakLevel = 0.0f;
         juce::AudioBuffer<float> processBuffer;
         juce::AudioBuffer<float> stereoBuffer;
+        juce::MidiBuffer livePreviewMessages;
+        int livePreviewActiveNotes = 0;
+        bool livePreviewTailActive = false;
+        int livePreviewTailSilentBlocks = 0;
     };
 
     struct AudioEngineState
@@ -946,12 +1877,11 @@ private:
             if (pluginInstance == nullptr)
                 return makeResponse(false, "No plugin loaded");
 
-            juce::MessageManager::callAsync([this]
-            {
-                if (pluginInstance != nullptr)
-                    openEditorWindow();
-            });
-            auto response = makeResponse(true, "Editor opened");
+            openEditorWindow();
+            const bool editorOpened = editorWindow != nullptr && editorWindow->isVisible();
+            auto response = makeResponse(editorOpened,
+                                         editorOpened ? "Editor opened"
+                                                      : "Editor did not open");
             appendStatusFields(response);
             return response;
         }
@@ -961,6 +1891,14 @@ private:
             closeEditorWindow();
             auto response = makeResponse(true, "Editor closed");
             appendStatusFields(response, true);
+            return response;
+        }
+
+        if (command == "editor_state")
+        {
+            auto response = makeResponse(true, "Editor state");
+            setResponseField(response, "editor_open", editorWindow != nullptr && editorWindow->isVisible());
+            setResponseField(response, "graph_editor_open", graphEditorWindow != nullptr && graphEditorWindow->isVisible());
             return response;
         }
 
@@ -1084,7 +2022,6 @@ private:
 
             enqueueMidiMessage(juce::MidiMessage::noteOn(channel, note, velocity));
             auto response = makeResponse(true, "Note on");
-            appendStatusFields(response);
             setResponseField(response, "note", note);
             setResponseField(response, "channel", channel);
             return response;
@@ -1102,7 +2039,6 @@ private:
 
             enqueueMidiMessage(juce::MidiMessage::noteOff(channel, note, velocity));
             auto response = makeResponse(true, "Note off");
-            appendStatusFields(response);
             setResponseField(response, "note", note);
             setResponseField(response, "channel", channel);
             return response;
@@ -1116,7 +2052,6 @@ private:
             clearScheduledMidiEvents(channel);
             enqueuePanicMessages(channel);
             auto response = makeResponse(true, "All notes off");
-            appendStatusFields(response);
             setResponseField(response, "channel", channel);
             return response;
         }
@@ -1126,9 +2061,7 @@ private:
             clearScheduledMidiEvents();
             keyboardState.reset();
             enqueuePanicMessages(0);
-            auto response = makeResponse(true, "Panic sent");
-            appendStatusFields(response);
-            return response;
+            return makeResponse(true, "Panic sent");
         }
 
         if (command == "set_output_mix")
@@ -1486,8 +2419,10 @@ private:
             const auto loopEndTick = object->hasProperty("loop_end_tick")
                 ? static_cast<int64_t>(static_cast<double>(object->getProperty("loop_end_tick"))) : int64_t(0);
             const auto notesVar = object->getProperty("notes");
+            const auto controllerEventsVar = object->getProperty("controller_events");
 
             std::vector<TransportNote> notes;
+            std::vector<TransportControllerEvent> controllerEvents;
             if (auto* notesArray = notesVar.getArray())
             {
                 notes.reserve(static_cast<size_t>(notesArray->size()));
@@ -1508,9 +2443,40 @@ private:
                 }
             }
 
+            if (auto* controllerArray = controllerEventsVar.getArray())
+            {
+                controllerEvents.reserve(static_cast<size_t>(controllerArray->size()));
+                for (const auto& controllerVar : *controllerArray)
+                {
+                    auto* controllerObj = controllerVar.getDynamicObject();
+                    if (controllerObj == nullptr)
+                        continue;
+
+                    TransportControllerEvent event;
+                    event.tick = static_cast<int>(controllerObj->hasProperty("tick")
+                        ? controllerObj->getProperty("tick")
+                        : juce::var(0));
+                    event.controller = juce::jlimit(0,
+                                                    127,
+                                                    static_cast<int>(controllerObj->hasProperty("control")
+                                                        ? controllerObj->getProperty("control")
+                                                        : juce::var(0)));
+                    event.value = juce::jlimit(0,
+                                               127,
+                                               static_cast<int>(controllerObj->hasProperty("value")
+                                                   ? controllerObj->getProperty("value")
+                                                   : juce::var(0)));
+                    event.channel = clampMidiChannel(controllerObj->hasProperty("channel")
+                        ? static_cast<int>(controllerObj->getProperty("channel"))
+                        : kDefaultMidiChannel);
+                    controllerEvents.push_back(event);
+                }
+            }
+
             {
                 juce::ScopedLock lock(pluginLock);
                 inProcessTransport.notes = std::move(notes);
+                inProcessTransport.controllerEvents = std::move(controllerEvents);
                 inProcessTransport.bpm = juce::jmax(1.0, bpm);
                 inProcessTransport.ticksPerBeat = juce::jmax(1, ticksPerBeat);
                 inProcessTransport.loopEnabled = loopEnabled;
@@ -1519,8 +2485,9 @@ private:
             }
 
             auto response = makeResponse(true, "Transport notes updated");
-            appendStatusFields(response);
+            appendStatusFields(response, true);
             setResponseField(response, "note_count", static_cast<int>(inProcessTransport.notes.size()));
+            setResponseField(response, "controller_event_count", static_cast<int>(inProcessTransport.controllerEvents.size()));
             return response;
         }
 
@@ -1543,7 +2510,7 @@ private:
             }
 
             auto response = makeResponse(true, "In-process transport started");
-            appendStatusFields(response);
+            appendStatusFields(response, true);
             setResponseField(response, "start_tick", static_cast<double>(startTick));
             setResponseField(response, "position_frame", static_cast<double>(inProcessTransport.positionFrame));
             return response;
@@ -1558,7 +2525,7 @@ private:
             }
 
             auto response = makeResponse(true, "In-process transport stopped");
-            appendStatusFields(response);
+            appendStatusFields(response, true);
             return response;
         }
 
@@ -1603,7 +2570,7 @@ private:
             }
 
             auto response = makeResponse(true, "Audio engine state updated");
-            appendStatusFields(response);
+            appendStatusFields(response, true);
             setResponseField(response, "track_count", static_cast<int>(audioEngine.tracks.size()));
             if (!trackErrors.isEmpty())
                 setResponseField(response, "track_errors", juce::var(trackErrors));
@@ -1659,7 +2626,7 @@ private:
             }
 
             auto response = makeResponse(true, "Audio engine transport updated");
-            appendStatusFields(response);
+            appendStatusFields(response, true);
             return response;
         }
 
@@ -1697,7 +2664,11 @@ private:
             int noteCount = 0;
             {
                 juce::ScopedLock lock(pluginLock);
-                if (!updateAudioEngineTrackNotes(trackIndex, object->getProperty("notes"), error, noteCount))
+                if (!updateAudioEngineTrackNotes(trackIndex,
+                                                object->getProperty("notes"),
+                                                object->getProperty("controller_events"),
+                                                error,
+                                                noteCount))
                     return makeResponse(false, error.isNotEmpty() ? error : "Could not update audio engine track notes");
             }
 
@@ -1814,7 +2785,7 @@ private:
             }
 
             auto response = makeResponse(true, "Audio engine seek updated");
-            appendStatusFields(response);
+            appendStatusFields(response, true);
             setResponseField(response, "start_tick", static_cast<double>(startTick));
             setResponseField(response, "position_frame", static_cast<double>(audioEngine.positionFrame));
             return response;
@@ -1854,7 +2825,7 @@ private:
             }
 
             auto response = makeResponse(true, "Audio engine started");
-            appendStatusFields(response);
+            appendStatusFields(response, true);
             setResponseField(response, "start_tick", static_cast<double>(startTick));
             setResponseField(response, "position_frame", static_cast<double>(audioEngine.positionFrame));
             return response;
@@ -1887,6 +2858,109 @@ private:
             }
 
             auto response = makeResponse(true, "Audio engine stopped");
+            appendStatusFields(response, true);
+            return response;
+        }
+
+        if (command == "configure_audio_device")
+        {
+            if (!audioInitialised)
+                return makeResponse(false, "Audio device is not ready");
+
+            const auto requestedType = object->hasProperty("audio_device_type")
+                ? object->getProperty("audio_device_type").toString().trim()
+                : juce::String();
+            const auto requestedOutputName = object->hasProperty("audio_device_name")
+                ? object->getProperty("audio_device_name").toString().trim()
+                : juce::String();
+            const auto requestedSampleRate = object->hasProperty("sample_rate")
+                ? static_cast<double>(object->getProperty("sample_rate"))
+                : 0.0;
+            const auto requestedBufferSize = object->hasProperty("buffer_size")
+                ? static_cast<int>(object->getProperty("buffer_size"))
+                : 0;
+
+            if (requestedType.isNotEmpty() && !applyAudioDeviceType(requestedType, true))
+                return makeResponse(false, "Could not switch audio driver backend to \"" + requestedType + "\"");
+
+            auto* device = deviceManager.getCurrentAudioDevice();
+            if (device == nullptr)
+                return makeResponse(false, "Audio device is not ready");
+
+            auto setup = deviceManager.getAudioDeviceSetup();
+            bool changed = false;
+
+            if (requestedOutputName.isNotEmpty())
+            {
+                const auto canonicalName = canonicalAudioOutputDeviceName(requestedOutputName);
+                if (canonicalName.isEmpty())
+                    return makeResponse(false, "Could not resolve audio output device \"" + requestedOutputName + "\"");
+
+                if (!setup.outputDeviceName.equalsIgnoreCase(canonicalName))
+                {
+                    setup.outputDeviceName = canonicalName;
+                    appSettings.setValue("audio_output_device_name", canonicalName);
+                    changed = true;
+                }
+            }
+
+            if (requestedSampleRate > 0.0)
+            {
+                bool matched = false;
+                for (const auto rate : device->getAvailableSampleRates())
+                {
+                    if (std::abs(rate - requestedSampleRate) < 0.1)
+                    {
+                        if (std::abs(setup.sampleRate - rate) >= 0.1)
+                        {
+                            setup.sampleRate = rate;
+                            appSettings.setValue("audio_sample_rate", rate);
+                            changed = true;
+                        }
+                        matched = true;
+                        break;
+                    }
+                }
+
+                if (!matched)
+                    return makeResponse(false, "Unsupported sample rate requested.");
+            }
+
+            if (requestedBufferSize > 0)
+            {
+                bool matched = false;
+                for (const auto size : device->getAvailableBufferSizes())
+                {
+                    if (size == requestedBufferSize)
+                    {
+                        if (setup.bufferSize != size)
+                        {
+                            setup.bufferSize = size;
+                            appSettings.setValue("audio_buffer_size", size);
+                            changed = true;
+                        }
+                        matched = true;
+                        break;
+                    }
+                }
+
+                if (!matched)
+                    return makeResponse(false, "Unsupported audio buffer size requested.");
+            }
+
+            if (changed)
+            {
+                const auto error = deviceManager.setAudioDeviceSetup(setup, true);
+                if (error.isNotEmpty())
+                    return makeResponse(false, error);
+
+                preparePluginForPlayback();
+            }
+
+            updateDeviceBoxes();
+            updateDeviceLabel();
+
+            auto response = makeResponse(true, changed ? "Audio device updated" : "Audio device unchanged");
             appendStatusFields(response);
             return response;
         }
@@ -2019,6 +3093,12 @@ private:
             if (pluginInstance == nullptr)
                 return makeResponse(false, "No plugin loaded");
 
+            juce::String loadedPluginPathSnapshot;
+            {
+                juce::ScopedLock lock(pluginLock);
+                loadedPluginPathSnapshot = loadedPluginPath;
+            }
+
             const auto requestedFrames = static_cast<int>(object->hasProperty("frames")
                 ? object->getProperty("frames")
                 : juce::var(currentBlockSize));
@@ -2027,8 +3107,8 @@ private:
             setResponseField(response, "plugin_loaded", pluginInstance != nullptr);
             setResponseField(response, "plugin_name", pluginDescription.name);
             setResponseField(response, "plugin_path",
-                             normaliseVst3PathForSettings(pathEditor.getText().trim()));
-            setResponseField(response, "editor_open", editorWindow != nullptr);
+                             normaliseVst3PathForSettings(loadedPluginPathSnapshot));
+            setResponseField(response, "editor_open", editorWindow != nullptr && editorWindow->isVisible());
             setResponseField(response, "sample_rate", currentSampleRate);
             setResponseField(response, "buffer_size", currentBlockSize);
             setResponseField(response, "command_port", getActiveCommandPort());
@@ -2067,6 +3147,7 @@ private:
         bool pluginIsInstrument = false;
         bool pluginIsEffect = false;
         juce::String pluginCategory = pluginDescription.category;
+        juce::String loadedPluginPathSnapshot;
         juce::StringArray parameterNames;
         juce::Array<juce::var> parameters;
         juce::String audioDeviceType;
@@ -2081,6 +3162,7 @@ private:
         {
             juce::ScopedLock lock(pluginLock);
             currentPluginOutputPeakLevel = pluginOutputPeakLevel;
+            loadedPluginPathSnapshot = loadedPluginPath;
             if (pluginInstance != nullptr)
             {
                 pluginIsInstrument = pluginDescription.isInstrument
@@ -2131,37 +3213,23 @@ private:
             }
         }
 
-        if (audioInitialised)
         {
-            audioDeviceType = deviceManager.getCurrentAudioDeviceType();
-            if (auto* device = deviceManager.getCurrentAudioDevice())
-            {
-                audioDeviceName = device->getName();
-                if (!lightweight)
-                {
-                    for (const auto rate : device->getAvailableSampleRates())
-                        availableAudioSampleRates.add(static_cast<int>(std::round(rate)));
-                    for (const auto size : device->getAvailableBufferSizes())
-                        availableAudioBufferSizes.add(size);
-                }
-            }
+            const juce::ScopedLock lock(statusSnapshotLock);
+            audioDeviceType = cachedAudioDeviceType;
+            audioDeviceName = cachedAudioDeviceName;
             if (!lightweight)
             {
-                for (auto* type : const_cast<juce::AudioDeviceManager&>(deviceManager).getAvailableDeviceTypes())
-                {
-                    if (type == nullptr || ! isUsableAudioDeviceType(*type))
-                        continue;
-                    availableAudioDeviceTypes.addIfNotAlreadyThere(type->getTypeName());
-                }
-                if (auto* type = deviceManager.getCurrentDeviceTypeObject())
-                    availableAudioOutputDevices = type->getDeviceNames(false);
+                availableAudioDeviceTypes = cachedAvailableAudioDeviceTypes;
+                availableAudioOutputDevices = cachedAvailableAudioOutputDevices;
+                availableAudioSampleRates = cachedAvailableAudioSampleRates;
+                availableAudioBufferSizes = cachedAvailableAudioBufferSizes;
             }
         }
 
         setResponseField(response, "plugin_loaded", pluginInstance != nullptr);
         setResponseField(response, "plugin_name", pluginDescription.name);
         setResponseField(response, "plugin_path",
-                         normaliseVst3PathForSettings(pathEditor.getText().trim()));
+                         normaliseVst3PathForSettings(loadedPluginPathSnapshot));
         if (!lightweight)
         {
             setResponseField(response, "plugin_is_instrument", pluginIsInstrument);
@@ -2173,29 +3241,10 @@ private:
             setResponseField(response, "parameter_names", juce::var(parameterNames));
             setResponseField(response, "plugin_parameters", juce::var(parameters));
         }
-        setResponseField(response, "editor_open", editorWindow != nullptr);
-
-        // Detect plugin state changes that don't fire audioProcessorChanged
-        // by checksumming the actual state blob on each status poll.
-        // Skip this while a realtime transport is running because
-        // getStateInformation can be expensive enough to glitch live audio.
-        const bool realtimeTransportActive = inProcessTransport.running
-            || static_cast<bool>(graphTransportEnabled.load())
-            || audioEngine.running;
-        if (pluginInstance != nullptr && editorWindow != nullptr && !realtimeTransportActive)
-        {
-            juce::MemoryBlock stateBlock;
-            pluginInstance->getStateInformation(stateBlock);
-            uint64_t checksum = 0xcbf29ce484222325ULL; // FNV-1a offset basis
-            for (size_t i = 0; i < stateBlock.getSize(); ++i)
-            {
-                checksum ^= static_cast<uint64_t>(static_cast<const uint8_t*>(stateBlock.getData())[i]);
-                checksum *= 0x100000001b3ULL; // FNV-1a prime
-            }
-            if (checksum != lastPluginStateChecksum && lastPluginStateChecksum != 0)
-                pluginStateGeneration.fetch_add(1, std::memory_order_relaxed);
-            lastPluginStateChecksum = checksum;
-        }
+        const bool editorWindowPresent = editorWindow != nullptr;
+        const bool editorVisible = editorWindowPresent && editorWindow->isVisible();
+        const bool graphEditorVisible = graphEditorWindow != nullptr && graphEditorWindow->isVisible();
+        setResponseField(response, "editor_open", editorVisible);
 
         setResponseField(response, "state_generation", pluginStateGeneration.load(std::memory_order_relaxed));
         setResponseField(response, "sample_rate", currentSampleRate);
@@ -2211,7 +3260,7 @@ private:
         setResponseField(response, "graph_editor_slot", graphEditorSlotIndex);
         setResponseField(response, "graph_transport_enabled", static_cast<bool>(graphTransportEnabled.load()));
         if (!lightweight)
-            setResponseField(response, "graph_editor_open", graphEditorWindow != nullptr);
+            setResponseField(response, "graph_editor_open", graphEditorVisible);
         setResponseField(response, "inprocess_transport_running", inProcessTransport.running);
         setResponseField(response, "inprocess_transport_position_frame",
                          static_cast<double>(inProcessTransport.positionFrame));
@@ -2278,6 +3327,7 @@ private:
         if (target.isEmpty())
             return {};
 
+        scanAvailableAudioDeviceTypes();
         for (auto* type : deviceManager.getAvailableDeviceTypes())
         {
             if (type == nullptr)
@@ -2296,6 +3346,7 @@ private:
         if (target.isEmpty())
             return {};
 
+        scanAvailableAudioDeviceTypes();
         if (auto* type = deviceManager.getCurrentDeviceTypeObject())
         {
             for (const auto& deviceName : type->getDeviceNames(false))
@@ -2306,6 +3357,42 @@ private:
         }
 
         return {};
+    }
+
+    void scanAvailableAudioDeviceTypes() const
+    {
+        for (auto* type : const_cast<juce::AudioDeviceManager&>(deviceManager).getAvailableDeviceTypes())
+        {
+            if (type != nullptr)
+                type->scanForDevices();
+        }
+    }
+
+    bool ensureFallbackAudioDeviceOpen()
+    {
+        if (!audioInitialised)
+            return false;
+
+        scanAvailableAudioDeviceTypes();
+        if (deviceManager.getCurrentAudioDevice() != nullptr)
+            return true;
+
+        const auto failedType = deviceManager.getCurrentAudioDeviceType();
+        for (auto* type : deviceManager.getAvailableDeviceTypes())
+        {
+            if (type == nullptr || ! isUsableAudioDeviceType(*type))
+                continue;
+
+            const auto typeName = type->getTypeName();
+            if (typeName.equalsIgnoreCase(failedType))
+                continue;
+
+            deviceManager.setCurrentAudioDeviceType(typeName, false);
+            if (deviceManager.getCurrentAudioDevice() != nullptr)
+                return true;
+        }
+
+        return deviceManager.getCurrentAudioDevice() != nullptr;
     }
 
     bool applyAudioDeviceType(const juce::String& requestedType, bool treatAsChosenDevice)
@@ -2328,9 +3415,12 @@ private:
 
     void initialiseAudio()
     {
-        deviceManager.initialise(0, 2, nullptr, true, {}, nullptr);
-        deviceManager.addAudioCallback(this);
         audioInitialised = true;
+        scanAvailableAudioDeviceTypes();
+        deviceManager.initialise(0, 2, nullptr, true, {}, nullptr);
+        scanAvailableAudioDeviceTypes();
+        ensureFallbackAudioDeviceOpen();
+        deviceManager.addAudioCallback(this);
     }
 
     void restoreAudioPreferences(double startupSampleRate,
@@ -2341,6 +3431,7 @@ private:
         if (!audioInitialised)
             return;
 
+        scanAvailableAudioDeviceTypes();
         const auto preferredType = startupDeviceType.isNotEmpty()
             ? startupDeviceType.trim()
             : appSettings.getValue("audio_device_type").trim();
@@ -2401,23 +3492,7 @@ private:
                 deviceManager.setAudioDeviceSetup(setup, true);
         }
 
-        if (deviceManager.getCurrentAudioDevice() == nullptr)
-        {
-            const auto failedType = deviceManager.getCurrentAudioDeviceType();
-            for (auto* type : deviceManager.getAvailableDeviceTypes())
-            {
-                if (type == nullptr || ! isUsableAudioDeviceType(*type))
-                    continue;
-
-                const auto typeName = type->getTypeName();
-                if (typeName.equalsIgnoreCase(failedType))
-                    continue;
-
-                deviceManager.setCurrentAudioDeviceType(typeName, false);
-                if (deviceManager.getCurrentAudioDevice() != nullptr)
-                    break;
-            }
-        }
+        ensureFallbackAudioDeviceOpen();
 
         if (auto* device = deviceManager.getCurrentAudioDevice())
         {
@@ -2437,6 +3512,7 @@ private:
         if (bridgeMode)
             return;
 
+        scanAvailableAudioDeviceTypes();
         outputDeviceBox.clear(juce::dontSendNotification);
 
         juce::String currentDeviceName;
@@ -2469,6 +3545,7 @@ private:
         if (bridgeMode)
             return;
 
+        scanAvailableAudioDeviceTypes();
         deviceTypeBox.clear(juce::dontSendNotification);
 
         const auto currentType = deviceManager.getCurrentAudioDeviceType();
@@ -2497,6 +3574,9 @@ private:
 
     void updateDeviceBoxes()
     {
+        if (!bridgeMode && deviceManager.getCurrentAudioDevice() == nullptr)
+            ensureFallbackAudioDeviceOpen();
+
         updateDeviceTypeBox();
         updateOutputDeviceBox();
         sampleRateBox.clear(juce::dontSendNotification);
@@ -2510,6 +3590,7 @@ private:
             sampleRateBox.setSelectedId(rateValue, juce::dontSendNotification);
             bufferSizeBox.addItem(juce::String(bufferValue) + " samples", bufferValue);
             bufferSizeBox.setSelectedId(bufferValue, juce::dontSendNotification);
+            refreshAudioStatusSnapshot();
             return;
         }
 
@@ -2535,6 +3616,56 @@ private:
             if (selectedBuffer != 0)
                 bufferSizeBox.setSelectedId(selectedBuffer, juce::dontSendNotification);
         }
+
+        refreshAudioStatusSnapshot();
+    }
+
+    void refreshAudioStatusSnapshot()
+    {
+        juce::String deviceType;
+        juce::String deviceName;
+        juce::StringArray availableDeviceTypes;
+        juce::StringArray availableOutputDevices;
+        juce::Array<juce::var> availableSampleRates;
+        juce::Array<juce::var> availableBufferSizes;
+
+        if (bridgeMode)
+        {
+            availableSampleRates.add(static_cast<int>(std::round(currentSampleRate)));
+            availableBufferSizes.add(juce::jmax(64, currentBlockSize));
+        }
+        else if (audioInitialised)
+        {
+            scanAvailableAudioDeviceTypes();
+            deviceType = deviceManager.getCurrentAudioDeviceType();
+
+            if (auto* device = deviceManager.getCurrentAudioDevice())
+            {
+                deviceName = device->getName();
+                for (const auto rate : device->getAvailableSampleRates())
+                    availableSampleRates.add(static_cast<int>(std::round(rate)));
+                for (const auto size : device->getAvailableBufferSizes())
+                    availableBufferSizes.add(size);
+            }
+
+            for (auto* type : const_cast<juce::AudioDeviceManager&>(deviceManager).getAvailableDeviceTypes())
+            {
+                if (type == nullptr || !isUsableAudioDeviceType(*type))
+                    continue;
+                availableDeviceTypes.addIfNotAlreadyThere(type->getTypeName());
+            }
+
+            if (auto* type = deviceManager.getCurrentDeviceTypeObject())
+                availableOutputDevices = type->getDeviceNames(false);
+        }
+
+        const juce::ScopedLock lock(statusSnapshotLock);
+        cachedAudioDeviceType = deviceType;
+        cachedAudioDeviceName = deviceName;
+        cachedAvailableAudioDeviceTypes = availableDeviceTypes;
+        cachedAvailableAudioOutputDevices = availableOutputDevices;
+        cachedAvailableAudioSampleRates = availableSampleRates;
+        cachedAvailableAudioBufferSizes = availableBufferSizes;
     }
 
     void updateDeviceLabel()
@@ -2574,7 +3705,10 @@ private:
     }
 
     // AudioProcessorListener — detect preset / state changes in the main plugin.
-    void audioProcessorParameterChanged(juce::AudioProcessor*, int, float) override {}
+    void audioProcessorParameterChanged(juce::AudioProcessor*, int, float) override
+    {
+        pluginStateGeneration.fetch_add(1, std::memory_order_relaxed);
+    }
     void audioProcessorChanged(juce::AudioProcessor*, const juce::AudioProcessorListener::ChangeDetails&) override
     {
         pluginStateGeneration.fetch_add(1, std::memory_order_relaxed);
@@ -2698,11 +3832,13 @@ private:
             updateOutputDeviceBox();
             updateDeviceLabel();
         }
+        refreshAudioStatusSnapshot();
         keyboardState.reset();
         ensureScratchBufferSize(currentBlockSize);
         preparePluginForPlayback();
         preparePersistentPluginGraphForPlayback();
         prepareAudioEngineForPlayback();
+        refreshRealtimeTransportSnapshot();
     }
 
     void audioDeviceStopped() override
@@ -2710,6 +3846,8 @@ private:
         releasePluginResources();
         releasePersistentPluginGraphResources();
         releaseAudioEngineResources();
+        refreshAudioStatusSnapshot();
+        refreshRealtimeTransportSnapshot();
     }
 
     void audioDeviceIOCallbackWithContext(const float* const* /*inputChannelData*/,
@@ -2719,12 +3857,17 @@ private:
                                           int numSamples,
                                           const juce::AudioIODeviceCallbackContext& /*context*/) override
     {
+        const ScopedProfileSample profileSample(HostProfileSection::audioCallback);
         juce::AudioBuffer<float> buffer(outputChannelData, numOutputChannels, numSamples);
         buffer.clear();
         ensureScratchBufferSize(numSamples);
 
         {
+            const auto lockStartMicros = runtimeProfiler().isEnabled() ? profileNowMicroseconds() : 0;
             juce::ScopedLock lock(pluginLock);
+            if (lockStartMicros > 0)
+                runtimeProfiler().addSample(HostProfileSection::audioCallbackLockWait,
+                                            profileNowMicroseconds() - lockStartMicros);
             auto* plugin = pluginInstance.get();
             if (plugin != nullptr)
             {
@@ -2747,9 +3890,18 @@ private:
                 processPersistentPluginGraphTransport(buffer, numSamples, renderedSampleFrames.load());
             if (audioEngine.running || audioEngine.tailStopping)
                 processAudioEngine(buffer, numSamples);
+            refreshRealtimeTransportSnapshot();
         }
 
         mixQueuedAudioStreamsIntoBuffer(buffer);
+        transportSnapshotMasterPeakLeft.store(
+            buffer.getNumChannels() > 0 ? juce::jlimit(0.0f, 1.0f, buffer.getMagnitude(0, numSamples)) : 0.0f,
+            std::memory_order_release);
+        transportSnapshotMasterPeakRight.store(
+            buffer.getNumChannels() > 1
+                ? juce::jlimit(0.0f, 1.0f, buffer.getMagnitude(1, numSamples))
+                : transportSnapshotMasterPeakLeft.load(std::memory_order_acquire),
+            std::memory_order_release);
 
         renderedSampleFrames.fetch_add(numSamples);
     }
@@ -3411,6 +4563,7 @@ private:
         {
             juce::ScopedLock lock(pluginLock);
             pluginDescription = description;
+            loadedPluginPath = pluginFile.getFullPathName();
             pluginInstance = std::move(instance);
             pluginInstance->disableNonMainBuses();
             pluginInstance->addListener(this);
@@ -3423,6 +4576,7 @@ private:
         preparePluginForPlayback();
         statusLabel.setText("Loaded: " + pluginDescription.name, juce::dontSendNotification);
         updateButtons();
+        refreshRealtimeTransportSnapshot();
     }
 
     void unloadPlugin()
@@ -3442,9 +4596,11 @@ private:
             juce::ScopedLock lock(pluginLock);
             pluginInstance.reset();
             pluginDescription = {};
+            loadedPluginPath.clear();
         }
         statusLabel.setText("Plugin unloaded", juce::dontSendNotification);
         updateButtons();
+        refreshRealtimeTransportSnapshot();
     }
 
     void preparePluginForPlayback()
@@ -3754,6 +4910,34 @@ private:
         return -1;
     }
 
+    static std::string normalisePluginParameterLookupKey(const juce::String& rawName)
+    {
+        return rawName.trim().toLowerCase().toStdString();
+    }
+
+    static std::unordered_map<std::string, int> buildPluginParameterLookup(juce::AudioPluginInstance& plugin)
+    {
+        std::unordered_map<std::string, int> lookup;
+        auto parameters = plugin.getParameters();
+        lookup.reserve(static_cast<size_t>(parameters.size()));
+
+        for (int index = 0; index < parameters.size(); ++index)
+        {
+            auto* parameter = parameters[index];
+            if (parameter == nullptr)
+                continue;
+
+            auto parameterName = parameter->getName(256).trim();
+            if (parameterName.isEmpty())
+                parameterName = "Param " + juce::String(index + 1);
+
+            lookup.emplace(normalisePluginParameterLookupKey(parameterName), index);
+            lookup.emplace(normalisePluginParameterLookupKey("Param " + juce::String(index + 1)), index);
+        }
+
+        return lookup;
+    }
+
     static bool parseRequestedParameterValues(const juce::var& parametersVar,
                                               std::vector<ParameterValueUpdate>& parameterUpdates,
                                               juce::String& error)
@@ -3941,6 +5125,7 @@ private:
 
     void applyQueuedAudioEngineTrackParameterUpdates()
     {
+        const ScopedProfileSample profileSample(HostProfileSection::applyQueuedTrackParameterUpdates);
         std::vector<QueuedAudioEngineTrackParameterUpdate> queuedUpdates;
         {
             const juce::SpinLock::ScopedTryLockType lock(pendingAudioEngineTrackParameterLock);
@@ -3958,16 +5143,33 @@ private:
             if (track.plugin == nullptr)
                 continue;
 
-            juce::String error;
             int appliedCount = 0;
-            juce::StringArray unmatchedParameters;
-            if (applyRequestedParameterValuesToPlugin(
-                    *track.plugin,
-                    update.parameters,
-                    error,
-                    appliedCount,
-                    unmatchedParameters)
-                && update.parameterSignature.isNotEmpty())
+            auto parameters = track.plugin->getParameters();
+            for (const auto& parameterUpdate : update.parameters)
+            {
+                const auto lookupKey = normalisePluginParameterLookupKey(parameterUpdate.name);
+                auto lookupIt = track.parameterIndexLookup.find(lookupKey);
+                if (lookupIt == track.parameterIndexLookup.end())
+                {
+                    const auto resolvedIndex = resolvePluginParameterIndex(*track.plugin, parameterUpdate.name);
+                    if (resolvedIndex < 0)
+                        continue;
+                    lookupIt = track.parameterIndexLookup.emplace(lookupKey, resolvedIndex).first;
+                }
+
+                const auto parameterIndex = lookupIt->second;
+                if (!juce::isPositiveAndBelow(parameterIndex, parameters.size()))
+                    continue;
+
+                auto* parameter = parameters[parameterIndex];
+                if (parameter == nullptr)
+                    continue;
+
+                parameter->setValue(juce::jlimit(0.0f, 1.0f, parameterUpdate.value / 100.0f));
+                ++appliedCount;
+            }
+
+            if (appliedCount > 0 && update.parameterSignature.isNotEmpty())
             {
                 track.parameterSignature = update.parameterSignature;
             }
@@ -5080,6 +6282,7 @@ private:
         track.stateMtimeNs = 0;
         track.parameterSignature.clear();
         track.fxChainSignature.clear();
+        track.parameterIndexLookup.clear();
         track.baseVolume = 1.0f;
         track.basePan = 0.0f;
         track.baseOutputGainDb = 0.0f;
@@ -5087,10 +6290,15 @@ private:
         track.processBuffer.setSize(0, 0);
         track.stereoBuffer.setSize(0, 0);
         track.peakLevel = 0.0f;
+        track.livePreviewMessages.clear();
+        track.livePreviewActiveNotes = 0;
+        track.livePreviewTailActive = false;
+        track.livePreviewTailSilentBlocks = 0;
     }
 
     void clearAudioEngine()
     {
+        closeAllAudioEngineTrackEditorWindows();
         audioEngine.running = false;
         audioEngine.bootstrapPending = false;
         clearQueuedAudioEngineTrackParameterUpdates();
@@ -5103,6 +6311,7 @@ private:
         audioEngine.metronomeClickBuffer.setSize(0, 0);
         audioEngine.metronomeAccentBuffer.setSize(0, 0);
         clearAudioEngineTailState();
+        refreshRealtimeTransportSnapshot();
     }
 
     void resetAudioEngineTrackProcessingState(AudioEngineTrack& track)
@@ -5218,22 +6427,14 @@ private:
 
     static void applyAudioEngineTrackParameterAutomation(AudioEngineTrack& track, double tick)
     {
-        auto* plugin = track.plugin.get();
-        if (plugin == nullptr)
-            return;
-
-        auto parameters = plugin->getParameters();
+        const ScopedProfileSample profileSample(HostProfileSection::applyTrackParameterAutomation);
         for (auto& lane : track.automationLanes)
         {
             if (lane.type != AudioEngineAutomationTargetType::vstParameter
-                || !juce::isPositiveAndBelow(lane.parameterIndex, parameters.size()))
+                || lane.parameter == nullptr)
             {
                 continue;
             }
-
-            auto* parameter = parameters[lane.parameterIndex];
-            if (parameter == nullptr)
-                continue;
 
             const auto value = juce::jlimit(0.0f, 100.0f, evaluateAudioEngineAutomationLane(lane, tick));
             if (std::isfinite(lane.lastAppliedValue)
@@ -5242,9 +6443,13 @@ private:
                 continue;
             }
 
-            parameter->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, value / 100.0f));
+            lane.parameter->setValue(juce::jlimit(0.0f, 1.0f, value / 100.0f));
             lane.lastAppliedValue = value;
         }
+        track.livePreviewMessages.clear();
+        track.livePreviewActiveNotes = 0;
+        track.livePreviewTailActive = false;
+        track.livePreviewTailSilentBlocks = 0;
     }
 
     static void applyAudioEngineTrackMixAutomation(const AudioEngineState& engineState,
@@ -5456,6 +6661,7 @@ private:
             track.fxChain.push_back(std::move(effectSlot));
         }
 
+        refreshRealtimeTransportSnapshot();
         return true;
     }
 
@@ -5505,6 +6711,50 @@ private:
         return notes;
     }
 
+    std::vector<AudioEngineTrackControllerEvent> parseAudioEngineTrackControllerEvents(const juce::var& controllerEventsVar) const
+    {
+        std::vector<AudioEngineTrackControllerEvent> events;
+        if (auto* eventsArray = controllerEventsVar.getArray())
+        {
+            events.reserve(static_cast<size_t>(eventsArray->size()));
+            for (const auto& eventVar : *eventsArray)
+            {
+                auto* eventObject = eventVar.getDynamicObject();
+                if (eventObject == nullptr)
+                    continue;
+
+                AudioEngineTrackControllerEvent event;
+                event.tick = static_cast<int>(eventObject->hasProperty("tick")
+                    ? eventObject->getProperty("tick")
+                    : juce::var(0));
+                event.controller = juce::jlimit(0,
+                                                127,
+                                                static_cast<int>(eventObject->hasProperty("control")
+                                                    ? eventObject->getProperty("control")
+                                                    : juce::var(0)));
+                event.value = juce::jlimit(0,
+                                           127,
+                                           static_cast<int>(eventObject->hasProperty("value")
+                                               ? eventObject->getProperty("value")
+                                               : juce::var(0)));
+                event.channel = clampMidiChannel(static_cast<int>(eventObject->hasProperty("channel")
+                    ? eventObject->getProperty("channel")
+                    : juce::var(kDefaultMidiChannel)));
+                events.push_back(event);
+            }
+        }
+
+        std::sort(events.begin(), events.end(), [] (const AudioEngineTrackControllerEvent& lhs, const AudioEngineTrackControllerEvent& rhs)
+        {
+            if (lhs.tick != rhs.tick)
+                return lhs.tick < rhs.tick;
+            if (lhs.channel != rhs.channel)
+                return lhs.channel < rhs.channel;
+            return lhs.controller < rhs.controller;
+        });
+        return events;
+    }
+
     bool configureAudioEngine(const juce::var& tracksVar,
                               double bpm,
                               int ticksPerBeat,
@@ -5537,7 +6787,10 @@ private:
         if (audioEngine.tracks.size() > static_cast<size_t>(requestedTrackCount))
         {
             for (size_t index = static_cast<size_t>(requestedTrackCount); index < audioEngine.tracks.size(); ++index)
+            {
+                closeAudioEngineTrackEditorWindow(static_cast<int>(index));
                 releaseAudioEngineTrack(audioEngine.tracks[index]);
+            }
             audioEngine.tracks.resize(static_cast<size_t>(requestedTrackCount));
             structuralChange = true;
         }
@@ -5555,6 +6808,7 @@ private:
             auto& track = audioEngine.tracks[static_cast<size_t>(trackIndex)];
             if (trackObject == nullptr)
             {
+                closeAudioEngineTrackEditorWindow(trackIndex);
                 releaseAudioEngineTrack(track);
                 auto* errorObject = new juce::DynamicObject();
                 errorObject->setProperty("track_index", trackIndex);
@@ -5594,6 +6848,7 @@ private:
                 || static_cast<bool>(trackObject->getProperty("audible"));
 
             auto notes = parseAudioEngineTrackNotes(trackObject->getProperty("notes"));
+            auto controllerEvents = parseAudioEngineTrackControllerEvents(trackObject->getProperty("controller_events"));
 
             std::vector<AudioEngineAudioClip> audioClips;
             if (requestedKind == AudioEngineTrackKind::audio)
@@ -5650,6 +6905,7 @@ private:
 
             if (requestedKind == AudioEngineTrackKind::instrument && pluginPath.isEmpty())
             {
+                closeAudioEngineTrackEditorWindow(trackIndex);
                 releaseAudioEngineTrack(track);
                 auto* errorObject = new juce::DynamicObject();
                 errorObject->setProperty("track_index", trackIndex);
@@ -5674,6 +6930,7 @@ private:
             if (!canReuse)
             {
                 structuralChange = true;
+                closeAudioEngineTrackEditorWindow(trackIndex);
                 releaseAudioEngineTrack(track);
                 track.kind = requestedKind;
 
@@ -5702,6 +6959,7 @@ private:
                     track.parameterSignature = parameterSignature;
                     track.fxChainSignature = fxChainSignature;
                     track.plugin = std::move(instance);
+                    track.parameterIndexLookup = buildPluginParameterLookup(*track.plugin);
                 }
                 else
                 {
@@ -5710,6 +6968,7 @@ private:
                     track.stateMtimeNs = stateMtimeNs;
                     track.parameterSignature = parameterSignature;
                     track.fxChainSignature = fxChainSignature;
+                    track.parameterIndexLookup.clear();
                 }
 
                 configureAudioEngineTrackEffectChain(track, trackObject->getProperty("fx_chain"), trackIndex, trackErrors);
@@ -5755,6 +7014,7 @@ private:
                         lane.parameterIndex = track.plugin != nullptr
                             ? resolvePluginParameterIndex(*track.plugin, lane.parameterName)
                             : -1;
+                        lane.parameter = nullptr;
                         if (lane.parameterName.isEmpty() || lane.parameterIndex < 0)
                         {
                             auto* errorObject = new juce::DynamicObject();
@@ -5768,6 +7028,7 @@ private:
                         if (juce::isPositiveAndBelow(lane.parameterIndex, parameters.size())
                             && parameters[lane.parameterIndex] != nullptr)
                         {
+                            lane.parameter = parameters[lane.parameterIndex];
                             lane.defaultValue = parameters[lane.parameterIndex]->getValue() * 100.0f;
                         }
                     }
@@ -5822,6 +7083,9 @@ private:
             track.notes = requestedKind == AudioEngineTrackKind::instrument
                 ? std::move(notes)
                 : std::vector<AudioEngineTrackNote>{};
+            track.controllerEvents = requestedKind == AudioEngineTrackKind::instrument
+                ? std::move(controllerEvents)
+                : std::vector<AudioEngineTrackControllerEvent>{};
             track.audioClips = requestedKind == AudioEngineTrackKind::audio
                 ? std::move(audioClips)
                 : std::vector<AudioEngineAudioClip>{};
@@ -5903,6 +7167,7 @@ private:
 
     bool updateAudioEngineTrackNotes(int trackIndex,
                                      const juce::var& notesVar,
+                                     const juce::var& controllerEventsVar,
                                      juce::String& error,
                                      int& noteCount)
     {
@@ -5920,6 +7185,7 @@ private:
         }
 
         track.notes = parseAudioEngineTrackNotes(notesVar);
+        track.controllerEvents = parseAudioEngineTrackControllerEvents(controllerEventsVar);
         noteCount = static_cast<int>(track.notes.size());
         return true;
     }
@@ -6025,11 +7291,150 @@ private:
         }
     }
 
+    void appendAudioEngineControllerEvents(const AudioEngineTrack& track,
+                                           juce::MidiBuffer& midi,
+                                           int64_t chunkStartFrame,
+                                           int chunkSamples,
+                                           double sampleRate,
+                                           bool bootstrapActive)
+    {
+        if (track.controllerEvents.empty())
+            return;
+
+        const auto chunkEndFrame = chunkStartFrame + chunkSamples;
+        std::map<std::pair<int, int>, AudioEngineTrackControllerEvent> bootstrapControllers;
+        for (const auto& controllerEvent : track.controllerEvents)
+        {
+            const auto eventFrame = audioEngine.tickToFrame(controllerEvent.tick, sampleRate);
+            if (bootstrapActive && eventFrame < chunkStartFrame)
+            {
+                bootstrapControllers[{ controllerEvent.channel, controllerEvent.controller }] = controllerEvent;
+                continue;
+            }
+
+            if (eventFrame >= chunkStartFrame && eventFrame < chunkEndFrame)
+            {
+                midi.addEvent(juce::MidiMessage::controllerEvent(controllerEvent.channel,
+                                                                 controllerEvent.controller,
+                                                                 controllerEvent.value),
+                              static_cast<int>(eventFrame - chunkStartFrame));
+            }
+        }
+
+        if (bootstrapActive)
+        {
+            for (const auto& entry : bootstrapControllers)
+            {
+                const auto& controllerEvent = entry.second;
+                midi.addEvent(juce::MidiMessage::controllerEvent(controllerEvent.channel,
+                                                                 controllerEvent.controller,
+                                                                 controllerEvent.value),
+                              0);
+            }
+        }
+    }
+
+    static bool audioEngineTrackHasLivePreviewActivity(const AudioEngineTrack& track)
+    {
+        return track.livePreviewActiveNotes > 0
+            || track.livePreviewTailActive
+            || !track.livePreviewMessages.isEmpty();
+    }
+
+    bool audioEngineHasLivePreviewActivity() const
+    {
+        for (const auto& track : audioEngine.tracks)
+        {
+            if (audioEngineTrackHasLivePreviewActivity(track))
+                return true;
+        }
+
+        return false;
+    }
+
+    void appendAudioEngineLivePreviewMessages(AudioEngineTrack& track, juce::MidiBuffer& midi)
+    {
+        if (track.livePreviewMessages.isEmpty())
+            return;
+
+        for (const auto metadata : track.livePreviewMessages)
+            midi.addEvent(metadata.getMessage(), metadata.samplePosition);
+        track.livePreviewMessages.clear();
+    }
+
+    juce::Result noteOnAudioEngineTrack(int trackIndex, int note, int channel, float velocity)
+    {
+        juce::ScopedLock lock(pluginLock);
+        if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(audioEngine.tracks.size())))
+            return juce::Result::fail("Invalid audio engine track index");
+
+        auto& track = audioEngine.tracks[static_cast<size_t>(trackIndex)];
+        if (track.kind != AudioEngineTrackKind::instrument || track.plugin == nullptr)
+            return juce::Result::fail("Audio engine track has no live instrument plugin");
+
+        track.livePreviewMessages.addEvent(juce::MidiMessage::noteOn(clampMidiChannel(channel),
+                                                                     clampMidiNote(note),
+                                                                     clampMidiVelocity(velocity)),
+                                           0);
+        track.livePreviewActiveNotes = juce::jmax(0, track.livePreviewActiveNotes) + 1;
+        track.livePreviewTailActive = true;
+        track.livePreviewTailSilentBlocks = 0;
+        return juce::Result::ok();
+    }
+
+    juce::Result noteOffAudioEngineTrack(int trackIndex, int note, int channel, float velocity)
+    {
+        juce::ScopedLock lock(pluginLock);
+        if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(audioEngine.tracks.size())))
+            return juce::Result::fail("Invalid audio engine track index");
+
+        auto& track = audioEngine.tracks[static_cast<size_t>(trackIndex)];
+        if (track.kind != AudioEngineTrackKind::instrument || track.plugin == nullptr)
+            return juce::Result::fail("Audio engine track has no live instrument plugin");
+
+        track.livePreviewMessages.addEvent(juce::MidiMessage::noteOff(clampMidiChannel(channel),
+                                                                      clampMidiNote(note),
+                                                                      clampMidiVelocity(velocity)),
+                                           0);
+        track.livePreviewActiveNotes = juce::jmax(0, track.livePreviewActiveNotes - 1);
+        track.livePreviewTailActive = true;
+        track.livePreviewTailSilentBlocks = 0;
+        return juce::Result::ok();
+    }
+
+    juce::Result allNotesOffAudioEngineTrack(int trackIndex, int channel)
+    {
+        juce::ScopedLock lock(pluginLock);
+        if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(audioEngine.tracks.size())))
+            return juce::Result::fail("Invalid audio engine track index");
+
+        auto& track = audioEngine.tracks[static_cast<size_t>(trackIndex)];
+        if (track.kind != AudioEngineTrackKind::instrument || track.plugin == nullptr)
+            return juce::Result::fail("Audio engine track has no live instrument plugin");
+
+        const auto clampedChannel = channel > 0 ? clampMidiChannel(channel) : 0;
+        for (int currentChannel = 1; currentChannel <= 16; ++currentChannel)
+        {
+            if (clampedChannel > 0 && currentChannel != clampedChannel)
+                continue;
+
+            track.livePreviewMessages.addEvent(juce::MidiMessage::allNotesOff(currentChannel), 0);
+            track.livePreviewMessages.addEvent(juce::MidiMessage::allSoundOff(currentChannel), 0);
+        }
+
+        track.livePreviewActiveNotes = 0;
+        track.livePreviewTailActive = true;
+        track.livePreviewTailSilentBlocks = 0;
+        return juce::Result::ok();
+    }
+
     void processAudioEngine(juce::AudioBuffer<float>& buffer, int numSamples)
     {
+        const ScopedProfileSample profileSample(HostProfileSection::processAudioEngine);
         const bool transportRunning = audioEngine.running;
         const bool tailStopping = audioEngine.tailStopping;
-        if ((!transportRunning && !tailStopping) || numSamples <= 0)
+        const bool livePreviewActive = audioEngineHasLivePreviewActivity();
+        if ((!transportRunning && !tailStopping && !livePreviewActive) || numSamples <= 0)
             return;
 
         applyQueuedAudioEngineTrackParameterUpdates();
@@ -6067,6 +7472,21 @@ private:
                     if (plugin == nullptr)
                         continue;
 
+                    const bool hasMidiOrControllerContent = !track.notes.empty() || !track.controllerEvents.empty();
+                    const bool hasParameterAutomation = audioEngineTrackHasParameterAutomation(track);
+                    const bool hasLivePreview = audioEngineTrackHasLivePreviewActivity(track);
+                    if (!transportRunning && !tailStopping && !hasLivePreview)
+                    {
+                        track.peakLevel = 0.0f;
+                        continue;
+                    }
+
+                    if (transportRunning && !hasMidiOrControllerContent && !hasParameterAutomation && !hasLivePreview)
+                    {
+                        track.peakLevel = 0.0f;
+                        continue;
+                    }
+
                     const auto trackChannelCount = juce::jmax(
                         2,
                         juce::jmax(plugin->getTotalNumInputChannels(), plugin->getTotalNumOutputChannels())
@@ -6087,17 +7507,31 @@ private:
                             wrapAfterChunk,
                             loopEndFrame
                         );
+                        appendAudioEngineControllerEvents(
+                            track,
+                            midi,
+                            chunkStartFrame,
+                            chunkSamples,
+                            sampleRate,
+                            bootstrapActive
+                        );
                     }
                     else if (audioEngine.tailReleasePending)
                     {
                         appendAudioEngineTailReleaseEvents(track, midi);
                     }
 
+                    appendAudioEngineLivePreviewMessages(track, midi);
+
                     applyAudioEngineTrackParameterAutomation(
                         track,
                         audioEngine.frameToTickDouble(chunkStartFrame, sampleRate)
                     );
+                    const auto pluginProcessStartMicros = runtimeProfiler().isEnabled() ? profileNowMicroseconds() : 0;
                     plugin->processBlock(track.processBuffer, midi);
+                    if (pluginProcessStartMicros > 0)
+                        runtimeProfiler().addSample(HostProfileSection::processAudioEnginePluginBlock,
+                                                    profileNowMicroseconds() - pluginProcessStartMicros);
                     extractPluginOutputToStereo(*plugin, track.processBuffer, track.stereoBuffer);
                 }
                 else
@@ -6106,9 +7540,37 @@ private:
                         renderAudioEngineTrackClips(track, chunkStartFrame, chunkSamples);
                 }
 
+                const auto fxStartMicros = runtimeProfiler().isEnabled() ? profileNowMicroseconds() : 0;
                 processAudioEngineEffectChain(track, track.stereoBuffer);
+                if (fxStartMicros > 0)
+                    runtimeProfiler().addSample(HostProfileSection::processAudioEngineFxChain,
+                                                profileNowMicroseconds() - fxStartMicros);
+                const auto mixStartMicros = runtimeProfiler().isEnabled() ? profileNowMicroseconds() : 0;
                 applyAudioEngineTrackMixAutomation(audioEngine, track, track.stereoBuffer, chunkStartFrame, sampleRate);
+                if (mixStartMicros > 0)
+                    runtimeProfiler().addSample(HostProfileSection::processAudioEngineMixAutomation,
+                                                profileNowMicroseconds() - mixStartMicros);
                 track.peakLevel = peakLevelForBuffer(track.stereoBuffer);
+                if (track.kind == AudioEngineTrackKind::instrument && track.livePreviewTailActive)
+                {
+                    if (track.livePreviewActiveNotes <= 0)
+                    {
+                        if (track.peakLevel <= 1.0e-4f)
+                            ++track.livePreviewTailSilentBlocks;
+                        else
+                            track.livePreviewTailSilentBlocks = 0;
+
+                        if (track.livePreviewTailSilentBlocks >= 6 && track.livePreviewMessages.isEmpty())
+                        {
+                            track.livePreviewTailActive = false;
+                            track.livePreviewTailSilentBlocks = 0;
+                        }
+                    }
+                    else
+                    {
+                        track.livePreviewTailSilentBlocks = 0;
+                    }
+                }
                 tailPeakLevel = juce::jmax(tailPeakLevel, track.peakLevel);
                 buffer.addFrom(0, sampleOffset, track.stereoBuffer, 0, 0, chunkSamples);
                 buffer.addFrom(1, sampleOffset, track.stereoBuffer, 1, 0, chunkSamples);
@@ -6158,12 +7620,14 @@ private:
         if (editorWindow != nullptr)
         {
             editorWindow->forceTopmostFront();
+            notifyEditorStateChanged(editorWindow->isVisible());
+            updateButtons();
             return;
         }
 
         auto key = pluginDescription.fileOrIdentifier;
         if (key.isEmpty())
-            key = pathEditor.getText().trim();
+            key = loadedPluginPath.trim();
 
         key = normaliseVst3PathForSettings(key);
 
@@ -6175,10 +7639,22 @@ private:
             {
                 dispatchShortcutCallback(command);
             });
-        editorWindow->onWindowClosed = [this]
+        editorWindow->onWindowClosed = [safeThis = juce::Component::SafePointer<HostComponent>(this)]
         {
-            editorWindow.reset();
-            updateButtons();
+            if (safeThis == nullptr)
+                return;
+
+            safeThis->notifyEditorStateChanged(false);
+            safeThis->updateButtons();
+
+            juce::MessageManager::callAsync([safeThis]
+            {
+                if (safeThis == nullptr)
+                    return;
+
+                if (safeThis->editorWindow != nullptr && !safeThis->editorWindow->isVisible())
+                    safeThis->editorWindow.reset();
+            });
         };
         if (bridgeMode)
         {
@@ -6188,15 +7664,10 @@ private:
         {
             editorWindow->forceTopmostFront();
             editorWindow->beginTopmostWarmup();
-            juce::MessageManager::callAsync([this]
-            {
-                if (editorWindow != nullptr)
-                {
-                    editorWindow->forceTopmostFront();
-                    editorWindow->beginTopmostWarmup();
-                }
-            });
         }
+
+        notifyEditorStateChanged(true);
+        refreshRealtimeTransportSnapshot();
     }
 
     void openGraphEditorWindow(int slotIndex)
@@ -6229,11 +7700,24 @@ private:
                 dispatchShortcutCallback(command);
             });
         graphEditorSlotIndex = slotIndex;
-        graphEditorWindow->onWindowClosed = [this]
+        graphEditorWindow->onWindowClosed = [safeThis = juce::Component::SafePointer<HostComponent>(this)]
         {
-            graphEditorWindow.reset();
-            graphEditorSlotIndex = -1;
-            updateButtons();
+            if (safeThis == nullptr)
+                return;
+
+            safeThis->updateButtons();
+
+            juce::MessageManager::callAsync([safeThis]
+            {
+                if (safeThis == nullptr)
+                    return;
+
+                if (safeThis->graphEditorWindow != nullptr && !safeThis->graphEditorWindow->isVisible())
+                {
+                    safeThis->graphEditorWindow.reset();
+                    safeThis->graphEditorSlotIndex = -1;
+                }
+            });
         };
         if (bridgeMode)
         {
@@ -6243,21 +7727,246 @@ private:
         {
             graphEditorWindow->forceTopmostFront();
             graphEditorWindow->beginTopmostWarmup();
-            juce::MessageManager::callAsync([this]
-            {
-                if (graphEditorWindow != nullptr)
-                {
-                    graphEditorWindow->forceTopmostFront();
-                    graphEditorWindow->beginTopmostWarmup();
-                }
-            });
         }
+    }
+
+    PluginEditorWindow* findAudioEngineTrackEditorWindow(int trackIndex)
+    {
+        for (auto& entry : audioEngineTrackEditorWindows)
+        {
+            if (entry.trackIndex == trackIndex)
+                return entry.window.get();
+        }
+
+        return nullptr;
+    }
+
+    const PluginEditorWindow* findAudioEngineTrackEditorWindow(int trackIndex) const
+    {
+        for (const auto& entry : audioEngineTrackEditorWindows)
+        {
+            if (entry.trackIndex == trackIndex)
+                return entry.window.get();
+        }
+
+        return nullptr;
+    }
+
+    bool anyEditorWindowVisible() const
+    {
+        if (editorWindow != nullptr && editorWindow->isVisible())
+            return true;
+
+        if (graphEditorWindow != nullptr && graphEditorWindow->isVisible())
+            return true;
+
+        for (const auto& entry : audioEngineTrackEditorWindows)
+        {
+            if (entry.window != nullptr && entry.window->isVisible())
+                return true;
+        }
+
+        return false;
+    }
+
+    void removeAudioEngineTrackEditorWindow(int trackIndex)
+    {
+        audioEngineTrackEditorWindows.erase(
+            std::remove_if(
+                audioEngineTrackEditorWindows.begin(),
+                audioEngineTrackEditorWindows.end(),
+                [trackIndex](const auto& entry) { return entry.trackIndex == trackIndex; }),
+            audioEngineTrackEditorWindows.end());
+        notifyEditorStateChanged(anyEditorWindowVisible());
+        refreshRealtimeTransportSnapshot();
+    }
+
+    juce::Result openAudioEngineTrackEditorWindow(int trackIndex)
+    {
+        if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(audioEngine.tracks.size())))
+            return juce::Result::fail("Invalid audio engine track index");
+
+        auto& track = audioEngine.tracks[static_cast<size_t>(trackIndex)];
+        if (track.plugin == nullptr)
+            return juce::Result::fail("Audio engine track has no live plugin instance");
+
+        if (auto* existingWindow = findAudioEngineTrackEditorWindow(trackIndex))
+        {
+            existingWindow->forceTopmostFront();
+            notifyEditorStateChanged(anyEditorWindowVisible());
+            refreshRealtimeTransportSnapshot();
+            return juce::Result::ok();
+        }
+
+        auto key = normaliseVst3PathForSettings(track.pluginPath);
+        if (key.isEmpty())
+            key = "audio_engine_track_" + juce::String(trackIndex + 1);
+
+        AudioEngineTrackEditorWindowEntry entry;
+        entry.trackIndex = trackIndex;
+        entry.window = std::make_unique<PluginEditorWindow>(
+            *track.plugin,
+            "audio_engine_editor_" + key + "_" + juce::String(trackIndex + 1),
+            appSettings,
+            [this](const juce::String& command)
+            {
+                dispatchShortcutCallback(command);
+            });
+
+        entry.window->onWindowClosed = [safeThis = juce::Component::SafePointer<HostComponent>(this), trackIndex]
+        {
+            if (safeThis == nullptr)
+                return;
+
+            juce::MessageManager::callAsync([safeThis, trackIndex]
+            {
+                if (safeThis == nullptr)
+                    return;
+
+                const auto* window = safeThis->findAudioEngineTrackEditorWindow(trackIndex);
+                if (window == nullptr || window->isVisible())
+                    return;
+
+                safeThis->removeAudioEngineTrackEditorWindow(trackIndex);
+            });
+        };
+
+        if (bridgeMode)
+            entry.window->showBridgeEditorWindow();
+        else
+        {
+            entry.window->forceTopmostFront();
+            entry.window->beginTopmostWarmup();
+        }
+
+        audioEngineTrackEditorWindows.push_back(std::move(entry));
+        notifyEditorStateChanged(anyEditorWindowVisible());
+        refreshRealtimeTransportSnapshot();
+        return juce::Result::ok();
+    }
+
+    void closeAudioEngineTrackEditorWindow(int trackIndex)
+    {
+        for (auto it = audioEngineTrackEditorWindows.begin(); it != audioEngineTrackEditorWindows.end(); ++it)
+        {
+            if (it->trackIndex != trackIndex)
+                continue;
+
+            it->window.reset();
+            audioEngineTrackEditorWindows.erase(it);
+            notifyEditorStateChanged(anyEditorWindowVisible());
+            refreshRealtimeTransportSnapshot();
+            return;
+        }
+    }
+
+    void closeAllAudioEngineTrackEditorWindows()
+    {
+        if (audioEngineTrackEditorWindows.empty())
+            return;
+
+        for (auto& entry : audioEngineTrackEditorWindows)
+            entry.window.reset();
+        audioEngineTrackEditorWindows.clear();
+        notifyEditorStateChanged(anyEditorWindowVisible());
+        refreshRealtimeTransportSnapshot();
+    }
+
+    juce::Result queryAudioEngineTrackEditorOpen(int trackIndex, bool& isOpen) const
+    {
+        isOpen = false;
+
+        if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(audioEngine.tracks.size())))
+            return juce::Result::fail("Invalid audio engine track index");
+
+        const auto* window = findAudioEngineTrackEditorWindow(trackIndex);
+        isOpen = window != nullptr && window->isVisible();
+        return juce::Result::ok();
+    }
+
+    juce::Result getAudioEngineTrackParameterSnapshot(int trackIndex,
+                                                      AimsVstHostParameterSnapshot& snapshot,
+                                                      AimsVstHostParameterSnapshotEntry* parameterEntries,
+                                                      int parameterEntryCapacity) const
+    {
+        snapshot = {};
+
+        const auto lockStartMicros = runtimeProfiler().isEnabled() ? profileNowMicroseconds() : 0;
+        const juce::ScopedLock lock(pluginLock);
+        if (lockStartMicros > 0)
+            runtimeProfiler().addSample(HostProfileSection::parameterSnapshotLockWait,
+                                        profileNowMicroseconds() - lockStartMicros);
+
+        if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(audioEngine.tracks.size())))
+            return juce::Result::fail("Invalid audio engine track index");
+
+        const auto& track = audioEngine.tracks[static_cast<size_t>(trackIndex)];
+        snapshot.editorOpen = 0;
+        if (const auto* window = findAudioEngineTrackEditorWindow(trackIndex))
+            snapshot.editorOpen = window->isVisible() ? 1 : 0;
+        snapshot.stateGeneration = pluginStateGeneration.load(std::memory_order_relaxed);
+
+        if (track.plugin == nullptr || parameterEntries == nullptr || parameterEntryCapacity <= 0)
+            return juce::Result::ok();
+
+        auto pluginParameters = track.plugin->getParameters();
+        const auto count = juce::jmin(parameterEntryCapacity, pluginParameters.size());
+        for (int index = 0; index < count; ++index)
+        {
+            auto* parameter = pluginParameters[index];
+            if (parameter == nullptr)
+                continue;
+
+            auto parameterName = parameter->getName(256).trim();
+            if (parameterName.isEmpty())
+                parameterName = "Param " + juce::String(index + 1);
+
+            std::memset(parameterEntries[index].name, 0, sizeof(parameterEntries[index].name));
+            parameterName.copyToUTF8(parameterEntries[index].name,
+                                     static_cast<int>(sizeof(parameterEntries[index].name)));
+            parameterEntries[index].normalizedValue = juce::jlimit(0.0f, 1.0f, parameter->getValue());
+            snapshot.parameterCount = index + 1;
+        }
+
+        return juce::Result::ok();
+    }
+
+    juce::Result saveAudioEngineTrackPluginStateToFile(int trackIndex, const juce::File& stateFile)
+    {
+        juce::MemoryBlock rawState;
+        {
+            juce::ScopedLock lock(pluginLock);
+            if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(audioEngine.tracks.size())))
+                return juce::Result::fail("Invalid audio engine track index");
+
+            auto& track = audioEngine.tracks[static_cast<size_t>(trackIndex)];
+            if (track.plugin == nullptr)
+                return juce::Result::fail("Audio engine track has no live plugin instance");
+
+            track.plugin->getStateInformation(rawState);
+        }
+
+        if (rawState.getSize() == 0)
+            return juce::Result::fail("Could not capture the live audio engine track state");
+
+        const auto parentDir = stateFile.getParentDirectory();
+        if (!parentDir.exists() && !parentDir.createDirectory())
+            return juce::Result::fail("Could not create the target state folder");
+
+        if (!stateFile.replaceWithData(rawState.getData(), rawState.getSize()))
+            return juce::Result::fail("Could not write the live audio engine track state file");
+
+        return juce::Result::ok();
     }
 
     void closeEditorWindow()
     {
         if (editorWindow != nullptr)
+        {
             editorWindow.reset();
+            notifyEditorStateChanged(anyEditorWindowVisible());
+            refreshRealtimeTransportSnapshot();
+        }
     }
 
     void closeGraphEditorWindow()
@@ -6265,6 +7974,8 @@ private:
         if (graphEditorWindow != nullptr)
             graphEditorWindow.reset();
         graphEditorSlotIndex = -1;
+        notifyEditorStateChanged(anyEditorWindowVisible());
+        refreshRealtimeTransportSnapshot();
     }
 
     void dispatchShortcutCallback(const juce::String& command) const
@@ -6341,10 +8052,14 @@ private:
     juce::MidiKeyboardComponent keyboardComponent;
 
     juce::PluginDescription pluginDescription;
+    juce::String loadedPluginPath;
     std::unique_ptr<juce::AudioPluginInstance> pluginInstance;
     std::unique_ptr<PluginEditorWindow> editorWindow;
     std::vector<PersistentGraphSlot> persistentGraphSlots;
     std::unique_ptr<PluginEditorWindow> graphEditorWindow;
+    std::vector<AudioEngineTrackEditorWindowEntry> audioEngineTrackEditorWindows;
+    EditorStateCallback editorStateCallback = nullptr;
+    void* editorStateUserData = nullptr;
     int graphEditorSlotIndex = -1;
     std::unique_ptr<juce::FileChooser> fileChooser;
     std::unique_ptr<HostCommandServer> commandServer;
@@ -6355,8 +8070,58 @@ private:
     double currentSampleRate = 44100.0;
     int currentBlockSize = 512;
     float pluginOutputPeakLevel = 0.0f;
+    mutable juce::CriticalSection statusSnapshotLock;
+    juce::String cachedAudioDeviceType;
+    juce::String cachedAudioDeviceName;
+    juce::StringArray cachedAvailableAudioDeviceTypes;
+    juce::StringArray cachedAvailableAudioOutputDevices;
+    juce::Array<juce::var> cachedAvailableAudioSampleRates;
+    juce::Array<juce::var> cachedAvailableAudioBufferSizes;
     mutable std::atomic<int> pluginStateGeneration { 0 };
     mutable uint64_t lastPluginStateChecksum { 0 };
+    std::atomic<double> transportSnapshotSampleRate { 44100.0 };
+    std::atomic<double> transportSnapshotCpuUsage { 0.0 };
+    std::atomic<int> transportSnapshotInProcessRunning { 0 };
+    std::atomic<double> transportSnapshotInProcessPositionFrame { 0.0 };
+    std::atomic<int> transportSnapshotAudioEngineRunning { 0 };
+    std::atomic<int> transportSnapshotAudioEngineTailing { 0 };
+    std::atomic<double> transportSnapshotAudioEnginePositionFrame { 0.0 };
+    std::atomic<float> transportSnapshotPluginOutputPeakLevel { 0.0f };
+    std::atomic<float> transportSnapshotMasterPeakLeft { 0.0f };
+    std::atomic<float> transportSnapshotMasterPeakRight { 0.0f };
+    mutable std::atomic<int> transportSnapshotEditorOpen { 0 };
+    mutable juce::SpinLock transportSnapshotTrackPeaksLock;
+    std::vector<float> transportSnapshotTrackPeaks;
+
+    void notifyEditorStateChanged(bool isOpen) const
+    {
+        transportSnapshotEditorOpen.store(isOpen ? 1 : 0, std::memory_order_release);
+        if (editorStateCallback != nullptr)
+            editorStateCallback(isOpen ? 1 : 0, editorStateUserData);
+    }
+
+    void refreshRealtimeTransportSnapshot()
+    {
+        transportSnapshotSampleRate.store(currentSampleRate, std::memory_order_release);
+        transportSnapshotCpuUsage.store(deviceManager.getCpuUsage(), std::memory_order_release);
+        transportSnapshotInProcessRunning.store(inProcessTransport.running ? 1 : 0, std::memory_order_release);
+        transportSnapshotInProcessPositionFrame.store(static_cast<double>(inProcessTransport.positionFrame),
+                                                      std::memory_order_release);
+        transportSnapshotAudioEngineRunning.store(audioEngine.running ? 1 : 0, std::memory_order_release);
+        transportSnapshotAudioEngineTailing.store(audioEngine.tailStopping ? 1 : 0, std::memory_order_release);
+        transportSnapshotAudioEnginePositionFrame.store(static_cast<double>(audioEngine.positionFrame),
+                                                        std::memory_order_release);
+        transportSnapshotPluginOutputPeakLevel.store(juce::jlimit(0.0f, 1.0f, pluginOutputPeakLevel),
+                                                     std::memory_order_release);
+        transportSnapshotEditorOpen.store(anyEditorWindowVisible() ? 1 : 0,
+                                          std::memory_order_release);
+        audioEngineTrackCount.store(static_cast<int>(audioEngine.tracks.size()), std::memory_order_release);
+
+        const juce::SpinLock::ScopedLockType peakLock(transportSnapshotTrackPeaksLock);
+        transportSnapshotTrackPeaks.resize(audioEngine.tracks.size());
+        for (size_t index = 0; index < audioEngine.tracks.size(); ++index)
+            transportSnapshotTrackPeaks[index] = juce::jlimit(0.0f, 1.0f, audioEngine.tracks[index].peakLevel);
+    }
 
     // Pre-allocated scratch buffers for realtime audio callback (avoid heap allocs)
     std::vector<float> deinterleaveLeft;
@@ -6617,7 +8382,7 @@ private:
 #if defined(AIMS_VST_HOST_BUILD_LIBRARY)
 namespace
 {
-   #if JUCE_WINDOWS
+   #if JUCE_WINDOWS && defined(AIMS_VST_HOST_SHARED)
     #define AIMS_VST_HOST_API extern "C" __declspec(dllexport)
    #else
     #define AIMS_VST_HOST_API extern "C"
@@ -6653,9 +8418,12 @@ namespace
                             double startupSampleRate,
                             int startupBufferSize,
                             const juce::String& startupAudioDeviceType,
-                            const juce::String& startupAudioOutputDeviceName)
-            : guiInitializer(std::make_unique<juce::ScopedJuceInitialiser_GUI>())
+                            const juce::String& startupAudioOutputDeviceName,
+                            bool bridgeModeEnabled)
         {
+#if defined(AIMS_VST_HOST_SHARED)
+            guiInitializer = std::make_unique<juce::ScopedJuceInitialiser_GUI>();
+#endif
             appProperties = std::make_unique<juce::ApplicationProperties>();
             appProperties->setStorageParameters(hostSettingsOptions());
             component = std::make_unique<HostComponent>(*appProperties->getUserSettings(),
@@ -6664,7 +8432,7 @@ namespace
                                                         restoreLastPluginOnStartup,
                                                         shouldOpenEditorOnStartup,
                                                         0,
-                                                        true,
+                                                        bridgeModeEnabled,
                                                         startupSampleRate,
                                                         startupBufferSize,
                                                         startupAudioDeviceType,
@@ -6677,6 +8445,267 @@ namespace
                                         : juce::JSON::toString(makeResponse(false, "Host component unavailable"), true);
         }
 
+        void setEditorStateCallback(EditorStateCallback callback, void* userData)
+        {
+            if (component != nullptr)
+                component->setEditorStateCallback(callback, userData);
+        }
+
+        juce::Result getTransportSnapshot(AimsVstHostTransportSnapshot& snapshot,
+                                          float* trackPeakLevels,
+                                          int trackPeakLevelCapacity) const
+        {
+            return component != nullptr ? component->getTransportSnapshot(snapshot, trackPeakLevels, trackPeakLevelCapacity)
+                                        : juce::Result::fail("Host component unavailable");
+        }
+
+        juce::Result getParameterSnapshot(AimsVstHostParameterSnapshot& snapshot,
+                                          AimsVstHostParameterSnapshotEntry* parameterEntries,
+                                          int parameterEntryCapacity) const
+        {
+            return component != nullptr ? component->getParameterSnapshot(snapshot, parameterEntries, parameterEntryCapacity)
+                                        : juce::Result::fail("Host component unavailable");
+        }
+
+        juce::Result getPluginSnapshot(AimsVstHostPluginSnapshot& snapshot) const
+        {
+            return component != nullptr ? component->getPluginSnapshot(snapshot)
+                                        : juce::Result::fail("Host component unavailable");
+        }
+
+        juce::Result getAudioDeviceSnapshot(AimsVstHostAudioDeviceSnapshot& snapshot,
+                                            AimsVstHostStringEntry* availableDeviceTypes,
+                                            int availableDeviceTypeCapacity,
+                                            AimsVstHostStringEntry* availableOutputDevices,
+                                            int availableOutputDeviceCapacity,
+                                            double* availableSampleRates,
+                                            int availableSampleRateCapacity,
+                                            int* availableBufferSizes,
+                                            int availableBufferSizeCapacity) const
+        {
+            return component != nullptr ? component->getAudioDeviceSnapshot(snapshot,
+                                                                            availableDeviceTypes,
+                                                                            availableDeviceTypeCapacity,
+                                                                            availableOutputDevices,
+                                                                            availableOutputDeviceCapacity,
+                                                                            availableSampleRates,
+                                                                            availableSampleRateCapacity,
+                                                                            availableBufferSizes,
+                                                                            availableBufferSizeCapacity)
+                                        : juce::Result::fail("Host component unavailable");
+        }
+
+        juce::Result loadPlugin(const juce::String& pluginPath)
+        {
+            return component != nullptr ? component->loadPluginDirect(pluginPath)
+                                        : juce::Result::fail("Host component unavailable");
+        }
+
+        juce::Result loadPluginState(const juce::String& statePath)
+        {
+            return component != nullptr ? component->loadPluginStateDirect(statePath)
+                                        : juce::Result::fail("Host component unavailable");
+        }
+
+        juce::Result savePluginState(const juce::String& statePath)
+        {
+            return component != nullptr ? component->savePluginStateDirect(statePath)
+                                        : juce::Result::fail("Host component unavailable");
+        }
+
+        juce::Result openEditor()
+        {
+            return component != nullptr ? component->openEditorDirect()
+                                        : juce::Result::fail("Host component unavailable");
+        }
+
+        juce::Result closeEditor()
+        {
+            return component != nullptr ? component->closeEditorDirect()
+                                        : juce::Result::fail("Host component unavailable");
+        }
+
+        juce::Result openAudioEngineTrackEditor(int trackIndex)
+        {
+            return component != nullptr ? component->openAudioEngineTrackEditorDirect(trackIndex)
+                                        : juce::Result::fail("Host component unavailable");
+        }
+
+        juce::Result closeAudioEngineTrackEditor(int trackIndex)
+        {
+            return component != nullptr ? component->closeAudioEngineTrackEditorDirect(trackIndex)
+                                        : juce::Result::fail("Host component unavailable");
+        }
+
+        juce::Result queryAudioEngineTrackEditorOpen(int trackIndex, bool& isOpen) const
+        {
+            return component != nullptr ? component->queryAudioEngineTrackEditorOpenDirect(trackIndex, isOpen)
+                                        : juce::Result::fail("Host component unavailable");
+        }
+
+        juce::Result getAudioEngineTrackParameterSnapshot(int trackIndex,
+                                                          AimsVstHostParameterSnapshot& snapshot,
+                                                          AimsVstHostParameterSnapshotEntry* parameterEntries,
+                                                          int parameterEntryCapacity) const
+        {
+            return component != nullptr
+                ? component->getAudioEngineTrackParameterSnapshotDirect(trackIndex,
+                                                                        snapshot,
+                                                                        parameterEntries,
+                                                                        parameterEntryCapacity)
+                : juce::Result::fail("Host component unavailable");
+        }
+
+        juce::Result saveAudioEngineTrackPluginState(int trackIndex, const juce::String& statePath)
+        {
+            return component != nullptr ? component->saveAudioEngineTrackPluginStateDirect(trackIndex, statePath)
+                                        : juce::Result::fail("Host component unavailable");
+        }
+
+        juce::Result noteOnAudioEngineTrack(int trackIndex, int note, int channel, float velocity)
+        {
+            return component != nullptr ? component->noteOnAudioEngineTrackDirect(trackIndex, note, channel, velocity)
+                                        : juce::Result::fail("Host component unavailable");
+        }
+
+        juce::Result noteOffAudioEngineTrack(int trackIndex, int note, int channel, float velocity)
+        {
+            return component != nullptr ? component->noteOffAudioEngineTrackDirect(trackIndex, note, channel, velocity)
+                                        : juce::Result::fail("Host component unavailable");
+        }
+
+        juce::Result allNotesOffAudioEngineTrack(int trackIndex, int channel)
+        {
+            return component != nullptr ? component->allNotesOffAudioEngineTrackDirect(trackIndex, channel)
+                                        : juce::Result::fail("Host component unavailable");
+        }
+
+        juce::Result setAudioEngineState(const juce::String& tracksJson,
+                                         double bpm,
+                                         int ticksPerBeat,
+                                         bool loopEnabled,
+                                         int64_t loopStartTick,
+                                         int64_t loopEndTick,
+                                         bool metronomeEnabled,
+                                         bool preserveTransport)
+        {
+            return component != nullptr
+                ? component->setAudioEngineStateDirect(tracksJson,
+                                                       bpm,
+                                                       ticksPerBeat,
+                                                       loopEnabled,
+                                                       loopStartTick,
+                                                       loopEndTick,
+                                                       metronomeEnabled,
+                                                       preserveTransport)
+                : juce::Result::fail("Host component unavailable");
+        }
+
+        juce::Result updateAudioEngineTransport(double bpm,
+                                                int ticksPerBeat,
+                                                bool loopEnabled,
+                                                int64_t loopStartTick,
+                                                int64_t loopEndTick,
+                                                bool metronomeEnabled)
+        {
+            return component != nullptr
+                ? component->updateAudioEngineTransportDirect(bpm,
+                                                              ticksPerBeat,
+                                                              loopEnabled,
+                                                              loopStartTick,
+                                                              loopEndTick,
+                                                              metronomeEnabled)
+                : juce::Result::fail("Host component unavailable");
+        }
+
+        juce::Result setAudioEngineTrackParameters(int trackIndex,
+                                                   const AimsVstHostParameterSnapshotEntry* parameterEntries,
+                                                   int parameterCount,
+                                                   const juce::String& parameterSignature)
+        {
+            return component != nullptr
+                ? component->queueAudioEngineTrackParametersDirect(trackIndex,
+                                                                   parameterEntries,
+                                                                   parameterCount,
+                                                                   parameterSignature)
+                : juce::Result::fail("Host component unavailable");
+        }
+
+        juce::Result setAudioEngineTrackNotes(int trackIndex,
+                                              const AimsVstHostTrackNoteEntry* noteEntries,
+                                              int noteCount,
+                                              const AimsVstHostTrackControllerEventEntry* controllerEntries,
+                                              int controllerCount,
+                                              int* appliedNoteCount)
+        {
+            return component != nullptr
+                ? component->setAudioEngineTrackNotesDirect(trackIndex,
+                                                            noteEntries,
+                                                            noteCount,
+                                                            controllerEntries,
+                                                            controllerCount,
+                                                            appliedNoteCount)
+                : juce::Result::fail("Host component unavailable");
+        }
+
+        juce::Result setAudioEngineTrackMixState(int trackIndex,
+                                                 float volume,
+                                                 float outputGainDb,
+                                                 float pan,
+                                                 bool audible)
+        {
+            return component != nullptr
+                ? component->setAudioEngineTrackMixStateDirect(trackIndex,
+                                                               volume,
+                                                               outputGainDb,
+                                                               pan,
+                                                               audible)
+                : juce::Result::fail("Host component unavailable");
+        }
+
+        juce::Result startAudioEngine(int64_t startTick)
+        {
+            return component != nullptr ? component->startAudioEngineDirect(startTick)
+                                        : juce::Result::fail("Host component unavailable");
+        }
+
+        juce::Result stopAudioEngine(bool allowTail)
+        {
+            return component != nullptr ? component->stopAudioEngineDirect(allowTail)
+                                        : juce::Result::fail("Host component unavailable");
+        }
+
+        juce::Result configureAudioDevice(const juce::String& requestedType,
+                                          const juce::String& requestedOutputName,
+                                          double requestedSampleRate,
+                                          int requestedBufferSize)
+        {
+            return component != nullptr
+                ? component->configureAudioDeviceDirect(requestedType,
+                                                        requestedOutputName,
+                                                        requestedSampleRate,
+                                                        requestedBufferSize)
+                : juce::Result::fail("Host component unavailable");
+        }
+
+        juce::Result noteOn(int note, int channel, float velocity)
+        {
+            return component != nullptr ? component->noteOn(note, channel, velocity)
+                                        : juce::Result::fail("Host component unavailable");
+        }
+
+        juce::Result noteOff(int note, int channel, float velocity)
+        {
+            return component != nullptr ? component->noteOff(note, channel, velocity)
+                                        : juce::Result::fail("Host component unavailable");
+        }
+
+        juce::Result allNotesOff(int channel)
+        {
+            return component != nullptr ? component->allNotesOff(channel)
+                                        : juce::Result::fail("Host component unavailable");
+        }
+
     private:
         std::unique_ptr<juce::ScopedJuceInitialiser_GUI> guiInitializer;
         std::unique_ptr<juce::ApplicationProperties> appProperties;
@@ -6684,15 +8713,16 @@ namespace
     };
 }
 
-AIMS_VST_HOST_API void* aims_vst_host_create(const char* pluginPath,
-                                             int restoreLastPluginOnStartup,
-                                             int openEditor,
-                                             double sampleRate,
-                                             int bufferSize,
-                                             const char* audioDeviceType,
-                                             const char* audioOutputDeviceName,
-                                             char* errorBuffer,
-                                             int errorBufferBytes)
+AIMS_VST_HOST_API void* aims_vst_host_create_ex(const char* pluginPath,
+                                                int restoreLastPluginOnStartup,
+                                                int openEditor,
+                                                double sampleRate,
+                                                int bufferSize,
+                                                const char* audioDeviceType,
+                                                const char* audioOutputDeviceName,
+                                                int bridgeModeEnabled,
+                                                char* errorBuffer,
+                                                int errorBufferBytes)
 {
     try
     {
@@ -6702,7 +8732,8 @@ AIMS_VST_HOST_API void* aims_vst_host_create(const char* pluginPath,
                                                               sampleRate,
                                                               bufferSize,
                                                               juce::String::fromUTF8(audioDeviceType != nullptr ? audioDeviceType : ""),
-                                                              juce::String::fromUTF8(audioOutputDeviceName != nullptr ? audioOutputDeviceName : ""));
+                                                              juce::String::fromUTF8(audioOutputDeviceName != nullptr ? audioOutputDeviceName : ""),
+                                                              bridgeModeEnabled != 0);
         copyUtf8ToBuffer("", errorBuffer, errorBufferBytes);
         return instance.release();
     }
@@ -6715,6 +8746,28 @@ AIMS_VST_HOST_API void* aims_vst_host_create(const char* pluginPath,
         copyUtf8ToBuffer("Unknown error creating in-process VST host", errorBuffer, errorBufferBytes);
     }
     return nullptr;
+}
+
+AIMS_VST_HOST_API void* aims_vst_host_create(const char* pluginPath,
+                                             int restoreLastPluginOnStartup,
+                                             int openEditor,
+                                             double sampleRate,
+                                             int bufferSize,
+                                             const char* audioDeviceType,
+                                             const char* audioOutputDeviceName,
+                                             char* errorBuffer,
+                                             int errorBufferBytes)
+{
+    return aims_vst_host_create_ex(pluginPath,
+                                   restoreLastPluginOnStartup,
+                                   openEditor,
+                                   sampleRate,
+                                   bufferSize,
+                                   audioDeviceType,
+                                   audioOutputDeviceName,
+                                   0,
+                                   errorBuffer,
+                                   errorBufferBytes);
 }
 
 AIMS_VST_HOST_API int aims_vst_host_command(void* handle,
@@ -6731,6 +8784,983 @@ AIMS_VST_HOST_API int aims_vst_host_command(void* handle,
     const auto response = instance->command(juce::String::fromUTF8(requestLine != nullptr ? requestLine : ""));
     copyUtf8ToBuffer(response, responseBuffer, responseBufferBytes);
     return 1;
+}
+
+AIMS_VST_HOST_API int aims_vst_host_load_plugin(void* handle,
+                                                const char* pluginPath,
+                                                char* errorBuffer,
+                                                int errorBufferBytes)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr)
+    {
+        copyUtf8ToBuffer("Invalid host handle", errorBuffer, errorBufferBytes);
+        return 0;
+    }
+
+    try
+    {
+        const auto result = instance->loadPlugin(juce::String::fromUTF8(pluginPath != nullptr ? pluginPath : ""));
+        copyUtf8ToBuffer(result.getErrorMessage(), errorBuffer, errorBufferBytes);
+        return result.wasOk() ? 1 : 0;
+    }
+    catch (const std::exception& exc)
+    {
+        copyUtf8ToBuffer(juce::String(exc.what()), errorBuffer, errorBufferBytes);
+    }
+    catch (...)
+    {
+        copyUtf8ToBuffer("Unknown error loading plugin in in-process VST host", errorBuffer, errorBufferBytes);
+    }
+
+    return 0;
+}
+
+AIMS_VST_HOST_API int aims_vst_host_load_plugin_state(void* handle,
+                                                      const char* statePath,
+                                                      char* errorBuffer,
+                                                      int errorBufferBytes)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr)
+    {
+        copyUtf8ToBuffer("Invalid host handle", errorBuffer, errorBufferBytes);
+        return 0;
+    }
+
+    try
+    {
+        const auto result = instance->loadPluginState(juce::String::fromUTF8(statePath != nullptr ? statePath : ""));
+        copyUtf8ToBuffer(result.getErrorMessage(), errorBuffer, errorBufferBytes);
+        return result.wasOk() ? 1 : 0;
+    }
+    catch (const std::exception& exc)
+    {
+        copyUtf8ToBuffer(juce::String(exc.what()), errorBuffer, errorBufferBytes);
+    }
+    catch (...)
+    {
+        copyUtf8ToBuffer("Unknown error loading plugin state in in-process VST host", errorBuffer, errorBufferBytes);
+    }
+
+    return 0;
+}
+
+AIMS_VST_HOST_API int aims_vst_host_save_plugin_state(void* handle,
+                                                      const char* statePath,
+                                                      char* errorBuffer,
+                                                      int errorBufferBytes)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr)
+    {
+        copyUtf8ToBuffer("Invalid host handle", errorBuffer, errorBufferBytes);
+        return 0;
+    }
+
+    try
+    {
+        const auto result = instance->savePluginState(juce::String::fromUTF8(statePath != nullptr ? statePath : ""));
+        copyUtf8ToBuffer(result.getErrorMessage(), errorBuffer, errorBufferBytes);
+        return result.wasOk() ? 1 : 0;
+    }
+    catch (const std::exception& exc)
+    {
+        copyUtf8ToBuffer(juce::String(exc.what()), errorBuffer, errorBufferBytes);
+    }
+    catch (...)
+    {
+        copyUtf8ToBuffer("Unknown error saving plugin state in in-process VST host", errorBuffer, errorBufferBytes);
+    }
+
+    return 0;
+}
+
+AIMS_VST_HOST_API int aims_vst_host_save_audio_engine_track_plugin_state(void* handle,
+                                                                         int trackIndex,
+                                                                         const char* statePath,
+                                                                         char* errorBuffer,
+                                                                         int errorBufferBytes)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr)
+    {
+        copyUtf8ToBuffer("Invalid host handle", errorBuffer, errorBufferBytes);
+        return 0;
+    }
+
+    try
+    {
+        const auto result = instance->saveAudioEngineTrackPluginState(trackIndex, juce::String::fromUTF8(statePath));
+        copyUtf8ToBuffer(result.getErrorMessage(), errorBuffer, errorBufferBytes);
+        return result.wasOk() ? 1 : 0;
+    }
+    catch (const std::exception& exc)
+    {
+        copyUtf8ToBuffer(juce::String(exc.what()), errorBuffer, errorBufferBytes);
+    }
+    catch (...)
+    {
+        copyUtf8ToBuffer("Unknown error saving live audio engine track state in in-process VST host",
+                         errorBuffer,
+                         errorBufferBytes);
+    }
+
+    return 0;
+}
+
+AIMS_VST_HOST_API int aims_vst_host_open_editor(void* handle,
+                                                char* errorBuffer,
+                                                int errorBufferBytes)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr)
+    {
+        copyUtf8ToBuffer("Invalid host handle", errorBuffer, errorBufferBytes);
+        return 0;
+    }
+
+    try
+    {
+        const auto result = instance->openEditor();
+        copyUtf8ToBuffer(result.getErrorMessage(), errorBuffer, errorBufferBytes);
+        return result.wasOk() ? 1 : 0;
+    }
+    catch (const std::exception& exc)
+    {
+        copyUtf8ToBuffer(juce::String(exc.what()), errorBuffer, errorBufferBytes);
+    }
+    catch (...)
+    {
+        copyUtf8ToBuffer("Unknown error opening plugin editor in in-process VST host", errorBuffer, errorBufferBytes);
+    }
+
+    return 0;
+}
+
+AIMS_VST_HOST_API int aims_vst_host_close_editor(void* handle,
+                                                 char* errorBuffer,
+                                                 int errorBufferBytes)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr)
+    {
+        copyUtf8ToBuffer("Invalid host handle", errorBuffer, errorBufferBytes);
+        return 0;
+    }
+
+    try
+    {
+        const auto result = instance->closeEditor();
+        copyUtf8ToBuffer(result.getErrorMessage(), errorBuffer, errorBufferBytes);
+        return result.wasOk() ? 1 : 0;
+    }
+    catch (const std::exception& exc)
+    {
+        copyUtf8ToBuffer(juce::String(exc.what()), errorBuffer, errorBufferBytes);
+    }
+    catch (...)
+    {
+        copyUtf8ToBuffer("Unknown error closing plugin editor in in-process VST host", errorBuffer, errorBufferBytes);
+    }
+
+    return 0;
+}
+
+AIMS_VST_HOST_API int aims_vst_host_open_audio_engine_track_editor(void* handle,
+                                                                   int trackIndex,
+                                                                   char* errorBuffer,
+                                                                   int errorBufferBytes)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr)
+    {
+        copyUtf8ToBuffer("Invalid host handle", errorBuffer, errorBufferBytes);
+        return 0;
+    }
+
+    try
+    {
+        const auto result = instance->openAudioEngineTrackEditor(trackIndex);
+        copyUtf8ToBuffer(result.getErrorMessage(), errorBuffer, errorBufferBytes);
+        return result.wasOk() ? 1 : 0;
+    }
+    catch (const std::exception& exc)
+    {
+        copyUtf8ToBuffer(juce::String(exc.what()), errorBuffer, errorBufferBytes);
+    }
+    catch (...)
+    {
+        copyUtf8ToBuffer("Unknown error opening live audio engine track editor in in-process VST host",
+                         errorBuffer,
+                         errorBufferBytes);
+    }
+
+    return 0;
+}
+
+AIMS_VST_HOST_API int aims_vst_host_close_audio_engine_track_editor(void* handle,
+                                                                    int trackIndex,
+                                                                    char* errorBuffer,
+                                                                    int errorBufferBytes)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr)
+    {
+        copyUtf8ToBuffer("Invalid host handle", errorBuffer, errorBufferBytes);
+        return 0;
+    }
+
+    try
+    {
+        const auto result = instance->closeAudioEngineTrackEditor(trackIndex);
+        copyUtf8ToBuffer(result.getErrorMessage(), errorBuffer, errorBufferBytes);
+        return result.wasOk() ? 1 : 0;
+    }
+    catch (const std::exception& exc)
+    {
+        copyUtf8ToBuffer(juce::String(exc.what()), errorBuffer, errorBufferBytes);
+    }
+    catch (...)
+    {
+        copyUtf8ToBuffer("Unknown error closing live audio engine track editor in in-process VST host",
+                         errorBuffer,
+                         errorBufferBytes);
+    }
+
+    return 0;
+}
+
+AIMS_VST_HOST_API int aims_vst_host_get_audio_engine_track_editor_state(void* handle,
+                                                                        int trackIndex,
+                                                                        int* isOpen,
+                                                                        char* errorBuffer,
+                                                                        int errorBufferBytes)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr)
+    {
+        copyUtf8ToBuffer("Invalid host handle", errorBuffer, errorBufferBytes);
+        return 0;
+    }
+
+    try
+    {
+        bool open = false;
+        const auto result = instance->queryAudioEngineTrackEditorOpen(trackIndex, open);
+        if (isOpen != nullptr)
+            *isOpen = open ? 1 : 0;
+        copyUtf8ToBuffer(result.getErrorMessage(), errorBuffer, errorBufferBytes);
+        return result.wasOk() ? 1 : 0;
+    }
+    catch (const std::exception& exc)
+    {
+        copyUtf8ToBuffer(juce::String(exc.what()), errorBuffer, errorBufferBytes);
+    }
+    catch (...)
+    {
+        copyUtf8ToBuffer("Unknown error querying live audio engine track editor state in in-process VST host",
+                         errorBuffer,
+                         errorBufferBytes);
+    }
+
+    return 0;
+}
+
+AIMS_VST_HOST_API int aims_vst_host_note_on(void* handle,
+                                            int note,
+                                            int channel,
+                                            float velocity,
+                                            char* errorBuffer,
+                                            int errorBufferBytes)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr)
+    {
+        copyUtf8ToBuffer("Invalid host handle", errorBuffer, errorBufferBytes);
+        return 0;
+    }
+
+    try
+    {
+        const auto result = instance->noteOn(note, channel, velocity);
+        copyUtf8ToBuffer(result.getErrorMessage(), errorBuffer, errorBufferBytes);
+        return result.wasOk() ? 1 : 0;
+    }
+    catch (const std::exception& exc)
+    {
+        copyUtf8ToBuffer(juce::String(exc.what()), errorBuffer, errorBufferBytes);
+    }
+    catch (...)
+    {
+        copyUtf8ToBuffer("Unknown error sending note-on to in-process VST host", errorBuffer, errorBufferBytes);
+    }
+
+    return 0;
+}
+
+AIMS_VST_HOST_API int aims_vst_host_note_off(void* handle,
+                                             int note,
+                                             int channel,
+                                             float velocity,
+                                             char* errorBuffer,
+                                             int errorBufferBytes)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr)
+    {
+        copyUtf8ToBuffer("Invalid host handle", errorBuffer, errorBufferBytes);
+        return 0;
+    }
+
+    try
+    {
+        const auto result = instance->noteOff(note, channel, velocity);
+        copyUtf8ToBuffer(result.getErrorMessage(), errorBuffer, errorBufferBytes);
+        return result.wasOk() ? 1 : 0;
+    }
+    catch (const std::exception& exc)
+    {
+        copyUtf8ToBuffer(juce::String(exc.what()), errorBuffer, errorBufferBytes);
+    }
+    catch (...)
+    {
+        copyUtf8ToBuffer("Unknown error sending note-off to in-process VST host", errorBuffer, errorBufferBytes);
+    }
+
+    return 0;
+}
+
+AIMS_VST_HOST_API int aims_vst_host_all_notes_off(void* handle,
+                                                  int channel,
+                                                  char* errorBuffer,
+                                                  int errorBufferBytes)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr)
+    {
+        copyUtf8ToBuffer("Invalid host handle", errorBuffer, errorBufferBytes);
+        return 0;
+    }
+
+    try
+    {
+        const auto result = instance->allNotesOff(channel);
+        copyUtf8ToBuffer(result.getErrorMessage(), errorBuffer, errorBufferBytes);
+        return result.wasOk() ? 1 : 0;
+    }
+    catch (const std::exception& exc)
+    {
+        copyUtf8ToBuffer(juce::String(exc.what()), errorBuffer, errorBufferBytes);
+    }
+    catch (...)
+    {
+        copyUtf8ToBuffer("Unknown error sending all-notes-off to in-process VST host", errorBuffer, errorBufferBytes);
+    }
+
+    return 0;
+}
+
+AIMS_VST_HOST_API int aims_vst_host_audio_engine_track_note_on(void* handle,
+                                                               int trackIndex,
+                                                               int note,
+                                                               int channel,
+                                                               float velocity,
+                                                               char* errorBuffer,
+                                                               int errorBufferBytes)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr)
+    {
+        copyUtf8ToBuffer("Invalid host handle", errorBuffer, errorBufferBytes);
+        return 0;
+    }
+
+    try
+    {
+        const auto result = instance->noteOnAudioEngineTrack(trackIndex, note, channel, velocity);
+        copyUtf8ToBuffer(result.getErrorMessage(), errorBuffer, errorBufferBytes);
+        return result.wasOk() ? 1 : 0;
+    }
+    catch (const std::exception& exc)
+    {
+        copyUtf8ToBuffer(juce::String(exc.what()), errorBuffer, errorBufferBytes);
+    }
+    catch (...)
+    {
+        copyUtf8ToBuffer("Unknown error sending note-on to live audio engine track in in-process VST host",
+                         errorBuffer,
+                         errorBufferBytes);
+    }
+
+    return 0;
+}
+
+AIMS_VST_HOST_API int aims_vst_host_audio_engine_track_note_off(void* handle,
+                                                                int trackIndex,
+                                                                int note,
+                                                                int channel,
+                                                                float velocity,
+                                                                char* errorBuffer,
+                                                                int errorBufferBytes)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr)
+    {
+        copyUtf8ToBuffer("Invalid host handle", errorBuffer, errorBufferBytes);
+        return 0;
+    }
+
+    try
+    {
+        const auto result = instance->noteOffAudioEngineTrack(trackIndex, note, channel, velocity);
+        copyUtf8ToBuffer(result.getErrorMessage(), errorBuffer, errorBufferBytes);
+        return result.wasOk() ? 1 : 0;
+    }
+    catch (const std::exception& exc)
+    {
+        copyUtf8ToBuffer(juce::String(exc.what()), errorBuffer, errorBufferBytes);
+    }
+    catch (...)
+    {
+        copyUtf8ToBuffer("Unknown error sending note-off to live audio engine track in in-process VST host",
+                         errorBuffer,
+                         errorBufferBytes);
+    }
+
+    return 0;
+}
+
+AIMS_VST_HOST_API int aims_vst_host_audio_engine_track_all_notes_off(void* handle,
+                                                                     int trackIndex,
+                                                                     int channel,
+                                                                     char* errorBuffer,
+                                                                     int errorBufferBytes)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr)
+    {
+        copyUtf8ToBuffer("Invalid host handle", errorBuffer, errorBufferBytes);
+        return 0;
+    }
+
+    try
+    {
+        const auto result = instance->allNotesOffAudioEngineTrack(trackIndex, channel);
+        copyUtf8ToBuffer(result.getErrorMessage(), errorBuffer, errorBufferBytes);
+        return result.wasOk() ? 1 : 0;
+    }
+    catch (const std::exception& exc)
+    {
+        copyUtf8ToBuffer(juce::String(exc.what()), errorBuffer, errorBufferBytes);
+    }
+    catch (...)
+    {
+        copyUtf8ToBuffer("Unknown error sending all-notes-off to live audio engine track in in-process VST host",
+                         errorBuffer,
+                         errorBufferBytes);
+    }
+
+    return 0;
+}
+
+AIMS_VST_HOST_API int aims_vst_host_set_audio_engine_state_json(void* handle,
+                                                                const char* tracksJson,
+                                                                double bpm,
+                                                                int ticksPerBeat,
+                                                                int loopEnabled,
+                                                                int64_t loopStartTick,
+                                                                int64_t loopEndTick,
+                                                                int metronomeEnabled,
+                                                                int preserveTransport,
+                                                                char* errorBuffer,
+                                                                int errorBufferBytes)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr)
+    {
+        copyUtf8ToBuffer("Invalid host handle", errorBuffer, errorBufferBytes);
+        return 0;
+    }
+
+    try
+    {
+        const auto result = instance->setAudioEngineState(juce::String::fromUTF8(tracksJson != nullptr ? tracksJson : ""),
+                                                          bpm,
+                                                          ticksPerBeat,
+                                                          loopEnabled != 0,
+                                                          loopStartTick,
+                                                          loopEndTick,
+                                                          metronomeEnabled != 0,
+                                                          preserveTransport != 0);
+        copyUtf8ToBuffer(result.getErrorMessage(), errorBuffer, errorBufferBytes);
+        return result.wasOk() ? 1 : 0;
+    }
+    catch (const std::exception& exc)
+    {
+        copyUtf8ToBuffer(juce::String(exc.what()), errorBuffer, errorBufferBytes);
+    }
+    catch (...)
+    {
+        copyUtf8ToBuffer("Unknown error configuring live audio engine state in in-process VST host",
+                         errorBuffer,
+                         errorBufferBytes);
+    }
+
+    return 0;
+}
+
+AIMS_VST_HOST_API int aims_vst_host_set_audio_engine_transport(void* handle,
+                                                               double bpm,
+                                                               int ticksPerBeat,
+                                                               int loopEnabled,
+                                                               int64_t loopStartTick,
+                                                               int64_t loopEndTick,
+                                                               int metronomeEnabled,
+                                                               char* errorBuffer,
+                                                               int errorBufferBytes)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr)
+    {
+        copyUtf8ToBuffer("Invalid host handle", errorBuffer, errorBufferBytes);
+        return 0;
+    }
+
+    try
+    {
+        const auto result = instance->updateAudioEngineTransport(bpm,
+                                                                 ticksPerBeat,
+                                                                 loopEnabled != 0,
+                                                                 loopStartTick,
+                                                                 loopEndTick,
+                                                                 metronomeEnabled != 0);
+        copyUtf8ToBuffer(result.getErrorMessage(), errorBuffer, errorBufferBytes);
+        return result.wasOk() ? 1 : 0;
+    }
+    catch (const std::exception& exc)
+    {
+        copyUtf8ToBuffer(juce::String(exc.what()), errorBuffer, errorBufferBytes);
+    }
+    catch (...)
+    {
+        copyUtf8ToBuffer("Unknown error updating live audio engine transport in in-process VST host",
+                         errorBuffer,
+                         errorBufferBytes);
+    }
+
+    return 0;
+}
+
+AIMS_VST_HOST_API int aims_vst_host_set_audio_engine_track_parameters(void* handle,
+                                                                      int trackIndex,
+                                                                      const AimsVstHostParameterSnapshotEntry* parameterEntries,
+                                                                      int parameterCount,
+                                                                      const char* parameterSignature,
+                                                                      char* errorBuffer,
+                                                                      int errorBufferBytes)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr)
+    {
+        copyUtf8ToBuffer("Invalid host handle", errorBuffer, errorBufferBytes);
+        return 0;
+    }
+
+    try
+    {
+        const auto result = instance->setAudioEngineTrackParameters(trackIndex,
+                                                                    parameterEntries,
+                                                                    parameterCount,
+                                                                    juce::String::fromUTF8(parameterSignature != nullptr ? parameterSignature : ""));
+        copyUtf8ToBuffer(result.getErrorMessage(), errorBuffer, errorBufferBytes);
+        return result.wasOk() ? 1 : 0;
+    }
+    catch (const std::exception& exc)
+    {
+        copyUtf8ToBuffer(juce::String(exc.what()), errorBuffer, errorBufferBytes);
+    }
+    catch (...)
+    {
+        copyUtf8ToBuffer("Unknown error queueing live audio engine track parameters in in-process VST host",
+                         errorBuffer,
+                         errorBufferBytes);
+    }
+
+    return 0;
+}
+
+AIMS_VST_HOST_API int aims_vst_host_set_audio_engine_track_notes(void* handle,
+                                                                 int trackIndex,
+                                                                 const AimsVstHostTrackNoteEntry* noteEntries,
+                                                                 int noteCount,
+                                                                 const AimsVstHostTrackControllerEventEntry* controllerEntries,
+                                                                 int controllerCount,
+                                                                 int* appliedNoteCount,
+                                                                 char* errorBuffer,
+                                                                 int errorBufferBytes)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr)
+    {
+        copyUtf8ToBuffer("Invalid host handle", errorBuffer, errorBufferBytes);
+        return 0;
+    }
+
+    try
+    {
+        const auto result = instance->setAudioEngineTrackNotes(trackIndex,
+                                                               noteEntries,
+                                                               noteCount,
+                                                               controllerEntries,
+                                                               controllerCount,
+                                                               appliedNoteCount);
+        copyUtf8ToBuffer(result.getErrorMessage(), errorBuffer, errorBufferBytes);
+        return result.wasOk() ? 1 : 0;
+    }
+    catch (const std::exception& exc)
+    {
+        copyUtf8ToBuffer(juce::String(exc.what()), errorBuffer, errorBufferBytes);
+    }
+    catch (...)
+    {
+        copyUtf8ToBuffer("Unknown error updating live audio engine track notes in in-process VST host",
+                         errorBuffer,
+                         errorBufferBytes);
+    }
+
+    return 0;
+}
+
+AIMS_VST_HOST_API int aims_vst_host_set_audio_engine_track_mix_state(void* handle,
+                                                                     int trackIndex,
+                                                                     float volume,
+                                                                     float outputGainDb,
+                                                                     float pan,
+                                                                     int audible,
+                                                                     char* errorBuffer,
+                                                                     int errorBufferBytes)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr)
+    {
+        copyUtf8ToBuffer("Invalid host handle", errorBuffer, errorBufferBytes);
+        return 0;
+    }
+
+    try
+    {
+        const auto result = instance->setAudioEngineTrackMixState(trackIndex,
+                                                                  volume,
+                                                                  outputGainDb,
+                                                                  pan,
+                                                                  audible != 0);
+        copyUtf8ToBuffer(result.getErrorMessage(), errorBuffer, errorBufferBytes);
+        return result.wasOk() ? 1 : 0;
+    }
+    catch (const std::exception& exc)
+    {
+        copyUtf8ToBuffer(juce::String(exc.what()), errorBuffer, errorBufferBytes);
+    }
+    catch (...)
+    {
+        copyUtf8ToBuffer("Unknown error updating live audio engine track mix in in-process VST host",
+                         errorBuffer,
+                         errorBufferBytes);
+    }
+
+    return 0;
+}
+
+AIMS_VST_HOST_API int aims_vst_host_start_audio_engine(void* handle,
+                                                       int64_t startTick,
+                                                       char* errorBuffer,
+                                                       int errorBufferBytes)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr)
+    {
+        copyUtf8ToBuffer("Invalid host handle", errorBuffer, errorBufferBytes);
+        return 0;
+    }
+
+    try
+    {
+        const auto result = instance->startAudioEngine(startTick);
+        copyUtf8ToBuffer(result.getErrorMessage(), errorBuffer, errorBufferBytes);
+        return result.wasOk() ? 1 : 0;
+    }
+    catch (const std::exception& exc)
+    {
+        copyUtf8ToBuffer(juce::String(exc.what()), errorBuffer, errorBufferBytes);
+    }
+    catch (...)
+    {
+        copyUtf8ToBuffer("Unknown error starting live audio engine in in-process VST host",
+                         errorBuffer,
+                         errorBufferBytes);
+    }
+
+    return 0;
+}
+
+AIMS_VST_HOST_API int aims_vst_host_stop_audio_engine(void* handle,
+                                                      int allowTail,
+                                                      char* errorBuffer,
+                                                      int errorBufferBytes)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr)
+    {
+        copyUtf8ToBuffer("Invalid host handle", errorBuffer, errorBufferBytes);
+        return 0;
+    }
+
+    try
+    {
+        const auto result = instance->stopAudioEngine(allowTail != 0);
+        copyUtf8ToBuffer(result.getErrorMessage(), errorBuffer, errorBufferBytes);
+        return result.wasOk() ? 1 : 0;
+    }
+    catch (const std::exception& exc)
+    {
+        copyUtf8ToBuffer(juce::String(exc.what()), errorBuffer, errorBufferBytes);
+    }
+    catch (...)
+    {
+        copyUtf8ToBuffer("Unknown error stopping live audio engine in in-process VST host",
+                         errorBuffer,
+                         errorBufferBytes);
+    }
+
+    return 0;
+}
+
+AIMS_VST_HOST_API int aims_vst_host_configure_audio_device(void* handle,
+                                                           const char* audioDeviceType,
+                                                           const char* audioDeviceName,
+                                                           double sampleRate,
+                                                           int bufferSize,
+                                                           char* errorBuffer,
+                                                           int errorBufferBytes)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr)
+    {
+        copyUtf8ToBuffer("Invalid host handle", errorBuffer, errorBufferBytes);
+        return 0;
+    }
+
+    try
+    {
+        const auto result = instance->configureAudioDevice(juce::String::fromUTF8(audioDeviceType != nullptr ? audioDeviceType : ""),
+                                                           juce::String::fromUTF8(audioDeviceName != nullptr ? audioDeviceName : ""),
+                                                           sampleRate,
+                                                           bufferSize);
+        copyUtf8ToBuffer(result.getErrorMessage(), errorBuffer, errorBufferBytes);
+        return result.wasOk() ? 1 : 0;
+    }
+    catch (const std::exception& exc)
+    {
+        copyUtf8ToBuffer(juce::String(exc.what()), errorBuffer, errorBufferBytes);
+    }
+    catch (...)
+    {
+        copyUtf8ToBuffer("Unknown error configuring audio device in in-process VST host",
+                         errorBuffer,
+                         errorBufferBytes);
+    }
+
+    return 0;
+}
+
+AIMS_VST_HOST_API int aims_vst_host_get_transport_snapshot(void* handle,
+                                                           AimsVstHostTransportSnapshot* snapshot,
+                                                           float* trackPeakLevels,
+                                                           int trackPeakLevelCapacity,
+                                                           char* errorBuffer,
+                                                           int errorBufferBytes)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr || snapshot == nullptr)
+    {
+        copyUtf8ToBuffer("Invalid host snapshot request", errorBuffer, errorBufferBytes);
+        return 0;
+    }
+
+    try
+    {
+        const auto result = instance->getTransportSnapshot(*snapshot, trackPeakLevels, trackPeakLevelCapacity);
+        copyUtf8ToBuffer(result.getErrorMessage(), errorBuffer, errorBufferBytes);
+        return result.wasOk() ? 1 : 0;
+    }
+    catch (const std::exception& exc)
+    {
+        copyUtf8ToBuffer(juce::String(exc.what()), errorBuffer, errorBufferBytes);
+    }
+    catch (...)
+    {
+        copyUtf8ToBuffer("Unknown error getting in-process VST host transport snapshot", errorBuffer, errorBufferBytes);
+    }
+
+    return 0;
+}
+
+AIMS_VST_HOST_API int aims_vst_host_get_parameter_snapshot(void* handle,
+                                                           AimsVstHostParameterSnapshot* snapshot,
+                                                           AimsVstHostParameterSnapshotEntry* parameterEntries,
+                                                           int parameterEntryCapacity,
+                                                           char* errorBuffer,
+                                                           int errorBufferBytes)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr || snapshot == nullptr)
+    {
+        copyUtf8ToBuffer("Invalid host parameter snapshot request", errorBuffer, errorBufferBytes);
+        return 0;
+    }
+
+    try
+    {
+        const auto result = instance->getParameterSnapshot(*snapshot, parameterEntries, parameterEntryCapacity);
+        copyUtf8ToBuffer(result.getErrorMessage(), errorBuffer, errorBufferBytes);
+        return result.wasOk() ? 1 : 0;
+    }
+    catch (const std::exception& exc)
+    {
+        copyUtf8ToBuffer(juce::String(exc.what()), errorBuffer, errorBufferBytes);
+    }
+    catch (...)
+    {
+        copyUtf8ToBuffer("Unknown error getting in-process VST host parameter snapshot", errorBuffer, errorBufferBytes);
+    }
+
+    return 0;
+}
+
+AIMS_VST_HOST_API int aims_vst_host_get_audio_engine_track_parameter_snapshot(void* handle,
+                                                                              int trackIndex,
+                                                                              AimsVstHostParameterSnapshot* snapshot,
+                                                                              AimsVstHostParameterSnapshotEntry* parameterEntries,
+                                                                              int parameterEntryCapacity,
+                                                                              char* errorBuffer,
+                                                                              int errorBufferBytes)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr || snapshot == nullptr)
+    {
+        copyUtf8ToBuffer("Invalid host handle", errorBuffer, errorBufferBytes);
+        return 0;
+    }
+
+    try
+    {
+        const auto result = instance->getAudioEngineTrackParameterSnapshot(trackIndex,
+                                                                           *snapshot,
+                                                                           parameterEntries,
+                                                                           parameterEntryCapacity);
+        copyUtf8ToBuffer(result.getErrorMessage(), errorBuffer, errorBufferBytes);
+        return result.wasOk() ? 1 : 0;
+    }
+    catch (const std::exception& exc)
+    {
+        copyUtf8ToBuffer(juce::String(exc.what()), errorBuffer, errorBufferBytes);
+    }
+    catch (...)
+    {
+        copyUtf8ToBuffer("Unknown error querying live audio engine track parameter snapshot in in-process VST host",
+                         errorBuffer,
+                         errorBufferBytes);
+    }
+
+    return 0;
+}
+
+AIMS_VST_HOST_API int aims_vst_host_get_plugin_snapshot(void* handle,
+                                                        AimsVstHostPluginSnapshot* snapshot,
+                                                        char* errorBuffer,
+                                                        int errorBufferBytes)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr || snapshot == nullptr)
+    {
+        copyUtf8ToBuffer("Invalid host plugin snapshot request", errorBuffer, errorBufferBytes);
+        return 0;
+    }
+
+    try
+    {
+        const auto result = instance->getPluginSnapshot(*snapshot);
+        copyUtf8ToBuffer(result.getErrorMessage(), errorBuffer, errorBufferBytes);
+        return result.wasOk() ? 1 : 0;
+    }
+    catch (const std::exception& exc)
+    {
+        copyUtf8ToBuffer(juce::String(exc.what()), errorBuffer, errorBufferBytes);
+    }
+    catch (...)
+    {
+        copyUtf8ToBuffer("Unknown error getting in-process VST host plugin snapshot", errorBuffer, errorBufferBytes);
+    }
+
+    return 0;
+}
+
+AIMS_VST_HOST_API int aims_vst_host_get_audio_device_snapshot(void* handle,
+                                                              AimsVstHostAudioDeviceSnapshot* snapshot,
+                                                              AimsVstHostStringEntry* availableDeviceTypes,
+                                                              int availableDeviceTypeCapacity,
+                                                              AimsVstHostStringEntry* availableOutputDevices,
+                                                              int availableOutputDeviceCapacity,
+                                                              double* availableSampleRates,
+                                                              int availableSampleRateCapacity,
+                                                              int* availableBufferSizes,
+                                                              int availableBufferSizeCapacity,
+                                                              char* errorBuffer,
+                                                              int errorBufferBytes)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr || snapshot == nullptr)
+    {
+        copyUtf8ToBuffer("Invalid host audio snapshot request", errorBuffer, errorBufferBytes);
+        return 0;
+    }
+
+    try
+    {
+        const auto result = instance->getAudioDeviceSnapshot(*snapshot,
+                                                             availableDeviceTypes,
+                                                             availableDeviceTypeCapacity,
+                                                             availableOutputDevices,
+                                                             availableOutputDeviceCapacity,
+                                                             availableSampleRates,
+                                                             availableSampleRateCapacity,
+                                                             availableBufferSizes,
+                                                             availableBufferSizeCapacity);
+        copyUtf8ToBuffer(result.getErrorMessage(), errorBuffer, errorBufferBytes);
+        return result.wasOk() ? 1 : 0;
+    }
+    catch (const std::exception& exc)
+    {
+        copyUtf8ToBuffer(juce::String(exc.what()), errorBuffer, errorBufferBytes);
+    }
+    catch (...)
+    {
+        copyUtf8ToBuffer("Unknown error getting in-process VST host audio device snapshot", errorBuffer, errorBufferBytes);
+    }
+
+    return 0;
+}
+
+AIMS_VST_HOST_API void aims_vst_host_set_editor_state_callback(void* handle,
+                                                               void (*callback)(int isOpen, void* userData),
+                                                               void* userData)
+{
+    auto* instance = static_cast<LibraryHostInstance*>(handle);
+    if (instance == nullptr)
+        return;
+
+    instance->setEditorStateCallback(callback, userData);
 }
 
 AIMS_VST_HOST_API void aims_vst_host_destroy(void* handle)

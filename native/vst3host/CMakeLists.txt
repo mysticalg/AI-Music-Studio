@@ -80,6 +80,7 @@ target_sources(AIMusicStudioVSTHostLib
 target_compile_definitions(AIMusicStudioVSTHostLib
     PRIVATE
         AIMS_VST_HOST_BUILD_LIBRARY=1
+        AIMS_VST_HOST_SHARED=1
         JUCE_DIRECTSOUND=1
         JUCE_DISABLE_CAUTIOUS_PARAMETER_ID_CHECKING=1
         JUCE_PLUGINHOST_AU=0
