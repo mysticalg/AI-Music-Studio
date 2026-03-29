@@ -1,0 +1,123 @@
+name: Build Bundled VST3 Instruments
+
+on:
+  push:
+    paths:
+      - "Source/**"
+      - "scripts/**"
+      - "CMakeLists.txt"
+      - "README.md"
+      - ".github/workflows/build-vsti.yml"
+      - ".gitignore"
+  pull_request:
+    paths:
+      - "Source/**"
+      - "scripts/**"
+      - "CMakeLists.txt"
+      - "README.md"
+      - ".github/workflows/build-vsti.yml"
+      - ".gitignore"
+  workflow_dispatch:
+
+jobs:
+  build-windows-vst3:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Clone JUCE
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/juce-framework/JUCE.git JUCE
+
+      - name: Configure CMake
+        shell: bash
+        run: |
+          cmake -S . -B build -DJUCE_DIR="${GITHUB_WORKSPACE}/JUCE"
+
+      - name: Build Release
+        shell: bash
+        run: |
+          cmake --build build --config Release
+
+      - name: Package plugin artifacts
+        shell: pwsh
+        run: |
+          $artifactRoot = "build"
+          $vstOutputs = Get-ChildItem -Path $artifactRoot -Recurse -Filter *.vst3 -Directory
+          if (-not $vstOutputs) {
+            Write-Error "Expected VST3 build artifacts were not found under $artifactRoot"
+          }
+
+          $bundleRoot = "dist/bundled-vsti"
+          if (Test-Path $bundleRoot) {
+            Remove-Item $bundleRoot -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $bundleRoot -Force | Out-Null
+
+          foreach ($plugin in $vstOutputs) {
+            Copy-Item $plugin.FullName -Destination (Join-Path $bundleRoot $plugin.Name) -Recurse -Force
+          }
+
+          $packagePath = "dist/AI-Music-Studio-bundled-vst3-windows-release.zip"
+          if (Test-Path $packagePath) {
+            Remove-Item $packagePath -Force
+          }
+
+          Compress-Archive -Path "$bundleRoot/*" -DestinationPath $packagePath
+
+      - name: Upload downloadable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AI-Music-Studio-bundled-vst3-windows-release
+          path: dist/AI-Music-Studio-bundled-vst3-windows-release.zip
+          if-no-files-found: error
+
+  build-macos-vst3:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Clone JUCE
+        run: |
+          git clone --depth 1 https://github.com/juce-framework/JUCE.git JUCE
+
+      - name: Configure CMake
+        run: |
+          cmake -S . -B build-macos -DJUCE_DIR="${GITHUB_WORKSPACE}/JUCE" -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build Release
+        run: |
+          cmake --build build-macos --config Release
+
+      - name: Package plugin artifacts
+        run: |
+          artifact_root="build-macos"
+          bundle_root="dist/bundled-vsti-macos"
+          package_path="dist/AI-Music-Studio-bundled-vst3-macos-release.zip"
+
+          rm -rf "$bundle_root"
+          mkdir -p "$bundle_root"
+
+          while IFS= read -r -d '' plugin; do
+            cp -R "$plugin" "$bundle_root/"
+          done < <(find "$artifact_root" -type d -name "*.vst3" -print0)
+
+          if [ -z "$(find "$bundle_root" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+            echo "Expected VST3 build artifacts were not found under $artifact_root" >&2
+            exit 1
+          fi
+
+          rm -f "$package_path"
+          ditto -c -k --sequesterRsrc --keepParent "$bundle_root" "$package_path"
+
+      - name: Upload downloadable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AI-Music-Studio-bundled-vst3-macos-release
+          path: dist/AI-Music-Studio-bundled-vst3-macos-release.zip
+          if-no-files-found: error

@@ -202,6 +202,7 @@ private:
         float auxPhase = 0.0f;
         float toneState = 0.0f;
         float colourState = 0.0f;
+        float articulationState = 0.0f;
         int externalPadIndex = -1;
         int externalSampleRootMidi = 60;
         double externalSamplePosition = 0.0;

@@ -37,7 +37,7 @@ The packaged variants use flavor-specific defaults. `AI Drum Machine` is now voi
 
 ## Fetch acoustic sample libraries
 
-Run this once from the repo root to populate `.cache/OpenInstrumentSamples` with the open sample sets used by the acoustic plugins:
+Run this once from the plugin repo root to populate `.cache/OpenInstrumentSamples` with the open sample sets used by the acoustic plugins:
 
 ```bash
 python scripts/fetch_open_instrument_samples.py
@@ -47,12 +47,12 @@ That script pulls a sparse subset of Sonatina Symphonic Orchestra for strings / 
 
 ## Automated GitHub build + download
 
-The repository includes a GitHub Actions workflow at `.github/workflows/build-vsti.yml` that compiles the bundled VST3 instruments on `windows-latest` and uploads a downloadable ZIP artifact.
+This repository includes a GitHub Actions workflow at `.github/workflows/build-vsti.yml` that compiles the bundled VST3 instruments on `windows-latest` and `macos-latest` and uploads downloadable ZIP artifacts.
 
 ### When it runs
 
-- Pushes affecting `plugins/AdvancedVSTi/**`
-- Pull requests affecting `plugins/AdvancedVSTi/**`
+- Pushes affecting the native VST source tree
+- Pull requests affecting the native VST source tree
 - Manual runs from **Actions > Build Bundled VST3 Instruments > Run workflow**
 
 ### How to download
@@ -68,17 +68,17 @@ The repository includes a GitHub Actions workflow at `.github/workflows/build-vs
 2. Configure:
 
 ```bash
-cmake -S plugins/AdvancedVSTi -B plugins/AdvancedVSTi/build -DJUCE_DIR=C:/dev/JUCE
+cmake -S . -B build -DJUCE_DIR=C:/dev/JUCE
 ```
 
 3. Build:
 
 ```bash
-cmake --build plugins/AdvancedVSTi/build --config Release
+cmake --build build --config Release
 ```
 
 4. JUCE creates one `*.vst3` bundle per target in the build artifacts.
-5. Copy the desired `.vst3` bundles into `AI-Music-Studio/vsti/` to package them with the app.
+5. If you are using this repo as the `plugins/AdvancedVSTi` submodule inside AI Music Studio, copy the desired `.vst3` bundles into `../vsti/` from the parent app repo to package them with the app.
 
 ## About `.dll`
 

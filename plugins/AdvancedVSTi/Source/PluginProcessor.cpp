@@ -3316,6 +3316,7 @@ void AdvancedVSTiAudioProcessor::startVoiceForMidiNote (int midiNote, float velo
     voice.auxPhase = 0.0f;
     voice.toneState = 0.0f;
     voice.colourState = 0.0f;
+    voice.articulationState = 0.0f;
     if constexpr (isAcousticFlavor())
     {
         const auto seedA = 0.5f + (0.5f * std::sin ((static_cast<float> (midiNote) * 0.713f) + (velocity * 3.91f)));
@@ -3323,6 +3324,7 @@ void AdvancedVSTiAudioProcessor::startVoiceForMidiNote (int midiNote, float velo
         voice.auxPhase = std::fmod (seedA * 0.97f, 1.0f);
         voice.toneState = seedB * 0.018f;
         voice.colourState = (seedA - 0.5f) * 0.028f;
+        voice.articulationState = seedB * 0.012f;
     }
     voice.externalPadIndex = externalPadIndex;
     voice.externalSampleRootMidi = midiNote;
@@ -4467,7 +4469,26 @@ float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice, SampleMo
 
     const auto soundingMidiNote = voice.currentMidiNote >= 0.0f ? voice.currentMidiNote
                                                                  : static_cast<float> (voice.midiNote);
-    const auto multisampleMidiNote = juce::jlimit (0.0f, 127.0f, soundingMidiNote + voiceMod.osc1Pitch);
+    float multisamplePitchSemitones = voiceMod.osc1Pitch;
+    if constexpr (buildFlavor() == InstrumentFlavor::saxophone)
+    {
+        const auto tenorBank = params.sampleBank == 1;
+        const auto bariBank = params.sampleBank == 2;
+        const auto jazzBank = params.sampleBank == 3;
+        const auto vibratoMacro = std::sqrt (juce::jlimit (0.0f, 1.0f, params.lfo1Pitch / 24.0f));
+        const auto vibratoRate = jazzBank ? 5.6f : (bariBank ? 4.5f : (tenorBank ? 4.9f : 5.2f));
+        const auto vibratoRamp = std::pow (juce::jlimit (0.0f,
+                                                         1.0f,
+                                                         (voice.noteAge - (jazzBank ? 0.04f : 0.08f))
+                                                             / (tenorBank ? 0.28f : 0.24f)),
+                                           1.2f);
+        const auto vibratoPhase = std::fmod (voice.auxPhase + (voice.noteAge * vibratoRate), 1.0f);
+        const auto sampleVibratoSemitones = std::sin (twoPi * vibratoPhase)
+                                            * juce::jmap (vibratoMacro, 0.0f, 0.58f)
+                                            * vibratoRamp;
+        multisamplePitchSemitones = sampleVibratoSemitones + (voiceMod.osc1Pitch * 0.08f);
+    }
+    const auto multisampleMidiNote = juce::jlimit (0.0f, 127.0f, soundingMidiNote + multisamplePitchSemitones);
 
     auto baseHz = midiToHzFloat (soundingMidiNote);
     baseHz *= std::pow (2.0f, voiceMod.osc1Pitch / 12.0f);
@@ -4743,9 +4764,8 @@ float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice, SampleMo
                                                          (voice.noteAge - (jazzBank ? 0.04f : 0.08f))
                                                              / (tenorBank ? 0.34f : 0.26f)),
                                            1.4f);
-        voice.auxPhase = std::fmod (voice.auxPhase + ((jazzBank ? 5.4f : (bariBank ? 4.3f : 4.8f)) / static_cast<float> (currentSampleRate)),
-                                    1.0f);
-        const auto vibrato = std::sin (twoPi * voice.auxPhase)
+        const auto vibratoPhase = std::fmod (voice.auxPhase + (voice.noteAge * (jazzBank ? 5.6f : (bariBank ? 4.5f : (tenorBank ? 4.9f : 5.2f)))), 1.0f);
+        const auto vibrato = std::sin (twoPi * vibratoPhase)
                              * (0.0012f + voice.velocity * (jazzBank ? 0.0024f : 0.0018f))
                              * (0.55f + vibratoMacro * 2.5f)
                              * vibratoRamp;
@@ -4753,7 +4773,7 @@ float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice, SampleMo
                                            jazzBank ? 0.07f : 0.05f,
                                            voice.colourState);
         const auto growl = std::sin ((twoPi * std::fmod (voice.phase + vibrato, 1.0f))
-                                     + (std::sin (twoPi * voice.auxPhase) * (jazzBank ? 1.9f : 1.4f)));
+                                     + (std::sin (twoPi * vibratoPhase) * (jazzBank ? 1.9f : 1.4f)));
         const auto body = std::sin (twoPi * std::fmod ((voice.phase * (bariBank ? 0.5f : 1.0f)) + 0.09f, 1.0f)) * (bariBank ? 0.12f : 0.07f);
         const auto reed = voice.colourState * (tenorBank ? 0.1f : (bariBank ? 0.14f : 0.16f));
         const auto slap = (random.nextFloat() * 2.0f - 1.0f)
@@ -4762,19 +4782,22 @@ float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice, SampleMo
         const auto scoop = std::exp (-voice.noteAge * (jazzBank ? 10.0f : 14.0f)) * (0.03f + voice.velocity * 0.03f);
         const auto overtone = std::sin (twoPi * std::fmod ((voice.phase * 2.0f) + vibrato - scoop, 1.0f)) * (jazzBank ? 0.08f : 0.06f);
         const auto releaseAir = releaseHint * reed * (0.14f + colorMacro * 0.14f);
-        const auto bodyTrack = smoothTowards (s, 0.012f + ((1.0f - toneMacro) * 0.04f), voice.toneState);
+        const auto bodyTrack = smoothTowards (s, 0.004f + ((1.0f - toneMacro) * 0.09f), voice.toneState);
         const auto edge = s - bodyTrack;
-        const auto toneTilt = ((bodyTrack * juce::jmap (toneMacro, 1.03f, 0.92f))
-                               + (edge * juce::jmap (toneMacro, 0.25f, 2.9f)))
-                              * (0.95f + focusMacro * 0.08f);
-        const auto formant = std::sin (twoPi * std::fmod ((voice.phase * (1.75f + focusMacro * (bariBank ? 0.55f : 0.85f)))
-                                                          + 0.11f
-                                                          + (vibrato * 0.5f),
-                                                         1.0f))
-                             * (0.018f + focusMacro * (jazzBank ? 0.078f : 0.06f));
-        const auto biteAccent = (slap * (0.55f + biteMacro * 1.7f))
-                                + (overtone * (0.32f + biteMacro * 1.45f));
-        const auto reedBody = reed * (0.7f + focusMacro * 1.05f + colorMacro * 0.75f);
+        const auto toneTilt = ((bodyTrack * juce::jmap (toneMacro, 1.42f, 0.56f))
+                               + (edge * juce::jmap (toneMacro, 0.025f, 5.4f)))
+                              * (0.92f + focusMacro * 0.18f);
+        const auto nasalTrack = smoothTowards (edge, 0.012f + (focusMacro * 0.17f), voice.articulationState);
+        const auto formant = nasalTrack * (0.08f + focusMacro * (jazzBank ? 1.75f : 1.48f))
+                             + (std::sin (twoPi * std::fmod ((voice.phase * (1.65f + focusMacro * (bariBank ? 0.45f : 0.72f)))
+                                                             + 0.11f
+                                                             + (vibrato * 0.5f),
+                                                            1.0f))
+                                * (0.02f + focusMacro * (jazzBank ? 0.09f : 0.072f)));
+        const auto biteAccent = (slap * (0.22f + biteMacro * 2.4f))
+                                + (overtone * (0.12f + biteMacro * 1.9f))
+                                + (edge * biteMacro * (0.14f + toneMacro * 0.75f));
+        const auto reedBody = reed * (0.72f + focusMacro * 1.2f + colorMacro * 0.85f + biteMacro * 0.45f);
         const auto saxCore = toneTilt
                              + (growl * (0.016f + focusMacro * 0.026f + (jazzBank ? 0.012f : 0.0f)))
                              + (body * (0.022f + focusMacro * 0.05f))
@@ -4784,8 +4807,11 @@ float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice, SampleMo
                              + releaseAir;
         if (useInstrumentMultisample)
         {
-            s = softSaturate (saxCore * (1.0f + colorMacro * (jazzBank ? 0.24f : 0.18f) + biteMacro * 0.08f))
-                * (0.975f + toneMacro * 0.015f)
+            s = softSaturate (saxCore * (1.02f
+                                         + colorMacro * (jazzBank ? 0.46f : 0.34f)
+                                         + biteMacro * 0.52f
+                                         + focusMacro * 0.18f))
+                * (0.965f + toneMacro * 0.03f)
                 * attackBlend;
         }
         else
@@ -4793,7 +4819,7 @@ float AdvancedVSTiAudioProcessor::renderVoiceSample (VoiceState& voice, SampleMo
             s = softSaturate (((saxCore * 0.92f)
                                + (growl * (0.028f + focusMacro * 0.04f))
                                + (body * 0.08f))
-                              * (1.05f + colorMacro * 0.28f + focusMacro * 0.08f))
+                              * (1.08f + colorMacro * 0.34f + focusMacro * 0.12f + biteMacro * 0.16f))
                 * 0.94f
                 * attackBlend;
         }
