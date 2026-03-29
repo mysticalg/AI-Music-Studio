@@ -1,7 +1,0 @@
-build/
-build*/
-dist/
-JUCE/
-.cache/
-*.zip
-.DS_Store

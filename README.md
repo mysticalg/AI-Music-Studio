@@ -59,6 +59,7 @@ If OpenAI is not connected, classification falls back to deterministic GM/track-
 ## Quick start
 
 ```bash
+git submodule update --init --recursive
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -197,9 +198,9 @@ For the full web manual with screenshots, see the GitHub Pages guide:
 - `Delete` → Delete selected notes
 - `Z/X/C/V/B/N/M/,` → Trigger virtual piano notes
 
-## Experimental bundled VST3 instruments
+## Native bundled VST3 instruments
 
-A JUCE-based instrument scaffold is available in `plugins/AdvancedVSTi` with core synthesis modules (multi-wave oscillator, unison, FM, sync, filter modes, ADSR + curved envelopes, LFO routing, arp, rhythm gate). The shared source now builds these bundled VST3 instruments:
+The native JUCE-based VST3 instruments now live in the `plugins/AdvancedVSTi` git submodule, backed by the standalone public repo [AI-Music-Studio-VST](https://github.com/mysticalg/AI-Music-Studio-VST). That shared source builds these bundled instruments:
 
 - `Virus Synth`
 - `AI Drum Machine`
@@ -220,15 +221,15 @@ A JUCE-based instrument scaffold is available in `plugins/AdvancedVSTi` with cor
 - `AI Bass Guitar`
 - `AI Organ`
 
-The acoustic suite keeps ADSR, filters, and onboard FX, but now leans on more instrument-specific playback: `AI Piano` uses a bundled multisample piano library, and `AI Strings`, `AI Violin`, `AI Flute`, `AI Saxophone`, `AI Bass Guitar`, and `AI Organ` can load open SFZ-based sample libraries from `.cache/OpenInstrumentSamples`.
+The acoustic suite keeps ADSR, filters, and onboard FX, but now leans on more instrument-specific playback: `AI Piano` uses a bundled multisample piano library, and `AI Strings`, `AI Violin`, `AI Flute`, `AI Saxophone`, `AI Bass Guitar`, and `AI Organ` can load open SFZ-based sample libraries from `plugins/AdvancedVSTi/.cache/OpenInstrumentSamples`.
 
 Populate that cache with:
 
 ```bash
-python scripts/fetch_open_instrument_samples.py
+python plugins/AdvancedVSTi/scripts/fetch_open_instrument_samples.py
 ```
 
-See `plugins/AdvancedVSTi/README.md` for build steps. The GitHub Actions workflow (`.github/workflows/build-vsti.yml`) packages the built `.vst3` bundles into a downloadable ZIP. If those bundles are copied into the app's local `vsti/` folder, AI Music Studio now auto-discovers and adds them to the VST rack on startup.
+See `plugins/AdvancedVSTi/README.md` for build steps inside the submodule. The standalone VST repo owns the native plugin CI and release artifacts. If those built `.vst3` bundles are copied into the app's local `vsti/` folder, AI Music Studio auto-discovers and adds them to the VST rack on startup.
 
 ## Support
 

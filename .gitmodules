@@ -1,0 +1,4 @@
+[submodule "plugins/AdvancedVSTi"]
+	path = plugins/AdvancedVSTi
+	url = https://github.com/mysticalg/AI-Music-Studio-VST.git
+	branch = main
