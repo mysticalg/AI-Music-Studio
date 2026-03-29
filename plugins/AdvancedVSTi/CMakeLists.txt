@@ -22,6 +22,7 @@ endif()
 set(AIMS_ASSET_SOURCES "${AIMS_VIRUS_IMAGE}")
 set(AIMS_HAS_TR909_IMAGE 0)
 set(AIMS_VEC1_LIBRARY_DIR "D:/OneDrive/Music/Sound Design/Sample Library/sample library/VEC1")
+set(AIMS_PIANO_LIBRARY_DIR "${AIMS_REPO_ROOT}/.cache/SplendidGrandPiano")
 set(AIMS_TR909_IMAGE "${AIMS_REPO_ROOT}/tr9092.jpg")
 if(EXISTS "${AIMS_TR909_IMAGE}")
   list(APPEND AIMS_ASSET_SOURCES "${AIMS_TR909_IMAGE}")
@@ -57,6 +58,7 @@ function(add_ai_music_vst3 target_name product_name plugin_code flavor_code bund
     PRIVATE
       AIMS_INSTRUMENT_FLAVOR=${flavor_code}
       AIMS_HAS_TR909_IMAGE=${AIMS_HAS_TR909_IMAGE}
+      AIMS_REPO_ROOT_PATH="${AIMS_REPO_ROOT}"
     PUBLIC
       JUCE_WEB_BROWSER=0
       JUCE_USE_CURL=0
@@ -84,6 +86,13 @@ add_ai_music_vst3(AISampler "AI Sampler" ASmp 7 com.aimusicstudio.aisampler)
 add_ai_music_vst3(AI808Machine "AI 808 Machine" A808 8 com.aimusicstudio.ai808machine)
 add_ai_music_vst3(AITB303 "AI TB303" ATB3 9 com.aimusicstudio.aitb303)
 add_ai_music_vst3(AIVEC1DrumPads "AI VEC1 Drum Pads" AVPD 10 com.aimusicstudio.aivec1drumpads)
+add_ai_music_vst3(AIPiano "AI Piano" AIPn 11 com.aimusicstudio.aipiano)
+add_ai_music_vst3(AIStrings "AI Strings" AISe 12 com.aimusicstudio.aistrings)
+add_ai_music_vst3(AIViolin "AI Violin" AIVl 13 com.aimusicstudio.aiviolin)
+add_ai_music_vst3(AIFlute "AI Flute" AIFt 14 com.aimusicstudio.aiflute)
+add_ai_music_vst3(AISaxophone "AI Saxophone" AISx 15 com.aimusicstudio.aisaxophone)
+add_ai_music_vst3(AIBassGuitar "AI Bass Guitar" AIBG 16 com.aimusicstudio.aibassguitar)
+add_ai_music_vst3(AIOrgan "AI Organ" AIOr 17 com.aimusicstudio.aiorgan)
 
 if(EXISTS "${AIMS_VEC1_LIBRARY_DIR}")
   add_custom_command(TARGET AIVEC1DrumPads_VST3 POST_BUILD
@@ -93,5 +102,15 @@ if(EXISTS "${AIMS_VEC1_LIBRARY_DIR}")
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${AIMS_VEC1_LIBRARY_DIR}"
             "$<TARGET_FILE_DIR:AIVEC1DrumPads_VST3>/../Resources/VEC1"
+    VERBATIM)
+endif()
+
+if(EXISTS "${AIMS_PIANO_LIBRARY_DIR}")
+  add_custom_command(TARGET AIPiano_VST3 POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E echo "Bundling Splendid Grand Piano into AI Piano.vst3"
+    COMMAND ${CMAKE_COMMAND} -E rm -rf "$<TARGET_FILE_DIR:AIPiano_VST3>/../Resources/Piano"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${AIMS_PIANO_LIBRARY_DIR}"
+            "$<TARGET_FILE_DIR:AIPiano_VST3>/../Resources/Piano"
     VERBATIM)
 endif()

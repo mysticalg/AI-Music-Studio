@@ -12,7 +12,7 @@ This folder adds a JUCE-based VST instrument scaffold with these implemented blo
 - Arpeggiator modes: up, down, up/down, random.
 - Rhythm gate and per-note oscillator length gate.
 
-The shared source now builds ten VST3 products:
+The shared source now builds these VST3 products:
 
 - `Virus Synth`
 - `AI Drum Machine`
@@ -24,8 +24,26 @@ The shared source now builds ten VST3 products:
 - `AI Pad Synth`
 - `AI Pluck Synth`
 - `AI Sampler`
+- `AI VEC1 Drum Pads`
+- `AI Piano`
+- `AI Strings`
+- `AI Violin`
+- `AI Flute`
+- `AI Saxophone`
+- `AI Bass Guitar`
+- `AI Organ`
 
-The packaged variants use flavor-specific defaults. `AI Drum Machine` is now voiced as a punchier 909-style kit, `AI 808 Machine` adds longer analogue-style low-end drums, and `AI TB303` adds a more resonant acid-bass flavor. The sampler variant adds internal sample-bank playback with loop-window controls, so it behaves like a compact ROMpler/sampler without depending on external content.
+The packaged variants use flavor-specific defaults. `AI Drum Machine` is now voiced as a punchier 909-style kit, `AI 808 Machine` adds longer analogue-style low-end drums, and `AI TB303` adds a more resonant acid-bass flavor. The sampler variant adds internal sample-bank playback with loop-window controls, so it behaves like a compact ROMpler/sampler without depending on external content. The acoustic suite now covers `AI Piano`, `AI Strings`, `AI Violin`, `AI Flute`, `AI Saxophone`, `AI Bass Guitar`, and `AI Organ`: piano uses the bundled Splendid Grand library, and the others can load open multisample libraries from `.cache/OpenInstrumentSamples` for real SFZ-based playback.
+
+## Fetch acoustic sample libraries
+
+Run this once from the repo root to populate `.cache/OpenInstrumentSamples` with the open sample sets used by the acoustic plugins:
+
+```bash
+python scripts/fetch_open_instrument_samples.py
+```
+
+That script pulls a sparse subset of Sonatina Symphonic Orchestra for strings / violin / flute, the FreePats electric bass repository for bass guitar, and small FreePats archive sets for tenor saxophone and church organ.
 
 ## Automated GitHub build + download
 

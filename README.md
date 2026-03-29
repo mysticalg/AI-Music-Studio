@@ -199,7 +199,7 @@ For the full web manual with screenshots, see the GitHub Pages guide:
 
 ## Experimental bundled VST3 instruments
 
-A JUCE-based instrument scaffold is available in `plugins/AdvancedVSTi` with core synthesis modules (multi-wave oscillator, unison, FM, sync, filter modes, ADSR + curved envelopes, LFO routing, arp, rhythm gate). The shared source now builds multiple bundled VST3 instruments:
+A JUCE-based instrument scaffold is available in `plugins/AdvancedVSTi` with core synthesis modules (multi-wave oscillator, unison, FM, sync, filter modes, ADSR + curved envelopes, LFO routing, arp, rhythm gate). The shared source now builds these bundled VST3 instruments:
 
 - `Virus Synth`
 - `AI Drum Machine`
@@ -211,6 +211,22 @@ A JUCE-based instrument scaffold is available in `plugins/AdvancedVSTi` with cor
 - `AI Pad Synth`
 - `AI Pluck Synth`
 - `AI Sampler`
+- `AI VEC1 Drum Pads`
+- `AI Piano`
+- `AI Strings`
+- `AI Violin`
+- `AI Flute`
+- `AI Saxophone`
+- `AI Bass Guitar`
+- `AI Organ`
+
+The acoustic suite keeps ADSR, filters, and onboard FX, but now leans on more instrument-specific playback: `AI Piano` uses a bundled multisample piano library, and `AI Strings`, `AI Violin`, `AI Flute`, `AI Saxophone`, `AI Bass Guitar`, and `AI Organ` can load open SFZ-based sample libraries from `.cache/OpenInstrumentSamples`.
+
+Populate that cache with:
+
+```bash
+python scripts/fetch_open_instrument_samples.py
+```
 
 See `plugins/AdvancedVSTi/README.md` for build steps. The GitHub Actions workflow (`.github/workflows/build-vsti.yml`) packages the built `.vst3` bundles into a downloadable ZIP. If those bundles are copied into the app's local `vsti/` folder, AI Music Studio now auto-discovers and adds them to the VST rack on startup.
 

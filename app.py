@@ -13,6 +13,7 @@ import math
 import os
 import queue
 import secrets
+import shutil
 import struct
 import subprocess
 import sys
@@ -1198,13 +1199,14 @@ class MidiSection:
 DEFAULT_STARTUP_TRACK_LAYOUT: tuple[tuple[str, str, int, str], ...] = (
     ("TB303", "AI TB303", 0, "synth"),
     ("VEC Drum Machine", "AI VEC1 Drum Pads", 9, "drums"),
-    ("Noisemaker", "TAL-NoiseMaker", 1, "synth"),
-    ("Virus", "Virus Synth", 2, "synth"),
+    ("AI Bass Guitar", "AI Bass Guitar", 1, "bass"),
+    ("AI Strings", "AI Strings", 2, "strings"),
     ("AI Organ", "AI Organ", 3, "keys"),
     ("AI Piano", "AI Piano", 4, "keys"),
     ("AI Flute", "AI Flute", 5, "woodwind"),
     ("AI Sax", "AI Saxophone", 6, "woodwind"),
     ("AI Violin", "AI Violin", 7, "strings"),
+    ("Virus", "Virus Synth", 8, "synth"),
 )
 
 
@@ -16004,6 +16006,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if not candidates:
             return None
         preferred = self._preferred_instrument_entry_by_names(
+            'AI Piano',
+            'AI Strings',
+            'AI Bass Guitar',
+            'AI Organ',
+            'AI Flute',
+            'AI Saxophone',
+            'AI Violin',
             'AI Bass Synth',
             'AI Lead Synth',
             'AI Pad Synth',
@@ -16032,19 +16041,19 @@ class MainWindow(QtWidgets.QMainWindow):
         if midi_channel == 9 or family == 'drums' or 'drum' in instrument_name or 'kit' in instrument_name:
             preferred = ('AI Drum Machine',)
         elif family == 'bass' or 32 <= midi_program <= 39 or 'bass' in instrument_name:
-            preferred = ('AI Bass Synth', 'AI Lead Synth')
+            preferred = ('AI Bass Guitar', 'AI Bass Synth', 'AI Lead Synth')
         elif family == 'strings' or any(token in instrument_name for token in ('string', 'violin', 'cello', 'pad')):
-            preferred = ('AI String Synth', 'AI Pad Synth')
+            preferred = ('AI Strings', 'AI Violin', 'AI String Synth', 'AI Pad Synth')
         elif family in {'guitar'} or any(token in instrument_name for token in ('guitar', 'pluck', 'harp', 'mallet')):
-            preferred = ('AI Pluck Synth', 'AI Lead Synth')
+            preferred = ('AI Bass Guitar', 'AI Pluck Synth', 'AI Lead Synth')
         elif family in {'piano', 'organ'} or any(token in instrument_name for token in ('piano', 'keys', 'organ', 'ep')):
-            preferred = ('AI Pluck Synth', 'AI Pad Synth', 'AI Lead Synth')
+            preferred = ('AI Piano', 'AI Organ', 'AI Pluck Synth', 'AI Pad Synth', 'AI Lead Synth')
         elif family in {'horn', 'brass', 'woodwind'} or any(
             token in instrument_name for token in ('horn', 'brass', 'trumpet', 'trombone', 'sax', 'flute', 'lead')
         ):
-            preferred = ('AI Lead Synth', 'AI String Synth')
+            preferred = ('AI Saxophone', 'AI Flute', 'AI Lead Synth', 'AI String Synth')
         else:
-            preferred = ('AI Lead Synth', 'AI Pad Synth', 'AI String Synth', 'AI Bass Synth')
+            preferred = ('AI Piano', 'AI Strings', 'AI Lead Synth', 'AI Pad Synth', 'AI String Synth', 'AI Bass Synth')
 
         entry = self._preferred_instrument_entry_by_names(*preferred)
         if entry is not None:
@@ -20688,6 +20697,7 @@ class MainWindow(QtWidgets.QMainWindow):
         APP_PREFS_PATH.write_text(json.dumps(payload, indent=2))
 
     def _sync_bundled_vsti_directory(self) -> None:
+        self._sync_development_bundled_vsti_outputs()
         discovered_roots: list[Path] = []
         seen_roots: set[str] = set()
         candidate_roots = [self.vsti_directory, self.user_vsti_directory]
@@ -20736,6 +20746,68 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if changed or added_to_rack or cleaned or changed_plugins:
             self._save_preferences()
+
+    def _development_bundled_vsti_source_roots(self) -> list[Path]:
+        if getattr(sys, "frozen", False):
+            return []
+        plugin_root = APP_ROOT_DIR / "plugins" / "AdvancedVSTi"
+        build_dirs = (
+            plugin_root / "build",
+            plugin_root / "build-windows",
+            plugin_root / "build-macos",
+            plugin_root / "build-linux",
+        )
+        roots: list[Path] = []
+        seen: set[str] = set()
+        for build_dir in build_dirs:
+            if not build_dir.exists():
+                continue
+            for candidate in build_dir.rglob("VST3"):
+                if not candidate.is_dir():
+                    continue
+                parent_name = candidate.parent.name.lower()
+                if parent_name not in {"release", "debug", "relwithdebinfo", "minsizerel"}:
+                    continue
+                try:
+                    resolved = candidate.resolve()
+                except Exception:
+                    continue
+                key = str(resolved)
+                if key in seen:
+                    continue
+                seen.add(key)
+                roots.append(resolved)
+        return roots
+
+    def _sync_development_bundled_vsti_outputs(self) -> int:
+        if getattr(sys, "frozen", False):
+            return 0
+        copied = 0
+        self.vsti_directory.mkdir(parents=True, exist_ok=True)
+        for source_root in self._development_bundled_vsti_source_roots():
+            for source_bundle in sorted(source_root.glob("*.vst3")):
+                if not source_bundle.is_dir():
+                    continue
+                dest_bundle = self.vsti_directory / source_bundle.name
+                source_mtime = self._vsti_plugin_mtime_ns(source_bundle)
+                dest_mtime = self._vsti_plugin_mtime_ns(dest_bundle)
+                if dest_bundle.exists() and dest_mtime >= source_mtime and dest_mtime > 0:
+                    continue
+                try:
+                    if dest_bundle.exists():
+                        if dest_bundle.is_dir():
+                            shutil.rmtree(dest_bundle)
+                        else:
+                            dest_bundle.unlink()
+                    shutil.copytree(source_bundle, dest_bundle)
+                    copied += 1
+                except Exception:
+                    _APP_LOGGER.exception(
+                        "Failed syncing development bundled VST output source=%s dest=%s",
+                        source_bundle,
+                        dest_bundle,
+                    )
+        return copied
 
     def _preferred_vsti_browser_directory(self) -> Path:
         candidates: list[Path] = []

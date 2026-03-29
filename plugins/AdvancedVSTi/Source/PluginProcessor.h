@@ -92,7 +92,14 @@ private:
         sampler,
         drum808,
         acid303,
-        vec1DrumPad
+        vec1DrumPad,
+        piano,
+        stringEnsemble,
+        violin,
+        flute,
+        saxophone,
+        bassGuitar,
+        organ
     };
 
     static constexpr int drumVoiceLevelCount = 15;
@@ -171,6 +178,8 @@ private:
     };
 
     struct ExternalSampleData;
+    struct PianoSampleLibrary;
+    struct AcousticSampleLibrary;
 
     static constexpr int maxVoices = 256;
     static constexpr int maxUnisonOscillators = 8;
@@ -194,7 +203,13 @@ private:
         float toneState = 0.0f;
         float colourState = 0.0f;
         int externalPadIndex = -1;
+        int externalSampleRootMidi = 60;
         double externalSamplePosition = 0.0;
+        float externalSampleGain = 1.0f;
+        float externalSampleTuneSemitones = 0.0f;
+        int externalSampleLoopStart = 0;
+        int externalSampleLoopEnd = 0;
+        bool externalSampleLoopEnabled = false;
         std::shared_ptr<const ExternalSampleData> externalSample;
         std::array<float, maxUnisonOscillators> unisonPhases {};
         std::array<float, maxUnisonOscillators> unisonSyncPhases {};
@@ -425,6 +440,9 @@ private:
     juce::AudioFormatManager audioFormatManager;
     std::vector<ExternalPadDefinition> externalPads;
     std::array<std::shared_ptr<const ExternalSampleData>, vecPadCount> externalPadSamples {};
+    std::shared_ptr<const PianoSampleLibrary> pianoSampleLibrary;
+    std::shared_ptr<const AcousticSampleLibrary> acousticSampleLibrary;
+    int loadedAcousticSampleBank = -1;
     std::array<int, vecPadCount> loadedExternalPadIndices = []
     {
         std::array<int, vecPadCount> values {};
@@ -507,6 +525,20 @@ private:
         return InstrumentFlavor::acid303;
 #elif AIMS_INSTRUMENT_FLAVOR == 10
         return InstrumentFlavor::vec1DrumPad;
+#elif AIMS_INSTRUMENT_FLAVOR == 11
+        return InstrumentFlavor::piano;
+#elif AIMS_INSTRUMENT_FLAVOR == 12
+        return InstrumentFlavor::stringEnsemble;
+#elif AIMS_INSTRUMENT_FLAVOR == 13
+        return InstrumentFlavor::violin;
+#elif AIMS_INSTRUMENT_FLAVOR == 14
+        return InstrumentFlavor::flute;
+#elif AIMS_INSTRUMENT_FLAVOR == 15
+        return InstrumentFlavor::saxophone;
+#elif AIMS_INSTRUMENT_FLAVOR == 16
+        return InstrumentFlavor::bassGuitar;
+#elif AIMS_INSTRUMENT_FLAVOR == 17
+        return InstrumentFlavor::organ;
 #else
         return InstrumentFlavor::advanced;
 #endif
@@ -524,34 +556,68 @@ private:
         return buildFlavor() == InstrumentFlavor::drumMachine || buildFlavor() == InstrumentFlavor::drum808;
     }
 
+    [[nodiscard]] static constexpr bool isAcousticFlavor() noexcept
+    {
+        return buildFlavor() == InstrumentFlavor::piano
+               || buildFlavor() == InstrumentFlavor::stringEnsemble
+               || buildFlavor() == InstrumentFlavor::violin
+               || buildFlavor() == InstrumentFlavor::flute
+               || buildFlavor() == InstrumentFlavor::saxophone
+               || buildFlavor() == InstrumentFlavor::bassGuitar
+               || buildFlavor() == InstrumentFlavor::organ;
+    }
+
+    [[nodiscard]] static constexpr bool supportsOffFilterChoice() noexcept
+    {
+        return isDrumFlavor() || isAcousticFlavor();
+    }
+
     [[nodiscard]] static constexpr bool isMonophonicFlavor() noexcept
     {
-        return buildFlavor() == InstrumentFlavor::bassSynth;
+        return buildFlavor() == InstrumentFlavor::bassSynth
+               || buildFlavor() == InstrumentFlavor::flute
+               || buildFlavor() == InstrumentFlavor::saxophone
+               || buildFlavor() == InstrumentFlavor::bassGuitar;
     }
 
     [[nodiscard]] static constexpr int voiceLimitForFlavor() noexcept
     {
         if constexpr (buildFlavor() == InstrumentFlavor::bassSynth)
             return 1;
-        if constexpr (buildFlavor() == InstrumentFlavor::drumMachine || buildFlavor() == InstrumentFlavor::drum808)
+        else if constexpr (buildFlavor() == InstrumentFlavor::drumMachine || buildFlavor() == InstrumentFlavor::drum808)
             return 8;
-        if constexpr (buildFlavor() == InstrumentFlavor::vec1DrumPad)
+        else if constexpr (buildFlavor() == InstrumentFlavor::vec1DrumPad)
             return 24;
-        if constexpr (buildFlavor() == InstrumentFlavor::stringSynth)
+        else if constexpr (buildFlavor() == InstrumentFlavor::stringSynth)
             return maxVoices;
-        if constexpr (buildFlavor() == InstrumentFlavor::leadSynth)
+        else if constexpr (buildFlavor() == InstrumentFlavor::leadSynth)
             return 8;
-        if constexpr (buildFlavor() == InstrumentFlavor::padSynth)
+        else if constexpr (buildFlavor() == InstrumentFlavor::padSynth)
             return 8;
-        if constexpr (buildFlavor() == InstrumentFlavor::pluckSynth)
+        else if constexpr (buildFlavor() == InstrumentFlavor::pluckSynth)
             return 6;
-        if constexpr (buildFlavor() == InstrumentFlavor::sampler)
+        else if constexpr (buildFlavor() == InstrumentFlavor::sampler)
             return 6;
-        if constexpr (buildFlavor() == InstrumentFlavor::acid303)
+        else if constexpr (buildFlavor() == InstrumentFlavor::acid303)
             return 1;
-        if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+        else if constexpr (buildFlavor() == InstrumentFlavor::piano)
+            return 16;
+        else if constexpr (buildFlavor() == InstrumentFlavor::stringEnsemble)
+            return 12;
+        else if constexpr (buildFlavor() == InstrumentFlavor::violin)
             return 8;
-        return maxVoices;
+        else if constexpr (buildFlavor() == InstrumentFlavor::flute)
+            return 1;
+        else if constexpr (buildFlavor() == InstrumentFlavor::saxophone)
+            return 1;
+        else if constexpr (buildFlavor() == InstrumentFlavor::bassGuitar)
+            return 1;
+        else if constexpr (buildFlavor() == InstrumentFlavor::organ)
+            return 16;
+        else if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+            return 8;
+        else
+            return maxVoices;
     }
 
     [[nodiscard]] static constexpr int maxUnisonForFlavor() noexcept
@@ -562,17 +628,24 @@ private:
                       || buildFlavor() == InstrumentFlavor::vec1DrumPad
                       || buildFlavor() == InstrumentFlavor::sampler
                       || buildFlavor() == InstrumentFlavor::pluckSynth
+                      || buildFlavor() == InstrumentFlavor::piano
+                      || buildFlavor() == InstrumentFlavor::flute
+                      || buildFlavor() == InstrumentFlavor::saxophone
+                      || buildFlavor() == InstrumentFlavor::bassGuitar
                       || buildFlavor() == InstrumentFlavor::acid303)
             return 1;
-        if constexpr (buildFlavor() == InstrumentFlavor::stringSynth)
+        else if constexpr (buildFlavor() == InstrumentFlavor::stringSynth)
             return maxUnisonOscillators;
-        if constexpr (buildFlavor() == InstrumentFlavor::padSynth)
+        else if constexpr (buildFlavor() == InstrumentFlavor::stringEnsemble)
             return 2;
-        if constexpr (buildFlavor() == InstrumentFlavor::leadSynth)
+        else if constexpr (buildFlavor() == InstrumentFlavor::violin)
+            return 2;
+        else if constexpr (buildFlavor() == InstrumentFlavor::padSynth)
+            return 2;
+        else if constexpr (buildFlavor() == InstrumentFlavor::leadSynth)
             return 1;
-        if constexpr (buildFlavor() == InstrumentFlavor::advanced)
+        else
             return 2;
-        return 2;
     }
 
     [[nodiscard]] int activeVoiceLimit() const noexcept;
@@ -592,8 +665,15 @@ private:
     [[nodiscard]] static juce::StringArray sampleBankChoices();
     [[nodiscard]] static juce::StringArray presetChoicesForFlavor();
     void initializeExternalPadLibrary();
+    void initializePianoSampleLibrary();
+    void initializeAcousticSampleLibrary (int bankIndex);
     void refreshExternalPadSamples();
+    void assignPianoSampleToVoice (VoiceState& voice, int midiNote, float velocity);
+    void assignAcousticSampleToVoice (VoiceState& voice, int midiNote, float velocity);
     void loadExternalPadSample (int padIndex);
+    [[nodiscard]] std::shared_ptr<const ExternalSampleData> loadExternalSampleData (const juce::File& sourceFile,
+                                                                                    const juce::String& displayName,
+                                                                                    const juce::String& presetName);
     [[nodiscard]] int externalPadIndexForMidi (int midiNote) const noexcept;
     [[nodiscard]] static juce::String externalPadSampleParameterIdForIndex (int padIndex);
     [[nodiscard]] static juce::String externalPadLevelParameterIdForIndex (int padIndex);
@@ -612,6 +692,7 @@ private:
     void setParameterActual (const char* paramId, float value);
     void parameterChanged (const juce::String& parameterID, float newValue) override;
     void handleAsyncUpdate() override;
+    float renderInstrumentMultisampleVoice (VoiceState& voice, float soundingMidiNote);
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (AdvancedVSTiAudioProcessor)
 };

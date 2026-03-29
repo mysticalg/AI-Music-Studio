@@ -8,6 +8,16 @@ juce::String normalizedPluginName (const AdvancedVSTiAudioProcessor& processor)
     return processor.getName().trim().toLowerCase();
 }
 
+bool isAcousticStringsPluginName (const juce::String& name)
+{
+    return name.contains ("ai strings") && ! name.contains ("string synth");
+}
+
+bool isStringSynthPluginName (const juce::String& name)
+{
+    return name.contains ("string synth");
+}
+
 int scaledInt (float value, float scale)
 {
     return juce::roundToInt (value * scale);
@@ -1475,7 +1485,8 @@ AdvancedVSTiAudioProcessorEditor::AdvancedVSTiAudioProcessorEditor (AdvancedVSTi
         maxWidth = kVirusTemplateWidth;
         maxHeight = kVirusTemplateHeight;
     }
-    else if (normalizedPluginName (audioProcessor).contains ("string"))
+    else if (isStringSynthPluginName (normalizedPluginName (audioProcessor))
+             || isAcousticStringsPluginName (normalizedPluginName (audioProcessor)))
     {
         defaultWidth = 1380;
         defaultHeight = 900;
@@ -3852,13 +3863,55 @@ AdvancedVSTiAudioProcessorEditor::Theme AdvancedVSTiAudioProcessorEditor::buildT
         return tribute;
     }
 
+    if (name.contains ("bass guitar"))
+        return { "AI Bass Guitar", "Electric bass voicing with finger and pick-ready low-end controls and restrained stage-space FX.",
+                 juce::Colour::fromRGB (116, 212, 158), juce::Colour::fromRGB (38, 128, 92),
+                 juce::Colour::fromRGB (15, 19, 19), juce::Colour::fromRGB (21, 30, 29), juce::Colour::fromRGB (43, 85, 69),
+                 juce::Colours::white, juce::Colour::fromRGB (191, 214, 205) };
+
+    if (name.contains ("piano"))
+        return { "AI Piano", "Acoustic piano voicing with tighter transient shaping, body bloom, and mix-ready ambience.",
+                 juce::Colour::fromRGB (244, 206, 150), juce::Colour::fromRGB (176, 122, 64),
+                 juce::Colour::fromRGB (21, 18, 16), juce::Colour::fromRGB (31, 26, 22), juce::Colour::fromRGB (97, 67, 43),
+                 juce::Colours::white, juce::Colour::fromRGB (223, 207, 190) };
+
+    if (isAcousticStringsPluginName (name))
+        return { "AI Strings", "Acoustic section voicing with chamber width, bow bloom, and cinematic movement.",
+                 juce::Colour::fromRGB (228, 188, 144), juce::Colour::fromRGB (154, 96, 62),
+                 juce::Colour::fromRGB (23, 18, 18), juce::Colour::fromRGB (34, 27, 25), juce::Colour::fromRGB (100, 70, 56),
+                 juce::Colours::white, juce::Colour::fromRGB (222, 205, 194) };
+
+    if (name.contains ("violin"))
+        return { "AI Violin", "Solo-string articulation with bow bloom, vibrato motion, and a more expressive chamber palette.",
+                 juce::Colour::fromRGB (246, 195, 106), juce::Colour::fromRGB (194, 132, 38),
+                 juce::Colour::fromRGB (22, 18, 17), juce::Colour::fromRGB (31, 25, 22), juce::Colour::fromRGB (112, 80, 35),
+                 juce::Colours::white, juce::Colour::fromRGB (224, 208, 182) };
+
+    if (name.contains ("flute"))
+        return { "AI Flute", "Airy woodwind voicing with breath, shimmer, and a cleaner top-end control path.",
+                 juce::Colour::fromRGB (170, 232, 220), juce::Colour::fromRGB (70, 160, 144),
+                 juce::Colour::fromRGB (16, 22, 22), juce::Colour::fromRGB (22, 32, 31), juce::Colour::fromRGB (48, 102, 97),
+                 juce::Colours::white, juce::Colour::fromRGB (196, 220, 214) };
+
+    if (name.contains ("sax"))
+        return { "AI Saxophone", "Reed-forward brass-woodwind blend with focused grit, vibrato, and stage-ready presence.",
+                 juce::Colour::fromRGB (230, 177, 94), juce::Colour::fromRGB (176, 112, 38),
+                 juce::Colour::fromRGB (23, 20, 18), juce::Colour::fromRGB (33, 28, 24), juce::Colour::fromRGB (111, 76, 34),
+                 juce::Colours::white, juce::Colour::fromRGB (221, 205, 183) };
+
+    if (name.contains ("organ"))
+        return { "AI Organ", "Tonewheel and pipe-inspired voicing with drawbar-style weight and restrained room color.",
+                 juce::Colour::fromRGB (170, 216, 143), juce::Colour::fromRGB (98, 150, 68),
+                 juce::Colour::fromRGB (18, 22, 16), juce::Colour::fromRGB (25, 31, 23), juce::Colour::fromRGB (62, 99, 46),
+                 juce::Colours::white, juce::Colour::fromRGB (203, 219, 193) };
+
     if (name.contains ("bass"))
         return { "AI Bass Synth", "Heavier subs, firmer harmonics, and a darker panel built for low-end shaping.",
                  juce::Colour::fromRGB (82, 231, 166), juce::Colour::fromRGB (24, 153, 111),
                  juce::Colour::fromRGB (14, 18, 18), juce::Colour::fromRGB (18, 28, 27), juce::Colour::fromRGB (30, 87, 71),
                  juce::Colours::white, juce::Colour::fromRGB (175, 212, 202) };
 
-    if (name.contains ("string"))
+    if (isStringSynthPluginName (name))
         return { "AI String Synth", "Softer ensemble motion, longer blooms, and warmer control cards for layered pads.",
                  juce::Colour::fromRGB (255, 210, 98), juce::Colour::fromRGB (198, 142, 49),
                  juce::Colour::fromRGB (18, 18, 23), juce::Colour::fromRGB (28, 26, 23), juce::Colour::fromRGB (102, 75, 34),
@@ -3940,7 +3993,63 @@ std::vector<AdvancedVSTiAudioProcessorEditor::ChoiceSpec> AdvancedVSTiAudioProce
         return specs;
     }
 
-    if (name.contains ("string"))
+    if (name.contains ("piano"))
+    {
+        specs.push_back ({ "SAMPLEBANK", "Source", "Acoustic piano body model", { "Concert Grand", "Felt Upright", "Pop Piano", "Cinematic Hall" }, {}, false, 0 });
+        specs.push_back ({ "FILTERTYPE", "Filter", "Tonal contour", { "Off", "LP", "BP", "HP", "Notch" }, {}, false, 0 });
+        specs.push_back ({ "FILTERSLOPE", "Slope", "Brightness roll-off", { "12 dB", "16 dB", "24 dB" }, {}, false, 0 });
+        return specs;
+    }
+
+    if (isAcousticStringsPluginName (name))
+    {
+        specs.push_back ({ "SAMPLEBANK", "Source", "Section and articulation profile", { "Chamber Ensemble", "Lush Section", "Pizzicato Stage", "Cinematic Swell" }, {}, false, 0 });
+        specs.push_back ({ "FILTERTYPE", "Filter", "Section contour", { "Off", "LP", "BP", "HP", "Notch" }, {}, false, 0 });
+        specs.push_back ({ "FILTERSLOPE", "Slope", "Upper-harmonic roll-off", { "12 dB", "16 dB", "24 dB" }, {}, false, 0 });
+        return specs;
+    }
+
+    if (name.contains ("bass guitar"))
+    {
+        specs.push_back ({ "SAMPLEBANK", "Source", "Bass pickup and playing style", { "Finger Bass", "Pick Bass", "Muted Bass", "Round Bass" }, {}, false, 0 });
+        specs.push_back ({ "FILTERTYPE", "Filter", "Low-end contour", { "Off", "LP", "BP", "HP", "Notch" }, {}, false, 0 });
+        specs.push_back ({ "FILTERSLOPE", "Slope", "Top-end roll-off", { "12 dB", "16 dB", "24 dB" }, {}, false, 0 });
+        return specs;
+    }
+
+    if (name.contains ("violin"))
+    {
+        specs.push_back ({ "SAMPLEBANK", "Source", "Bow and ensemble profile", { "Solo Legato", "Expressive Vib", "Studio Section", "Rosin Accent" }, {}, false, 0 });
+        specs.push_back ({ "FILTERTYPE", "Filter", "Body contour", { "Off", "LP", "BP", "HP", "Notch" }, {}, false, 0 });
+        specs.push_back ({ "FILTERSLOPE", "Slope", "Upper-harmonic roll-off", { "12 dB", "16 dB", "24 dB" }, {}, false, 0 });
+        return specs;
+    }
+
+    if (name.contains ("flute"))
+    {
+        specs.push_back ({ "SAMPLEBANK", "Source", "Breath and register model", { "Concert Flute", "Breathy Alto", "Whistle Air", "Warm Low Flute" }, {}, false, 0 });
+        specs.push_back ({ "FILTERTYPE", "Filter", "Air / body contour", { "Off", "LP", "BP", "HP", "Notch" }, {}, false, 0 });
+        specs.push_back ({ "FILTERSLOPE", "Slope", "Top-end shape", { "12 dB", "16 dB", "24 dB" }, {}, false, 0 });
+        return specs;
+    }
+
+    if (name.contains ("sax"))
+    {
+        specs.push_back ({ "SAMPLEBANK", "Source", "Tenor sax performance profile", { "Tenor Solo", "Tenor Warm", "Tenor Air", "Jazz Tenor" }, {}, false, 0 });
+        specs.push_back ({ "FILTERTYPE", "Filter", "Reed contour", { "Off", "LP", "BP", "HP", "Notch" }, {}, false, 0 });
+        specs.push_back ({ "FILTERSLOPE", "Slope", "Top-edge focus", { "12 dB", "16 dB", "24 dB" }, {}, false, 0 });
+        return specs;
+    }
+
+    if (name.contains ("organ"))
+    {
+        specs.push_back ({ "SAMPLEBANK", "Source", "Pipe organ stop profile", { "Cathedral Principal", "Soft Stops", "Bright Mixture", "Warm Diapason" }, {}, false, 0 });
+        specs.push_back ({ "FILTERTYPE", "Filter", "Upper harmonic contour", { "Off", "LP", "BP", "HP", "Notch" }, {}, false, 0 });
+        specs.push_back ({ "FILTERSLOPE", "Slope", "Brightness roll-off", { "12 dB", "16 dB", "24 dB" }, {}, false, 0 });
+        return specs;
+    }
+
+    if (isStringSynthPluginName (name))
     {
         specs.push_back ({ "OSCTYPE", "Oscillator", "Core ensemble source", { "Sine", "Saw", "Square", "Noise", "Sample" }, {}, false, 0 });
         specs.push_back ({ "FILTERTYPE", "Filter", "Main timbre curve", { "LP", "BP", "HP", "Notch" }, {}, false, 0 });
@@ -4135,6 +4244,73 @@ std::vector<AdvancedVSTiAudioProcessorEditor::KnobSpec> AdvancedVSTiAudioProcess
             { "DRUMLEVEL_PERC", "Perc", "", 50 },
         };
 
+    if (name.contains ("piano"))
+        return {
+            { "CUTOFF", "Tone", "Brightness and felt" },
+            { "FILTERENVAMOUNT", "Hammer", "Transient snap" },
+            { "AMPDECAY", "Decay", "Body bloom" },
+            { "AMPRELEASE", "Release", "Tail length" },
+            { "REVERBMIX", "Room", "Instrument space" },
+            { "FXMIX", "Color", "Subtle cabinet / character" },
+        };
+
+    if (isAcousticStringsPluginName (name))
+        return {
+            { "CUTOFF", "Tone", "Section brightness" },
+            { "FILTERENVAMOUNT", "Bow", "Attack and bow pressure" },
+            { "AMPATTACK", "Attack", "Section onset" },
+            { "AMPRELEASE", "Release", "Ensemble tail" },
+            { "REVERBMIX", "Room", "Stage depth" },
+            { "FXMIX", "Ensemble", "Width and motion" },
+        };
+
+    if (name.contains ("bass guitar"))
+        return {
+            { "CUTOFF", "Tone", "Pickup brightness" },
+            { "RESONANCE", "Res", "Focused edge" },
+            { "FILTERENVAMOUNT", "Attack", "Pluck emphasis" },
+            { "AMPDECAY", "Decay", "String settle" },
+            { "AMPRELEASE", "Release", "Tail length" },
+        };
+
+    if (name.contains ("violin"))
+        return {
+            { "CUTOFF", "Tone", "Bow brightness" },
+            { "AMPATTACK", "Attack", "Bow rise" },
+            { "AMPRELEASE", "Release", "Bow-off tail" },
+            { "LFO1PITCH", "Vibrato", "Pitch motion" },
+            { "REVERBMIX", "Room", "Stage space" },
+            { "FXMIX", "Ensemble", "Width and movement" },
+        };
+
+    if (name.contains ("flute"))
+        return {
+            { "CUTOFF", "Tone", "Air brightness" },
+            { "AMPATTACK", "Attack", "Breath onset" },
+            { "AMPRELEASE", "Release", "Breath tail" },
+            { "LFO1PITCH", "Vibrato", "Pitch motion" },
+            { "REVERBMIX", "Room", "Air around the source" },
+        };
+
+    if (name.contains ("sax"))
+        return {
+            { "CUTOFF", "Tone", "Reed brightness" },
+            { "RESONANCE", "Focus", "Nasal peak" },
+            { "FILTERENVAMOUNT", "Bite", "Attack push" },
+            { "LFO1PITCH", "Vibrato", "Pitch motion" },
+            { "FXMIX", "Color", "Saturation / body" },
+            { "REVERBMIX", "Room", "Stage depth" },
+        };
+
+    if (name.contains ("organ"))
+        return {
+            { "CUTOFF", "Tone", "Top-end contour" },
+            { "FXMIX", "Chorus", "Motion blend" },
+            { "FXINTENSITY", "Depth", "Rotary / chorus depth" },
+            { "AMPRELEASE", "Release", "Key-off tail" },
+            { "REVERBMIX", "Room", "Cabinet / hall space" },
+        };
+
     if (name.contains ("bass"))
         return {
             { "CUTOFF", "Cutoff", "Low-end brightness" },
@@ -4144,7 +4320,7 @@ std::vector<AdvancedVSTiAudioProcessorEditor::KnobSpec> AdvancedVSTiAudioProcess
             { "AMPRELEASE", "Release", "Tail and sustain feel" },
         };
 
-    if (name.contains ("string"))
+    if (isStringSynthPluginName (name))
         return {
             { "POLYPHONY", "Poly", "Max active notes" },
             { "UNISON", "Unison", "Voices per note" },
