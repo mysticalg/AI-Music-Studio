@@ -493,22 +493,6 @@ void readAutomationLanes(const juce::var& lanesVar, std::vector<AutomationLane>&
     }
 }
 
-void readTempoMarkers(const juce::var& markersVar, std::vector<TempoMarker>& markers)
-{
-    markers.clear();
-    if (auto* markerArray = markersVar.getArray())
-    {
-        markers.reserve(static_cast<size_t>(markerArray->size()));
-        for (const auto& markerVar : *markerArray)
-        {
-            TempoMarker marker;
-            marker.tick = getIntProperty(markerVar, "tick", 0, 0);
-            marker.bpm = getIntProperty(markerVar, "bpm", kDefaultBpm, 20, 300);
-            markers.push_back(marker);
-        }
-    }
-}
-
 void readVstParameters(const juce::var& parametersVar, juce::NamedValueSet& parameters)
 {
     parameters.clear();
@@ -1693,7 +1677,7 @@ void synchronisePatternClipsToTrackNotes(ProjectState& project)
         sanitiseMidiNoteList(track.notes);
 }
 
-void removeUnusedPatterns(ProjectState& project)
+static void removeUnusedPatterns(ProjectState& project)
 {
     juce::StringArray referencedPatternIds;
     for (const auto& section : project.midiSections)

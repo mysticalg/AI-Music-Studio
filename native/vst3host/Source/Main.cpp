@@ -30,7 +30,6 @@ namespace
 constexpr int kDefaultWindowWidth = 1040;
 constexpr int kDefaultWindowHeight = 720;
 constexpr int kDefaultMidiChannel = 1;
-constexpr int kDefaultCommandPort = 47653;
 const juce::String kMainAudioStreamId = "main";
 const juce::String kPreviewAudioStreamId = "preview";
 const juce::String kLiveMidiAudioStreamId = "live_midi";
@@ -530,8 +529,8 @@ public:
                   const juce::String& startupAudioDeviceType,
                   const juce::String& startupAudioOutputDeviceName)
         : appSettings(settings),
-          bridgeMode(bridgeModeEnabled),
           keyboardComponent(keyboardState, juce::MidiKeyboardComponent::horizontalKeyboard),
+          bridgeMode(bridgeModeEnabled),
           managedStateFile(startupStatePath.isNotEmpty() ? juce::File(startupStatePath) : juce::File())
     {
         formatManager.addFormat(std::make_unique<juce::VST3PluginFormat>());

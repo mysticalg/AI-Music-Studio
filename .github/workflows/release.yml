@@ -24,6 +24,17 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Compute artifact ref
+        id: artifact_ref
+        shell: pwsh
+        run: |
+          $safeRef = "${{ github.ref_name }}" -replace '[<>:"/\\|?*\r\n]', '-'
+          $safeRef = $safeRef.Trim('-')
+          if (-not $safeRef) {
+            $safeRef = "ref"
+          }
+          "safe_ref=$safeRef" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
       - name: Package portable Windows build
         shell: pwsh
         run: |
@@ -99,9 +110,9 @@ jobs:
           "INSTALLER_CHECKSUM_PATH=$checksumPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
-          name: Mutagen-${{ github.ref_name }}-windows-x64
+          name: Mutagen-${{ steps.artifact_ref.outputs.safe_ref }}-windows-x64
           path: |
             ${{ env.ARCHIVE_PATH }}
             ${{ env.CHECKSUM_PATH }}
@@ -122,6 +133,17 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
+
+      - name: Compute artifact ref
+        id: artifact_ref
+        shell: pwsh
+        run: |
+          $safeRef = "${{ github.ref_name }}" -replace '[<>:"/\\|?*\r\n]', '-'
+          $safeRef = $safeRef.Trim('-')
+          if (-not $safeRef) {
+            $safeRef = "ref"
+          }
+          "safe_ref=$safeRef" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Package portable macOS build
         run: |
@@ -147,9 +169,9 @@ jobs:
           echo "CHECKSUM_PATH=$checksum_path" >> "$GITHUB_ENV"
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
-          name: Mutagen-${{ github.ref_name }}-macos
+          name: Mutagen-${{ steps.artifact_ref.outputs.safe_ref }}-macos
           path: |
             ${{ env.ARCHIVE_PATH }}
             ${{ env.CHECKSUM_PATH }}
@@ -187,6 +209,17 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Compute artifact ref
+        id: artifact_ref
+        shell: pwsh
+        run: |
+          $safeRef = "${{ github.ref_name }}" -replace '[<>:"/\\|?*\r\n]', '-'
+          $safeRef = $safeRef.Trim('-')
+          if (-not $safeRef) {
+            $safeRef = "ref"
+          }
+          "safe_ref=$safeRef" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
       - name: Package portable Linux build
         run: |
           set -euo pipefail
@@ -211,9 +244,9 @@ jobs:
           echo "CHECKSUM_PATH=$checksum_path" >> "$GITHUB_ENV"
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
-          name: Mutagen-${{ github.ref_name }}-linux
+          name: Mutagen-${{ steps.artifact_ref.outputs.safe_ref }}-linux
           path: |
             ${{ env.ARCHIVE_PATH }}
             ${{ env.CHECKSUM_PATH }}
@@ -226,7 +259,7 @@ jobs:
 
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: release-assets
           merge-multiple: true
