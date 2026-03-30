@@ -21,15 +21,15 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Build bundled VST3 instruments
-        shell: pwsh
-        run: |
-          ./scripts/build_bundled_vsti_windows.ps1 -RepoRoot $PWD -OutputDir (Join-Path $PWD "vsti")
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
       - name: Package portable Windows build
         shell: pwsh
         run: |
-          $archiveOutput = ./scripts/build_windows_release.ps1 -RepoRoot $PWD -ReleaseVersion "${{ github.ref_name }}" -SkipBundledVstBuild
+          $archiveOutput = python ./scripts/build_release_package.py --repo-root $PWD --release-version "${{ github.ref_name }}"
           $archivePath = ($archiveOutput | Select-Object -Last 1).ToString().Trim()
           if (-not $archivePath) {
             throw "Packaging step did not return an archive path."
@@ -106,8 +106,110 @@ jobs:
             ${{ env.INSTALLER_CHECKSUM_PATH }}
           if-no-files-found: error
 
+  macos-release:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Package portable macOS build
+        run: |
+          archive_path="$(python3 ./scripts/build_release_package.py --repo-root "$PWD" --release-version "${{ github.ref_name }}" | tail -n 1)"
+          if [ -z "$archive_path" ]; then
+            echo "Packaging step did not return an archive path." >&2
+            exit 1
+          fi
+          if [ ! -e "$archive_path" ]; then
+            echo "Archive path not found: $archive_path" >&2
+            exit 1
+          fi
+          echo "ARCHIVE_PATH=$archive_path" >> "$GITHUB_ENV"
+
+      - name: Create SHA256 checksum
+        run: |
+          checksum_path="$ARCHIVE_PATH.sha256"
+          shasum -a 256 "$ARCHIVE_PATH" | awk '{print tolower($1) "  " $2}' > "$checksum_path"
+          echo "CHECKSUM_PATH=$checksum_path" >> "$GITHUB_ENV"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mutagen-${{ github.ref_name }}-macos
+          path: |
+            ${{ env.ARCHIVE_PATH }}
+            ${{ env.CHECKSUM_PATH }}
+          if-no-files-found: error
+
+  linux-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev \
+            libjack-jackd2-dev \
+            libfreetype6-dev \
+            libfontconfig1-dev \
+            libx11-dev \
+            libxcomposite-dev \
+            libxcursor-dev \
+            libxext-dev \
+            libxinerama-dev \
+            libxrandr-dev \
+            libxrender-dev \
+            libglu1-mesa-dev \
+            mesa-common-dev
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Package portable Linux build
+        run: |
+          archive_path="$(python3 ./scripts/build_release_package.py --repo-root "$PWD" --release-version "${{ github.ref_name }}" | tail -n 1)"
+          if [ -z "$archive_path" ]; then
+            echo "Packaging step did not return an archive path." >&2
+            exit 1
+          fi
+          if [ ! -e "$archive_path" ]; then
+            echo "Archive path not found: $archive_path" >&2
+            exit 1
+          fi
+          echo "ARCHIVE_PATH=$archive_path" >> "$GITHUB_ENV"
+
+      - name: Create SHA256 checksum
+        run: |
+          checksum_path="$ARCHIVE_PATH.sha256"
+          sha256sum "$ARCHIVE_PATH" | awk '{print tolower($1) "  " $2}' > "$checksum_path"
+          echo "CHECKSUM_PATH=$checksum_path" >> "$GITHUB_ENV"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mutagen-${{ github.ref_name }}-linux
+          path: |
+            ${{ env.ARCHIVE_PATH }}
+            ${{ env.CHECKSUM_PATH }}
+          if-no-files-found: error
+
   publish-release:
-    needs: [windows-release]
+    needs: [windows-release, macos-release, linux-release]
     runs-on: ubuntu-latest
 
     steps:

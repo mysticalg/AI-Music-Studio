@@ -42,21 +42,43 @@ target_sources(AIMusicStudioVSTHost
 target_compile_definitions(AIMusicStudioVSTHost
     PRIVATE
         AIMS_VST_HOST_BUILD_APP=1
-        JUCE_DIRECTSOUND=1
         JUCE_DISABLE_CAUTIOUS_PARAMETER_ID_CHECKING=1
-        JUCE_PLUGINHOST_AU=0
-        JUCE_PLUGINHOST_LADSPA=0
-        JUCE_PLUGINHOST_LV2=0
         JUCE_PLUGINHOST_VST=0
         JUCE_PLUGINHOST_VST3=1
-        JUCE_ASIO=${AIMS_JUCE_ASIO}
-        JUCE_ASIO_USE_EXTERNAL_SDK=0
         JUCE_USE_CURL=0
         JUCE_VST3_HOST_CROSS_PLATFORM_UID=1
-        JUCE_WASAPI=1
-        JUCE_WASAPI_EXCLUSIVE=${AIMS_JUCE_WASAPI_EXCLUSIVE}
         JUCE_WEB_BROWSER=0
 )
+
+if(WIN32)
+  target_compile_definitions(AIMusicStudioVSTHost
+      PRIVATE
+          JUCE_DIRECTSOUND=1
+          JUCE_PLUGINHOST_AU=0
+          JUCE_PLUGINHOST_LADSPA=0
+          JUCE_PLUGINHOST_LV2=0
+          JUCE_ASIO=${AIMS_JUCE_ASIO}
+          JUCE_ASIO_USE_EXTERNAL_SDK=0
+          JUCE_WASAPI=1
+          JUCE_WASAPI_EXCLUSIVE=${AIMS_JUCE_WASAPI_EXCLUSIVE}
+  )
+elseif(APPLE)
+  target_compile_definitions(AIMusicStudioVSTHost
+      PRIVATE
+          JUCE_PLUGINHOST_AU=1
+          JUCE_PLUGINHOST_LADSPA=0
+          JUCE_PLUGINHOST_LV2=0
+  )
+elseif(UNIX)
+  target_compile_definitions(AIMusicStudioVSTHost
+      PRIVATE
+          JUCE_PLUGINHOST_AU=0
+          JUCE_PLUGINHOST_LADSPA=0
+          JUCE_PLUGINHOST_LV2=0
+          JUCE_ALSA=1
+          JUCE_JACK=1
+  )
+endif()
 
 target_link_libraries(AIMusicStudioVSTHost
     PRIVATE
@@ -81,21 +103,43 @@ target_compile_definitions(AIMusicStudioVSTHostLib
     PRIVATE
         AIMS_VST_HOST_BUILD_LIBRARY=1
         AIMS_VST_HOST_SHARED=1
-        JUCE_DIRECTSOUND=1
         JUCE_DISABLE_CAUTIOUS_PARAMETER_ID_CHECKING=1
-        JUCE_PLUGINHOST_AU=0
-        JUCE_PLUGINHOST_LADSPA=0
-        JUCE_PLUGINHOST_LV2=0
         JUCE_PLUGINHOST_VST=0
         JUCE_PLUGINHOST_VST3=1
-        JUCE_ASIO=${AIMS_JUCE_ASIO}
-        JUCE_ASIO_USE_EXTERNAL_SDK=0
         JUCE_USE_CURL=0
         JUCE_VST3_HOST_CROSS_PLATFORM_UID=1
-        JUCE_WASAPI=1
-        JUCE_WASAPI_EXCLUSIVE=${AIMS_JUCE_WASAPI_EXCLUSIVE}
         JUCE_WEB_BROWSER=0
 )
+
+if(WIN32)
+  target_compile_definitions(AIMusicStudioVSTHostLib
+      PRIVATE
+          JUCE_DIRECTSOUND=1
+          JUCE_PLUGINHOST_AU=0
+          JUCE_PLUGINHOST_LADSPA=0
+          JUCE_PLUGINHOST_LV2=0
+          JUCE_ASIO=${AIMS_JUCE_ASIO}
+          JUCE_ASIO_USE_EXTERNAL_SDK=0
+          JUCE_WASAPI=1
+          JUCE_WASAPI_EXCLUSIVE=${AIMS_JUCE_WASAPI_EXCLUSIVE}
+  )
+elseif(APPLE)
+  target_compile_definitions(AIMusicStudioVSTHostLib
+      PRIVATE
+          JUCE_PLUGINHOST_AU=1
+          JUCE_PLUGINHOST_LADSPA=0
+          JUCE_PLUGINHOST_LV2=0
+  )
+elseif(UNIX)
+  target_compile_definitions(AIMusicStudioVSTHostLib
+      PRIVATE
+          JUCE_PLUGINHOST_AU=0
+          JUCE_PLUGINHOST_LADSPA=0
+          JUCE_PLUGINHOST_LV2=0
+          JUCE_ALSA=1
+          JUCE_JACK=1
+  )
+endif()
 
 target_link_libraries(AIMusicStudioVSTHostLib
     PRIVATE
