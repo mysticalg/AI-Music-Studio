@@ -23,6 +23,11 @@ if (-not $OutputDir) {
 }
 $OutputDir = (Resolve-Path $OutputDir).Path
 
+$sanitizedReleaseVersion = [regex]::Replace($ReleaseVersion, '[^A-Za-z0-9._-]', '-')
+if (-not $sanitizedReleaseVersion) {
+    $sanitizedReleaseVersion = "dev"
+}
+
 $candidateIsccPaths = @(
     "C:\\Program Files (x86)\\Inno Setup 6\\ISCC.exe",
     "C:\\Program Files\\Inno Setup 6\\ISCC.exe",
@@ -40,7 +45,7 @@ if (-not (Test-Path $scriptPath)) {
 }
 
 & $isccPath `
-    "/DMyAppVersion=$ReleaseVersion" `
+    "/DMyAppVersion=$sanitizedReleaseVersion" `
     "/DSourceRoot=$SourceDir" `
     "/DOutputRoot=$OutputDir" `
     $scriptPath
@@ -49,7 +54,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "Inno Setup build failed."
 }
 
-$installerPath = Join-Path $OutputDir ("Mutagen-{0}-setup.exe" -f $ReleaseVersion)
+$installerPath = Join-Path $OutputDir ("Mutagen-{0}-setup.exe" -f $sanitizedReleaseVersion)
 if (-not (Test-Path $installerPath)) {
     throw "Expected installer not found: $installerPath"
 }

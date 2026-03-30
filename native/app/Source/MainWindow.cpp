@@ -8001,7 +8001,7 @@ void StudioShellComponent::createNewProject()
 
     documentState = makeDefaultProjectFile();
     syncBundledRackCatalogInProject();
-    currentProjectFile = {};
+    currentProjectFile = juce::File();
     clearDirty();
     undoManager.clearUndoHistory();
     refreshUi();
