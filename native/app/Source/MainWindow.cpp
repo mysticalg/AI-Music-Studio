@@ -5,6 +5,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <stdexcept>
 
 namespace aims
@@ -967,10 +968,10 @@ private:
                   juce::Rectangle<float> area,
                   const juce::String& label,
                   const juce::String& value,
-                  Mode mode) const
+                  Mode displayMode) const
     {
-        const auto useYautja = mode == Mode::yautja;
-        const auto useVirus = mode == Mode::virus;
+        const auto useYautja = displayMode == Mode::yautja;
+        const auto useVirus = displayMode == Mode::virus;
         auto cell = area.reduced(4.0f, 0.0f);
         auto labelArea = cell.removeFromLeft(useYautja ? 36.0f : (useVirus ? 32.0f : 26.0f));
         auto valueArea = cell;
@@ -985,7 +986,7 @@ private:
                                            : (useVirus ? juce::Colour::fromRGB(232, 244, 255)
                                                        : lcdValueColour);
 
-        drawLabelText(g, labelArea, label, labelColour, 10.5f, mode);
+        drawLabelText(g, labelArea, label, labelColour, 10.5f, displayMode);
 
         const auto ghostText = lcdGhostForValue(value);
         if (useYautja)
@@ -4583,40 +4584,6 @@ juce::String describeTrack(const ProjectState& project, const TrackState& track)
     return lines.joinIntoString("\n");
 }
 
-juce::NamedValueSet parameterValuesFromHostStatus(const juce::var& status)
-{
-    juce::NamedValueSet values;
-    auto* object = status.getDynamicObject();
-    if (object == nullptr)
-        return values;
-
-    auto* parameterArray = object->getProperty("plugin_parameters").getArray();
-    if (parameterArray == nullptr)
-        return values;
-
-    for (int index = 0; index < parameterArray->size(); ++index)
-    {
-        const auto& parameterVar = parameterArray->getReference(index);
-        auto* parameterObject = parameterVar.getDynamicObject();
-        if (parameterObject == nullptr)
-            continue;
-
-        auto name = parameterObject->getProperty("name").toString().trim();
-        if (name.isEmpty() || name == "-" || name == "--" || name == "---")
-            name = "Param " + juce::String(index + 1);
-
-        auto normalizedValue = static_cast<double>(parameterObject->hasProperty("normalized_value")
-            ? parameterObject->getProperty("normalized_value")
-            : parameterObject->getProperty("value"));
-        if (!std::isfinite(normalizedValue))
-            normalizedValue = 0.0;
-
-        values.set(juce::Identifier(name), juce::jlimit(0.0, 100.0, normalizedValue * 100.0));
-    }
-
-    return values;
-}
-
 juce::String parameterSetSignature(const juce::NamedValueSet& values)
 {
     juce::StringArray entries;
@@ -8001,7 +7968,7 @@ void StudioShellComponent::createNewProject()
 
     documentState = makeDefaultProjectFile();
     syncBundledRackCatalogInProject();
-    currentProjectFile = {};
+    currentProjectFile = juce::File();
     clearDirty();
     undoManager.clearUndoHistory();
     refreshUi();
@@ -10129,9 +10096,13 @@ void StudioShellComponent::setTrackStateInternal(int trackIndex,
         || !previousTrack.vstiStatePath.equalsIgnoreCase(currentTrack.vstiStatePath);
     const bool noteContentChanged = noteTransportSignature(previousTrack.notes) != noteTransportSignature(currentTrack.notes);
     const bool parameterContentChanged = parameterSetSignature(previousTrack.vstiParameters) != parameterSetSignature(currentTrack.vstiParameters);
-    const bool mixStateChanged = previousTrack.volume != currentTrack.volume
-        || previousTrack.pan != currentTrack.pan
-        || previousTrack.vstiOutputGainDb != currentTrack.vstiOutputGainDb
+    const auto mixValueChanged = [] (double lhs, double rhs)
+    {
+        return std::abs(lhs - rhs) > 1.0e-6;
+    };
+    const bool mixStateChanged = mixValueChanged(previousTrack.volume, currentTrack.volume)
+        || mixValueChanged(previousTrack.pan, currentTrack.pan)
+        || mixValueChanged(previousTrack.vstiOutputGainDb, currentTrack.vstiOutputGainDb)
         || previousTrack.mute != currentTrack.mute
         || previousTrack.solo != currentTrack.solo
         || projectTrackIsAudible(previousProject, trackIndex) != projectTrackIsAudible(documentState.project, trackIndex);

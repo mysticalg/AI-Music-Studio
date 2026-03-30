@@ -1203,8 +1203,8 @@ void ArrangementOverviewComponent::showSectionContextMenu(int sectionIndex,
                                    break;
                            }
 
-                           const bool hasSection = juce::isPositiveAndBelow(sectionIndex,
-                                                                           static_cast<int>(safeThis->project().midiSections.size()));
+                           const bool sectionAvailable = juce::isPositiveAndBelow(sectionIndex,
+                                                                                 static_cast<int>(safeThis->project().midiSections.size()));
 
                            if (result == menuPaste)
                            {
@@ -1219,7 +1219,7 @@ void ArrangementOverviewComponent::showSectionContextMenu(int sectionIndex,
                                return;
                            }
 
-                           if (!hasSection)
+                           if (!sectionAvailable)
                                return;
 
                            if (result == menuOpen)
