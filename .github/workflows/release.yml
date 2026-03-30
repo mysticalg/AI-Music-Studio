@@ -4,12 +4,10 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
-
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   windows-release:
@@ -17,19 +15,24 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
       - name: Package portable Windows build
         shell: pwsh
         run: |
-          $archiveOutput = python ./scripts/build_release_package.py --repo-root $PWD --release-version "${{ github.ref_name }}"
+          $archiveOutput = & python ./scripts/build_release_package.py --repo-root $PWD --release-version "${{ github.ref_name }}" 2>&1
+          $status = $LASTEXITCODE
+          $archiveOutput | ForEach-Object { Write-Host $_ }
+          if ($status -ne 0) {
+            exit $status
+          }
           $archivePath = ($archiveOutput | Select-Object -Last 1).ToString().Trim()
           if (-not $archivePath) {
             throw "Packaging step did not return an archive path."
@@ -111,18 +114,21 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
       - name: Package portable macOS build
         run: |
-          archive_path="$(python3 ./scripts/build_release_package.py --repo-root "$PWD" --release-version "${{ github.ref_name }}" | tail -n 1)"
+          set -euo pipefail
+          log_file="$(mktemp)"
+          python3 ./scripts/build_release_package.py --repo-root "$PWD" --release-version "${{ github.ref_name }}" 2>&1 | tee "$log_file"
+          archive_path="$(tail -n 1 "$log_file")"
           if [ -z "$archive_path" ]; then
             echo "Packaging step did not return an archive path." >&2
             exit 1
@@ -131,6 +137,7 @@ jobs:
             echo "Archive path not found: $archive_path" >&2
             exit 1
           fi
+          rm -f "$log_file"
           echo "ARCHIVE_PATH=$archive_path" >> "$GITHUB_ENV"
 
       - name: Create SHA256 checksum
@@ -153,7 +160,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -176,13 +183,16 @@ jobs:
             mesa-common-dev
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
       - name: Package portable Linux build
         run: |
-          archive_path="$(python3 ./scripts/build_release_package.py --repo-root "$PWD" --release-version "${{ github.ref_name }}" | tail -n 1)"
+          set -euo pipefail
+          log_file="$(mktemp)"
+          python3 ./scripts/build_release_package.py --repo-root "$PWD" --release-version "${{ github.ref_name }}" 2>&1 | tee "$log_file"
+          archive_path="$(tail -n 1 "$log_file")"
           if [ -z "$archive_path" ]; then
             echo "Packaging step did not return an archive path." >&2
             exit 1
@@ -191,6 +201,7 @@ jobs:
             echo "Archive path not found: $archive_path" >&2
             exit 1
           fi
+          rm -f "$log_file"
           echo "ARCHIVE_PATH=$archive_path" >> "$GITHUB_ENV"
 
       - name: Create SHA256 checksum
@@ -209,6 +220,7 @@ jobs:
           if-no-files-found: error
 
   publish-release:
+    if: github.ref_type == 'tag'
     needs: [windows-release, macos-release, linux-release]
     runs-on: ubuntu-latest
 

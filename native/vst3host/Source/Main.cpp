@@ -6,6 +6,10 @@
 #if JUCE_WINDOWS
 #include <windows.h>
 #include <crtdbg.h>
+#else
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
 #endif
 #include <array>
 #include <atomic>
@@ -429,7 +433,6 @@ private:
     juce::PropertiesFile& appSettings;
     std::function<void(const juce::String&)> onShortcutCommand;
     double lastShortcutDispatchMs = 0.0;
-    int topmostWarmupPassesRemaining = 0;
 };
 
 using EditorStateCallback = void (*)(int isOpen, void* userData);
@@ -528,8 +531,8 @@ public:
                   const juce::String& startupAudioOutputDeviceName)
         : appSettings(settings),
           bridgeMode(bridgeModeEnabled),
-          managedStateFile(startupStatePath.isNotEmpty() ? juce::File(startupStatePath) : juce::File()),
-          keyboardComponent(keyboardState, juce::MidiKeyboardComponent::horizontalKeyboard)
+          keyboardComponent(keyboardState, juce::MidiKeyboardComponent::horizontalKeyboard),
+          managedStateFile(startupStatePath.isNotEmpty() ? juce::File(startupStatePath) : juce::File())
     {
         formatManager.addFormat(std::make_unique<juce::VST3PluginFormat>());
         audioFormatManager.registerBasicFormats();
@@ -4786,8 +4789,9 @@ private:
             // Fast path: stereo-to-stereo bulk de-interleave + add
             for (int sample = 0; sample < copiedFrames; ++sample)
             {
-                deinterleaveLeft[sample] = source[sample * 2];
-                deinterleaveRight[sample] = source[sample * 2 + 1];
+                const auto sampleIndex = static_cast<size_t>(sample);
+                deinterleaveLeft[sampleIndex] = source[sample * 2];
+                deinterleaveRight[sampleIndex] = source[sample * 2 + 1];
             }
             juce::FloatVectorOperations::add(buffer.getWritePointer(0), deinterleaveLeft.data(), copiedFrames);
             juce::FloatVectorOperations::add(buffer.getWritePointer(1), deinterleaveRight.data(), copiedFrames);
@@ -8200,10 +8204,20 @@ void HostCommandServer::run()
         // Windows — far too slow for realtime audio IPC.
         {
             int flag = 1;
+#if JUCE_WINDOWS
             // IPPROTO_TCP = 6, TCP_NODELAY = 1
             ::setsockopt(static_cast<int>(client->getRawSocketHandle()),
-                         6, 1,
-                         reinterpret_cast<const char*>(&flag), sizeof(flag));
+                         6,
+                         1,
+                         reinterpret_cast<const char*>(&flag),
+                         sizeof(flag));
+#else
+            ::setsockopt(static_cast<int>(client->getRawSocketHandle()),
+                         IPPROTO_TCP,
+                         TCP_NODELAY,
+                         &flag,
+                         static_cast<socklen_t>(sizeof(flag)));
+#endif
         }
 
         handleClient(*client);
@@ -8712,6 +8726,231 @@ namespace
         std::unique_ptr<HostComponent> component;
     };
 }
+
+AIMS_VST_HOST_API void* aims_vst_host_create_ex(const char* pluginPath,
+                                                int restoreLastPluginOnStartup,
+                                                int openEditor,
+                                                double sampleRate,
+                                                int bufferSize,
+                                                const char* audioDeviceType,
+                                                const char* audioOutputDeviceName,
+                                                int bridgeModeEnabled,
+                                                char* errorBuffer,
+                                                int errorBufferBytes);
+
+AIMS_VST_HOST_API void* aims_vst_host_create(const char* pluginPath,
+                                             int restoreLastPluginOnStartup,
+                                             int openEditor,
+                                             double sampleRate,
+                                             int bufferSize,
+                                             const char* audioDeviceType,
+                                             const char* audioOutputDeviceName,
+                                             char* errorBuffer,
+                                             int errorBufferBytes);
+
+AIMS_VST_HOST_API int aims_vst_host_command(void* handle,
+                                            const char* requestLine,
+                                            char* responseBuffer,
+                                            int responseBufferBytes);
+
+AIMS_VST_HOST_API int aims_vst_host_load_plugin(void* handle,
+                                                const char* pluginPath,
+                                                char* errorBuffer,
+                                                int errorBufferBytes);
+
+AIMS_VST_HOST_API int aims_vst_host_load_plugin_state(void* handle,
+                                                      const char* statePath,
+                                                      char* errorBuffer,
+                                                      int errorBufferBytes);
+
+AIMS_VST_HOST_API int aims_vst_host_save_plugin_state(void* handle,
+                                                      const char* statePath,
+                                                      char* errorBuffer,
+                                                      int errorBufferBytes);
+
+AIMS_VST_HOST_API int aims_vst_host_save_audio_engine_track_plugin_state(void* handle,
+                                                                         int trackIndex,
+                                                                         const char* statePath,
+                                                                         char* errorBuffer,
+                                                                         int errorBufferBytes);
+
+AIMS_VST_HOST_API int aims_vst_host_open_editor(void* handle,
+                                                char* errorBuffer,
+                                                int errorBufferBytes);
+
+AIMS_VST_HOST_API int aims_vst_host_close_editor(void* handle,
+                                                 char* errorBuffer,
+                                                 int errorBufferBytes);
+
+AIMS_VST_HOST_API int aims_vst_host_open_audio_engine_track_editor(void* handle,
+                                                                   int trackIndex,
+                                                                   char* errorBuffer,
+                                                                   int errorBufferBytes);
+
+AIMS_VST_HOST_API int aims_vst_host_close_audio_engine_track_editor(void* handle,
+                                                                    int trackIndex,
+                                                                    char* errorBuffer,
+                                                                    int errorBufferBytes);
+
+AIMS_VST_HOST_API int aims_vst_host_get_audio_engine_track_editor_state(void* handle,
+                                                                        int trackIndex,
+                                                                        int* isOpen,
+                                                                        char* errorBuffer,
+                                                                        int errorBufferBytes);
+
+AIMS_VST_HOST_API int aims_vst_host_note_on(void* handle,
+                                            int note,
+                                            int channel,
+                                            float velocity,
+                                            char* errorBuffer,
+                                            int errorBufferBytes);
+
+AIMS_VST_HOST_API int aims_vst_host_note_off(void* handle,
+                                             int note,
+                                             int channel,
+                                             float velocity,
+                                             char* errorBuffer,
+                                             int errorBufferBytes);
+
+AIMS_VST_HOST_API int aims_vst_host_all_notes_off(void* handle,
+                                                  int channel,
+                                                  char* errorBuffer,
+                                                  int errorBufferBytes);
+
+AIMS_VST_HOST_API int aims_vst_host_audio_engine_track_note_on(void* handle,
+                                                               int trackIndex,
+                                                               int note,
+                                                               int channel,
+                                                               float velocity,
+                                                               char* errorBuffer,
+                                                               int errorBufferBytes);
+
+AIMS_VST_HOST_API int aims_vst_host_audio_engine_track_note_off(void* handle,
+                                                                int trackIndex,
+                                                                int note,
+                                                                int channel,
+                                                                float velocity,
+                                                                char* errorBuffer,
+                                                                int errorBufferBytes);
+
+AIMS_VST_HOST_API int aims_vst_host_audio_engine_track_all_notes_off(void* handle,
+                                                                     int trackIndex,
+                                                                     int channel,
+                                                                     char* errorBuffer,
+                                                                     int errorBufferBytes);
+
+AIMS_VST_HOST_API int aims_vst_host_set_audio_engine_state_json(void* handle,
+                                                                const char* tracksJson,
+                                                                double bpm,
+                                                                int ticksPerBeat,
+                                                                int loopEnabled,
+                                                                int64_t loopStartTick,
+                                                                int64_t loopEndTick,
+                                                                int metronomeEnabled,
+                                                                int preserveTransport,
+                                                                char* errorBuffer,
+                                                                int errorBufferBytes);
+
+AIMS_VST_HOST_API int aims_vst_host_set_audio_engine_transport(void* handle,
+                                                               double bpm,
+                                                               int ticksPerBeat,
+                                                               int loopEnabled,
+                                                               int64_t loopStartTick,
+                                                               int64_t loopEndTick,
+                                                               int metronomeEnabled,
+                                                               char* errorBuffer,
+                                                               int errorBufferBytes);
+
+AIMS_VST_HOST_API int aims_vst_host_set_audio_engine_track_parameters(void* handle,
+                                                                      int trackIndex,
+                                                                      const AimsVstHostParameterSnapshotEntry* parameterEntries,
+                                                                      int parameterCount,
+                                                                      const char* parameterSignature,
+                                                                      char* errorBuffer,
+                                                                      int errorBufferBytes);
+
+AIMS_VST_HOST_API int aims_vst_host_set_audio_engine_track_notes(void* handle,
+                                                                 int trackIndex,
+                                                                 const AimsVstHostTrackNoteEntry* noteEntries,
+                                                                 int noteCount,
+                                                                 const AimsVstHostTrackControllerEventEntry* controllerEntries,
+                                                                 int controllerCount,
+                                                                 int* appliedNoteCount,
+                                                                 char* errorBuffer,
+                                                                 int errorBufferBytes);
+
+AIMS_VST_HOST_API int aims_vst_host_set_audio_engine_track_mix_state(void* handle,
+                                                                     int trackIndex,
+                                                                     float volume,
+                                                                     float outputGainDb,
+                                                                     float pan,
+                                                                     int audible,
+                                                                     char* errorBuffer,
+                                                                     int errorBufferBytes);
+
+AIMS_VST_HOST_API int aims_vst_host_start_audio_engine(void* handle,
+                                                       int64_t startTick,
+                                                       char* errorBuffer,
+                                                       int errorBufferBytes);
+
+AIMS_VST_HOST_API int aims_vst_host_stop_audio_engine(void* handle,
+                                                      int allowTail,
+                                                      char* errorBuffer,
+                                                      int errorBufferBytes);
+
+AIMS_VST_HOST_API int aims_vst_host_configure_audio_device(void* handle,
+                                                           const char* audioDeviceType,
+                                                           const char* audioDeviceName,
+                                                           double sampleRate,
+                                                           int bufferSize,
+                                                           char* errorBuffer,
+                                                           int errorBufferBytes);
+
+AIMS_VST_HOST_API int aims_vst_host_get_transport_snapshot(void* handle,
+                                                           AimsVstHostTransportSnapshot* snapshot,
+                                                           float* trackPeakLevels,
+                                                           int trackPeakLevelCapacity,
+                                                           char* errorBuffer,
+                                                           int errorBufferBytes);
+
+AIMS_VST_HOST_API int aims_vst_host_get_parameter_snapshot(void* handle,
+                                                           AimsVstHostParameterSnapshot* snapshot,
+                                                           AimsVstHostParameterSnapshotEntry* parameterEntries,
+                                                           int parameterEntryCapacity,
+                                                           char* errorBuffer,
+                                                           int errorBufferBytes);
+
+AIMS_VST_HOST_API int aims_vst_host_get_audio_engine_track_parameter_snapshot(void* handle,
+                                                                              int trackIndex,
+                                                                              AimsVstHostParameterSnapshot* snapshot,
+                                                                              AimsVstHostParameterSnapshotEntry* parameterEntries,
+                                                                              int parameterEntryCapacity,
+                                                                              char* errorBuffer,
+                                                                              int errorBufferBytes);
+
+AIMS_VST_HOST_API int aims_vst_host_get_plugin_snapshot(void* handle,
+                                                        AimsVstHostPluginSnapshot* snapshot,
+                                                        char* errorBuffer,
+                                                        int errorBufferBytes);
+
+AIMS_VST_HOST_API int aims_vst_host_get_audio_device_snapshot(void* handle,
+                                                              AimsVstHostAudioDeviceSnapshot* snapshot,
+                                                              AimsVstHostStringEntry* availableDeviceTypes,
+                                                              int availableDeviceTypeCapacity,
+                                                              AimsVstHostStringEntry* availableOutputDevices,
+                                                              int availableOutputDeviceCapacity,
+                                                              double* availableSampleRates,
+                                                              int availableSampleRateCapacity,
+                                                              int* availableBufferSizes,
+                                                              int availableBufferSizeCapacity,
+                                                              char* errorBuffer,
+                                                              int errorBufferBytes);
+
+AIMS_VST_HOST_API void aims_vst_host_set_editor_state_callback(void* handle,
+                                                               void (*callback)(int isOpen, void* userData),
+                                                               void* userData);
+
+AIMS_VST_HOST_API void aims_vst_host_destroy(void* handle);
 
 AIMS_VST_HOST_API void* aims_vst_host_create_ex(const char* pluginPath,
                                                 int restoreLastPluginOnStartup,
