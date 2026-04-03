@@ -97,13 +97,13 @@ python .\scripts\profile_native_stress.py
 Portable ZIP:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_release.ps1 -ReleaseVersion v0.1.0
+powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_release.ps1 -ReleaseVersion v0.3.1
 ```
 
 Installer:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_installer.ps1 -ReleaseVersion v0.1.0
+powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_installer.ps1 -ReleaseVersion v0.3.1
 ```
 
 ## Scope note

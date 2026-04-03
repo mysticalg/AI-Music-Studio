@@ -1,4 +1,5 @@
 #include "AutomationEditorComponent.h"
+#include "UiStyle.h"
 
 #include <algorithm>
 #include <cmath>
@@ -77,7 +78,7 @@ public:
                                                         : juce::Colour::fromRGB(20, 26, 34)));
 
         g.setColour(rowIsSelected ? juce::Colours::white : juce::Colour::fromRGB(219, 229, 241));
-        g.setFont(juce::FontOptions(13.0f, rowIsSelected ? juce::Font::bold : juce::Font::plain));
+        g.setFont(rowIsSelected ? ui::strongFont() : ui::font());
         g.drawText(text, 10, 0, width - 20, height, juce::Justification::centredLeft, true);
 
         g.setColour(juce::Colour::fromRGB(48, 60, 76));
@@ -106,7 +107,12 @@ public:
         setMouseClickGrabsKeyboardFocus(true);
     }
 
-    void clearLane(int playheadTickIn, int loopStartTickIn, int loopEndTickIn, int maxTickIn)
+    void clearLane(int playheadTickIn,
+                   int loopStartTickIn,
+                   int loopEndTickIn,
+                   int maxTickIn,
+                   int beatTickLengthIn,
+                   int barTickLengthIn)
     {
         hasLane = false;
         laneLabel = "Automation";
@@ -118,7 +124,12 @@ public:
         maximum = 1.0;
         defaultValue = 0.0;
         formatter = {};
-        updateTimeline(playheadTickIn, loopStartTickIn, loopEndTickIn, maxTickIn);
+        updateTimeline(playheadTickIn,
+                       loopStartTickIn,
+                       loopEndTickIn,
+                       maxTickIn,
+                       beatTickLengthIn,
+                       barTickLengthIn);
     }
 
     void setLane(const juce::String& laneLabelIn,
@@ -129,6 +140,8 @@ public:
                  int playheadTickIn,
                  int loopStartTickIn,
                  int loopEndTickIn,
+                 int beatTickLengthIn,
+                 int barTickLengthIn,
                  std::vector<AutomationPoint> pointsIn,
                  Formatter formatterIn)
     {
@@ -143,15 +156,27 @@ public:
         selectedPointIndex = juce::jlimit(-1, static_cast<int>(points.size()) - 1, selectedPointIndex);
         hoverPointIndex = -1;
         draggingPoint = false;
-        updateTimeline(playheadTickIn, loopStartTickIn, loopEndTickIn, maxTickIn);
+        updateTimeline(playheadTickIn,
+                       loopStartTickIn,
+                       loopEndTickIn,
+                       maxTickIn,
+                       beatTickLengthIn,
+                       barTickLengthIn);
     }
 
-    void updateTimeline(int playheadTickIn, int loopStartTickIn, int loopEndTickIn, int maxTickIn)
+    void updateTimeline(int playheadTickIn,
+                        int loopStartTickIn,
+                        int loopEndTickIn,
+                        int maxTickIn,
+                        int beatTickLengthIn,
+                        int barTickLengthIn)
     {
         playheadTick = juce::jmax(0, playheadTickIn);
         loopStartTick = juce::jmax(0, loopStartTickIn);
         loopEndTick = juce::jmax(loopStartTick + 1, loopEndTickIn);
-        maxTick = juce::jmax(kTicksPerBar, maxTickIn);
+        beatTickLength = juce::jmax(1, beatTickLengthIn);
+        barTickLength = juce::jmax(beatTickLength, barTickLengthIn);
+        maxTick = juce::jmax(barTickLength, maxTickIn);
         repaint();
     }
 
@@ -176,11 +201,11 @@ public:
             g.fillRect(juce::Rectangle<float>(loopLeft, rect.getY(), loopRight - loopLeft, rect.getHeight()));
         }
 
-        for (int tick = 0; tick <= maxTick; tick += kTicksPerBeat)
+        for (int tick = 0; tick <= maxTick; tick += beatTickLength)
         {
             const auto x = tickToX(tick);
-            g.setColour((tick % kTicksPerBar) == 0 ? juce::Colour::fromRGB(49, 65, 84)
-                                                   : juce::Colour::fromRGB(33, 45, 60));
+            g.setColour((tick % barTickLength) == 0 ? juce::Colour::fromRGB(49, 65, 84)
+                                                    : juce::Colour::fromRGB(33, 45, 60));
             g.drawVerticalLine(juce::roundToInt(x), rect.getY(), rect.getBottom());
         }
 
@@ -194,6 +219,7 @@ public:
 
             const auto value = maximum - (static_cast<double>(progress) * (maximum - minimum));
             g.setColour(juce::Colour::fromRGB(154, 172, 194));
+            g.setFont(ui::tinyFont());
             g.drawText(formatValue(value),
                        juce::Rectangle<int>(6, juce::roundToInt(y) - 10, 42, 20),
                        juce::Justification::centredRight,
@@ -272,14 +298,14 @@ public:
         g.drawVerticalLine(juce::roundToInt(tickToX(playheadTick)), rect.getY(), rect.getBottom());
 
         g.setColour(juce::Colour::fromRGB(220, 228, 239));
-        g.setFont(juce::FontOptions(14.0f, juce::Font::bold));
+        g.setFont(ui::sectionFont());
         g.drawText(laneLabel,
                    juce::Rectangle<int>(juce::roundToInt(rect.getX()), 4, juce::roundToInt(rect.getWidth()), 18),
                    juce::Justification::centredLeft,
                    true);
 
         g.setColour(juce::Colour::fromRGB(152, 176, 198));
-        g.setFont(juce::FontOptions(12.0f));
+        g.setFont(ui::font());
         g.drawText(buildFooterText(),
                    juce::Rectangle<int>(juce::roundToInt(rect.getX()),
                                         juce::roundToInt(rect.getBottom()) + 6,
@@ -540,6 +566,8 @@ private:
     double maximum = 1.0;
     double defaultValue = 0.0;
     int maxTick = kTicksPerBar;
+    int beatTickLength = kTicksPerBeat;
+    int barTickLength = kTicksPerBar;
     int playheadTick = 0;
     int loopStartTick = 0;
     int loopEndTick = kTicksPerBar;
@@ -558,15 +586,15 @@ AutomationEditorComponent::AutomationEditorComponent(ProjectGetter projectGetter
       trackWriter(std::move(trackWriterIn))
 {
     headerLabel.setText("Automation", juce::dontSendNotification);
-    headerLabel.setFont(juce::FontOptions(16.0f, juce::Font::bold));
+    headerLabel.setFont(ui::sectionFont());
     headerLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(233, 238, 245));
     addAndMakeVisible(headerLabel);
     trackSummaryLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(214, 223, 235));
-    trackSummaryLabel.setFont(juce::FontOptions(13.0f, juce::Font::bold));
+    trackSummaryLabel.setFont(ui::strongFont());
     addAndMakeVisible(trackSummaryLabel);
 
     laneSummaryLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(151, 167, 186));
-    laneSummaryLabel.setFont(juce::FontOptions(12.0f));
+    laneSummaryLabel.setFont(ui::font());
     addAndMakeVisible(laneSummaryLabel);
 
     targetLabel.setText("Target", juce::dontSendNotification);
@@ -674,7 +702,9 @@ void AutomationEditorComponent::refreshFromModel()
         curveComponent->clearLane(projectGetter().playheadTick,
                                   projectGetter().leftLocatorTick,
                                   projectGetter().rightLocatorTick,
-                                  computeCurveMaxTick());
+                                  computeCurveMaxTick(),
+                                  ticksPerTimeSignatureBeat(projectGetter()),
+                                  ticksPerBar(projectGetter()));
         updateLaneControls();
         updatingUi = false;
         return;
@@ -733,7 +763,9 @@ void AutomationEditorComponent::refreshViewState()
     curveComponent->updateTimeline(projectGetter().playheadTick,
                                    projectGetter().leftLocatorTick,
                                    projectGetter().rightLocatorTick,
-                                   computeCurveMaxTick());
+                                   computeCurveMaxTick(),
+                                   ticksPerTimeSignatureBeat(projectGetter()),
+                                   ticksPerBar(projectGetter()));
 }
 
 const TrackState* AutomationEditorComponent::getSelectedTrack() const
@@ -857,7 +889,9 @@ void AutomationEditorComponent::syncCurveFromSelection()
         curveComponent->clearLane(projectGetter().playheadTick,
                                   projectGetter().leftLocatorTick,
                                   projectGetter().rightLocatorTick,
-                                  computeCurveMaxTick());
+                                  computeCurveMaxTick(),
+                                  ticksPerTimeSignatureBeat(projectGetter()),
+                                  ticksPerBar(projectGetter()));
         return;
     }
 
@@ -874,6 +908,8 @@ void AutomationEditorComponent::syncCurveFromSelection()
                             projectGetter().playheadTick,
                             projectGetter().leftLocatorTick,
                             projectGetter().rightLocatorTick,
+                            ticksPerTimeSignatureBeat(projectGetter()),
+                            ticksPerBar(projectGetter()),
                             lane->points,
                             [trackSnapshot, laneTarget] (double value)
                             {
@@ -884,18 +920,19 @@ void AutomationEditorComponent::syncCurveFromSelection()
 int AutomationEditorComponent::computeCurveMaxTick() const
 {
     const auto& project = projectGetter();
-    int maxTick = juce::jmax(kTicksPerBar, project.rightLocatorTick);
+    const auto projectBarTicks = ticksPerBar(project);
+    int maxTick = juce::jmax(projectBarTicks, project.rightLocatorTick);
 
     if (hasTrackSnapshot)
     {
         for (const auto& note : currentTrackSnapshot.notes)
-            maxTick = juce::jmax(maxTick, note.startTick + note.durationTick + kTicksPerBar);
+            maxTick = juce::jmax(maxTick, note.startTick + note.durationTick + projectBarTicks);
     }
 
     if (const auto* lane = getSelectedLane())
     {
         for (const auto& point : lane->points)
-            maxTick = juce::jmax(maxTick, point.tick + kTicksPerBar);
+            maxTick = juce::jmax(maxTick, point.tick + projectBarTicks);
     }
 
     return maxTick;

@@ -18,6 +18,14 @@
 namespace aims
 {
 
+enum class AIComposeTargetMode
+{
+    replaceCurrentTrack,
+    replaceAllTracks,
+    addToCurrentTrack,
+    addToAllTracks
+};
+
 class FloatingPanelWindow;
 class TransportPanelComponent;
 class AudioSettingsPanelComponent;
@@ -43,8 +51,14 @@ public:
     void paint(juce::Graphics& g) override;
     void resized() override;
     bool keyPressed(const juce::KeyPress& key) override;
+    void mouseMove(const juce::MouseEvent& event) override;
+    void mouseExit(const juce::MouseEvent& event) override;
+    void mouseDown(const juce::MouseEvent& event) override;
+    void mouseDrag(const juce::MouseEvent& event) override;
+    void mouseUp(const juce::MouseEvent& event) override;
 
     juce::Result openProjectFile(const juce::File& file);
+    void showAboutDialog();
 
 private:
     class TrackTableModel final : public juce::TableListBoxModel
@@ -56,6 +70,7 @@ private:
         void paintRowBackground(juce::Graphics& g, int rowNumber, int width, int height, bool rowIsSelected) override;
         void paintCell(juce::Graphics& g, int rowNumber, int columnId, int width, int height, bool rowIsSelected) override;
         void cellClicked(int rowNumber, int columnId, const juce::MouseEvent& event) override;
+        void backgroundClicked(const juce::MouseEvent& event) override;
         void selectedRowsChanged(int lastRowSelected) override;
 
     private:
@@ -100,6 +115,9 @@ private:
     void saveProject();
     void saveProjectAs();
     void jumpPlayheadToStart();
+    void setTransportPlayheadTick(int tick);
+    void setTransportLeftLocatorTick(int tick);
+    void setTransportRightLocatorTick(int tick);
     void setTransportTempo(int bpm);
     void setTransportLoopEnabled(bool enabled);
     void setTransportMetronomeEnabled(bool enabled);
@@ -107,6 +125,7 @@ private:
     void duplicateSelectedTrack();
     void removeSelectedTrack();
     void handleTempoChanged();
+    void handleTimeSignatureChanged();
     void handlePatternBarsChanged();
     void handleKeyQuantizeChanged();
     void handleArrangementSnapChanged();
@@ -128,6 +147,8 @@ private:
     void showAiSettingsDialog();
     void composeWithAi();
     void openSelectedTrackRackEditor();
+    void openTrackEffectEditorFromMixer(int trackIndex, int effectIndex);
+    void openMasterEffectEditorFromMixer(int effectIndex);
     void saveSelectedTrackRackState();
     void playSelectedTrackThroughRack();
     void playFullProjectThroughNativeEngine();
@@ -214,12 +235,19 @@ private:
     void refreshFloatingWindows(bool includeEditorRefresh = true);
     void refreshProjectSummaryLabels();
     void applyEditorViewScaleState();
+    void refreshPlaybackToggleButton();
     void repaintTrackVolumeMeters();
+    void restorePersistedSessionState();
+    void persistSessionState() const;
     void restorePersistedWindowVisibility();
     void persistWindowVisibilityState() const;
     void restorePersistedThemeSelection();
+    void restorePersistedFontSelection();
+    juce::String buildAboutDetails() const;
     void persistThemeSelection() const;
+    void persistFontSelection() const;
     void applyTheme();
+    void applyUiFont();
     void appendActivityLog(const juce::String& title, const juce::String& body);
     void appendActivityLogToFile(const juce::String& entry) const;
     juce::String activityLogTextSnapshot() const;
@@ -273,6 +301,10 @@ private:
     int getThemeCount() const noexcept;
     juce::String getThemeName(int index) const;
     void setThemeIndex(int index);
+    int getCurrentFontIndex() const noexcept;
+    int getFontCount() const noexcept;
+    juce::String getFontName(int index) const;
+    void setFontIndex(int index);
     TrackState* getSelectedTrack();
     const TrackState* getSelectedTrack() const;
 
@@ -342,12 +374,14 @@ private:
     juce::TextButton openRackEditorButton;
     juce::TextButton saveRackStateButton;
     juce::TextButton playProjectButton;
-    juce::TextButton playTrackButton;
-    juce::TextButton stopTrackButton;
     juce::TextButton undoButton;
     juce::TextButton redoButton;
     juce::Slider tempoSlider;
     juce::Label tempoLabel;
+    juce::Label timeSignatureLabel;
+    juce::ComboBox timeSignatureNumeratorBox;
+    juce::Label timeSignatureSlashLabel;
+    juce::ComboBox timeSignatureDenominatorBox;
     juce::Label patternBarsLabel;
     juce::ComboBox patternBarsBox;
     juce::Label keyQuantizeLabel;
@@ -362,8 +396,8 @@ private:
     juce::Slider pianoRollZoomSlider;
     juce::Label pianoRollRowHeightLabel;
     juce::Slider pianoRollRowHeightSlider;
-    juce::ToggleButton loopToggle;
-    juce::ToggleButton metronomeToggle;
+    juce::TextButton loopToggle;
+    juce::TextButton metronomeToggle;
     std::unique_ptr<juce::FileChooser> activeFileChooser;
     AIClient aiClient;
     NativeVstHostSession nativeVstHost;
@@ -376,6 +410,15 @@ private:
     juce::String aiComposeDefaultPrompt;
     int aiComposeDefaultBars = 8;
     int aiComposeRequestedBars = 8;
+    AIComposeTargetMode aiComposeDefaultMode = AIComposeTargetMode::replaceAllTracks;
+    AIComposeTargetMode aiComposeRequestedMode = AIComposeTargetMode::replaceAllTracks;
+    juce::String aiComposeDefaultStyle = "Balanced";
+    juce::String aiComposeDefaultEnergy = "Medium";
+    juce::String aiComposeDefaultDensity = "Balanced";
+    juce::String aiComposeDefaultVariation = "Moderate";
+    juce::String aiComposeDefaultRegister = "Natural";
+    std::vector<int> aiComposeRequestedTargetTracks;
+    int aiComposeRequestedInsertTick = 0;
     bool aiComposeBusy = false;
     std::vector<std::unique_ptr<RackEditorSession>> rackEditorSessions;
     bool loadedRackEditorOpen = false;
@@ -393,11 +436,18 @@ private:
     float pianoRollZoomPixelsPerBeat = 28.0f;
     float pianoRollRowHeightPixels = 16.0f;
     int currentThemeIndex = 0;
+    int currentFontIndex = 0;
+    juce::StringArray availableUiFonts;
+    std::unique_ptr<juce::LookAndFeel_V4> compactHeaderLookAndFeel;
     juce::uint32 lastSharedRackParameterSyncMs = 0;
     juce::uint32 lastRackEditorSessionSyncMs = 0;
     juce::uint32 lastDeferredParameterFlushMs = 0;
     int pollingTimerHz = 0;
     int playbackUiTickCounter = 0;
+    int leftPaneWidthPixels = 0;
+    int leftPaneDragStartWidth = 0;
+    bool leftPaneResizeDragging = false;
+    juce::Rectangle<int> leftPaneResizeHandleBounds;
     std::unique_ptr<juce::PropertiesFile> windowStateSettings;
     mutable juce::CriticalSection activityLogLock;
     juce::StringArray activityLogEntries;
@@ -456,6 +506,8 @@ class MainWindow final : public juce::DocumentWindow,
 public:
     explicit MainWindow(const juce::File& startupProject = {});
     ~MainWindow() override;
+    void toggleBorderlessFullscreen();
+    bool isBorderlessFullscreenActive() const;
 
 private:
     enum MenuItemId
@@ -495,13 +547,18 @@ private:
         menuWindowsPianoRoll,
         menuWindowsVirtualPiano,
         menuWindowsActivityLog,
-        menuThemeBase = 4000
+        menuWindowsFullscreen,
+        menuHelpSite = 3000,
+        menuHelpAbout,
+        menuThemeBase = 4000,
+        menuFontChoiceBase = 5000
     };
 
     juce::StringArray getMenuBarNames() override;
     juce::PopupMenu getMenuForIndex(int topLevelMenuIndex, const juce::String& menuName) override;
     void menuItemSelected(int menuItemID, int topLevelMenuIndex) override;
     void closeButtonPressed() override;
+    bool keyPressed(const juce::KeyPress& key) override;
 
     StudioShellComponent* shell = nullptr;
 

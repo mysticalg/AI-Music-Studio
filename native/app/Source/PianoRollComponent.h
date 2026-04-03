@@ -27,7 +27,8 @@ public:
         square,
         saw,
         triangle,
-        circle
+        circle,
+        noise
     };
 
     using ProjectGetter = std::function<const ProjectState&()>;
@@ -55,6 +56,7 @@ public:
                                  NotePreviewCallback noteOffCallbackIn,
                                  PreviewStopCallback stopPreviewCallbackIn = {});
     void setToolModeChangeCallback(ToolModeChangeCallback toolModeChangeCallbackIn);
+    int viewPositionYForPitch(int pitch, int viewportHeight) const;
 
     bool copySelected() const;
     bool cutSelected();

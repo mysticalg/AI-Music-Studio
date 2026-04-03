@@ -1,4 +1,5 @@
 #include "PianoRollComponent.h"
+#include "UiStyle.h"
 
 #include <array>
 #include <algorithm>
@@ -10,8 +11,8 @@ namespace aims
 {
 namespace
 {
-constexpr int kPitchMin = 12;
-constexpr int kPitchMax = 84;
+constexpr int kPitchMin = kEditableMidiPitchMin;
+constexpr int kPitchMax = kEditableMidiPitchMax;
 const char* kClipboardType = "aims.native.piano_roll_notes";
 const juce::Colour kBackgroundColour = juce::Colour::fromRGB(15, 17, 22);
 const juce::Colour kLaneDark = juce::Colour::fromRGB(24, 28, 34);
@@ -151,6 +152,7 @@ juce::String pencilDrawModeLabel(PianoRollComponent::PencilDrawMode mode)
         case PianoRollComponent::PencilDrawMode::saw: return "Saw";
         case PianoRollComponent::PencilDrawMode::triangle: return "Triangle";
         case PianoRollComponent::PencilDrawMode::circle: return "Circle";
+        case PianoRollComponent::PencilDrawMode::noise: return "Noise";
     }
 
     return "Single";
@@ -159,6 +161,17 @@ juce::String pencilDrawModeLabel(PianoRollComponent::PencilDrawMode mode)
 juce::String velocityControllerTarget()
 {
     return "velocity";
+}
+
+int hashedNoiseValue(int seed)
+{
+    auto value = static_cast<uint32_t>(seed);
+    value ^= value >> 16;
+    value *= 0x7feb352dU;
+    value ^= value >> 15;
+    value *= 0x846ca68bU;
+    value ^= value >> 16;
+    return static_cast<int>(value & 0x7fffffffU);
 }
 } // namespace
 
@@ -271,6 +284,18 @@ void PianoRollComponent::setNotePreviewCallbacks(NotePreviewCallback noteOnCallb
 void PianoRollComponent::setToolModeChangeCallback(ToolModeChangeCallback toolModeChangeCallbackIn)
 {
     toolModeChangeCallback = std::move(toolModeChangeCallbackIn);
+}
+
+int PianoRollComponent::viewPositionYForPitch(int pitch, int viewportHeight) const
+{
+    if (!showsNoteEditor() || viewportHeight <= 0)
+        return 0;
+
+    const auto targetRow = nearestVisibleRowForPitch(pitch);
+    const auto targetCentreY = rulerHeight() + ((static_cast<float>(targetRow) + 0.5f) * cellHeight);
+    const auto targetTopY = juce::roundToInt(targetCentreY - (static_cast<float>(viewportHeight) * 0.5f));
+    const auto maxScrollY = juce::jmax(0, getHeight() - viewportHeight);
+    return juce::jlimit(0, maxScrollY, targetTopY);
 }
 
 bool PianoRollComponent::copySelected() const
@@ -471,7 +496,7 @@ void PianoRollComponent::paint(juce::Graphics& g)
             g.fillRect(0.0f, y, pianoWidth, cellHeight);
 
             g.setColour(juce::Colour::fromRGB(170, 180, 196));
-            g.setFont(11.0f);
+            g.setFont(ui::font());
             g.drawText(pitchLabel(pitch),
                        4,
                        juce::roundToInt(y),
@@ -490,22 +515,24 @@ void PianoRollComponent::paint(juce::Graphics& g)
     g.drawRect(contentBounds.toNearestInt(), 1);
 
     const auto totalTicks = contentTickLength();
-    const auto totalBeats = juce::jmax(minimumBeats, static_cast<int>(std::ceil(static_cast<double>(totalTicks) / static_cast<double>(kTicksPerBeat))));
+    const auto projectBarTicks = ticksPerBar(project());
+    const auto projectBeatTicks = ticksPerTimeSignatureBeat(project());
     const auto step = gridTick();
 
     if (showsNoteEditor())
     {
-        for (int beat = 0; beat <= totalBeats; ++beat)
+        for (int tick = 0; tick <= totalTicks; tick += projectBeatTicks)
         {
-            const auto tick = beat * kTicksPerBeat;
             const auto x = tickToX(tick);
-            g.setColour((beat % 4) == 0 ? kGridMajor : kGridMinor);
+            const auto isBarLine = (tick % projectBarTicks) == 0;
+            g.setColour(isBarLine ? kGridMajor : kGridMinor);
             g.drawVerticalLine(juce::roundToInt(x), 0.0f, contentBounds.getHeight());
 
-            if ((beat % 4) == 0)
+            if (isBarLine)
             {
                 g.setColour(juce::Colour::fromRGB(210, 216, 224));
-                g.drawText(juce::String((beat / 4) + 1),
+                g.setFont(ui::font());
+                g.drawText(juce::String((tick / projectBarTicks) + 1),
                            juce::roundToInt(x) + 3,
                            0,
                            30,
@@ -514,11 +541,11 @@ void PianoRollComponent::paint(juce::Graphics& g)
             }
         }
 
-        if (step < kTicksPerBeat)
+        if (step < projectBeatTicks)
         {
             for (int tick = step; tick < totalTicks; tick += step)
             {
-                if ((tick % kTicksPerBeat) == 0)
+                if ((tick % projectBeatTicks) == 0)
                     continue;
                 const auto x = tickToX(tick);
                 g.setColour(kGridSnap);
@@ -557,7 +584,7 @@ void PianoRollComponent::paint(juce::Graphics& g)
     if (currentPattern() == nullptr)
     {
         g.setColour(juce::Colour::fromRGB(192, 199, 208));
-        g.setFont(juce::FontOptions(18.0f, juce::Font::bold));
+        g.setFont(ui::sectionFont());
         g.drawFittedText("Select or create a pattern clip in the sequencer.",
                          getLocalBounds().reduced(24),
                          juce::Justification::centred,
@@ -575,8 +602,15 @@ void PianoRollComponent::paint(juce::Graphics& g)
             auto rect = noteRect(note);
             if (rect.isEmpty())
                 continue;
-            const auto fill = note.selected ? trackColour.brighter(0.25f) : trackColour.withAlpha(0.88f);
-            const auto outline = note.selected ? kSelectionOutline : trackColour.darker(0.7f);
+            const auto velocityShade = juce::jmap(static_cast<float>(juce::jlimit(1, 127, note.velocity)),
+                                                  1.0f,
+                                                  127.0f,
+                                                  0.48f,
+                                                  1.06f);
+            const auto shadedColour = trackColour.withMultipliedBrightness(velocityShade);
+            const auto fill = note.selected ? shadedColour.brighter(0.18f)
+                                            : shadedColour.withAlpha(0.88f);
+            const auto outline = note.selected ? kSelectionOutline : shadedColour.darker(0.7f);
 
             g.setColour(fill);
             g.fillRoundedRectangle(rect.reduced(1.0f, 1.0f), 3.0f);
@@ -599,7 +633,7 @@ void PianoRollComponent::paint(juce::Graphics& g)
 
         const auto controllerBounds = controllerTargetBounds();
         g.setColour(juce::Colour::fromRGB(170, 180, 196));
-        g.setFont(11.0f);
+        g.setFont(ui::font());
         g.drawText(juce::String(controllerBounds.second, controllerTargetEditsVelocity() || controllerTargetEditsPatternLane() ? 0 : 2),
                    4,
                    juce::roundToInt(controllerLane.getY() + 2.0f),
@@ -620,19 +654,18 @@ void PianoRollComponent::paint(juce::Graphics& g)
             g.drawHorizontalLine(juce::roundToInt(y), pitchLaneWidth(), static_cast<float>(getWidth()));
         }
 
-        for (int beat = 0; beat <= totalBeats; ++beat)
+        for (int tick = 0; tick <= totalTicks; tick += projectBeatTicks)
         {
-            const auto tick = beat * kTicksPerBeat;
             const auto x = tickToX(tick);
-            g.setColour((beat % 4) == 0 ? kGridMajor : kGridMinor);
+            g.setColour((tick % projectBarTicks) == 0 ? kGridMajor : kGridMinor);
             g.drawVerticalLine(juce::roundToInt(x), controllerHeader.getY(), controllerLane.getBottom());
         }
 
-        if (step < kTicksPerBeat)
+        if (step < projectBeatTicks)
         {
             for (int tick = step; tick < totalTicks; tick += step)
             {
-                if ((tick % kTicksPerBeat) == 0)
+                if ((tick % projectBeatTicks) == 0)
                     continue;
                 const auto x = tickToX(tick);
                 g.setColour(kGridSnap);
@@ -998,6 +1031,7 @@ void PianoRollComponent::showContextMenu(juce::Point<int> screenPosition)
         menuDrawSaw,
         menuDrawTriangle,
         menuDrawCircle,
+        menuDrawNoise,
         menuInsertSingle,
         menuInsertMajorTriad,
         menuInsertMinorTriad,
@@ -1034,6 +1068,7 @@ void PianoRollComponent::showContextMenu(juce::Point<int> screenPosition)
     drawMenu.addItem(menuDrawSaw, pencilDrawModeLabel(PencilDrawMode::saw), true, pencilDrawMode == PencilDrawMode::saw);
     drawMenu.addItem(menuDrawTriangle, pencilDrawModeLabel(PencilDrawMode::triangle), true, pencilDrawMode == PencilDrawMode::triangle);
     drawMenu.addItem(menuDrawCircle, pencilDrawModeLabel(PencilDrawMode::circle), true, pencilDrawMode == PencilDrawMode::circle);
+    drawMenu.addItem(menuDrawNoise, pencilDrawModeLabel(PencilDrawMode::noise), true, pencilDrawMode == PencilDrawMode::noise);
     menu.addSubMenu("Pencil Shape", drawMenu, true);
 
     juce::PopupMenu insertMenu;
@@ -1109,6 +1144,7 @@ void PianoRollComponent::showContextMenu(juce::Point<int> screenPosition)
                                 case menuDrawSaw: safeThis->pencilDrawMode = PencilDrawMode::saw; break;
                                 case menuDrawTriangle: safeThis->pencilDrawMode = PencilDrawMode::triangle; break;
                                 case menuDrawCircle: safeThis->pencilDrawMode = PencilDrawMode::circle; break;
+                                case menuDrawNoise: safeThis->pencilDrawMode = PencilDrawMode::noise; break;
 
                                 case menuInsertSingle: safeThis->insertMode = PianoRollInsertMode::singleNote; break;
                                 case menuInsertMajorTriad: safeThis->insertMode = PianoRollInsertMode::majorTriad; break;
@@ -1558,7 +1594,7 @@ const MidiPattern* PianoRollComponent::patternForSection(const ProjectState& sta
 void PianoRollComponent::updateContentSize()
 {
     const auto pitchCount = static_cast<int>(visiblePitches().size());
-    const auto width = juce::roundToInt(tickToX(contentTickLength() + kTicksPerBar));
+    const auto width = juce::roundToInt(tickToX(contentTickLength() + ticksPerBar(project())));
     auto height = 0.0f;
     if (showsNoteEditor())
         height += rulerHeight() + (static_cast<float>(pitchCount) * cellHeight);
@@ -1587,7 +1623,8 @@ float PianoRollComponent::noteRowsHeight() const
 
 int PianoRollComponent::contentTickLength() const
 {
-    int lastTick = juce::jmax(kTicksPerBar, minimumBeats * kTicksPerBeat);
+    int lastTick = juce::jmax(ticksPerBar(project()),
+                              minimumBeats * ticksPerTimeSignatureBeat(project()));
     if (const auto* pattern = currentPattern())
         lastTick = juce::jmax(lastTick, patternLengthTicks(*pattern));
     else
@@ -1634,7 +1671,10 @@ float PianoRollComponent::durationToWidth(int durationTick) const
 
 std::vector<int> PianoRollComponent::visiblePitches() const
 {
-    return visiblePitchesForProjectScale(displayedProject(), kPitchMin, kPitchMax);
+    const auto& displayed = displayedProject();
+    return visiblePitchesForProjectScale(displayed,
+                                         displayed.pianoRollVisiblePitchMin,
+                                         displayed.pianoRollVisiblePitchMax);
 }
 
 int PianoRollComponent::pitchToRow(int pitch) const
@@ -2366,6 +2406,17 @@ int PianoRollComponent::rowForProgress(float progress, int targetRow) const
             juce::ignoreUnused(circleProgress);
             return juce::roundToInt(static_cast<float>(anchorPitchRow) + vertical * static_cast<float>(shapeAmplitudeRows));
         }
+
+        case PencilDrawMode::noise:
+        {
+            const auto range = juce::jmax(1, shapeAmplitudeRows);
+            const auto seed = hashedNoiseValue(anchorGridTick
+                                               + juce::roundToInt(progress * 4096.0f)
+                                               + (shapeFrequencyCycles * 131)
+                                               + (anchorPitchRow * 17));
+            const auto offset = (seed % ((range * 2) + 1)) - range;
+            return anchorPitchRow + offset;
+        }
     }
 
     return targetRow;
@@ -2425,6 +2476,16 @@ double PianoRollComponent::valueForProgress(float progress, double targetValue) 
             const auto vertical = std::sin(angle);
             return clampValueToBounds(anchorControllerValue + vertical * (targetValue - anchorControllerValue));
         }
+
+        case PencilDrawMode::noise:
+        {
+            const auto seed = hashedNoiseValue(juce::roundToInt(progress * 4096.0f)
+                                               + juce::roundToInt(anchorControllerValue * 13.0)
+                                               + juce::roundToInt(targetValue * 7.0)
+                                               + (shapeFrequencyCycles * 97));
+            const auto ratio = static_cast<double>(seed % 10000) / 9999.0;
+            return clampValueToBounds(lowValue + ((highValue - lowValue) * ratio));
+        }
     }
 
     return clampValueToBounds(targetValue);
@@ -2446,8 +2507,16 @@ void PianoRollComponent::rebuildShapePreview(juce::Point<float> currentPosition,
     const auto leftToRight = currentTick >= anchorGridTick;
     const auto lineStartRow = leftToRight ? anchorPitchRow : currentRow;
     const auto lineEndRow = leftToRight ? currentRow : anchorPitchRow;
+    const auto step = gridTick();
 
-    if (adjustFrequency
+    if (pencilDrawMode == PencilDrawMode::noise)
+    {
+        shapeAmplitudeRows = juce::jlimit(1, 36, std::abs(currentRow - anchorPitchRow));
+        shapeFrequencyCycles = adjustFrequency
+            ? juce::jlimit(2, 8, 2 + (std::abs(currentTick - anchorGridTick) / juce::jmax(1, step * 4)))
+            : 1;
+    }
+    else if (adjustFrequency
         && pencilDrawMode != PencilDrawMode::line
         && pencilDrawMode != PencilDrawMode::box
         && pencilDrawMode != PencilDrawMode::brush)
@@ -2455,7 +2524,6 @@ void PianoRollComponent::rebuildShapePreview(juce::Point<float> currentPosition,
     else
         shapeAmplitudeRows = juce::jlimit(1, 36, std::abs(currentRow - anchorPitchRow));
 
-    const auto step = gridTick();
     const auto rootVelocity = 100;
     std::set<juce::int64> insertedKeys;
     std::vector<std::pair<int, int>> placements;
@@ -2498,6 +2566,18 @@ void PianoRollComponent::rebuildShapePreview(juce::Point<float> currentPosition,
         {
             for (int row = rowMin; row <= rowMax; ++row)
                 appendPlacement(tick, rowToPitch(row));
+        }
+    }
+    else if (pencilDrawMode == PencilDrawMode::noise)
+    {
+        const auto density = juce::jmax(1, shapeFrequencyCycles);
+        const auto noiseStep = juce::jmax(1, step / density);
+        for (int tick = minTick; tick <= maxTick; tick += noiseStep)
+        {
+            const auto progress = maxTick == minTick
+                ? 0.0f
+                : static_cast<float>(tick - minTick) / static_cast<float>(juce::jmax(1, maxTick - minTick));
+            appendPlacement(tick, rowToPitch(rowForProgress(progress, currentRow)));
         }
     }
     else

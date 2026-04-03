@@ -1,4 +1,5 @@
 #include "AIClient.h"
+#include "ProjectModel.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -172,7 +173,9 @@ AIComposeTrack parseComposeTrack(const juce::var& trackVar)
         AIComposeNote note;
         note.startBeat = juce::jmax(0.0, static_cast<double>(noteObject->getProperty("start_beat")));
         note.durationBeat = juce::jmax(0.125, static_cast<double>(noteObject->getProperty("duration_beat")));
-        note.pitch = juce::jlimit(12, 84, static_cast<int>(noteObject->getProperty("pitch")));
+        note.pitch = juce::jlimit(kEditableMidiPitchMin,
+                                  kEditableMidiPitchMax,
+                                  static_cast<int>(noteObject->getProperty("pitch")));
         note.velocity = juce::jlimit(1, 127, static_cast<int>(noteObject->getProperty("velocity")));
         track.notes.push_back(note);
     }
@@ -718,18 +721,29 @@ AIComposer::AIComposer(AIClient clientIn)
 {
 }
 
-AIComposeResult AIComposer::compose(const juce::String& prompt, int bars, int bpm) const
+AIComposeResult AIComposer::compose(const juce::String& prompt,
+                                    int bars,
+                                    int bpm,
+                                    int minTracks,
+                                    int maxTracks) const
 {
+    const auto safeMinTracks = juce::jlimit(1, 16, minTracks);
+    const auto safeMaxTracks = juce::jlimit(safeMinTracks, 16, maxTracks);
     const juce::String systemInstruction =
         "You are a MIDI composer for a DAW. Return strict JSON only with the schema: "
         "{\"tracks\": [{\"name\": str, \"instrument\": str, \"notes\": "
         "[{\"start_beat\": number, \"duration_beat\": number, \"pitch\": int, \"velocity\": int}]}]}. "
-        "Keep pitches in MIDI range 36..84 and fit inside requested bars.";
+        "Keep pitches in MIDI range " + juce::String(kEditableMidiPitchMin) + ".."
+        + juce::String(kEditableMidiPitchMax) + " and fit inside requested bars.";
 
     const juce::String userInstruction =
-        "Create a multi-track arrangement. Prompt: " + prompt + ". Bars: " + juce::String(juce::jmax(1, bars))
+        "Create a musically coherent MIDI composition. Prompt: " + prompt + ". Bars: " + juce::String(juce::jmax(1, bars))
         + ". BPM: " + juce::String(juce::jmax(20, bpm))
-        + ". Use 2-5 tracks and musically coherent note timing.";
+        + ". Use "
+        + (safeMinTracks == safeMaxTracks
+               ? ("exactly " + juce::String(safeMinTracks) + " track(s)")
+               : ("between " + juce::String(safeMinTracks) + " and " + juce::String(safeMaxTracks) + " tracks"))
+        + " and musically coherent note timing.";
 
     const auto rawResult = client.runJsonPrompt(systemInstruction, userInstruction);
     auto* object = rawResult.getDynamicObject();

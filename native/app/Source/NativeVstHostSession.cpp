@@ -316,6 +316,68 @@ juce::String parameterPayloadSignature(const juce::NamedValueSet& values)
     return entries.joinIntoString("|");
 }
 
+const aims::VstInstrument* findRackEntryByReference(const aims::ProjectState& project,
+                                                    const juce::String& reference,
+                                                    bool wantEffect)
+{
+    const auto trimmed = reference.trim();
+    if (trimmed.isEmpty())
+        return nullptr;
+
+    const auto normalisedPath = juce::File(trimmed).getFullPathName();
+    for (const auto& entry : project.vstRack)
+    {
+        if (!entry.hostSupported)
+            continue;
+        if (wantEffect && !entry.isEffect)
+            continue;
+        if (!wantEffect && !entry.isInstrument)
+            continue;
+
+        if (entry.name.equalsIgnoreCase(trimmed)
+            || entry.pluginName.equalsIgnoreCase(trimmed)
+            || entry.path.equalsIgnoreCase(trimmed)
+            || (!normalisedPath.isEmpty() && juce::File(entry.path).getFullPathName().equalsIgnoreCase(normalisedPath)))
+        {
+            return &entry;
+        }
+    }
+
+    return nullptr;
+}
+
+bool fxSlotBypassed(const std::vector<bool>& bypassStates, int index)
+{
+    return index >= 0
+        && index < static_cast<int>(bypassStates.size())
+        && bypassStates[static_cast<size_t>(index)];
+}
+
+juce::Array<juce::var> buildFxChainPayload(const aims::ProjectState& project,
+                                           const juce::StringArray& fxChain,
+                                           const std::vector<bool>& fxSlotBypassedStates)
+{
+    juce::Array<juce::var> payload;
+
+    for (int fxIndex = 0; fxIndex < fxChain.size(); ++fxIndex)
+    {
+        const auto& reference = fxChain[fxIndex];
+        const auto* entry = findRackEntryByReference(project, reference, true);
+        if (entry == nullptr || entry->path.isEmpty() || !juce::File(entry->path).exists())
+            continue;
+
+        auto* fxObject = new juce::DynamicObject();
+        fxObject->setProperty("name", entry->name.isNotEmpty() ? entry->name : reference);
+        fxObject->setProperty("plugin_path", entry->path);
+        fxObject->setProperty("state_path", "");
+        fxObject->setProperty("parameters", juce::var(new juce::DynamicObject()));
+        fxObject->setProperty("bypassed", fxSlotBypassed(fxSlotBypassedStates, fxIndex));
+        payload.add(juce::var(fxObject));
+    }
+
+    return payload;
+}
+
 juce::Array<juce::var> buildNotePayload(const aims::TrackState& track)
 {
     juce::Array<juce::var> notes;
@@ -421,6 +483,10 @@ juce::var buildAudioEngineTrackPayload(const aims::ProjectState& project, int tr
     payload->setProperty("output_gain_db", track.vstiOutputGainDb);
     payload->setProperty("pan", juce::jlimit(-1.0, 1.0, track.pan));
     payload->setProperty("audible", trackIsAudible(project, trackIndex));
+    payload->setProperty("fx_chain", juce::var(buildFxChainPayload(project,
+                                                                   track.vstFxChain,
+                                                                   track.vstFxSlotBypassed)));
+    payload->setProperty("fx_bypassed", track.vstFxBypassed);
 
     const auto pluginPath = aims::resolveRackPluginPath(project, track);
     const auto canUseInstrument = pluginPath.isNotEmpty()
@@ -449,6 +515,23 @@ juce::var buildAudioEngineTrackPayload(const aims::ProjectState& project, int tr
     if (!canUseInstrument && !hasAudioContent)
         payload->setProperty("audible", false);
 
+    return juce::var(payload);
+}
+
+juce::var buildAudioEngineStatePayload(const aims::ProjectState& project, double sampleRate)
+{
+    juce::Array<juce::var> tracks;
+    tracks.ensureStorageAllocated(static_cast<int>(project.tracks.size()));
+    for (int index = 0; index < static_cast<int>(project.tracks.size()); ++index)
+        tracks.add(buildAudioEngineTrackPayload(project, index, sampleRate));
+
+    auto* payload = new juce::DynamicObject();
+    payload->setProperty("tracks", juce::var(tracks));
+    payload->setProperty("master_volume", juce::jlimit(0.0, 2.0, project.masterVolume));
+    payload->setProperty("master_fx_chain", juce::var(buildFxChainPayload(project,
+                                                                          project.masterFxChain,
+                                                                          project.masterFxSlotBypassed)));
+    payload->setProperty("master_fx_bypassed", project.masterFxBypassed);
     return juce::var(payload);
 }
 } // namespace
@@ -579,12 +662,8 @@ juce::Result NativeVstHostSession::setAudioEngineState(const ProjectState& proje
             sampleRate = deviceSnapshot.sampleRate;
     }
 
-    juce::Array<juce::var> tracks;
-    tracks.ensureStorageAllocated(static_cast<int>(project.tracks.size()));
-    for (int trackIndex = 0; trackIndex < static_cast<int>(project.tracks.size()); ++trackIndex)
-        tracks.add(buildAudioEngineTrackPayload(project, trackIndex, sampleRate));
-
-    const auto tracksJson = juce::JSON::toString(juce::var(tracks), false);
+    const auto statePayload = buildAudioEngineStatePayload(project, sampleRate);
+    const auto tracksJson = juce::JSON::toString(statePayload, false);
     juce::HeapBlock<char> errorBuffer(static_cast<size_t>(kHostErrorBufferBytes));
     std::memset(errorBuffer.get(), 0, static_cast<size_t>(kHostErrorBufferBytes));
 
@@ -872,6 +951,35 @@ juce::Result NativeVstHostSession::openAudioEngineTrackEditor(int trackIndex)
 
     const auto error = juce::String::fromUTF8(errorBuffer.get()).trim();
     return juce::Result::fail(error.isNotEmpty() ? error : "Native host live track editor command failed.");
+}
+
+juce::Result NativeVstHostSession::openAudioEngineTrackEffectEditor(int trackIndex, int effectIndex)
+{
+    juce::DynamicObject::Ptr request = new juce::DynamicObject();
+    request->setProperty("command", "open_audio_engine_track_effect_editor");
+    request->setProperty("track_index", trackIndex);
+    request->setProperty("effect_index", effectIndex);
+
+    juce::var response;
+    const auto result = runCommand(juce::var(request.get()), response);
+    if (result.failed())
+        return result;
+
+    return resultFromResponse(response, "Native host live track FX editor command failed.");
+}
+
+juce::Result NativeVstHostSession::openAudioEngineMasterEffectEditor(int effectIndex)
+{
+    juce::DynamicObject::Ptr request = new juce::DynamicObject();
+    request->setProperty("command", "open_audio_engine_master_effect_editor");
+    request->setProperty("effect_index", effectIndex);
+
+    juce::var response;
+    const auto result = runCommand(juce::var(request.get()), response);
+    if (result.failed())
+        return result;
+
+    return resultFromResponse(response, "Native host live master FX editor command failed.");
 }
 
 juce::Result NativeVstHostSession::closeAudioEngineTrackEditor(int trackIndex)

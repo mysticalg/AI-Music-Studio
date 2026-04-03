@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(AIMusicStudioNative VERSION 0.1.0)
+project(AIMusicStudioNative VERSION 0.3.1)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -79,6 +79,8 @@ juce_add_gui_app(AIMusicStudioNative
     PRODUCT_NAME "Mutagen"
     COMPANY_NAME "Mutagen"
     BUNDLE_ID "com.mutagen.native"
+    ICON_BIG "${CMAKE_CURRENT_SOURCE_DIR}/Assets/mutagen-logo-source.png"
+    ICON_SMALL "${CMAKE_CURRENT_SOURCE_DIR}/Assets/mutagen-logo-80.png"
 )
 
 target_sources(AIMusicStudioNative

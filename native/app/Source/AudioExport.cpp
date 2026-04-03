@@ -35,6 +35,13 @@ struct RenderMidiEvent
     double velocity = 0.0;
 };
 
+bool fxSlotBypassed(const std::vector<bool>& bypassStates, int index)
+{
+    return index >= 0
+        && index < static_cast<int>(bypassStates.size())
+        && bypassStates[static_cast<size_t>(index)];
+}
+
 bool trackIsAudible(const ProjectState& project, int trackIndex)
 {
     bool anySolo = false;
@@ -157,8 +164,12 @@ juce::Array<juce::var> buildFxChainPayload(const ProjectState& project,
 {
     juce::Array<juce::var> payload;
 
-    for (const auto& fxName : track.vstFxChain)
+    if (track.vstFxBypassed)
+        return payload;
+
+    for (int fxIndex = 0; fxIndex < track.vstFxChain.size(); ++fxIndex)
     {
+        const auto& fxName = track.vstFxChain[fxIndex];
         const auto* entry = findRackEntryByReference(project, fxName, true);
         if (entry == nullptr || entry->path.isEmpty() || !juce::File(entry->path).exists())
         {
@@ -172,6 +183,7 @@ juce::Array<juce::var> buildFxChainPayload(const ProjectState& project,
         fxObject->setProperty("plugin_path", entry->path);
         fxObject->setProperty("state_path", "");
         fxObject->setProperty("parameters", juce::var(new juce::DynamicObject()));
+        fxObject->setProperty("bypassed", fxSlotBypassed(track.vstFxSlotBypassed, fxIndex));
         payload.add(juce::var(fxObject));
     }
 

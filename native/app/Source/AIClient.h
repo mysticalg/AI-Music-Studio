@@ -110,7 +110,11 @@ class AIComposer
 public:
     explicit AIComposer(AIClient clientIn);
 
-    AIComposeResult compose(const juce::String& prompt, int bars, int bpm) const;
+    AIComposeResult compose(const juce::String& prompt,
+                            int bars,
+                            int bpm,
+                            int minTracks = 2,
+                            int maxTracks = 5) const;
 
 private:
     AIClient client;

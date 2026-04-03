@@ -637,6 +637,7 @@ public:
         }
         closeGraphEditorWindow();
         closeAllAudioEngineTrackEditorWindows();
+        closeAllAudioEngineEffectEditorWindows();
         clearPersistentPluginGraph();
         clearAudioEngine();
         closeEditorWindow();
@@ -1080,15 +1081,33 @@ public:
                                            bool metronomeEnabled,
                                            bool preserveTransport)
     {
-        const auto tracksVar = juce::JSON::parse(tracksJson);
-        if (tracksVar.isVoid())
+        const auto payload = juce::JSON::parse(tracksJson);
+        if (payload.isVoid())
             return juce::Result::fail("Invalid audio engine track payload");
+
+        auto tracksVar = payload;
+        auto masterVolume = 1.0f;
+        juce::var masterFxChainVar(juce::Array<juce::var>{});
+        bool masterFxBypassed = false;
+        if (auto* payloadObject = payload.getDynamicObject())
+        {
+            tracksVar = payloadObject->getProperty("tracks");
+            masterVolume = payloadObject->hasProperty("master_volume")
+                ? static_cast<float>(static_cast<double>(payloadObject->getProperty("master_volume")))
+                : 1.0f;
+            masterFxChainVar = payloadObject->getProperty("master_fx_chain");
+            masterFxBypassed = payloadObject->hasProperty("master_fx_bypassed")
+                && static_cast<bool>(payloadObject->getProperty("master_fx_bypassed"));
+        }
 
         juce::Array<juce::var> trackErrors;
         juce::String error;
         {
             const juce::ScopedLock lock(pluginLock);
             if (!configureAudioEngine(tracksVar,
+                                      masterVolume,
+                                      masterFxChainVar,
+                                      masterFxBypassed,
                                       bpm,
                                       ticksPerBeat,
                                       loopEnabled,
@@ -1427,6 +1446,14 @@ private:
         std::unique_ptr<PluginEditorWindow> window;
     };
 
+    struct AudioEngineEffectEditorWindowEntry
+    {
+        bool isMaster = false;
+        int trackIndex = -1;
+        int effectIndex = -1;
+        std::unique_ptr<PluginEditorWindow> window;
+    };
+
     // In-process transport: the host owns the note list and generates MIDI
     // sample-accurately inside the audio callback, eliminating IPC drift.
     struct TransportNote
@@ -1588,6 +1615,7 @@ private:
             juce::String statePath;
             int64_t stateMtimeNs = 0;
             juce::String parameterSignature;
+            bool bypassed = false;
             std::unique_ptr<juce::AudioPluginInstance> plugin;
         };
 
@@ -1687,6 +1715,7 @@ private:
             juce::String statePath;
             int64_t stateMtimeNs = 0;
             juce::String parameterSignature;
+            bool bypassed = false;
             std::unique_ptr<juce::AudioPluginInstance> plugin;
         };
 
@@ -1707,6 +1736,7 @@ private:
         float baseVolume = 1.0f;
         float basePan = 0.0f;
         float baseOutputGainDb = 0.0f;
+        bool fxBypassed = false;
         bool audible = true;
         float peakLevel = 0.0f;
         juce::AudioBuffer<float> processBuffer;
@@ -1720,12 +1750,16 @@ private:
     struct AudioEngineState
     {
         std::vector<AudioEngineTrack> tracks;
+        std::vector<AudioEngineTrack::EffectSlot> masterFxChain;
         double bpm = 120.0;
         int ticksPerBeat = 480;
         int64_t positionFrame = 0;
         int64_t loopStartTick = 0;
         int64_t loopEndTick = 0;
         bool loopEnabled = false;
+        float masterVolume = 1.0f;
+        bool masterFxBypassed = false;
+        juce::String masterFxChainSignature;
         bool running = false;
         bool bootstrapPending = false;
         bool tailStopping = false;
@@ -1901,6 +1935,40 @@ private:
             auto response = makeResponse(true, "Editor state");
             setResponseField(response, "editor_open", editorWindow != nullptr && editorWindow->isVisible());
             setResponseField(response, "graph_editor_open", graphEditorWindow != nullptr && graphEditorWindow->isVisible());
+            return response;
+        }
+
+        if (command == "open_audio_engine_track_effect_editor")
+        {
+            const auto trackIndex = static_cast<int>(object->hasProperty("track_index")
+                ? object->getProperty("track_index")
+                : juce::var(-1));
+            const auto effectIndex = static_cast<int>(object->hasProperty("effect_index")
+                ? object->getProperty("effect_index")
+                : juce::var(-1));
+            const auto result = openAudioEngineTrackEffectEditorWindow(trackIndex, effectIndex);
+            if (result.failed())
+                return makeResponse(false, result.getErrorMessage());
+
+            auto response = makeResponse(true, "Track FX editor opened");
+            appendStatusFields(response, true);
+            setResponseField(response, "track_index", trackIndex);
+            setResponseField(response, "effect_index", effectIndex);
+            return response;
+        }
+
+        if (command == "open_audio_engine_master_effect_editor")
+        {
+            const auto effectIndex = static_cast<int>(object->hasProperty("effect_index")
+                ? object->getProperty("effect_index")
+                : juce::var(-1));
+            const auto result = openAudioEngineMasterEffectEditorWindow(effectIndex);
+            if (result.failed())
+                return makeResponse(false, result.getErrorMessage());
+
+            auto response = makeResponse(true, "Master FX editor opened");
+            appendStatusFields(response, true);
+            setResponseField(response, "effect_index", effectIndex);
             return response;
         }
 
@@ -2547,6 +2615,11 @@ private:
                 ? static_cast<bool>(object->getProperty("metronome_enabled")) : false;
             const auto preserveTransport = object->hasProperty("preserve_transport")
                 ? static_cast<bool>(object->getProperty("preserve_transport")) : false;
+            const auto masterVolume = object->hasProperty("master_volume")
+                ? static_cast<float>(static_cast<double>(object->getProperty("master_volume")))
+                : 1.0f;
+            const auto masterFxBypassed = object->hasProperty("master_fx_bypassed")
+                && static_cast<bool>(object->getProperty("master_fx_bypassed"));
 
             juce::Array<juce::var> trackErrors;
             juce::String error;
@@ -2554,6 +2627,9 @@ private:
                 juce::ScopedLock lock(pluginLock);
                 if (!configureAudioEngine(
                         object->getProperty("tracks"),
+                        masterVolume,
+                        object->getProperty("master_fx_chain"),
+                        masterFxBypassed,
                         bpm,
                         ticksPerBeat,
                         loopEnabled,
@@ -5623,6 +5699,8 @@ private:
             );
             const auto statePath = fxObject->getProperty("state_path").toString().trim();
             const auto parameterSignature = parameterPayloadSignature(fxObject->getProperty("parameters"));
+            const auto bypassed = fxObject->hasProperty("bypassed")
+                && static_cast<bool>(fxObject->getProperty("bypassed"));
             const auto name = fxObject->hasProperty("name")
                 ? fxObject->getProperty("name").toString().trim()
                 : juce::String();
@@ -6289,6 +6367,7 @@ private:
         track.baseVolume = 1.0f;
         track.basePan = 0.0f;
         track.baseOutputGainDb = 0.0f;
+        track.fxBypassed = false;
         track.audible = true;
         track.processBuffer.setSize(0, 0);
         track.stereoBuffer.setSize(0, 0);
@@ -6302,12 +6381,19 @@ private:
     void clearAudioEngine()
     {
         closeAllAudioEngineTrackEditorWindows();
+        closeAllAudioEngineEffectEditorWindows();
         audioEngine.running = false;
         audioEngine.bootstrapPending = false;
         clearQueuedAudioEngineTrackParameterUpdates();
         for (auto& track : audioEngine.tracks)
             releaseAudioEngineTrack(track);
         audioEngine.tracks.clear();
+        for (auto& effectSlot : audioEngine.masterFxChain)
+            releaseAudioEngineEffectSlot(effectSlot);
+        audioEngine.masterFxChain.clear();
+        audioEngine.masterFxChainSignature.clear();
+        audioEngine.masterVolume = 1.0f;
+        audioEngine.masterFxBypassed = false;
         audioEngineTrackCount.store(0, std::memory_order_release);
         audioEngine.positionFrame = 0;
         audioEngine.metronomeEnabled = false;
@@ -6329,6 +6415,15 @@ private:
         for (auto& lane : track.automationLanes)
             lane.lastAppliedValue = std::numeric_limits<float>::quiet_NaN();
         track.peakLevel = 0.0f;
+    }
+
+    void resetAudioEngineMasterProcessingState()
+    {
+        for (auto& effectSlot : audioEngine.masterFxChain)
+        {
+            if (effectSlot.plugin != nullptr)
+                effectSlot.plugin->reset();
+        }
     }
 
     void clearAudioEngineTailState()
@@ -6360,6 +6455,8 @@ private:
             for (const auto& effectSlot : track.fxChain)
                 accumulateTailSeconds(effectSlot.plugin.get());
         }
+        for (const auto& effectSlot : audioEngine.masterFxChain)
+            accumulateTailSeconds(effectSlot.plugin.get());
 
         const auto sampleRate = juce::jmax(1.0, currentSampleRate);
         const auto cappedTailSeconds = juce::jlimit(
@@ -6373,6 +6470,7 @@ private:
     {
         for (auto& track : audioEngine.tracks)
             resetAudioEngineTrackProcessingState(track);
+        resetAudioEngineMasterProcessingState();
     }
 
     static float evaluateAudioEngineAutomationLane(const AudioEngineAutomationLane& lane, double tick)
@@ -6513,13 +6611,18 @@ private:
         }
     }
 
-    void processAudioEngineEffectChain(AudioEngineTrack& track, juce::AudioBuffer<float>& stereoBuffer)
+    void processAudioEngineEffectChain(std::vector<AudioEngineTrack::EffectSlot>& fxChain,
+                                       bool bypassed,
+                                       juce::AudioBuffer<float>& stereoBuffer)
     {
-        if (track.fxChain.empty() || stereoBuffer.getNumSamples() <= 0)
+        if (bypassed || fxChain.empty() || stereoBuffer.getNumSamples() <= 0)
             return;
 
-        for (auto& effectSlot : track.fxChain)
+        for (auto& effectSlot : fxChain)
         {
+            if (effectSlot.bypassed)
+                continue;
+
             auto* plugin = effectSlot.plugin.get();
             if (plugin == nullptr)
                 continue;
@@ -6535,6 +6638,34 @@ private:
             juce::MidiBuffer midi;
             plugin->processBlock(processBuffer, midi);
             extractPluginOutputToStereo(*plugin, processBuffer, stereoBuffer);
+        }
+    }
+
+    void processAudioEngineEffectChain(AudioEngineTrack& track, juce::AudioBuffer<float>& stereoBuffer)
+    {
+        processAudioEngineEffectChain(track.fxChain, track.fxBypassed, stereoBuffer);
+    }
+
+    void processAudioEngineMasterEffectChain(juce::AudioBuffer<float>& stereoBuffer)
+    {
+        processAudioEngineEffectChain(audioEngine.masterFxChain, audioEngine.masterFxBypassed, stereoBuffer);
+    }
+
+    void updateAudioEngineEffectBypassStates(std::vector<AudioEngineTrack::EffectSlot>& fxChain,
+                                             const juce::var& fxChainVar)
+    {
+        auto* fxArray = fxChainVar.getArray();
+        for (int fxIndex = 0; fxIndex < static_cast<int>(fxChain.size()); ++fxIndex)
+        {
+            bool effectBypassed = false;
+            if (fxArray != nullptr && juce::isPositiveAndBelow(fxIndex, fxArray->size()))
+            {
+                if (auto* fxObject = fxArray->getReference(fxIndex).getDynamicObject())
+                    effectBypassed = fxObject->hasProperty("bypassed")
+                        && static_cast<bool>(fxObject->getProperty("bypassed"));
+            }
+
+            fxChain[static_cast<size_t>(fxIndex)].bypassed = effectBypassed;
         }
     }
 
@@ -6561,11 +6692,25 @@ private:
         resetAudioEngineTrackProcessingState(track);
     }
 
+    void prepareAudioEngineMasterForPlayback()
+    {
+        for (auto& effectSlot : audioEngine.masterFxChain)
+        {
+            if (effectSlot.plugin == nullptr)
+                continue;
+            effectSlot.plugin->setRateAndBufferSizeDetails(currentSampleRate, currentBlockSize);
+            effectSlot.plugin->prepareToPlay(currentSampleRate, currentBlockSize);
+            effectSlot.plugin->suspendProcessing(false);
+        }
+        resetAudioEngineMasterProcessingState();
+    }
+
     void prepareAudioEngineForPlayback()
     {
         prepareAudioEngineMetronome();
         for (auto& track : audioEngine.tracks)
             prepareAudioEngineTrackForPlayback(track);
+        prepareAudioEngineMasterForPlayback();
     }
 
     void releaseAudioEngineResources()
@@ -6586,6 +6731,14 @@ private:
                 }
             }
         }
+        for (auto& effectSlot : audioEngine.masterFxChain)
+        {
+            if (effectSlot.plugin != nullptr)
+            {
+                effectSlot.plugin->suspendProcessing(true);
+                effectSlot.plugin->releaseResources();
+            }
+        }
         audioEngine.metronomeClickBuffer.setSize(0, 0);
         audioEngine.metronomeAccentBuffer.setSize(0, 0);
         clearAudioEngineTailState();
@@ -6596,6 +6749,7 @@ private:
                                               int trackIndex,
                                               juce::Array<juce::var>& trackErrors)
     {
+        closeAudioEngineTrackEffectEditorWindows(trackIndex);
         for (auto& effectSlot : track.fxChain)
             releaseAudioEngineEffectSlot(effectSlot);
         track.fxChain.clear();
@@ -6623,6 +6777,8 @@ private:
             );
             const auto statePath = fxObject->getProperty("state_path").toString().trim();
             const auto parameterSignature = parameterPayloadSignature(fxObject->getProperty("parameters"));
+            const auto bypassed = fxObject->hasProperty("bypassed")
+                && static_cast<bool>(fxObject->getProperty("bypassed"));
             const auto name = fxObject->hasProperty("name")
                 ? fxObject->getProperty("name").toString().trim()
                 : juce::String();
@@ -6660,8 +6816,88 @@ private:
             effectSlot.pluginPath = pluginPath;
             effectSlot.statePath = statePath;
             effectSlot.parameterSignature = parameterSignature;
+            effectSlot.bypassed = bypassed;
             effectSlot.plugin = std::move(instance);
             track.fxChain.push_back(std::move(effectSlot));
+        }
+
+        refreshRealtimeTransportSnapshot();
+        return true;
+    }
+
+    bool configureAudioEngineMasterEffectChain(const juce::var& fxChainVar,
+                                               juce::Array<juce::var>& trackErrors)
+    {
+        closeAudioEngineMasterEffectEditorWindows();
+        for (auto& effectSlot : audioEngine.masterFxChain)
+            releaseAudioEngineEffectSlot(effectSlot);
+        audioEngine.masterFxChain.clear();
+
+        auto* fxArray = fxChainVar.getArray();
+        if (fxArray == nullptr || fxArray->isEmpty())
+            return true;
+
+        audioEngine.masterFxChain.reserve(static_cast<size_t>(fxArray->size()));
+        for (int fxIndex = 0; fxIndex < fxArray->size(); ++fxIndex)
+        {
+            auto* fxObject = fxArray->getReference(fxIndex).getDynamicObject();
+            if (fxObject == nullptr)
+            {
+                auto* errorObject = new juce::DynamicObject();
+                errorObject->setProperty("track_index", -1);
+                errorObject->setProperty("fx_index", fxIndex);
+                errorObject->setProperty("message", "Master FX payload must be an object");
+                trackErrors.add(juce::var(errorObject));
+                continue;
+            }
+
+            const auto pluginPath = normaliseVst3PathForSettings(
+                fxObject->getProperty("plugin_path").toString().trim()
+            );
+            const auto statePath = fxObject->getProperty("state_path").toString().trim();
+            const auto parameterSignature = parameterPayloadSignature(fxObject->getProperty("parameters"));
+            const auto bypassed = fxObject->hasProperty("bypassed")
+                && static_cast<bool>(fxObject->getProperty("bypassed"));
+            const auto name = fxObject->hasProperty("name")
+                ? fxObject->getProperty("name").toString().trim()
+                : juce::String();
+
+            if (pluginPath.isEmpty())
+            {
+                auto* errorObject = new juce::DynamicObject();
+                errorObject->setProperty("track_index", -1);
+                errorObject->setProperty("fx_index", fxIndex);
+                errorObject->setProperty("message", "Missing master FX plugin path");
+                trackErrors.add(juce::var(errorObject));
+                continue;
+            }
+
+            juce::String createError;
+            auto instance = createPreparedGraphPluginInstance(
+                pluginPath,
+                statePath,
+                fxObject->getProperty("parameters"),
+                createError
+            );
+            if (instance == nullptr)
+            {
+                auto* errorObject = new juce::DynamicObject();
+                errorObject->setProperty("track_index", -1);
+                errorObject->setProperty("fx_index", fxIndex);
+                errorObject->setProperty("plugin_path", pluginPath);
+                errorObject->setProperty("message", createError.isNotEmpty() ? createError : "Could not create master FX instance");
+                trackErrors.add(juce::var(errorObject));
+                continue;
+            }
+
+            AudioEngineTrack::EffectSlot effectSlot;
+            effectSlot.name = name.isNotEmpty() ? name : juce::File(pluginPath).getFileNameWithoutExtension();
+            effectSlot.pluginPath = pluginPath;
+            effectSlot.statePath = statePath;
+            effectSlot.parameterSignature = parameterSignature;
+            effectSlot.bypassed = bypassed;
+            effectSlot.plugin = std::move(instance);
+            audioEngine.masterFxChain.push_back(std::move(effectSlot));
         }
 
         refreshRealtimeTransportSnapshot();
@@ -6759,6 +6995,9 @@ private:
     }
 
     bool configureAudioEngine(const juce::var& tracksVar,
+                              float masterVolume,
+                              const juce::var& masterFxChainVar,
+                              bool masterFxBypassed,
                               double bpm,
                               int ticksPerBeat,
                               bool loopEnabled,
@@ -6786,6 +7025,18 @@ private:
             : 0.0;
         bool structuralChange = false;
         const auto previousTrackCount = static_cast<int>(audioEngine.tracks.size());
+        const auto masterFxChainSignature = graphEffectChainPayloadSignature(masterFxChainVar);
+        const bool masterFxChanged = audioEngine.masterFxChainSignature != masterFxChainSignature;
+
+        if (masterFxChanged)
+        {
+            configureAudioEngineMasterEffectChain(masterFxChainVar, trackErrors);
+            audioEngine.masterFxChainSignature = masterFxChainSignature;
+            structuralChange = true;
+        }
+        audioEngine.masterVolume = juce::jlimit(0.0f, 2.0f, masterVolume);
+        audioEngine.masterFxBypassed = masterFxBypassed;
+        updateAudioEngineEffectBypassStates(audioEngine.masterFxChain, masterFxChainVar);
 
         if (audioEngine.tracks.size() > static_cast<size_t>(requestedTrackCount))
         {
@@ -6847,6 +7098,8 @@ private:
             const auto outputGainDb = trackObject->hasProperty("output_gain_db")
                 ? static_cast<float>(static_cast<double>(trackObject->getProperty("output_gain_db")))
                 : 0.0f;
+            const auto fxBypassed = trackObject->hasProperty("fx_bypassed")
+                && static_cast<bool>(trackObject->getProperty("fx_bypassed"));
             const auto audible = !trackObject->hasProperty("audible")
                 || static_cast<bool>(trackObject->getProperty("audible"));
 
@@ -6977,6 +7230,8 @@ private:
                 configureAudioEngineTrackEffectChain(track, trackObject->getProperty("fx_chain"), trackIndex, trackErrors);
             }
 
+            updateAudioEngineEffectBypassStates(track.fxChain, trackObject->getProperty("fx_chain"));
+
             std::vector<AudioEngineAutomationLane> automationLanes;
             if (auto* automationArray = trackObject->getProperty("automation").getArray())
             {
@@ -7096,6 +7351,7 @@ private:
             track.baseVolume = baseVolume;
             track.basePan = pan;
             track.baseOutputGainDb = outputGainDb;
+            track.fxBypassed = fxBypassed;
             track.audible = audible;
             track.peakLevel = 0.0f;
             if (shouldPrepare && !canReuse)
@@ -7133,6 +7389,8 @@ private:
         if (shouldPrepare)
         {
             prepareAudioEngineMetronome();
+            if (masterFxChanged)
+                prepareAudioEngineMasterForPlayback();
             if (!structuralChange && requestedTrackCount != previousTrackCount)
                 structuralChange = true;
         }
@@ -7582,6 +7840,17 @@ private:
             if (transportRunning && audioEngine.metronomeEnabled)
                 mixAudioEngineMetronomeChunk(buffer, sampleOffset, chunkStartFrame, chunkSamples, sampleRate);
 
+            if (buffer.getNumChannels() >= 2)
+            {
+                float* channelPointers[] {
+                    buffer.getWritePointer(0, sampleOffset),
+                    buffer.getWritePointer(1, sampleOffset)
+                };
+                juce::AudioBuffer<float> masterSlice(channelPointers, 2, chunkSamples);
+                processAudioEngineMasterEffectChain(masterSlice);
+                masterSlice.applyGain(juce::jmax(0.0f, audioEngine.masterVolume));
+            }
+
             if (transportRunning)
             {
                 audioEngine.positionFrame += chunkSamples;
@@ -7769,6 +8038,12 @@ private:
                 return true;
         }
 
+        for (const auto& entry : audioEngineEffectEditorWindows)
+        {
+            if (entry.window != nullptr && entry.window->isVisible())
+                return true;
+        }
+
         return false;
     }
 
@@ -7780,6 +8055,38 @@ private:
                 audioEngineTrackEditorWindows.end(),
                 [trackIndex](const auto& entry) { return entry.trackIndex == trackIndex; }),
             audioEngineTrackEditorWindows.end());
+        notifyEditorStateChanged(anyEditorWindowVisible());
+        refreshRealtimeTransportSnapshot();
+    }
+
+    PluginEditorWindow* findAudioEngineEffectEditorWindow(bool isMaster, int trackIndex, int effectIndex)
+    {
+        for (auto& entry : audioEngineEffectEditorWindows)
+        {
+            if (entry.isMaster == isMaster
+                && entry.trackIndex == trackIndex
+                && entry.effectIndex == effectIndex)
+            {
+                return entry.window.get();
+            }
+        }
+
+        return nullptr;
+    }
+
+    void removeAudioEngineEffectEditorWindow(bool isMaster, int trackIndex, int effectIndex)
+    {
+        audioEngineEffectEditorWindows.erase(
+            std::remove_if(
+                audioEngineEffectEditorWindows.begin(),
+                audioEngineEffectEditorWindows.end(),
+                [isMaster, trackIndex, effectIndex](const auto& entry)
+                {
+                    return entry.isMaster == isMaster
+                        && entry.trackIndex == trackIndex
+                        && entry.effectIndex == effectIndex;
+                }),
+            audioEngineEffectEditorWindows.end());
         notifyEditorStateChanged(anyEditorWindowVisible());
         refreshRealtimeTransportSnapshot();
     }
@@ -7848,6 +8155,142 @@ private:
         return juce::Result::ok();
     }
 
+    juce::Result openAudioEngineTrackEffectEditorWindow(int trackIndex, int effectIndex)
+    {
+        if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(audioEngine.tracks.size())))
+            return juce::Result::fail("Invalid audio engine track index");
+
+        auto& track = audioEngine.tracks[static_cast<size_t>(trackIndex)];
+        if (!juce::isPositiveAndBelow(effectIndex, static_cast<int>(track.fxChain.size())))
+            return juce::Result::fail("Invalid track FX index");
+
+        auto& effectSlot = track.fxChain[static_cast<size_t>(effectIndex)];
+        if (effectSlot.plugin == nullptr)
+            return juce::Result::fail("Track FX slot has no live plugin instance");
+
+        if (auto* existingWindow = findAudioEngineEffectEditorWindow(false, trackIndex, effectIndex))
+        {
+            existingWindow->forceTopmostFront();
+            notifyEditorStateChanged(anyEditorWindowVisible());
+            refreshRealtimeTransportSnapshot();
+            return juce::Result::ok();
+        }
+
+        auto key = normaliseVst3PathForSettings(effectSlot.pluginPath);
+        if (key.isEmpty())
+            key = "audio_engine_track_fx_" + juce::String(trackIndex + 1) + "_" + juce::String(effectIndex + 1);
+
+        AudioEngineEffectEditorWindowEntry entry;
+        entry.isMaster = false;
+        entry.trackIndex = trackIndex;
+        entry.effectIndex = effectIndex;
+        entry.window = std::make_unique<PluginEditorWindow>(
+            *effectSlot.plugin,
+            "audio_engine_fx_editor_" + key + "_" + juce::String(trackIndex + 1) + "_" + juce::String(effectIndex + 1),
+            appSettings,
+            [this](const juce::String& command)
+            {
+                dispatchShortcutCallback(command);
+            });
+
+        entry.window->onWindowClosed = [safeThis = juce::Component::SafePointer<HostComponent>(this), trackIndex, effectIndex]
+        {
+            if (safeThis == nullptr)
+                return;
+
+            juce::MessageManager::callAsync([safeThis, trackIndex, effectIndex]
+            {
+                if (safeThis == nullptr)
+                    return;
+
+                const auto* window = safeThis->findAudioEngineEffectEditorWindow(false, trackIndex, effectIndex);
+                if (window == nullptr || window->isVisible())
+                    return;
+
+                safeThis->removeAudioEngineEffectEditorWindow(false, trackIndex, effectIndex);
+            });
+        };
+
+        if (bridgeMode)
+            entry.window->showBridgeEditorWindow();
+        else
+        {
+            entry.window->forceTopmostFront();
+            entry.window->beginTopmostWarmup();
+        }
+
+        audioEngineEffectEditorWindows.push_back(std::move(entry));
+        notifyEditorStateChanged(anyEditorWindowVisible());
+        refreshRealtimeTransportSnapshot();
+        return juce::Result::ok();
+    }
+
+    juce::Result openAudioEngineMasterEffectEditorWindow(int effectIndex)
+    {
+        if (!juce::isPositiveAndBelow(effectIndex, static_cast<int>(audioEngine.masterFxChain.size())))
+            return juce::Result::fail("Invalid master FX index");
+
+        auto& effectSlot = audioEngine.masterFxChain[static_cast<size_t>(effectIndex)];
+        if (effectSlot.plugin == nullptr)
+            return juce::Result::fail("Master FX slot has no live plugin instance");
+
+        if (auto* existingWindow = findAudioEngineEffectEditorWindow(true, -1, effectIndex))
+        {
+            existingWindow->forceTopmostFront();
+            notifyEditorStateChanged(anyEditorWindowVisible());
+            refreshRealtimeTransportSnapshot();
+            return juce::Result::ok();
+        }
+
+        auto key = normaliseVst3PathForSettings(effectSlot.pluginPath);
+        if (key.isEmpty())
+            key = "audio_engine_master_fx_" + juce::String(effectIndex + 1);
+
+        AudioEngineEffectEditorWindowEntry entry;
+        entry.isMaster = true;
+        entry.trackIndex = -1;
+        entry.effectIndex = effectIndex;
+        entry.window = std::make_unique<PluginEditorWindow>(
+            *effectSlot.plugin,
+            "audio_engine_master_fx_editor_" + key + "_" + juce::String(effectIndex + 1),
+            appSettings,
+            [this](const juce::String& command)
+            {
+                dispatchShortcutCallback(command);
+            });
+
+        entry.window->onWindowClosed = [safeThis = juce::Component::SafePointer<HostComponent>(this), effectIndex]
+        {
+            if (safeThis == nullptr)
+                return;
+
+            juce::MessageManager::callAsync([safeThis, effectIndex]
+            {
+                if (safeThis == nullptr)
+                    return;
+
+                const auto* window = safeThis->findAudioEngineEffectEditorWindow(true, -1, effectIndex);
+                if (window == nullptr || window->isVisible())
+                    return;
+
+                safeThis->removeAudioEngineEffectEditorWindow(true, -1, effectIndex);
+            });
+        };
+
+        if (bridgeMode)
+            entry.window->showBridgeEditorWindow();
+        else
+        {
+            entry.window->forceTopmostFront();
+            entry.window->beginTopmostWarmup();
+        }
+
+        audioEngineEffectEditorWindows.push_back(std::move(entry));
+        notifyEditorStateChanged(anyEditorWindowVisible());
+        refreshRealtimeTransportSnapshot();
+        return juce::Result::ok();
+    }
+
     void closeAudioEngineTrackEditorWindow(int trackIndex)
     {
         for (auto it = audioEngineTrackEditorWindows.begin(); it != audioEngineTrackEditorWindows.end(); ++it)
@@ -7871,6 +8314,64 @@ private:
         for (auto& entry : audioEngineTrackEditorWindows)
             entry.window.reset();
         audioEngineTrackEditorWindows.clear();
+        notifyEditorStateChanged(anyEditorWindowVisible());
+        refreshRealtimeTransportSnapshot();
+    }
+
+    void closeAudioEngineTrackEffectEditorWindows(int trackIndex)
+    {
+        bool removedAny = false;
+        for (auto it = audioEngineEffectEditorWindows.begin(); it != audioEngineEffectEditorWindows.end();)
+        {
+            if (it->isMaster || it->trackIndex != trackIndex)
+            {
+                ++it;
+                continue;
+            }
+
+            it->window.reset();
+            it = audioEngineEffectEditorWindows.erase(it);
+            removedAny = true;
+        }
+
+        if (removedAny)
+        {
+            notifyEditorStateChanged(anyEditorWindowVisible());
+            refreshRealtimeTransportSnapshot();
+        }
+    }
+
+    void closeAudioEngineMasterEffectEditorWindows()
+    {
+        bool removedAny = false;
+        for (auto it = audioEngineEffectEditorWindows.begin(); it != audioEngineEffectEditorWindows.end();)
+        {
+            if (!it->isMaster)
+            {
+                ++it;
+                continue;
+            }
+
+            it->window.reset();
+            it = audioEngineEffectEditorWindows.erase(it);
+            removedAny = true;
+        }
+
+        if (removedAny)
+        {
+            notifyEditorStateChanged(anyEditorWindowVisible());
+            refreshRealtimeTransportSnapshot();
+        }
+    }
+
+    void closeAllAudioEngineEffectEditorWindows()
+    {
+        if (audioEngineEffectEditorWindows.empty())
+            return;
+
+        for (auto& entry : audioEngineEffectEditorWindows)
+            entry.window.reset();
+        audioEngineEffectEditorWindows.clear();
         notifyEditorStateChanged(anyEditorWindowVisible());
         refreshRealtimeTransportSnapshot();
     }
@@ -8061,6 +8562,7 @@ private:
     std::vector<PersistentGraphSlot> persistentGraphSlots;
     std::unique_ptr<PluginEditorWindow> graphEditorWindow;
     std::vector<AudioEngineTrackEditorWindowEntry> audioEngineTrackEditorWindows;
+    std::vector<AudioEngineEffectEditorWindowEntry> audioEngineEffectEditorWindows;
     EditorStateCallback editorStateCallback = nullptr;
     void* editorStateUserData = nullptr;
     int graphEditorSlotIndex = -1;
@@ -10026,7 +10528,7 @@ class HostApplication final : public juce::JUCEApplication
 {
 public:
     const juce::String getApplicationName() override      { return "AI Music Studio VST Host"; }
-    const juce::String getApplicationVersion() override   { return "0.1.0"; }
+    const juce::String getApplicationVersion() override   { return "0.3.1"; }
     bool moreThanOneInstanceAllowed() override            { return true; }
 
     void initialise(const juce::String&) override

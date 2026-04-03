@@ -9,10 +9,89 @@ namespace aims
 {
 namespace
 {
+struct TrackColourThemeState
+{
+    juce::Colour accent = juce::Colour::fromRGB(72, 104, 160);
+    juce::Colour surface = juce::Colour::fromRGB(20, 22, 28);
+    juce::Colour outline = juce::Colour::fromRGB(56, 64, 79);
+    juce::Colour success = juce::Colour::fromRGB(143, 225, 170);
+    juce::Colour info = juce::Colour::fromRGB(156, 199, 239);
+    juce::Colour warning = juce::Colour::fromRGB(230, 190, 118);
+};
+
+TrackColourThemeState& trackColourThemeState()
+{
+    static TrackColourThemeState state;
+    return state;
+}
+
+juce::Colour rotateTrackHue(const juce::Colour& colour, float delta)
+{
+    auto hue = colour.getHue() + delta;
+    hue -= std::floor(hue);
+    if (hue < 0.0f)
+        hue += 1.0f;
+
+    const auto saturation = juce::jlimit(0.42f, 0.9f, (colour.getSaturation() * 0.94f) + 0.03f);
+    const auto brightness = juce::jlimit(0.48f, 0.94f, (colour.getBrightness() * 0.92f) + 0.04f);
+    return juce::Colour::fromHSV(hue, saturation, brightness, 1.0f);
+}
+
+juce::Colour normaliseThemeSeed(const juce::Colour& seed)
+{
+    const auto& theme = trackColourThemeState();
+    auto colour = seed.interpolatedWith(theme.surface.contrasting(0.7f), 0.08f);
+    colour = colour.interpolatedWith(theme.outline, 0.1f);
+
+    const auto saturation = juce::jlimit(0.44f, 0.9f, (colour.getSaturation() * 0.92f) + 0.05f);
+    const auto brightness = juce::jlimit(0.5f, 0.94f, (colour.getBrightness() * 0.9f) + 0.05f);
+    return juce::Colour::fromHSV(colour.getHue(), saturation, brightness, 1.0f);
+}
+
+std::array<juce::Colour, 8> themedTrackPalette()
+{
+    const auto& theme = trackColourThemeState();
+
+    const auto accent = normaliseThemeSeed(theme.accent);
+    const auto success = normaliseThemeSeed(theme.success);
+    const auto info = normaliseThemeSeed(theme.info);
+    const auto warning = normaliseThemeSeed(theme.warning);
+
+    return { {
+        accent,
+        normaliseThemeSeed(warning.interpolatedWith(accent, 0.18f)),
+        success,
+        info,
+        normaliseThemeSeed(rotateTrackHue(accent, 0.12f)),
+        normaliseThemeSeed(rotateTrackHue(warning.interpolatedWith(accent, 0.34f), -0.08f)),
+        normaliseThemeSeed(success.interpolatedWith(info, 0.46f)),
+        normaliseThemeSeed(rotateTrackHue(info.interpolatedWith(warning, 0.3f), -0.13f))
+    } };
+}
+
 template <typename Value>
 Value clampValue(Value value, Value minimum, Value maximum)
 {
     return juce::jlimit(minimum, maximum, value);
+}
+
+int nearestTimeSignatureDenominator(int denominator)
+{
+    static constexpr int allowedDenominators[] { 1, 2, 4, 8, 16, 32 };
+
+    auto best = 4;
+    auto bestDistance = std::numeric_limits<int>::max();
+    for (const auto allowed : allowedDenominators)
+    {
+        const auto distance = std::abs(denominator - allowed);
+        if (distance < bestDistance)
+        {
+            best = allowed;
+            bestDistance = distance;
+        }
+    }
+
+    return best;
 }
 
 struct KeyQuantizeScaleDefinition
@@ -169,6 +248,18 @@ juce::Array<juce::var> readVarArray(const juce::var& value)
     return result;
 }
 
+std::vector<bool> readBoolVector(const juce::var& value)
+{
+    std::vector<bool> result;
+    if (auto* array = value.getArray())
+    {
+        result.reserve(static_cast<size_t>(array->size()));
+        for (const auto& item : *array)
+            result.push_back(static_cast<bool>(item));
+    }
+    return result;
+}
+
 std::vector<float> readFloatVector(const juce::var& value)
 {
     std::vector<float> result;
@@ -201,12 +292,35 @@ juce::var makeVarArray(const juce::Array<juce::var>& values)
     return juce::var(array);
 }
 
+juce::var makeBoolArrayVar(const std::vector<bool>& values, int expectedSize = -1)
+{
+    juce::Array<juce::var> array;
+    const auto count = expectedSize >= 0 ? expectedSize : static_cast<int>(values.size());
+    for (int index = 0; index < count; ++index)
+    {
+        const auto enabled = index >= 0
+            && index < static_cast<int>(values.size())
+            && values[static_cast<size_t>(index)];
+        array.add(enabled);
+    }
+    return juce::var(array);
+}
+
 juce::var makeFloatArrayVar(const std::vector<float>& values)
 {
     juce::Array<juce::var> array;
     for (const auto value : values)
         array.add(static_cast<double>(value));
     return juce::var(array);
+}
+
+std::vector<bool> normaliseBoolVector(const std::vector<bool>& values, int expectedSize)
+{
+    std::vector<bool> result(static_cast<size_t>(juce::jmax(0, expectedSize)), false);
+    const auto count = juce::jmin(static_cast<int>(values.size()), expectedSize);
+    for (int index = 0; index < count; ++index)
+        result[static_cast<size_t>(index)] = values[static_cast<size_t>(index)];
+    return result;
 }
 
 juce::var serialiseMidiNote(const MidiNote& note)
@@ -220,7 +334,7 @@ juce::var serialiseMidiNote(const MidiNote& note)
     return value;
 }
 
-juce::var serialiseMidiPattern(const MidiPattern& pattern)
+juce::var serialiseMidiPattern(const MidiPattern& pattern, int barTicks = kTicksPerBar)
 {
     auto value = makeObjectVar();
     juce::Array<juce::var> notes;
@@ -233,7 +347,7 @@ juce::var serialiseMidiPattern(const MidiPattern& pattern)
     setObjectProperty(value, "id", pattern.id);
     setObjectProperty(value, "name", pattern.name);
     setObjectProperty(value, "length_ticks", pattern.lengthTicks);
-    setObjectProperty(value, "length_bars", juce::jmax(1, (pattern.lengthTicks + kTicksPerBar - 1) / kTicksPerBar));
+    setObjectProperty(value, "length_bars", juce::jmax(1, (pattern.lengthTicks + barTicks - 1) / barTicks));
     setObjectProperty(value, "notes", juce::var(notes));
     setObjectProperty(value, "controller_lanes", juce::var(controllerLanes));
     return value;
@@ -303,6 +417,9 @@ juce::var serialiseTrack(const TrackState& track)
     setObjectProperty(value, "vsti_output_bus_routes", makeVarArray(track.vstiOutputBusRoutes));
     setObjectProperty(value, "vsti_input_bus_routes", makeVarArray(track.vstiInputBusRoutes));
     setObjectProperty(value, "vst_fx_chain", makeStringArrayVar(track.vstFxChain));
+    setObjectProperty(value, "vst_fx_bypassed", track.vstFxBypassed);
+    setObjectProperty(value, "vst_fx_slot_bypassed",
+                      makeBoolArrayVar(track.vstFxSlotBypassed, track.vstFxChain.size()));
     setObjectProperty(value, "midi_program", track.midiProgram);
     setObjectProperty(value, "midi_channel", track.midiChannel);
     setObjectProperty(value, "synth_profile", track.synthProfile);
@@ -311,6 +428,8 @@ juce::var serialiseTrack(const TrackState& track)
     setObjectProperty(value, "solo", track.solo);
     setObjectProperty(value, "live_armed", track.liveArmed);
     setObjectProperty(value, "color_hex", track.colorHex);
+    setObjectProperty(value, "theme_track_colour", track.followThemeTrackColour);
+    setObjectProperty(value, "theme_colour_slot", track.themeColourSlot);
     setObjectProperty(value, "automation_lanes", juce::var(automationLanes));
     return value;
 }
@@ -351,13 +470,13 @@ juce::var serialiseSampleClip(const SampleClip& clip)
     return value;
 }
 
-juce::var serialiseMidiSection(const MidiSection& section)
+juce::var serialiseMidiSection(const MidiSection& section, int barTicks = kTicksPerBar)
 {
     auto value = makeObjectVar();
     setObjectProperty(value, "track_index", section.trackIndex);
     setObjectProperty(value, "start_tick", section.startTick);
     setObjectProperty(value, "length_ticks", section.lengthTicks);
-    setObjectProperty(value, "length_bars", juce::jmax(1, (section.lengthTicks + kTicksPerBar - 1) / kTicksPerBar));
+    setObjectProperty(value, "length_bars", juce::jmax(1, (section.lengthTicks + barTicks - 1) / barTicks));
     setObjectProperty(value, "start_sec", section.startSec);
     setObjectProperty(value, "duration_sec", section.durationSec);
     setObjectProperty(value, "name", section.name);
@@ -375,6 +494,7 @@ juce::var serialiseProjectState(const ProjectState& project)
     juce::Array<juce::var> patternArray;
     juce::Array<juce::var> sectionArray;
     juce::Array<juce::var> tempoMarkerArray;
+    const auto projectBarTicks = ticksPerBar(project);
 
     for (const auto& track : project.tracks)
         trackArray.add(serialiseTrack(track));
@@ -389,22 +509,26 @@ juce::var serialiseProjectState(const ProjectState& project)
         clipArray.add(serialiseSampleClip(clip));
 
     for (const auto& pattern : project.midiPatterns)
-        patternArray.add(serialiseMidiPattern(pattern));
+        patternArray.add(serialiseMidiPattern(pattern, projectBarTicks));
 
     for (const auto& section : project.midiSections)
-        sectionArray.add(serialiseMidiSection(section));
+        sectionArray.add(serialiseMidiSection(section, projectBarTicks));
 
     for (const auto& marker : project.tempoMarkers)
         tempoMarkerArray.add(serialiseTempoMarker(marker));
 
     setObjectProperty(value, "bpm", project.bpm);
+    setObjectProperty(value, "time_signature_numerator", project.timeSigNumerator);
+    setObjectProperty(value, "time_signature_denominator", project.timeSigDenominator);
     setObjectProperty(value, "default_pattern_ticks", project.defaultPatternTicks);
-    setObjectProperty(value, "default_pattern_bars", juce::jmax(1, (project.defaultPatternTicks + kTicksPerBar - 1) / kTicksPerBar));
+    setObjectProperty(value, "default_pattern_bars", juce::jmax(1, (project.defaultPatternTicks + projectBarTicks - 1) / projectBarTicks));
     setObjectProperty(value, "quantize_enabled", project.quantizeEnabled);
     setObjectProperty(value, "quantize_div", project.quantizeDiv);
     setObjectProperty(value, "quantize_triplet", project.quantizeTriplet);
     setObjectProperty(value, "key_quantize_root", project.keyQuantizeRoot);
     setObjectProperty(value, "key_quantize_scale", project.keyQuantizeScale);
+    setObjectProperty(value, "piano_roll_visible_pitch_min", project.pianoRollVisiblePitchMin);
+    setObjectProperty(value, "piano_roll_visible_pitch_max", project.pianoRollVisiblePitchMax);
     setObjectProperty(value, "arrangement_snap_ticks", project.arrangementSnapTicks);
     setObjectProperty(value, "loop_enabled", project.loopEnabled);
     setObjectProperty(value, "metronome_enabled", project.metronomeEnabled);
@@ -414,6 +538,11 @@ juce::var serialiseProjectState(const ProjectState& project)
     setObjectProperty(value, "left_locator_sec", project.leftLocatorSec);
     setObjectProperty(value, "right_locator_sec", project.rightLocatorSec);
     setObjectProperty(value, "playhead_sec", project.playheadSec);
+    setObjectProperty(value, "master_volume", project.masterVolume);
+    setObjectProperty(value, "master_fx_chain", makeStringArrayVar(project.masterFxChain));
+    setObjectProperty(value, "master_fx_bypassed", project.masterFxBypassed);
+    setObjectProperty(value, "master_fx_slot_bypassed",
+                      makeBoolArrayVar(project.masterFxSlotBypassed, project.masterFxChain.size()));
     setObjectProperty(value, "tempo_markers", juce::var(tempoMarkerArray));
     setObjectProperty(value, "tracks", juce::var(trackArray));
     setObjectProperty(value, "vsti_paths", makeStringArrayVar(project.vstiPaths));
@@ -439,26 +568,19 @@ TrackState makeDefaultTrack(const juce::String& name,
     track.rackVst = rackName;
     track.midiChannel = midiChannel;
     track.synthProfile = synthProfile;
+    track.followThemeTrackColour = true;
     return track;
 }
 
 std::vector<TrackState> makeDefaultTracks()
 {
     auto tracks = std::vector<TrackState> {
-        makeDefaultTrack("TB303", "AI TB303", 0, "synth"),
-        makeDefaultTrack("VEC Drum Machine", "AI VEC1 Drum Pads", 9, "drums"),
-        makeDefaultTrack("AI Bass Guitar", "AI Bass Guitar", 1, "bass"),
-        makeDefaultTrack("AI Strings", "AI Strings", 2, "strings"),
-        makeDefaultTrack("AI Organ", "AI Organ", 3, "keys"),
-        makeDefaultTrack("AI Piano", "AI Piano", 4, "keys"),
-        makeDefaultTrack("AI Flute", "AI Flute", 5, "woodwind"),
-        makeDefaultTrack("AI Sax", "AI Saxophone", 6, "woodwind"),
-        makeDefaultTrack("AI Violin", "AI Violin", 7, "strings"),
-        makeDefaultTrack("Virus", "Virus Synth", 8, "synth"),
+        makeDefaultTrack("Track 1", "AI Piano", 0, "keys"),
     };
 
     for (size_t index = 0; index < tracks.size(); ++index)
     {
+        tracks[index].themeColourSlot = static_cast<int>(index);
         if (tracks[index].colorHex.trim().isEmpty())
             tracks[index].colorHex = defaultTrackColour(static_cast<int>(index)).toDisplayString(false);
     }
@@ -564,6 +686,8 @@ void migrateLegacyTrackNotesToPatterns(ProjectState& project)
     if (!project.midiPatterns.empty())
         return;
 
+    const auto projectBarTicks = ticksPerBar(project);
+
     for (int trackIndex = 0; trackIndex < static_cast<int>(project.tracks.size()); ++trackIndex)
     {
         auto& track = project.tracks[static_cast<size_t>(trackIndex)];
@@ -576,10 +700,10 @@ void migrateLegacyTrackNotesToPatterns(ProjectState& project)
         pattern.notes = track.notes;
         sanitiseMidiNoteList(pattern.notes);
 
-        int lastTick = kTicksPerBar;
+        int lastTick = projectBarTicks;
         for (const auto& note : pattern.notes)
             lastTick = juce::jmax(lastTick, note.startTick + note.durationTick);
-        pattern.lengthTicks = juce::jmax(kTicksPerBar, lastTick);
+        pattern.lengthTicks = juce::jmax(projectBarTicks, lastTick);
         project.midiPatterns.push_back(pattern);
 
         bool attachedToExistingSection = false;
@@ -785,49 +909,101 @@ const juce::StringArray& trackColorPalette()
     return palette;
 }
 
-juce::Colour defaultTrackColour(int index)
+bool tryParseTrackHexColour(juce::String hex, juce::Colour& colour)
 {
-    const auto& palette = trackColorPalette();
-    const auto colourCount = juce::jmax(1, palette.size());
-    const auto colourIndex = ((index % colourCount) + colourCount) % colourCount;
-    auto hex = palette.isEmpty() ? juce::String("4AB4FF") : palette[colourIndex];
-
+    hex = hex.trim();
     if (hex.startsWithChar('#'))
         hex = hex.substring(1);
 
     if (hex.length() == 6 && hex.containsOnly("0123456789abcdefABCDEF"))
     {
         const auto value = static_cast<juce::uint32>(hex.getHexValue32());
-        return juce::Colour::fromRGB(static_cast<juce::uint8>((value >> 16) & 0xffu),
-                                     static_cast<juce::uint8>((value >> 8) & 0xffu),
-                                     static_cast<juce::uint8>(value & 0xffu));
-    }
-
-    return juce::Colour::fromRGB(74, 180, 255);
-}
-
-juce::Colour trackDisplayColour(const TrackState& track, int index)
-{
-    auto hex = track.colorHex.trim();
-    if (hex.startsWithChar('#'))
-        hex = hex.substring(1);
-
-    if (hex.length() == 6 && hex.containsOnly("0123456789abcdefABCDEF"))
-    {
-        const auto value = static_cast<juce::uint32>(hex.getHexValue32());
-        return juce::Colour::fromRGB(static_cast<juce::uint8>((value >> 16) & 0xffu),
-                                     static_cast<juce::uint8>((value >> 8) & 0xffu),
-                                     static_cast<juce::uint8>(value & 0xffu));
+        colour = juce::Colour::fromRGB(static_cast<juce::uint8>((value >> 16) & 0xffu),
+                                       static_cast<juce::uint8>((value >> 8) & 0xffu),
+                                       static_cast<juce::uint8>(value & 0xffu));
+        return true;
     }
 
     if (hex.length() == 8 && hex.containsOnly("0123456789abcdefABCDEF"))
     {
         const auto value = static_cast<juce::uint32>(hex.getHexValue32());
-        return juce::Colour::fromRGBA(static_cast<juce::uint8>((value >> 16) & 0xffu),
-                                      static_cast<juce::uint8>((value >> 8) & 0xffu),
-                                      static_cast<juce::uint8>(value & 0xffu),
-                                      static_cast<juce::uint8>((value >> 24) & 0xffu));
+        colour = juce::Colour::fromRGBA(static_cast<juce::uint8>((value >> 16) & 0xffu),
+                                        static_cast<juce::uint8>((value >> 8) & 0xffu),
+                                        static_cast<juce::uint8>(value & 0xffu),
+                                        static_cast<juce::uint8>((value >> 24) & 0xffu));
+        return true;
     }
+
+    return false;
+}
+
+bool isLegacyAutoTrackColour(const juce::String& value)
+{
+    juce::Colour candidate;
+    if (!tryParseTrackHexColour(value, candidate))
+        return false;
+
+    const auto candidateHex = candidate.toDisplayString(false);
+    for (const auto& paletteEntry : trackColorPalette())
+    {
+        juce::Colour paletteColour;
+        if (tryParseTrackHexColour(paletteEntry, paletteColour)
+            && paletteColour.toDisplayString(false).equalsIgnoreCase(candidateHex))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+juce::Colour applyThemeTrackTint(const juce::Colour& baseColour)
+{
+    const auto& theme = trackColourThemeState();
+    auto colour = baseColour.interpolatedWith(theme.surface, 0.08f);
+    colour = colour.interpolatedWith(theme.outline, 0.08f);
+
+    const auto saturation = juce::jlimit(0.34f,
+                                         0.9f,
+                                         (colour.getSaturation() * 0.92f) + 0.04f);
+    const auto brightness = juce::jlimit(0.42f,
+                                         0.94f,
+                                         (colour.getBrightness() * 0.9f) + 0.05f);
+    return juce::Colour::fromHSV(colour.getHue(), saturation, brightness, 1.0f);
+}
+
+void setTrackColourTheme(const juce::Colour& accent,
+                         const juce::Colour& surface,
+                         const juce::Colour& outline,
+                         const juce::Colour& success,
+                         const juce::Colour& info,
+                         const juce::Colour& warning)
+{
+    auto& theme = trackColourThemeState();
+    theme.accent = accent;
+    theme.surface = surface;
+    theme.outline = outline;
+    theme.success = success.isTransparent() ? rotateTrackHue(accent, 0.28f) : success;
+    theme.info = info.isTransparent() ? rotateTrackHue(accent, 0.12f) : info;
+    theme.warning = warning.isTransparent() ? rotateTrackHue(accent, -0.14f) : warning;
+}
+
+juce::Colour defaultTrackColour(int index)
+{
+    const auto palette = themedTrackPalette();
+    const auto colourCount = juce::jmax(1, static_cast<int>(palette.size()));
+    const auto colourIndex = ((index % colourCount) + colourCount) % colourCount;
+    return applyThemeTrackTint(palette[static_cast<size_t>(colourIndex)]);
+}
+
+juce::Colour trackDisplayColour(const TrackState& track, int index)
+{
+    if (track.followThemeTrackColour)
+        return defaultTrackColour(track.themeColourSlot >= 0 ? track.themeColourSlot : index);
+
+    juce::Colour explicitColour;
+    if (tryParseTrackHexColour(track.colorHex, explicitColour))
+        return explicitColour;
 
     return defaultTrackColour(index);
 }
@@ -860,24 +1036,69 @@ juce::String automationTargetParameterName(const juce::String& target)
     return trimmed.substring(static_cast<int>(std::strlen(kAutomationTargetVstParameterPrefix))).trim();
 }
 
-int normaliseSequenceTickLength(int tickLength)
+int normaliseTimeSignatureNumerator(int numerator)
 {
-    static constexpr int kAllowedTickLengths[] {
+    return clampValue(numerator, 1, 32);
+}
+
+int normaliseTimeSignatureDenominator(int denominator)
+{
+    return nearestTimeSignatureDenominator(denominator);
+}
+
+int ticksPerTimeSignatureBeat(int denominator)
+{
+    const auto safeDenominator = normaliseTimeSignatureDenominator(denominator);
+    return juce::jmax(1, (kTicksPerBeat * 4) / safeDenominator);
+}
+
+int ticksPerTimeSignatureBeat(const ProjectState& project)
+{
+    return ticksPerTimeSignatureBeat(project.timeSigDenominator);
+}
+
+int ticksPerBar(int numerator, int denominator)
+{
+    return juce::jmax(kMinSequenceSnapTicks,
+                      normaliseTimeSignatureNumerator(numerator) * ticksPerTimeSignatureBeat(denominator));
+}
+
+int ticksPerBar(const ProjectState& project)
+{
+    return ticksPerBar(project.timeSigNumerator, project.timeSigDenominator);
+}
+
+juce::String timeSignatureDisplayName(int numerator, int denominator)
+{
+    return juce::String(normaliseTimeSignatureNumerator(numerator))
+        + "/"
+        + juce::String(normaliseTimeSignatureDenominator(denominator));
+}
+
+juce::String timeSignatureDisplayName(const ProjectState& project)
+{
+    return timeSignatureDisplayName(project.timeSigNumerator, project.timeSigDenominator);
+}
+
+int normaliseSequenceTickLength(int tickLength, int barTicks)
+{
+    const auto safeBarTicks = juce::jmax(kMinSequenceSnapTicks, barTicks);
+    const std::array<int, 10> allowedTickLengths { {
         kTicksPerBeat / 16,
         kTicksPerBeat / 8,
         kTicksPerBeat / 4,
         kTicksPerBeat / 2,
         kTicksPerBeat,
         kTicksPerBeat * 2,
-        kTicksPerBar,
-        kTicksPerBar * 2,
-        kTicksPerBar * 4,
-        kTicksPerBar * 8
-    };
+        safeBarTicks,
+        safeBarTicks * 2,
+        safeBarTicks * 4,
+        safeBarTicks * 8
+    } };
 
-    auto best = kTicksPerBar;
+    auto best = safeBarTicks;
     auto bestDistance = std::numeric_limits<int>::max();
-    for (const auto allowed : kAllowedTickLengths)
+    for (const auto allowed : allowedTickLengths)
     {
         const auto distance = std::abs(tickLength - allowed);
         if (distance < bestDistance)
@@ -892,12 +1113,12 @@ int normaliseSequenceTickLength(int tickLength)
 
 int defaultPatternLengthTicks(const ProjectState& project)
 {
-    return normaliseSequenceTickLength(project.defaultPatternTicks);
+    return normaliseSequenceTickLength(project.defaultPatternTicks, ticksPerBar(project));
 }
 
 int arrangementSnapTickLength(const ProjectState& project)
 {
-    return normaliseSequenceTickLength(project.arrangementSnapTicks);
+    return normaliseSequenceTickLength(project.arrangementSnapTicks, ticksPerBar(project));
 }
 
 juce::String editorToolModeLabel(EditorToolMode mode)
@@ -1699,11 +1920,17 @@ static void removeUnusedPatterns(ProjectState& project)
 void ProjectState::recalculateTimeFields()
 {
     bpm = clampValue(bpm, 20, 300);
-    defaultPatternTicks = normaliseSequenceTickLength(defaultPatternTicks);
+    timeSigNumerator = normaliseTimeSignatureNumerator(timeSigNumerator);
+    timeSigDenominator = normaliseTimeSignatureDenominator(timeSigDenominator);
+    defaultPatternTicks = normaliseSequenceTickLength(defaultPatternTicks, ticksPerBar(*this));
     quantizeDiv = clampValue(quantizeDiv, 1, 64);
     keyQuantizeRoot = juce::negativeAwareModulo(keyQuantizeRoot, 12);
     keyQuantizeScale = normaliseKeyQuantizeScale(keyQuantizeScale);
-    arrangementSnapTicks = normaliseSequenceTickLength(arrangementSnapTicks);
+    pianoRollVisiblePitchMin = clampValue(pianoRollVisiblePitchMin, kEditableMidiPitchMin, kEditableMidiPitchMax);
+    pianoRollVisiblePitchMax = clampValue(pianoRollVisiblePitchMax, kEditableMidiPitchMin, kEditableMidiPitchMax);
+    if (pianoRollVisiblePitchMin > pianoRollVisiblePitchMax)
+        std::swap(pianoRollVisiblePitchMin, pianoRollVisiblePitchMax);
+    arrangementSnapTicks = normaliseSequenceTickLength(arrangementSnapTicks, ticksPerBar(*this));
     leftLocatorTick = juce::jmax(0, leftLocatorTick);
     rightLocatorTick = juce::jmax(leftLocatorTick + 1, rightLocatorTick);
     playheadTick = clampValue(playheadTick, leftLocatorTick, rightLocatorTick);
@@ -1808,21 +2035,37 @@ juce::Result loadProjectFile(const juce::File& file, ProjectFileData& outProject
 
     const auto projectRoot = getObjectProperty(parsed, "project", parsed);
     loaded.project.bpm = getIntProperty(projectRoot, "bpm", kDefaultBpm, 20, 300);
+    loaded.project.timeSigNumerator = getIntProperty(projectRoot, "time_signature_numerator", 4, 1, 32);
+    loaded.project.timeSigDenominator = normaliseTimeSignatureDenominator(getIntProperty(projectRoot,
+                                                                                          "time_signature_denominator",
+                                                                                          4,
+                                                                                          1,
+                                                                                          32));
     loaded.project.defaultPatternTicks = getIntProperty(projectRoot,
                                                         "default_pattern_ticks",
-                                                        getIntProperty(projectRoot, "default_pattern_bars", 1, 1, 128) * kTicksPerBar,
+                                                        getIntProperty(projectRoot, "default_pattern_bars", 1, 1, 128) * ticksPerBar(loaded.project),
                                                         kMinSequenceSnapTicks);
     loaded.project.quantizeEnabled = getBoolProperty(projectRoot, "quantize_enabled", true);
     loaded.project.quantizeDiv = getIntProperty(projectRoot, "quantize_div", 8, 1, 64);
     loaded.project.quantizeTriplet = getBoolProperty(projectRoot, "quantize_triplet", false);
     loaded.project.keyQuantizeRoot = getIntProperty(projectRoot, "key_quantize_root", 0, 0, 11);
     loaded.project.keyQuantizeScale = getStringProperty(projectRoot, "key_quantize_scale", "chromatic");
+    loaded.project.pianoRollVisiblePitchMin = getIntProperty(projectRoot,
+                                                             "piano_roll_visible_pitch_min",
+                                                             kEditableMidiPitchMin,
+                                                             kEditableMidiPitchMin,
+                                                             kEditableMidiPitchMax);
+    loaded.project.pianoRollVisiblePitchMax = getIntProperty(projectRoot,
+                                                             "piano_roll_visible_pitch_max",
+                                                             kEditableMidiPitchMax,
+                                                             kEditableMidiPitchMin,
+                                                             kEditableMidiPitchMax);
     loaded.project.arrangementSnapTicks = getIntProperty(projectRoot, "arrangement_snap_ticks", kTicksPerBeat, kMinSequenceSnapTicks);
     loaded.project.loopEnabled = getBoolProperty(projectRoot, "loop_enabled", true);
     loaded.project.metronomeEnabled = getBoolProperty(projectRoot, "metronome_enabled", false);
 
     const auto defaultLeftSec = 0.0;
-    const auto defaultRightSec = tickToSeconds(kTicksPerBar, loaded.project.bpm);
+    const auto defaultRightSec = tickToSeconds(ticksPerBar(loaded.project), loaded.project.bpm);
     const auto leftSec = getDoubleProperty(projectRoot, "left_locator_sec", defaultLeftSec, 0.0, 3600.0);
     const auto rightSec = getDoubleProperty(projectRoot, "right_locator_sec", defaultRightSec, 0.0, 3600.0);
     const auto playheadSec = getDoubleProperty(projectRoot, "playhead_sec", 0.0, 0.0, juce::jmax(rightSec, 0.0));
@@ -1857,6 +2100,9 @@ juce::Result loadProjectFile(const juce::File& file, ProjectFileData& outProject
             track.vstiOutputBusRoutes = readVarArray(getObjectProperty(trackVar, "vsti_output_bus_routes"));
             track.vstiInputBusRoutes = readVarArray(getObjectProperty(trackVar, "vsti_input_bus_routes"));
             track.vstFxChain = readStringArray(getObjectProperty(trackVar, "vst_fx_chain"));
+            track.vstFxBypassed = getBoolProperty(trackVar, "vst_fx_bypassed", false);
+            track.vstFxSlotBypassed = normaliseBoolVector(readBoolVector(getObjectProperty(trackVar, "vst_fx_slot_bypassed")),
+                                                          track.vstFxChain.size());
             track.midiProgram = getIntProperty(trackVar, "midi_program", 0, 0, 127);
             track.midiChannel = getIntProperty(trackVar, "midi_channel", trackIndex % 16, 0, 15);
             track.synthProfile = getStringProperty(trackVar, "synth_profile", track.synthProfile);
@@ -1865,6 +2111,10 @@ juce::Result loadProjectFile(const juce::File& file, ProjectFileData& outProject
             track.solo = getBoolProperty(trackVar, "solo", false);
             track.liveArmed = getBoolProperty(trackVar, "live_armed", false);
             track.colorHex = getStringProperty(trackVar, "color_hex");
+            track.followThemeTrackColour = getBoolProperty(trackVar,
+                                                           "theme_track_colour",
+                                                           track.colorHex.trim().isEmpty() || isLegacyAutoTrackColour(track.colorHex));
+            track.themeColourSlot = getIntProperty(trackVar, "theme_colour_slot", trackIndex, 0, 4096);
 
             if (auto* notesArray = getObjectProperty(trackVar, "notes").getArray())
             {
@@ -1893,6 +2143,11 @@ juce::Result loadProjectFile(const juce::File& file, ProjectFileData& outProject
     loaded.project.vstiPaths = readStringArray(getObjectProperty(projectRoot, "vsti_paths"));
     loaded.project.vstiFolderPaths = readStringArray(getObjectProperty(projectRoot, "vsti_folder_paths"));
     loaded.project.samplePaths = readStringArray(getObjectProperty(projectRoot, "sample_paths"));
+    loaded.project.masterVolume = getDoubleProperty(projectRoot, "master_volume", 1.0, 0.0, 2.0);
+    loaded.project.masterFxChain = readStringArray(getObjectProperty(projectRoot, "master_fx_chain"));
+    loaded.project.masterFxBypassed = getBoolProperty(projectRoot, "master_fx_bypassed", false);
+    loaded.project.masterFxSlotBypassed = normaliseBoolVector(readBoolVector(getObjectProperty(projectRoot, "master_fx_slot_bypassed")),
+                                                              loaded.project.masterFxChain.size());
 
     loaded.project.vstRack.clear();
     if (auto* rackArray = getObjectProperty(projectRoot, "vsti_rack").getArray())
@@ -1958,7 +2213,7 @@ juce::Result loadProjectFile(const juce::File& file, ProjectFileData& outProject
             const auto legacyPatternBarsVar = getObjectProperty(item, "length_bars");
             const auto legacyPatternLengthTicks = legacyPatternBarsVar.isVoid()
                 ? defaultPatternLengthTicks(loaded.project)
-                : getIntProperty(item, "length_bars", 1, 1, 128) * kTicksPerBar;
+                : getIntProperty(item, "length_bars", 1, 1, 128) * ticksPerBar(loaded.project);
             pattern.lengthTicks = getIntProperty(item,
                                                  "length_ticks",
                                                  legacyPatternLengthTicks,
@@ -2001,12 +2256,12 @@ juce::Result loadProjectFile(const juce::File& file, ProjectFileData& outProject
             const auto legacySectionDurationTicks = juce::jmax(kMinSequenceSnapTicks,
                                                                secondsToTick(getDoubleProperty(item,
                                                                                                "duration_sec",
-                                                                                               tickToSeconds(kTicksPerBar, loaded.project.bpm),
+                                                                                               tickToSeconds(ticksPerBar(loaded.project), loaded.project.bpm),
                                                                                                0.0),
                                                                              loaded.project.bpm));
             const auto legacySectionLengthTicks = legacySectionBarsVar.isVoid()
                 ? legacySectionDurationTicks
-                : getIntProperty(item, "length_bars", 1, 1, 128) * kTicksPerBar;
+                : getIntProperty(item, "length_bars", 1, 1, 128) * ticksPerBar(loaded.project);
             section.lengthTicks = getIntProperty(item,
                                                  "length_ticks",
                                                  legacySectionLengthTicks,
@@ -2058,24 +2313,30 @@ juce::Result saveProjectFile(const juce::File& file, const ProjectFileData& proj
     for (const auto& clip : normalisedProject.sampleClips)
         clipArray.add(serialiseSampleClip(clip));
 
+    const auto projectBarTicks = ticksPerBar(normalisedProject);
+
     for (const auto& pattern : normalisedProject.midiPatterns)
-        patternArray.add(serialiseMidiPattern(pattern));
+        patternArray.add(serialiseMidiPattern(pattern, projectBarTicks));
 
     for (const auto& section : normalisedProject.midiSections)
-        sectionArray.add(serialiseMidiSection(section));
+        sectionArray.add(serialiseMidiSection(section, projectBarTicks));
 
     setObjectProperty(root, "format", projectFile.format.isNotEmpty() ? projectFile.format : "ai_music_studio_project");
-    setObjectProperty(root, "version", projectFile.version > 0 ? projectFile.version : kProjectFileVersion);
+    setObjectProperty(root, "version", juce::jmax(projectFile.version, kProjectFileVersion));
     setObjectProperty(root, "saved_at_unix", juce::Time::getCurrentTime().toMilliseconds() / 1000);
 
     setObjectProperty(projectVar, "bpm", normalisedProject.bpm);
+    setObjectProperty(projectVar, "time_signature_numerator", normalisedProject.timeSigNumerator);
+    setObjectProperty(projectVar, "time_signature_denominator", normalisedProject.timeSigDenominator);
     setObjectProperty(projectVar, "default_pattern_ticks", normalisedProject.defaultPatternTicks);
-    setObjectProperty(projectVar, "default_pattern_bars", juce::jmax(1, (normalisedProject.defaultPatternTicks + kTicksPerBar - 1) / kTicksPerBar));
+    setObjectProperty(projectVar, "default_pattern_bars", juce::jmax(1, (normalisedProject.defaultPatternTicks + projectBarTicks - 1) / projectBarTicks));
     setObjectProperty(projectVar, "quantize_enabled", normalisedProject.quantizeEnabled);
     setObjectProperty(projectVar, "quantize_div", normalisedProject.quantizeDiv);
     setObjectProperty(projectVar, "quantize_triplet", normalisedProject.quantizeTriplet);
     setObjectProperty(projectVar, "key_quantize_root", normalisedProject.keyQuantizeRoot);
     setObjectProperty(projectVar, "key_quantize_scale", normalisedProject.keyQuantizeScale);
+    setObjectProperty(projectVar, "piano_roll_visible_pitch_min", normalisedProject.pianoRollVisiblePitchMin);
+    setObjectProperty(projectVar, "piano_roll_visible_pitch_max", normalisedProject.pianoRollVisiblePitchMax);
     setObjectProperty(projectVar, "arrangement_snap_ticks", normalisedProject.arrangementSnapTicks);
     setObjectProperty(projectVar, "loop_enabled", normalisedProject.loopEnabled);
     setObjectProperty(projectVar, "metronome_enabled", normalisedProject.metronomeEnabled);
@@ -2085,6 +2346,11 @@ juce::Result saveProjectFile(const juce::File& file, const ProjectFileData& proj
     setObjectProperty(projectVar, "left_locator_sec", normalisedProject.leftLocatorSec);
     setObjectProperty(projectVar, "right_locator_sec", normalisedProject.rightLocatorSec);
     setObjectProperty(projectVar, "playhead_sec", normalisedProject.playheadSec);
+    setObjectProperty(projectVar, "master_volume", normalisedProject.masterVolume);
+    setObjectProperty(projectVar, "master_fx_chain", makeStringArrayVar(normalisedProject.masterFxChain));
+    setObjectProperty(projectVar, "master_fx_bypassed", normalisedProject.masterFxBypassed);
+    setObjectProperty(projectVar, "master_fx_slot_bypassed",
+                      makeBoolArrayVar(normalisedProject.masterFxSlotBypassed, normalisedProject.masterFxChain.size()));
     setObjectProperty(projectVar, "tracks", juce::var(trackArray));
     setObjectProperty(projectVar, "vsti_paths", makeStringArrayVar(normalisedProject.vstiPaths));
     setObjectProperty(projectVar, "vsti_folder_paths", makeStringArrayVar(normalisedProject.vstiFolderPaths));

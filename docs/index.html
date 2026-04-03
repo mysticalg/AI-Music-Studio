@@ -144,12 +144,12 @@
           <div class="release-grid">
             <div class="release-card">
               <h3>Local Windows package</h3>
-              <pre><code>powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_release.ps1 -ReleaseVersion v0.1.0</code></pre>
+              <pre><code>powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_release.ps1 -ReleaseVersion v0.3.1</code></pre>
               <p>The packaging script builds the native app, copies the bundled VST3 instruments, and creates a portable ZIP containing <code>Mutagen.exe</code>.</p>
             </div>
             <div class="release-card">
               <h3>GitHub release automation</h3>
-              <pre><code>git tag v0.1.0
+              <pre><code>git tag v0.3.1
 git push origin main --tags</code></pre>
               <p>Pushing a <code>v*</code> tag triggers the native Windows release workflow and publishes the ZIP, installer, and SHA256 checksums to GitHub Releases.</p>
             </div>

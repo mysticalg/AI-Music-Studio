@@ -1,4 +1,5 @@
 #include "SampleTimelineComponent.h"
+#include "UiStyle.h"
 
 #include <cmath>
 
@@ -68,6 +69,7 @@ void SampleTimelineComponent::paint(juce::Graphics& g)
         }
 
         g.setColour(juce::Colour::fromRGB(182, 190, 201));
+        g.setFont(ui::font());
         g.drawText(label,
                    6,
                    juce::roundToInt(y),
@@ -88,6 +90,7 @@ void SampleTimelineComponent::paint(juce::Graphics& g)
         g.drawVerticalLine(juce::roundToInt(x), 0.0f, static_cast<float>(getHeight()));
 
         g.setColour(juce::Colour::fromRGB(219, 224, 232));
+        g.setFont(ui::font());
         g.drawText(juce::String(second) + "s",
                    juce::roundToInt(x) + 3,
                    0,
@@ -129,6 +132,7 @@ void SampleTimelineComponent::paint(juce::Graphics& g)
         }
 
         g.setColour(juce::Colour::fromRGB(18, 26, 31));
+        g.setFont(ui::font());
         g.drawText(juce::File(clip.path).getFileName(),
                    rect.toNearestInt().reduced(8, 4),
                    juce::Justification::topLeft,
@@ -147,6 +151,7 @@ void SampleTimelineComponent::paint(juce::Graphics& g)
     if (sampleTracks.empty())
     {
         g.setColour(juce::Colour::fromRGB(206, 214, 225));
+        g.setFont(ui::font());
         g.drawFittedText("Set a track's type to sample, then place audio here.",
                          juce::Rectangle<int>(juce::roundToInt(headerWidth + 20.0f),
                                               juce::roundToInt(topHeight + 20.0f),

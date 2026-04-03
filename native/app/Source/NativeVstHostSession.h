@@ -74,6 +74,8 @@ public:
     juce::Result stopAudioEngine(bool allowTail = false);
     void setEditorStateCallback(std::function<void(bool)> callback);
     juce::Result openAudioEngineTrackEditor(int trackIndex);
+    juce::Result openAudioEngineTrackEffectEditor(int trackIndex, int effectIndex);
+    juce::Result openAudioEngineMasterEffectEditor(int effectIndex);
     juce::Result closeAudioEngineTrackEditor(int trackIndex);
     juce::Result queryAudioEngineTrackEditorOpen(int trackIndex, bool& isOpen) const;
     juce::Result queryTransportSnapshot(TransportSnapshot& snapshot, bool includeTrackPeakLevels = true) const;

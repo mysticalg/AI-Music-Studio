@@ -1,4 +1,5 @@
 #include "MainWindow.h"
+#include "UiStyle.h"
 
 #include <BinaryData.h>
 
@@ -107,6 +108,7 @@ public:
         setUsingNativeTitleBar(false);
         setResizable(false, false);
         setAlwaysOnTop(true);
+        setIcon(loadMutagenSplashLogo());
         setContentOwned(new StartupSplashComponent(version), true);
         centreWithSize(520, 520);
         setVisible(true);
@@ -123,13 +125,85 @@ public:
             splash->setStatus(status);
     }
 };
+
+class StudioLookAndFeel final : public juce::LookAndFeel_V4
+{
+public:
+    using juce::LookAndFeel_V4::LookAndFeel_V4;
+
+    juce::Font getTextButtonFont(juce::TextButton&, int buttonHeight) override
+    {
+        return juce::FontOptions(juce::jlimit(aims::ui::kTinyTextSize,
+                                              aims::ui::kStrongTextSize,
+                                              static_cast<float>(buttonHeight) * 0.38f),
+                                 juce::Font::bold);
+    }
+
+    juce::Font getComboBoxFont(juce::ComboBox&) override
+    {
+        return aims::ui::font();
+    }
+
+    juce::Font getPopupMenuFont() override
+    {
+        return aims::ui::font();
+    }
+
+    juce::Font getLabelFont(juce::Label&) override
+    {
+        return aims::ui::font();
+    }
+
+    juce::Font getMenuBarFont(juce::MenuBarComponent&, int, const juce::String&) override
+    {
+        return aims::ui::strongFont();
+    }
+
+    int getDefaultMenuBarHeight() override
+    {
+        return 24;
+    }
+
+    juce::Font getAlertWindowTitleFont() override
+    {
+        return aims::ui::titleFont();
+    }
+
+    juce::Font getAlertWindowMessageFont() override
+    {
+        return aims::ui::font();
+    }
+
+    juce::Font getAlertWindowFont() override
+    {
+        return aims::ui::font();
+    }
+
+    juce::Label* createSliderTextBox(juce::Slider& slider) override
+    {
+        auto* label = juce::LookAndFeel_V4::createSliderTextBox(slider);
+        label->setFont(aims::ui::tinyFont());
+        label->setJustificationType(juce::Justification::centred);
+        label->setMinimumHorizontalScale(1.0f);
+        return label;
+    }
+
+    juce::Label* createComboBoxTextBox(juce::ComboBox& box) override
+    {
+        auto* label = juce::LookAndFeel_V4::createComboBoxTextBox(box);
+        label->setFont(aims::ui::font());
+        label->setJustificationType(juce::Justification::centredLeft);
+        label->setMinimumHorizontalScale(1.0f);
+        return label;
+    }
+};
 } // namespace
 
 class AIMusicStudioNativeApplication final : public juce::JUCEApplication
 {
 public:
     const juce::String getApplicationName() override      { return "Mutagen"; }
-    const juce::String getApplicationVersion() override   { return "0.1.0"; }
+    const juce::String getApplicationVersion() override   { return "0.3.1"; }
     bool moreThanOneInstanceAllowed() override            { return true; }
 
     void initialise(const juce::String&) override
@@ -186,7 +260,7 @@ private:
             juce::Thread::sleep(milliseconds);
     }
 
-    juce::LookAndFeel_V4 lookAndFeel { juce::LookAndFeel_V4::getDarkColourScheme() };
+    StudioLookAndFeel lookAndFeel { juce::LookAndFeel_V4::getDarkColourScheme() };
     std::unique_ptr<StartupSplashWindow> splashWindow;
     std::unique_ptr<aims::MainWindow> mainWindow;
 };

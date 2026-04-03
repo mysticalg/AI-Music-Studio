@@ -10,8 +10,10 @@ namespace aims
 constexpr int kTicksPerBeat = 480;
 constexpr int kTicksPerBar = kTicksPerBeat * 4;
 constexpr int kDefaultBpm = 120;
-constexpr int kProjectFileVersion = 7;
+constexpr int kProjectFileVersion = 10;
 constexpr int kMinSequenceSnapTicks = kTicksPerBeat / 16;
+constexpr int kEditableMidiPitchMin = 12;
+constexpr int kEditableMidiPitchMax = 120;
 inline constexpr const char* kAutomationTargetVolume = "volume";
 inline constexpr const char* kAutomationTargetPan = "pan";
 inline constexpr const char* kAutomationTargetVstOutputGainDb = "vsti_output_gain_db";
@@ -105,6 +107,8 @@ struct TrackState
     juce::Array<juce::var> vstiOutputBusRoutes;
     juce::Array<juce::var> vstiInputBusRoutes;
     juce::StringArray vstFxChain;
+    bool vstFxBypassed = false;
+    std::vector<bool> vstFxSlotBypassed;
     int midiProgram = 0;
     int midiChannel = 0;
     juce::String synthProfile = "synth";
@@ -113,6 +117,8 @@ struct TrackState
     bool solo = false;
     bool liveArmed = false;
     juce::String colorHex;
+    bool followThemeTrackColour = true;
+    int themeColourSlot = -1;
     std::vector<AutomationLane> automationLanes;
 };
 
@@ -160,12 +166,16 @@ struct MidiSection
 struct ProjectState
 {
     int bpm = kDefaultBpm;
+    int timeSigNumerator = 4;
+    int timeSigDenominator = 4;
     int defaultPatternTicks = kTicksPerBar;
     bool quantizeEnabled = true;
     int quantizeDiv = 8;
     bool quantizeTriplet = false;
     int keyQuantizeRoot = 0;
     juce::String keyQuantizeScale = "chromatic";
+    int pianoRollVisiblePitchMin = kEditableMidiPitchMin;
+    int pianoRollVisiblePitchMax = kEditableMidiPitchMax;
     int arrangementSnapTicks = kTicksPerBeat;
     bool loopEnabled = true;
     bool metronomeEnabled = false;
@@ -175,6 +185,10 @@ struct ProjectState
     double leftLocatorSec = 0.0;
     double rightLocatorSec = 0.0;
     double playheadSec = 0.0;
+    double masterVolume = 1.0;
+    juce::StringArray masterFxChain;
+    bool masterFxBypassed = false;
+    std::vector<bool> masterFxSlotBypassed;
     std::vector<TempoMarker> tempoMarkers;
     std::vector<TrackState> tracks;
     juce::StringArray vstiPaths;
@@ -202,6 +216,14 @@ struct ProjectFileData
 ProjectFileData makeDefaultProjectFile();
 double tickToSeconds(int tick, int bpm);
 int secondsToTick(double seconds, int bpm);
+int normaliseTimeSignatureNumerator(int numerator);
+int normaliseTimeSignatureDenominator(int denominator);
+int ticksPerTimeSignatureBeat(int denominator);
+int ticksPerTimeSignatureBeat(const ProjectState& project);
+int ticksPerBar(int numerator, int denominator);
+int ticksPerBar(const ProjectState& project);
+juce::String timeSignatureDisplayName(int numerator, int denominator);
+juce::String timeSignatureDisplayName(const ProjectState& project);
 void sanitiseTempoMarkers(std::vector<TempoMarker>& tempoMarkers, int fallbackBpm = kDefaultBpm);
 double tickToSeconds(const ProjectState& project, int tick);
 int secondsToTick(const ProjectState& project, double seconds);
@@ -209,13 +231,19 @@ int64_t tickToFrame(const ProjectState& project, int tick, double sampleRate);
 double frameToTickDouble(const ProjectState& project, int64_t frame, double sampleRate);
 int frameToTick(const ProjectState& project, int64_t frame, double sampleRate);
 const juce::StringArray& trackColorPalette();
+void setTrackColourTheme(const juce::Colour& accent,
+                         const juce::Colour& surface,
+                         const juce::Colour& outline,
+                         const juce::Colour& success = juce::Colours::transparentBlack,
+                         const juce::Colour& info = juce::Colours::transparentBlack,
+                         const juce::Colour& warning = juce::Colours::transparentBlack);
 juce::Colour defaultTrackColour(int index);
 juce::Colour trackDisplayColour(const TrackState& track, int index = 0);
 juce::Colour trackTextColour(const juce::Colour& colour);
 juce::String automationTargetForVstParameter(const juce::String& name);
 bool automationTargetIsVstParameter(const juce::String& target);
 juce::String automationTargetParameterName(const juce::String& target);
-int normaliseSequenceTickLength(int tickLength);
+int normaliseSequenceTickLength(int tickLength, int barTicks = kTicksPerBar);
 int defaultPatternLengthTicks(const ProjectState& project);
 int arrangementSnapTickLength(const ProjectState& project);
 juce::String editorToolModeLabel(EditorToolMode mode);

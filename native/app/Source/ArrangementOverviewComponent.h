@@ -40,6 +40,7 @@ public:
     void mouseDrag(const juce::MouseEvent& event) override;
     void mouseUp(const juce::MouseEvent& event) override;
     void mouseExit(const juce::MouseEvent& event) override;
+    bool keyPressed(const juce::KeyPress& key) override;
 
 private:
     enum class DragMode
@@ -47,6 +48,7 @@ private:
         none,
         moveSection,
         createSection,
+        marqueeSelect,
         resizeLeft,
         resizeRight,
         eraseSections,
@@ -93,11 +95,15 @@ private:
     bool previewActive = false;
     bool previewDirty = false;
     DragMode dragMode = DragMode::none;
+    juce::Point<float> marqueeStart;
+    juce::Rectangle<float> marqueeRect;
+    std::vector<int> selectedSectionIndices;
     int draggedSectionIndex = -1;
     int dragOffsetTick = 0;
     int createStartTick = 0;
     int resizeAnchorStartTick = 0;
     int resizeAnchorLengthTicks = kTicksPerBar;
+    bool dragCreatesCopy = false;
     std::vector<int> erasedSectionIndices;
     int contextMenuTrackIndex = -1;
     int contextMenuTick = 0;

@@ -1,5 +1,6 @@
 #include "MidiFileIO.h"
 
+#include <limits>
 #include <map>
 
 namespace aims
@@ -68,6 +69,10 @@ juce::Result importMidiFileToProject(const juce::File& file, ProjectState& proje
 
     std::map<BuilderKey, ImportedTrackBuilder> builders;
     std::map<ActiveNoteKey, std::vector<std::pair<int, int>>> activeNotes;
+    std::vector<TempoMarker> importedTempoMarkers;
+    auto importedTimeSigNumerator = project.timeSigNumerator;
+    auto importedTimeSigDenominator = project.timeSigDenominator;
+    auto importedTimeSigTick = std::numeric_limits<int>::max();
 
     for (int trackIndex = 0; trackIndex < midi.getNumTracks(); ++trackIndex)
     {
@@ -84,6 +89,35 @@ juce::Result importMidiFileToProject(const juce::File& file, ProjectState& proje
                 continue;
 
             const auto& message = event->message;
+            const auto scaledTick = scaleTick(message.getTimeStamp(), timeFormat);
+
+            if (message.isTempoMetaEvent())
+            {
+                const auto secondsPerQuarter = message.getTempoSecondsPerQuarterNote();
+                if (secondsPerQuarter > 0.0)
+                {
+                    TempoMarker marker;
+                    marker.tick = juce::jmax(0, scaledTick);
+                    marker.bpm = juce::jlimit(20, 300, juce::roundToInt(60.0 / secondsPerQuarter));
+                    importedTempoMarkers.push_back(marker);
+                }
+                continue;
+            }
+
+            if (message.isTimeSignatureMetaEvent())
+            {
+                int numerator = 4;
+                int denominator = 4;
+                message.getTimeSignatureInfo(numerator, denominator);
+                if (scaledTick < importedTimeSigTick)
+                {
+                    importedTimeSigTick = scaledTick;
+                    importedTimeSigNumerator = numerator;
+                    importedTimeSigDenominator = denominator;
+                }
+                continue;
+            }
+
             if (message.getChannel() <= 0)
                 continue;
 
@@ -101,7 +135,6 @@ juce::Result importMidiFileToProject(const juce::File& file, ProjectState& proje
                 continue;
             }
 
-            const auto scaledTick = scaleTick(message.getTimeStamp(), timeFormat);
             const auto noteNumber = juce::jlimit(0, 127, message.getNoteNumber());
             const auto noteKey = ActiveNoteKey(trackIndex, channel, noteNumber);
 
@@ -162,13 +195,27 @@ juce::Result importMidiFileToProject(const juce::File& file, ProjectState& proje
         importedTracks.push_back(std::move(track));
     }
 
+    project.timeSigNumerator = normaliseTimeSignatureNumerator(importedTimeSigNumerator);
+    project.timeSigDenominator = normaliseTimeSignatureDenominator(importedTimeSigDenominator);
+    if (!importedTempoMarkers.empty())
+    {
+        sanitiseTempoMarkers(importedTempoMarkers, project.bpm);
+        project.bpm = importedTempoMarkers.front().bpm;
+        project.tempoMarkers = std::move(importedTempoMarkers);
+    }
+    else
+    {
+        project.tempoMarkers.clear();
+    }
+
     project.tracks = std::move(importedTracks);
     project.midiPatterns.clear();
     project.midiSections.clear();
     project.playheadTick = 0;
     project.leftLocatorTick = 0;
 
-    int rightLocator = kTicksPerBar;
+    const auto projectBarTicks = ticksPerBar(project);
+    int rightLocator = projectBarTicks;
     for (int trackIndex = 0; trackIndex < static_cast<int>(project.tracks.size()); ++trackIndex)
     {
         auto& track = project.tracks[static_cast<size_t>(trackIndex)];
@@ -180,10 +227,10 @@ juce::Result importMidiFileToProject(const juce::File& file, ProjectState& proje
         pattern.name = track.name;
         pattern.notes = track.notes;
 
-        int patternEndTick = kTicksPerBar;
+        int patternEndTick = projectBarTicks;
         for (const auto& note : pattern.notes)
             patternEndTick = juce::jmax(patternEndTick, note.startTick + note.durationTick);
-        pattern.lengthTicks = juce::jmax(kTicksPerBar, patternEndTick);
+        pattern.lengthTicks = juce::jmax(projectBarTicks, patternEndTick);
         project.midiPatterns.push_back(pattern);
 
         MidiSection section;
@@ -195,7 +242,8 @@ juce::Result importMidiFileToProject(const juce::File& file, ProjectState& proje
         project.midiSections.push_back(section);
     }
 
-    project.rightLocatorTick = juce::jmax(project.leftLocatorTick + 1, rightLocator + kTicksPerBeat);
+    project.rightLocatorTick = juce::jmax(project.leftLocatorTick + 1,
+                                          rightLocator + ticksPerTimeSignatureBeat(project));
     project.recalculateTimeFields();
     return juce::Result::ok();
 }
@@ -209,8 +257,18 @@ juce::Result exportProjectToMidiFile(const juce::File& file, const ProjectState&
     midi.setTicksPerQuarterNote(kTicksPerBeat);
 
     juce::MidiMessageSequence tempoTrack;
-    const auto tempoMicros = juce::jmax(1, 60000000 / juce::jmax(1, project.bpm));
-    tempoTrack.addEvent(juce::MidiMessage::tempoMetaEvent(tempoMicros).withTimeStamp(0.0));
+    auto tempoMarkers = project.tempoMarkers;
+    if (tempoMarkers.empty())
+        tempoMarkers.push_back({ 0, project.bpm });
+    sanitiseTempoMarkers(tempoMarkers, project.bpm);
+
+    tempoTrack.addEvent(juce::MidiMessage::timeSignatureMetaEvent(project.timeSigNumerator,
+                                                                  project.timeSigDenominator).withTimeStamp(0.0));
+    for (const auto& marker : tempoMarkers)
+    {
+        const auto tempoMicros = juce::jmax(1, 60000000 / juce::jmax(1, marker.bpm));
+        tempoTrack.addEvent(juce::MidiMessage::tempoMetaEvent(tempoMicros).withTimeStamp(static_cast<double>(marker.tick)));
+    }
     tempoTrack.addEvent(juce::MidiMessage::endOfTrack().withTimeStamp(static_cast<double>(project.rightLocatorTick)));
     tempoTrack.updateMatchedPairs();
     midi.addTrack(tempoTrack);

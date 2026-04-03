@@ -1,4 +1,5 @@
 #include "ArrangementOverviewComponent.h"
+#include "UiStyle.h"
 
 #include <algorithm>
 #include <cmath>
@@ -268,11 +269,20 @@ ArrangementOverviewComponent::ArrangementOverviewComponent(ProjectGetter project
       toolGetter(std::move(toolGetterIn)),
       toolModeChangeCallback(std::move(toolModeChangeCallbackIn))
 {
+    setWantsKeyboardFocus(true);
     updateContentSize();
 }
 
 void ArrangementOverviewComponent::refreshFromModel()
 {
+    selectedSectionIndices.erase(std::remove_if(selectedSectionIndices.begin(),
+                                                selectedSectionIndices.end(),
+                                                [this] (int index)
+                                                {
+                                                    return !juce::isPositiveAndBelow(index,
+                                                                                    static_cast<int>(project().midiSections.size()));
+                                                }),
+                                 selectedSectionIndices.end());
     if (!previewActive)
         updateContentSize();
     repaint();
@@ -321,6 +331,8 @@ void ArrangementOverviewComponent::paint(juce::Graphics& g)
     const auto headerWidth = laneHeaderWidth();
     const auto topHeight = rulerHeight();
     const auto selectedSectionIndex = selectedSectionGetter != nullptr ? selectedSectionGetter() : -1;
+    const auto projectBarTicks = ticksPerBar(state);
+    const auto projectBeatTicks = ticksPerTimeSignatureBeat(state);
 
     g.setColour(kHeader);
     g.fillRect(0.0f, 0.0f, static_cast<float>(getWidth()), topHeight);
@@ -336,6 +348,7 @@ void ArrangementOverviewComponent::paint(juce::Graphics& g)
             ? state.tracks[static_cast<size_t>(lane)].name
             : "Track " + juce::String(lane + 1);
         g.setColour(juce::Colour::fromRGB(182, 190, 201));
+        g.setFont(ui::font());
         g.drawText(label,
                    6,
                    juce::roundToInt(y),
@@ -351,15 +364,15 @@ void ArrangementOverviewComponent::paint(juce::Graphics& g)
     const auto totalBars = displayedBarCount();
     for (int bar = 0; bar <= totalBars; ++bar)
     {
-        const auto barTick = bar * kTicksPerBar;
+        const auto barTick = bar * projectBarTicks;
         const auto x = tickToX(barTick);
         g.setColour(kGridMajor);
         g.drawVerticalLine(juce::roundToInt(x), 0.0f, static_cast<float>(getHeight()));
         if (bar < totalBars)
         {
-            for (int beat = 1; beat < 4; ++beat)
+            for (int beat = 1; beat < state.timeSigNumerator; ++beat)
             {
-                const auto beatX = tickToX(barTick + (beat * kTicksPerBeat));
+                const auto beatX = tickToX(barTick + (beat * projectBeatTicks));
                 g.setColour(kGridMinor);
                 g.drawVerticalLine(juce::roundToInt(beatX), topHeight, static_cast<float>(getHeight()));
             }
@@ -368,6 +381,7 @@ void ArrangementOverviewComponent::paint(juce::Graphics& g)
         if (bar < totalBars)
         {
             g.setColour(juce::Colour::fromRGB(219, 224, 232));
+            g.setFont(ui::font());
             g.drawText(juce::String(bar + 1),
                        juce::roundToInt(x) + 3,
                        0,
@@ -400,7 +414,8 @@ void ArrangementOverviewComponent::paint(juce::Graphics& g)
         g.setColour(fill);
         g.fillRoundedRectangle(rect, 5.0f);
 
-        const auto isSelected = sectionIndex == selectedSectionIndex;
+        const auto isSelected = sectionIndex == selectedSectionIndex
+            || std::find(selectedSectionIndices.begin(), selectedSectionIndices.end(), sectionIndex) != selectedSectionIndices.end();
         g.setColour(isSelected ? juce::Colours::white : baseColour.darker(0.55f));
         g.drawRoundedRectangle(rect, 5.0f, isSelected ? 2.0f : 1.2f);
 
@@ -411,6 +426,7 @@ void ArrangementOverviewComponent::paint(juce::Graphics& g)
             clipTitle = "Pattern";
 
         g.setColour(trackTextColour(baseColour));
+        g.setFont(ui::font());
         g.drawText(clipTitle,
                    rect.toNearestInt().reduced(6, 0),
                    juce::Justification::centredLeft,
@@ -435,6 +451,18 @@ void ArrangementOverviewComponent::paint(juce::Graphics& g)
                             handle.getBottom() - 1.0f);
         g.fillPath(pointer);
     }
+
+    if (dragMode == DragMode::marqueeSelect && !marqueeRect.isEmpty())
+    {
+        auto drawRect = marqueeRect.getIntersection(getLocalBounds().toFloat()).reduced(0.5f);
+        if (!drawRect.isEmpty())
+        {
+            g.setColour(juce::Colour::fromRGBA(128, 176, 255, 42));
+            g.fillRect(drawRect);
+            g.setColour(juce::Colour::fromRGB(144, 196, 255));
+            g.drawRect(drawRect, 1.5f);
+        }
+    }
 }
 
 void ArrangementOverviewComponent::resized()
@@ -450,6 +478,9 @@ void ArrangementOverviewComponent::mouseMove(const juce::MouseEvent& event)
 void ArrangementOverviewComponent::mouseDown(const juce::MouseEvent& event)
 {
     const auto toolMode = toolGetter != nullptr ? toolGetter() : EditorToolMode::pencil;
+
+    if (event.mods.isLeftButtonDown())
+        grabKeyboardFocus();
 
     if (event.position.x > laneHeaderWidth() && event.position.y <= rulerHeight())
     {
@@ -501,10 +532,15 @@ void ArrangementOverviewComponent::mouseDown(const juce::MouseEvent& event)
     dragOffsetTick = 0;
     createStartTick = 0;
     resizeAnchorStartTick = 0;
-    resizeAnchorLengthTicks = kTicksPerBar;
+    resizeAnchorLengthTicks = ticksPerBar(project());
+    dragCreatesCopy = false;
+    marqueeStart = {};
+    marqueeRect = {};
 
     if (hitSectionIndex >= 0)
     {
+        selectedSectionIndices.clear();
+        selectedSectionIndices.push_back(hitSectionIndex);
         if (sectionSelectCallback != nullptr)
             sectionSelectCallback(hitSectionIndex, event.getNumberOfClicks() > 1);
 
@@ -544,10 +580,32 @@ void ArrangementOverviewComponent::mouseDown(const juce::MouseEvent& event)
         previewDirty = false;
         dragMode = DragMode::moveSection;
         draggedSectionIndex = hitSectionIndex;
-        const auto& section = state.midiSections[static_cast<size_t>(hitSectionIndex)];
-        dragOffsetTick = juce::jmax(0, xToSnapStartTick(event.position.x) - section.startTick);
-        resizeAnchorStartTick = section.startTick;
-        resizeAnchorLengthTicks = clipLengthTicks(section, state);
+        const auto& sourceSection = state.midiSections[static_cast<size_t>(hitSectionIndex)];
+        const bool duplicateDragRequested = event.mods.isLeftButtonDown()
+            && hitEdge == "body"
+            && (event.mods.isAltDown() || event.mods.isCtrlDown() || event.mods.isCommandDown());
+
+        if (duplicateDragRequested)
+        {
+            if (const auto* sourcePattern = findMidiPattern(previewProject, sourceSection.patternId))
+            {
+                auto duplicatePattern = *sourcePattern;
+                duplicatePattern.id = juce::Uuid().toString();
+
+                auto duplicateSection = sourceSection;
+                duplicateSection.patternId = duplicatePattern.id;
+
+                previewProject.midiPatterns.push_back(std::move(duplicatePattern));
+                previewProject.midiSections.push_back(std::move(duplicateSection));
+                draggedSectionIndex = static_cast<int>(previewProject.midiSections.size()) - 1;
+                dragCreatesCopy = true;
+            }
+        }
+
+        const auto& draggedSection = previewProject.midiSections[static_cast<size_t>(draggedSectionIndex)];
+        dragOffsetTick = juce::jmax(0, xToSnapStartTick(event.position.x) - draggedSection.startTick);
+        resizeAnchorStartTick = draggedSection.startTick;
+        resizeAnchorLengthTicks = clipLengthTicks(draggedSection, previewProject);
         if (hitEdge == "left")
             dragMode = DragMode::resizeLeft;
         else if (hitEdge == "right")
@@ -556,8 +614,26 @@ void ArrangementOverviewComponent::mouseDown(const juce::MouseEvent& event)
         return;
     }
 
+    if (toolMode == EditorToolMode::selection && event.mods.isLeftButtonDown())
+    {
+        beforeProject = project();
+        previewProject = beforeProject;
+        previewActive = true;
+        previewDirty = false;
+        dragMode = DragMode::marqueeSelect;
+        draggedSectionIndex = -1;
+        selectedSectionIndices.clear();
+        marqueeStart = event.position;
+        marqueeRect = { marqueeStart, marqueeStart };
+        if (sectionSelectCallback != nullptr)
+            sectionSelectCallback(-1, false);
+        repaint();
+        return;
+    }
+
     if (toolMode != EditorToolMode::pencil)
     {
+        selectedSectionIndices.clear();
         if (sectionSelectCallback != nullptr)
             sectionSelectCallback(-1, false);
         updateCursorForPosition(event.position);
@@ -631,10 +707,27 @@ void ArrangementOverviewComponent::mouseDrag(const juce::MouseEvent& event)
         return;
     }
 
+    if (dragMode == DragMode::marqueeSelect)
+    {
+        const auto current = event.position;
+        marqueeRect = juce::Rectangle<float>::leftTopRightBottom(juce::jmin(marqueeStart.x, current.x),
+                                                                 juce::jmin(marqueeStart.y, current.y),
+                                                                 juce::jmax(marqueeStart.x, current.x),
+                                                                 juce::jmax(marqueeStart.y, current.y));
+        selectedSectionIndices.clear();
+        for (int sectionIndex = 0; sectionIndex < static_cast<int>(beforeProject.midiSections.size()); ++sectionIndex)
+        {
+            if (sectionRect(beforeProject.midiSections[static_cast<size_t>(sectionIndex)], beforeProject).intersects(marqueeRect))
+                selectedSectionIndices.push_back(sectionIndex);
+        }
+        repaint();
+        return;
+    }
+
     if (!juce::isPositiveAndBelow(draggedSectionIndex, static_cast<int>(previewProject.midiSections.size())))
         return;
 
-    if (dragMode != DragMode::createSection)
+    if (dragMode != DragMode::createSection && !dragCreatesCopy)
         previewProject = beforeProject;
 
     auto& section = previewProject.midiSections[static_cast<size_t>(draggedSectionIndex)];
@@ -700,9 +793,36 @@ void ArrangementOverviewComponent::mouseUp(const juce::MouseEvent&)
     if (!previewActive)
         return;
 
+    if (dragMode == DragMode::marqueeSelect)
+    {
+        previewActive = false;
+        previewDirty = false;
+        dragMode = DragMode::none;
+        draggedSectionIndex = -1;
+        dragOffsetTick = 0;
+        createStartTick = 0;
+        resizeAnchorStartTick = 0;
+        resizeAnchorLengthTicks = ticksPerBar(project());
+        dragCreatesCopy = false;
+        marqueeStart = {};
+        marqueeRect = {};
+        erasedSectionIndices.clear();
+
+        if (sectionSelectCallback != nullptr)
+        {
+            if (selectedSectionIndices.size() == 1)
+                sectionSelectCallback(selectedSectionIndices.front(), false);
+            else
+                sectionSelectCallback(-1, false);
+        }
+
+        repaint();
+        return;
+    }
+
     if (previewDirty)
     {
-        juce::String actionName = "Move Pattern Clip";
+        juce::String actionName = dragCreatesCopy ? "Duplicate Pattern Clip" : "Move Pattern Clip";
         bool undoable = true;
         if (dragMode == DragMode::createSection)
             actionName = "Create Pattern Clip";
@@ -735,7 +855,10 @@ void ArrangementOverviewComponent::mouseUp(const juce::MouseEvent&)
     dragOffsetTick = 0;
     createStartTick = 0;
     resizeAnchorStartTick = 0;
-    resizeAnchorLengthTicks = kTicksPerBar;
+    resizeAnchorLengthTicks = ticksPerBar(project());
+    dragCreatesCopy = false;
+    marqueeStart = {};
+    marqueeRect = {};
     erasedSectionIndices.clear();
     updateCursorForPosition({ -1.0f, -1.0f });
     refreshFromModel();
@@ -744,6 +867,39 @@ void ArrangementOverviewComponent::mouseUp(const juce::MouseEvent&)
 void ArrangementOverviewComponent::mouseExit(const juce::MouseEvent&)
 {
     updateCursorForPosition({ -1.0f, -1.0f });
+}
+
+bool ArrangementOverviewComponent::keyPressed(const juce::KeyPress& key)
+{
+    if (key != juce::KeyPress::deleteKey && key != juce::KeyPress::backspaceKey)
+        return false;
+
+    std::vector<int> indicesToDelete = selectedSectionIndices;
+    if (indicesToDelete.empty())
+    {
+        const auto selectedSectionIndex = selectedSectionGetter != nullptr ? selectedSectionGetter() : -1;
+        if (juce::isPositiveAndBelow(selectedSectionIndex, static_cast<int>(project().midiSections.size())))
+            indicesToDelete.push_back(selectedSectionIndex);
+    }
+
+    if (indicesToDelete.empty())
+        return false;
+
+    std::sort(indicesToDelete.begin(), indicesToDelete.end());
+    indicesToDelete.erase(std::unique(indicesToDelete.begin(), indicesToDelete.end()), indicesToDelete.end());
+
+    auto updatedProject = project();
+    for (auto iterator = indicesToDelete.rbegin(); iterator != indicesToDelete.rend(); ++iterator)
+    {
+        if (juce::isPositiveAndBelow(*iterator, static_cast<int>(updatedProject.midiSections.size())))
+            updatedProject.midiSections.erase(updatedProject.midiSections.begin() + *iterator);
+    }
+
+    selectedSectionIndices.clear();
+    projectWriter(updatedProject, true, "Delete Pattern Clips");
+    if (sectionSelectCallback != nullptr)
+        sectionSelectCallback(-1, false);
+    return true;
 }
 
 const ProjectState& ArrangementOverviewComponent::project() const
@@ -759,7 +915,7 @@ const ProjectState& ArrangementOverviewComponent::displayedProject() const
 void ArrangementOverviewComponent::updateContentSize()
 {
     const auto laneCount = juce::jmax(1, static_cast<int>(project().tracks.size()));
-    const auto width = juce::roundToInt(tickToX(displayedBarCount() * kTicksPerBar));
+    const auto width = juce::roundToInt(tickToX(displayedBarCount() * ticksPerBar(displayedProject())));
     const auto height = juce::roundToInt(rulerHeight() + (static_cast<float>(laneCount) * laneHeight()));
     setSize(juce::jmax(width, 900), juce::jmax(height, 180));
 }
@@ -812,13 +968,14 @@ ArrangementOverviewComponent::DragMode ArrangementOverviewComponent::hitTestTran
 
 float ArrangementOverviewComponent::tickToX(int tick) const
 {
-    return laneHeaderWidth() + (static_cast<float>(juce::jmax(0, tick)) / static_cast<float>(kTicksPerBar)) * pixelsPerBar;
+    return laneHeaderWidth()
+        + (static_cast<float>(juce::jmax(0, tick)) / static_cast<float>(ticksPerBar(displayedProject()))) * pixelsPerBar;
 }
 
 int ArrangementOverviewComponent::xToSnapStartTick(float x) const
 {
     const auto relative = juce::jmax(0.0f, x - laneHeaderWidth());
-    const auto pixelsPerTick = pixelsPerBar / static_cast<float>(kTicksPerBar);
+    const auto pixelsPerTick = pixelsPerBar / static_cast<float>(ticksPerBar(project()));
     const auto snapTicks = arrangementSnapTickLength(project());
     const auto rawTick = static_cast<int>(std::floor(relative / juce::jmax(0.001f, pixelsPerTick)));
     return juce::jmax(0, (rawTick / snapTicks) * snapTicks);
@@ -838,7 +995,8 @@ int ArrangementOverviewComponent::yToTrackIndex(float y) const
 int ArrangementOverviewComponent::displayedBarCount() const
 {
     const auto& state = displayedProject();
-    int lastTick = juce::jmax(kTicksPerBar * minimumBars, state.rightLocatorTick + kTicksPerBar);
+    const auto projectBarTicks = ticksPerBar(state);
+    int lastTick = juce::jmax(projectBarTicks * minimumBars, state.rightLocatorTick + projectBarTicks);
 
     for (const auto& section : state.midiSections)
         lastTick = juce::jmax(lastTick, section.startTick + clipLengthTicks(section, state));
@@ -848,10 +1006,10 @@ int ArrangementOverviewComponent::displayedBarCount() const
         const auto startTick = secondsToTick(state, clip.startSec);
         const auto endTick = secondsToTick(state, clip.startSec + juce::jmax(0.0, clip.durationSec));
         lastTick = juce::jmax(lastTick, endTick);
-        lastTick = juce::jmax(lastTick, startTick + kTicksPerBar);
+        lastTick = juce::jmax(lastTick, startTick + projectBarTicks);
     }
 
-    return juce::jmax(minimumBars, (lastTick + kTicksPerBar - 1) / kTicksPerBar);
+    return juce::jmax(minimumBars, (lastTick + projectBarTicks - 1) / projectBarTicks);
 }
 
 int ArrangementOverviewComponent::clipLengthTicks(const MidiSection& section, const ProjectState& state) const
