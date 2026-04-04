@@ -8,11 +8,13 @@ namespace
 juce::String chooseMutagenUiFont()
 {
     const auto available = juce::Font::findAllTypefaceNames();
-    constexpr std::array<const char*, 4> candidates
+    constexpr std::array<const char*, 6> candidates
     {
-        "Bahnschrift",
         "Bahnschrift SemiCondensed",
+        "Bahnschrift Condensed",
+        "Bahnschrift",
         "Agency FB",
+        "Franklin Gothic Medium",
         "Segoe UI"
     };
 
@@ -38,6 +40,8 @@ public:
         : version(std::move(versionIn)),
           logo(loadMutagenSplashLogo())
     {
+        setOpaque(true);
+        setSize(520, 520);
     }
 
     void setStatus(const juce::String& newStatus)
@@ -113,6 +117,9 @@ public:
         centreWithSize(520, 520);
         setVisible(true);
         toFront(false);
+        repaint();
+        if (auto* peer = getPeer())
+            peer->performAnyPendingRepaintsNow();
     }
 
     void closeButtonPressed() override
@@ -212,18 +219,57 @@ public:
         juce::LookAndFeel::setDefaultLookAndFeel(&lookAndFeel);
 
         const auto startupProject = parseStartupProject();
+        startupSequenceToken = std::make_shared<int>(1);
         splashWindow = std::make_unique<StartupSplashWindow>(getApplicationVersion());
-        pumpSplash("Loading native shell...", 40);
-        pumpSplash(startupProject.existsAsFile() ? "Opening project..." : "Preparing interface...", 40);
+        pumpSplash("Loading native shell...");
 
-        mainWindow = std::make_unique<aims::MainWindow>(startupProject);
+        auto continueStartup = [this,
+                                startupProject,
+                                token = std::weak_ptr<int>(startupSequenceToken)] (const juce::String& status,
+                                                                                   int delayMs,
+                                                                                   auto&& next) mutable
+        {
+            juce::Timer::callAfterDelay(delayMs,
+                                        [this,
+                                         startupProject,
+                                         status,
+                                         token,
+                                         next = std::forward<decltype(next)>(next)]() mutable
+                                        {
+                                            if (token.expired())
+                                                return;
 
-        pumpSplash("Ready", 120);
-        splashWindow.reset();
+                                            pumpSplash(status);
+                                            next();
+                                        });
+        };
+
+        continueStartup(startupProject.existsAsFile() ? "Opening project..." : "Preparing interface...",
+                        40,
+                        [this,
+                         startupProject,
+                         token = std::weak_ptr<int>(startupSequenceToken)]() mutable
+                        {
+                            if (token.expired())
+                                return;
+
+                            mainWindow = std::make_unique<aims::MainWindow>(startupProject);
+                            pumpSplash("Ready");
+
+                            juce::Timer::callAfterDelay(120,
+                                                        [this, token]() mutable
+                                                        {
+                                                            if (token.expired())
+                                                                return;
+
+                                                            splashWindow.reset();
+                                                        });
+                        });
     }
 
     void shutdown() override
     {
+        startupSequenceToken.reset();
         splashWindow.reset();
         mainWindow.reset();
         juce::LookAndFeel::setDefaultLookAndFeel(nullptr);
@@ -246,21 +292,21 @@ private:
         return {};
     }
 
-    void pumpSplash(const juce::String& status, int milliseconds)
+    void pumpSplash(const juce::String& status)
     {
         if (splashWindow != nullptr)
         {
             splashWindow->setStatus(status);
+            splashWindow->setVisible(true);
+            splashWindow->toFront(false);
             splashWindow->repaint();
             if (auto* peer = splashWindow->getPeer())
                 peer->performAnyPendingRepaintsNow();
         }
-
-        if (milliseconds > 0)
-            juce::Thread::sleep(milliseconds);
     }
 
     StudioLookAndFeel lookAndFeel { juce::LookAndFeel_V4::getDarkColourScheme() };
+    std::shared_ptr<int> startupSequenceToken;
     std::unique_ptr<StartupSplashWindow> splashWindow;
     std::unique_ptr<aims::MainWindow> mainWindow;
 };

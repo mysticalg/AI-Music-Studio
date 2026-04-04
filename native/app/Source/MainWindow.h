@@ -11,6 +11,7 @@
 #include "SampleFileIO.h"
 #include "SampleTimelineComponent.h"
 
+#include <juce_audio_devices/juce_audio_devices.h>
 #include <juce_gui_extra/juce_gui_extra.h>
 
 #include <future>
@@ -42,7 +43,9 @@ class RenderManagerWindowComponent;
 class HeaderLcdDisplay;
 
 class StudioShellComponent final : public juce::Component,
-                                   private juce::Timer
+                                   private juce::Timer,
+                                   private juce::MidiInputCallback,
+                                   private juce::AsyncUpdater
 {
 public:
     StudioShellComponent();
@@ -101,6 +104,16 @@ private:
         bool editorOpen = false;
     };
 
+    struct ActiveRealtimeRecordedNote
+    {
+        int trackIndex = -1;
+        juce::String patternId;
+        int sectionStartTick = 0;
+        int patternNoteStartTick = 0;
+        int absoluteStartTick = 0;
+        int pitch = 60;
+    };
+
     void createToolbarButton(juce::TextButton& button, const juce::String& text);
     void configureInspectorTextEditor(juce::TextEditor& editor, const juce::String& placeholder);
     void configureInspectorSlider(juce::Slider& slider, double minimum, double maximum, double step, const juce::String& suffix);
@@ -121,6 +134,7 @@ private:
     void setTransportTempo(int bpm);
     void setTransportLoopEnabled(bool enabled);
     void setTransportMetronomeEnabled(bool enabled);
+    void setTransportRecordEnabled(bool enabled);
     void addTrack();
     void duplicateSelectedTrack();
     void removeSelectedTrack();
@@ -180,6 +194,7 @@ private:
                                           const juce::String& audioDeviceName,
                                           int sampleRate,
                                           int bufferSize);
+    juce::Result setPreferredMidiInputDevice(const juce::String& deviceIdentifier);
     void setTransportWindowVisible(bool shouldBeVisible);
     bool isTransportWindowVisible() const noexcept;
     void setMixerWindowVisible(bool shouldBeVisible);
@@ -241,6 +256,23 @@ private:
     void persistSessionState() const;
     void restorePersistedWindowVisibility();
     void persistWindowVisibilityState() const;
+    void refreshMidiInputDevices();
+    void dispatchPendingMidiInputMessages();
+    void handleMidiKeyboardNoteOn(int pitch, int velocity);
+    void handleMidiKeyboardNoteOff(int pitch, int velocity);
+    int currentAudioEngineTransportTick() const;
+    int ensureMidiSectionForTrackAtTick(ProjectState& project, int trackIndex, int tick, bool& createdSection);
+    void commitRealtimeRecordedProjectState(ProjectState updatedProject,
+                                           const juce::Array<int>& changedTrackIndices,
+                                           int preferredTrackIndex,
+                                           int preferredSectionIndex);
+    void handleRealtimeMidiRecordingNoteOn(int pitch, int velocity);
+    void handleRealtimeMidiRecordingNoteOff(int pitch);
+    void finishActiveRealtimeRecordedNotes(int endTick = -1);
+    void insertLiveMidiNote(int pitch,
+                            int velocity = 100,
+                            bool flashVirtualKey = false,
+                            bool autoStopPreview = false);
     void restorePersistedThemeSelection();
     void restorePersistedFontSelection();
     juce::String buildAboutDetails() const;
@@ -278,6 +310,8 @@ private:
     bool syncTrackRackParametersFromValues(int trackIndex,
                                            const juce::NamedValueSet& hostParameters,
                                            bool skipParameterEnginePush = false);
+    void handleIncomingMidiMessage(juce::MidiInput* source, const juce::MidiMessage& message) override;
+    void handleAsyncUpdate() override;
     void timerCallback() override;
     void setTrackStateInternal(int trackIndex,
                                const TrackState& updatedTrack,
@@ -374,6 +408,7 @@ private:
     juce::TextButton openRackEditorButton;
     juce::TextButton saveRackStateButton;
     juce::TextButton playProjectButton;
+    juce::TextButton recordToggle;
     juce::TextButton undoButton;
     juce::TextButton redoButton;
     juce::Slider tempoSlider;
@@ -398,6 +433,7 @@ private:
     juce::Slider pianoRollRowHeightSlider;
     juce::TextButton loopToggle;
     juce::TextButton metronomeToggle;
+    juce::TextButton midiInsertToggle;
     std::unique_ptr<juce::FileChooser> activeFileChooser;
     AIClient aiClient;
     NativeVstHostSession nativeVstHost;
@@ -448,6 +484,17 @@ private:
     int leftPaneDragStartWidth = 0;
     bool leftPaneResizeDragging = false;
     juce::Rectangle<int> leftPaneResizeHandleBounds;
+    juce::String preferredMidiInputIdentifier;
+    juce::StringArray activeMidiInputNames;
+    std::vector<std::unique_ptr<juce::MidiInput>> midiInputs;
+    juce::MidiDeviceListConnection midiInputDeviceConnection;
+    juce::CriticalSection midiInputQueueLock;
+    std::vector<juce::MidiMessage> pendingMidiInputMessages;
+    std::vector<ActiveRealtimeRecordedNote> activeRealtimeRecordedNotes;
+    juce::Array<int> activeMidiInsertHeldPitches;
+    juce::String activeMidiInsertPatternId;
+    int activeMidiInsertTrackIndex = -1;
+    int activeMidiInsertChordStartTick = -1;
     std::unique_ptr<juce::PropertiesFile> windowStateSettings;
     mutable juce::CriticalSection activityLogLock;
     juce::StringArray activityLogEntries;
@@ -465,6 +512,8 @@ private:
     bool pianoRollWindowVisible = false;
     bool virtualPianoWindowVisible = false;
     bool activityLogWindowVisible = false;
+    bool midiInsertEnabled = false;
+    bool transportRecordEnabled = false;
     std::unique_ptr<FloatingPanelWindow> transportWindow;
     TransportPanelComponent* transportPanel = nullptr;
     std::unique_ptr<FloatingPanelWindow> mixerWindow;
@@ -549,6 +598,7 @@ private:
         menuWindowsActivityLog,
         menuWindowsFullscreen,
         menuHelpSite = 3000,
+        menuHelpOllama,
         menuHelpAbout,
         menuThemeBase = 4000,
         menuFontChoiceBase = 5000

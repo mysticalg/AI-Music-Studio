@@ -1,6 +1,7 @@
 #include "MixerComponent.h"
 #include "UiStyle.h"
 
+#include <array>
 #include <cmath>
 
 namespace aims
@@ -136,6 +137,38 @@ juce::String peakDbfsLabel(float level)
 
     const auto peakDb = 20.0 * std::log10(static_cast<double>(level));
     return juce::String(peakDb, 1) + " dBFS";
+}
+
+juce::String meterTooltipText(double gain, float level)
+{
+    return "Fader: " + gainDbLabel(gain) + " | Peak: " + peakDbfsLabel(level);
+}
+
+juce::String stereoMeterTooltipText(double gain, float leftLevel, float rightLevel)
+{
+    return "Fader: " + gainDbLabel(gain)
+        + " | L: " + peakDbfsLabel(leftLevel)
+        + " | R: " + peakDbfsLabel(rightLevel);
+}
+
+void removeFxSlotAt(juce::StringArray& chain, std::vector<bool>& bypassStates, int index)
+{
+    if (!juce::isPositiveAndBelow(index, chain.size()))
+        return;
+
+    chain.remove(index);
+    if (juce::isPositiveAndBelow(index, static_cast<int>(bypassStates.size())))
+        bypassStates.erase(bypassStates.begin() + index);
+
+    ensureFxBypassStateSize(bypassStates, chain.size());
+}
+
+void appendFxSlot(juce::StringArray& chain, std::vector<bool>& bypassStates, const juce::String& reference)
+{
+    chain.add(reference);
+    ensureFxBypassStateSize(bypassStates, chain.size());
+    if (juce::isPositiveAndBelow(chain.size() - 1, static_cast<int>(bypassStates.size())))
+        bypassStates[static_cast<size_t>(chain.size() - 1)] = false;
 }
 }
 
@@ -313,6 +346,31 @@ MixerComponent::ChannelStrip::ChannelStrip(int trackIndexIn,
     };
     addAndMakeVisible(fxBypassButton);
 
+    fxUpButton.setButtonText("^");
+    fxUpButton.setTooltip("Show higher FX slots");
+    configureSmallTextButton(fxUpButton);
+    fxUpButton.onClick = [this]
+    {
+        --fxScrollOffset;
+        clampFxScrollOffset();
+        resized();
+        repaint();
+    };
+    addAndMakeVisible(fxUpButton);
+
+    fxDownButton.setButtonText("v");
+    fxDownButton.setTooltip("Show lower FX slots");
+    configureSmallTextButton(fxDownButton);
+    fxDownButton.onClick = [this]
+    {
+        ++fxScrollOffset;
+        clampFxScrollOffset();
+        resized();
+        repaint();
+    };
+    addAndMakeVisible(fxDownButton);
+
+    addAndMakeVisible(meterScale);
     addAndMakeVisible(meter);
 
     volumeSlider.setSliderStyle(juce::Slider::LinearVertical);
@@ -324,13 +382,16 @@ MixerComponent::ChannelStrip::ChannelStrip(int trackIndexIn,
             return;
 
         currentTrack.volume = volumeSlider.getValue() / 100.0;
-        volumeLabel.setText(juce::String(juce::roundToInt(volumeSlider.getValue())) + "%", juce::dontSendNotification);
+        volumeLabel.setText(gainDbLabel(currentTrack.volume), juce::dontSendNotification);
+        updateMeterTooltip();
     };
     volumeSlider.onDragStart = [this] { volumeDragging = true; };
     volumeSlider.onDragEnd = [this]
     {
         volumeDragging = false;
         currentTrack.volume = volumeSlider.getValue() / 100.0;
+        volumeLabel.setText(gainDbLabel(currentTrack.volume), juce::dontSendNotification);
+        updateMeterTooltip();
         commitTrackEdit("Change Mixer Volume");
     };
     addAndMakeVisible(volumeSlider);
@@ -339,6 +400,11 @@ MixerComponent::ChannelStrip::ChannelStrip(int trackIndexIn,
     volumeLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(214, 220, 228));
     volumeLabel.setFont(ui::font());
     addAndMakeVisible(volumeLabel);
+
+    meterLabel.setJustificationType(juce::Justification::centred);
+    meterLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(214, 220, 228).withAlpha(0.78f));
+    meterLabel.setFont(ui::tinyFont(true));
+    addAndMakeVisible(meterLabel);
 
     panSlider.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
     panSlider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
@@ -394,6 +460,7 @@ void MixerComponent::ChannelStrip::applyTrack(const TrackState& track)
     const auto liveVolume = volumeSlider.getValue() / 100.0;
     const auto livePan = panSlider.getValue() / 100.0;
     currentTrack = track;
+    ensureFxBypassStateSize(currentTrack.vstFxSlotBypassed, currentTrack.vstFxChain.size());
 
     const auto accent = trackDisplayColour(track, trackIndex);
     const auto textColour = trackTextColour(accent);
@@ -407,12 +474,12 @@ void MixerComponent::ChannelStrip::applyTrack(const TrackState& track)
     if (volumeDragging)
     {
         currentTrack.volume = liveVolume;
-        volumeLabel.setText(juce::String(juce::roundToInt(volumeSlider.getValue())) + "%", juce::dontSendNotification);
+        volumeLabel.setText(gainDbLabel(currentTrack.volume), juce::dontSendNotification);
     }
     else
     {
         volumeSlider.setValue(track.volume * 100.0, juce::dontSendNotification);
-        volumeLabel.setText(juce::String(juce::roundToInt(track.volume * 100.0)) + "%", juce::dontSendNotification);
+        volumeLabel.setText(gainDbLabel(track.volume), juce::dontSendNotification);
     }
 
     if (panDragging)
@@ -427,12 +494,17 @@ void MixerComponent::ChannelStrip::applyTrack(const TrackState& track)
     fxBypassButton.setToggleState(track.vstFxBypassed, juce::dontSendNotification);
     muteButton.setToggleState(track.mute, juce::dontSendNotification);
     soloButton.setToggleState(track.solo, juce::dontSendNotification);
+    clampFxScrollOffset();
+    updateMeterTooltip();
     syncing = false;
 }
 
 void MixerComponent::ChannelStrip::refreshMeter()
 {
-    meter.setLevel(meterGetter != nullptr ? meterGetter(trackIndex) : 0.0f);
+    currentMeterLevel = meterGetter != nullptr ? meterGetter(trackIndex) : 0.0f;
+    meter.setLevel(currentMeterLevel);
+    meterLabel.setText(peakDbfsLabel(currentMeterLevel), juce::dontSendNotification);
+    updateMeterTooltip();
 }
 
 void MixerComponent::ChannelStrip::syncFxRows()
@@ -446,6 +518,8 @@ void MixerComponent::ChannelStrip::syncFxRows()
         row->nameLabel = std::make_unique<juce::Label>();
         row->nameLabel->setJustificationType(juce::Justification::centredLeft);
         row->nameLabel->setFont(ui::strongFont());
+        row->nameLabel->setMouseCursor(juce::MouseCursor::DraggingHandCursor);
+        row->nameLabel->addMouseListener(this, false);
         addAndMakeVisible(*row->nameLabel);
 
         row->viewButton = std::make_unique<juce::TextButton>("V");
@@ -457,6 +531,23 @@ void MixerComponent::ChannelStrip::syncFxRows()
                 openEffectEditor(raw->effectIndex);
         };
         addAndMakeVisible(*row->viewButton);
+
+        row->bypassButton = std::make_unique<juce::TextButton>("B");
+        row->bypassButton->setTooltip("Bypass FX");
+        row->bypassButton->setClickingTogglesState(true);
+        configureSmallTextButton(*row->bypassButton);
+        row->bypassButton->onClick = [this, raw = row.get()]
+        {
+            if (syncing || raw == nullptr || !juce::isPositiveAndBelow(raw->effectIndex, currentTrack.vstFxChain.size()))
+                return;
+
+            ensureFxBypassStateSize(currentTrack.vstFxSlotBypassed, currentTrack.vstFxChain.size());
+            if (juce::isPositiveAndBelow(raw->effectIndex, static_cast<int>(currentTrack.vstFxSlotBypassed.size())))
+                currentTrack.vstFxSlotBypassed[static_cast<size_t>(raw->effectIndex)] = raw->bypassButton->getToggleState();
+
+            commitTrackEdit("Toggle Track FX Slot Bypass");
+        };
+        addAndMakeVisible(*row->bypassButton);
 
         row->removeButton = std::make_unique<juce::TextButton>("-");
         row->removeButton->setTooltip("Remove FX");
@@ -476,6 +567,7 @@ void MixerComponent::ChannelStrip::syncFxRows()
         auto& row = fxRows.back();
         removeChildComponent(row->nameLabel.get());
         removeChildComponent(row->viewButton.get());
+        removeChildComponent(row->bypassButton.get());
         removeChildComponent(row->removeButton.get());
         fxRows.pop_back();
     }
@@ -493,13 +585,16 @@ void MixerComponent::ChannelStrip::syncFxRows()
             label = juce::File(reference).getFileNameWithoutExtension();
 
         row->nameLabel->setText(label, juce::dontSendNotification);
-        row->nameLabel->setTooltip(reference);
+        row->nameLabel->setTooltip(label + "  |  Drag to reorder");
         row->nameLabel->setVisible(true);
         row->viewButton->setVisible(true);
+        row->bypassButton->setToggleState(fxSlotBypassed(currentTrack.vstFxSlotBypassed, index), juce::dontSendNotification);
+        row->bypassButton->setVisible(true);
         row->removeButton->setVisible(true);
     }
 
     fxSummaryLabel.setVisible(effectCount == 0);
+    clampFxScrollOffset();
 }
 
 void MixerComponent::ChannelStrip::showAddFxMenu(juce::Component* target)
@@ -538,7 +633,9 @@ void MixerComponent::ChannelStrip::showAddFxMenu(juce::Component* target)
                                if (result != itemId)
                                    continue;
 
-                               safeThis->currentTrack.vstFxChain.add(reference);
+                               appendFxSlot(safeThis->currentTrack.vstFxChain,
+                                            safeThis->currentTrack.vstFxSlotBypassed,
+                                            reference);
                                safeThis->commitTrackEdit("Add Track FX");
                                return;
                            }
@@ -559,7 +656,7 @@ void MixerComponent::ChannelStrip::removeEffectAt(int effectIndex)
     if (!juce::isPositiveAndBelow(effectIndex, currentTrack.vstFxChain.size()))
         return;
 
-    currentTrack.vstFxChain.remove(effectIndex);
+    removeFxSlotAt(currentTrack.vstFxChain, currentTrack.vstFxSlotBypassed, effectIndex);
     commitTrackEdit("Remove Track FX");
 }
 
@@ -582,68 +679,124 @@ void MixerComponent::ChannelStrip::paint(juce::Graphics& g)
     auto accentBar = getLocalBounds().toFloat().reduced(3.0f);
     g.setColour(accent.withAlpha(0.62f));
     g.fillRoundedRectangle(accentBar.removeFromLeft(3.0f), 3.0f);
+
+    if (fxDragActive && fxDropInsertIndex >= 0)
+    {
+        const auto lineY = fxInsertionLineY(fxDropInsertIndex);
+        if (lineY > 0)
+        {
+            const auto left = static_cast<float>(getLocalBounds().getX() + 12);
+            const auto right = static_cast<float>(getLocalBounds().getRight() - 12);
+            g.setColour(accent.withAlpha(0.95f));
+            g.fillRoundedRectangle(juce::Rectangle<float>(left, static_cast<float>(lineY - 1), right - left, 3.0f), 1.5f);
+        }
+    }
 }
 
 void MixerComponent::ChannelStrip::resized()
 {
     auto area = getLocalBounds().reduced(7);
-    nameLabel.setBounds(area.removeFromTop(22));
+    nameLabel.setBounds(area.removeFromTop(18));
     area.removeFromTop(4);
 
-    auto bottomArea = area.removeFromBottom(258);
+    const int minimumFxAreaHeight = 44;
+    const int preferredBottomHeight = 214;
+    const auto maxBottomHeight = juce::jmax(0, area.getHeight() - minimumFxAreaHeight);
+    auto bottomArea = area.removeFromBottom(juce::jmin(preferredBottomHeight, maxBottomHeight));
 
-    auto buttonRow = bottomArea.removeFromBottom(22);
-    const int controlWidth = juce::jmin(28, (buttonRow.getWidth() - 4) / 2);
+    fxListBounds = area;
+    fxSummaryLabel.setBounds(fxListBounds);
+
+    auto buttonRow = bottomArea.removeFromBottom(24);
+    const int controlWidth = juce::jmin(30, (buttonRow.getWidth() - 4) / 2);
     auto controls = buttonRow.withSizeKeepingCentre((controlWidth * 2) + 4, buttonRow.getHeight());
     muteButton.setBounds(controls.removeFromLeft(controlWidth));
     controls.removeFromLeft(4);
     soloButton.setBounds(controls.removeFromLeft(controlWidth));
 
-    bottomArea.removeFromBottom(6);
-    panSlider.setBounds(bottomArea.removeFromBottom(40));
-
     bottomArea.removeFromBottom(4);
-    volumeLabel.setBounds(bottomArea.removeFromBottom(16));
+    panSlider.setBounds(bottomArea.removeFromBottom(34));
 
     bottomArea.removeFromBottom(2);
-    auto meterArea = bottomArea.removeFromBottom(154);
-    auto levelLane = meterArea.withSizeKeepingCentre(34, meterArea.getHeight());
-    meter.setBounds(levelLane.removeFromLeft(8));
+    volumeLabel.setBounds(bottomArea.removeFromBottom(14));
+
+    bottomArea.removeFromBottom(2);
+    meterLabel.setBounds(bottomArea.removeFromBottom(12));
+
+    bottomArea.removeFromBottom(2);
+    auto meterArea = bottomArea.removeFromBottom(118);
+    auto levelLane = meterArea.withSizeKeepingCentre(54, meterArea.getHeight());
+    meterScale.setBounds(levelLane.removeFromLeft(18));
+    meter.setBounds(levelLane.removeFromLeft(11));
     levelLane.removeFromLeft(4);
     volumeSlider.setBounds(levelLane);
 
-    bottomArea.removeFromBottom(6);
+    bottomArea.removeFromBottom(4);
     auto fxRow = bottomArea.removeFromBottom(20);
-    const int fxButtonWidth = 24;
-    auto fxButtons = fxRow.withSizeKeepingCentre((fxButtonWidth * 3) + 12, fxRow.getHeight());
-    fxButton.setBounds(fxButtons.removeFromLeft(fxButtonWidth + 2));
+    auto fxButtons = fxRow.withSizeKeepingCentre(juce::jmin(fxRow.getWidth(), 116), fxRow.getHeight());
+    fxButton.setBounds(fxButtons.removeFromLeft(22));
     fxButtons.removeFromLeft(4);
-    fxAddButton.setBounds(fxButtons.removeFromLeft(fxButtonWidth));
+    fxAddButton.setBounds(fxButtons.removeFromLeft(18));
     fxButtons.removeFromLeft(4);
-    fxBypassButton.setBounds(fxButtons.removeFromLeft(fxButtonWidth + 10));
-
-    auto fxArea = area;
-    fxSummaryLabel.setBounds(fxArea);
+    fxUpButton.setBounds(fxButtons.removeFromLeft(18));
+    fxButtons.removeFromLeft(4);
+    fxDownButton.setBounds(fxButtons.removeFromLeft(18));
+    fxButtons.removeFromLeft(4);
+    fxBypassButton.setBounds(fxButtons.removeFromLeft(24));
 
     const int rowHeight = 18;
-    int y = fxArea.getY();
-    for (auto& row : fxRows)
+    const int rowGap = 2;
+    const int rowPitch = rowHeight + rowGap;
+    fxVisibleRowCount = juce::jmax(0, (fxListBounds.getHeight() + rowGap) / rowPitch);
+    clampFxScrollOffset();
+    const auto effectCount = static_cast<int>(fxRows.size());
+    const auto startIndex = juce::jlimit(0, juce::jmax(0, effectCount), fxScrollOffset);
+    const auto endIndex = juce::jmin(effectCount, startIndex + fxVisibleRowCount);
+
+    fxUpButton.setEnabled(startIndex > 0);
+    fxDownButton.setEnabled(endIndex < effectCount);
+
+    int y = fxListBounds.getY();
+    for (int index = 0; index < effectCount; ++index)
     {
-        const bool fits = y + rowHeight <= fxArea.getBottom();
-        row->nameLabel->setVisible(fits);
-        row->viewButton->setVisible(fits);
-        row->removeButton->setVisible(fits);
-        if (!fits)
+        auto& row = fxRows[static_cast<size_t>(index)];
+        const bool visible = index >= startIndex && index < endIndex && y + rowHeight <= fxListBounds.getBottom();
+        row->rowBounds = {};
+        row->nameLabel->setVisible(visible);
+        row->viewButton->setVisible(visible);
+        row->bypassButton->setVisible(visible);
+        row->removeButton->setVisible(visible);
+        if (!visible)
             continue;
 
-        auto rowBounds = juce::Rectangle<int>(fxArea.getX(), y, fxArea.getWidth(), rowHeight);
-        row->nameLabel->setBounds(rowBounds.removeFromLeft(juce::jmax(8, rowBounds.getWidth() - 40)));
-        rowBounds.removeFromLeft(2);
-        row->viewButton->setBounds(rowBounds.removeFromLeft(18));
-        rowBounds.removeFromLeft(2);
-        row->removeButton->setBounds(rowBounds.removeFromLeft(18));
-        y += rowHeight + 2;
+        auto rowBounds = juce::Rectangle<int>(fxListBounds.getX(), y, fxListBounds.getWidth(), rowHeight);
+        row->rowBounds = rowBounds;
+        auto rowButtons = rowBounds.removeFromRight(58);
+        row->nameLabel->setBounds(rowBounds);
+        row->viewButton->setBounds(rowButtons.removeFromLeft(18));
+        rowButtons.removeFromLeft(2);
+        row->bypassButton->setBounds(rowButtons.removeFromLeft(18));
+        rowButtons.removeFromLeft(2);
+        row->removeButton->setBounds(rowButtons.removeFromLeft(18));
+        y += rowPitch;
     }
+}
+
+void MixerComponent::ChannelStrip::mouseWheelMove(const juce::MouseEvent& event, const juce::MouseWheelDetails& wheel)
+{
+    if (!fxListBounds.contains(event.getEventRelativeTo(this).getPosition()) || fxRows.size() <= static_cast<size_t>(fxVisibleRowCount))
+    {
+        juce::Component::mouseWheelMove(event, wheel);
+        return;
+    }
+
+    if (std::abs(wheel.deltaY) < 0.001f)
+        return;
+
+    fxScrollOffset += wheel.deltaY < 0.0f ? 1 : -1;
+    clampFxScrollOffset();
+    resized();
+    repaint();
 }
 
 void MixerComponent::ChannelStrip::showFxMenu()
@@ -692,6 +845,7 @@ void MixerComponent::ChannelStrip::showFxMenu()
                                    return;
 
                                safeThis->currentTrack.vstFxChain.clear();
+                               safeThis->currentTrack.vstFxSlotBypassed.clear();
                                safeThis->commitTrackEdit("Clear Track FX Chain");
                                return;
                            }
@@ -701,10 +855,20 @@ void MixerComponent::ChannelStrip::showFxMenu()
                                if (result != itemId)
                                    continue;
 
-                               if (safeThis->currentTrack.vstFxChain.contains(reference))
-                                   safeThis->currentTrack.vstFxChain.removeString(reference);
+                               int existingIndex = -1;
+                               for (int index = 0; index < safeThis->currentTrack.vstFxChain.size(); ++index)
+                               {
+                                   if (safeThis->currentTrack.vstFxChain[index].equalsIgnoreCase(reference))
+                                   {
+                                       existingIndex = index;
+                                       break;
+                                   }
+                               }
+
+                               if (existingIndex >= 0)
+                                   removeFxSlotAt(safeThis->currentTrack.vstFxChain, safeThis->currentTrack.vstFxSlotBypassed, existingIndex);
                                else
-                                   safeThis->currentTrack.vstFxChain.add(reference);
+                                   appendFxSlot(safeThis->currentTrack.vstFxChain, safeThis->currentTrack.vstFxSlotBypassed, reference);
 
                                safeThis->commitTrackEdit("Update Track FX Chain");
                                return;
@@ -717,6 +881,8 @@ void MixerComponent::ChannelStrip::updateButtonColours(const juce::Colour& accen
     const auto offColour = kStripBaseBackground.interpolatedWith(accentColour, 0.24f);
     const auto onColour = kStripBaseBackground.interpolatedWith(accentColour, 0.44f);
 
+    volumeLabel.setColour(juce::Label::textColourId, trackTextColour(accentColour).withAlpha(0.90f));
+    meterLabel.setColour(juce::Label::textColourId, trackTextColour(accentColour).withAlpha(0.72f));
     fxButton.setColour(juce::TextButton::buttonColourId, offColour);
     fxButton.setColour(juce::TextButton::buttonOnColourId, onColour);
     fxButton.setColour(juce::TextButton::textColourOffId, trackTextColour(offColour));
@@ -725,6 +891,14 @@ void MixerComponent::ChannelStrip::updateButtonColours(const juce::Colour& accen
     fxAddButton.setColour(juce::TextButton::buttonOnColourId, onColour);
     fxAddButton.setColour(juce::TextButton::textColourOffId, trackTextColour(offColour));
     fxAddButton.setColour(juce::TextButton::textColourOnId, trackTextColour(onColour));
+    fxUpButton.setColour(juce::TextButton::buttonColourId, offColour);
+    fxUpButton.setColour(juce::TextButton::buttonOnColourId, onColour);
+    fxUpButton.setColour(juce::TextButton::textColourOffId, trackTextColour(offColour));
+    fxUpButton.setColour(juce::TextButton::textColourOnId, trackTextColour(onColour));
+    fxDownButton.setColour(juce::TextButton::buttonColourId, offColour);
+    fxDownButton.setColour(juce::TextButton::buttonOnColourId, onColour);
+    fxDownButton.setColour(juce::TextButton::textColourOffId, trackTextColour(offColour));
+    fxDownButton.setColour(juce::TextButton::textColourOnId, trackTextColour(onColour));
     fxBypassButton.setColour(juce::TextButton::buttonColourId, offColour);
     fxBypassButton.setColour(juce::TextButton::buttonOnColourId, accentColour.withMultipliedBrightness(0.72f));
     fxBypassButton.setColour(juce::TextButton::textColourOffId, trackTextColour(offColour));
@@ -745,11 +919,159 @@ void MixerComponent::ChannelStrip::updateButtonColours(const juce::Colour& accen
         row->viewButton->setColour(juce::TextButton::buttonOnColourId, onColour);
         row->viewButton->setColour(juce::TextButton::textColourOffId, trackTextColour(offColour));
         row->viewButton->setColour(juce::TextButton::textColourOnId, trackTextColour(onColour));
+        row->bypassButton->setColour(juce::TextButton::buttonColourId, offColour);
+        row->bypassButton->setColour(juce::TextButton::buttonOnColourId, accentColour.withMultipliedBrightness(0.72f));
+        row->bypassButton->setColour(juce::TextButton::textColourOffId, trackTextColour(offColour));
+        row->bypassButton->setColour(juce::TextButton::textColourOnId, juce::Colours::white);
         row->removeButton->setColour(juce::TextButton::buttonColourId, offColour);
         row->removeButton->setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(204, 74, 74));
         row->removeButton->setColour(juce::TextButton::textColourOffId, trackTextColour(offColour));
         row->removeButton->setColour(juce::TextButton::textColourOnId, juce::Colours::white);
     }
+}
+
+void MixerComponent::ChannelStrip::updateMeterTooltip()
+{
+    const auto tooltip = meterTooltipText(currentTrack.volume, currentMeterLevel);
+    meter.setTooltip(tooltip);
+    meterScale.setTooltip("Meter scale in dBFS");
+    meterLabel.setTooltip("Peak level: " + peakDbfsLabel(currentMeterLevel));
+    volumeSlider.setTooltip("Fader: " + gainDbLabel(currentTrack.volume));
+}
+
+void MixerComponent::ChannelStrip::clampFxScrollOffset()
+{
+    const auto maxOffset = juce::jmax(0, static_cast<int>(fxRows.size()) - juce::jmax(1, fxVisibleRowCount));
+    fxScrollOffset = juce::jlimit(0, maxOffset, fxScrollOffset);
+}
+
+int MixerComponent::ChannelStrip::findFxRowIndexForComponent(const juce::Component* component) const
+{
+    if (component == nullptr)
+        return -1;
+
+    for (const auto& row : fxRows)
+    {
+        if (row != nullptr && row->nameLabel.get() == component)
+            return row->effectIndex;
+    }
+
+    return -1;
+}
+
+int MixerComponent::ChannelStrip::findFxInsertIndexForY(int y) const
+{
+    int insertIndex = 0;
+    bool foundVisibleRow = false;
+
+    for (const auto& row : fxRows)
+    {
+        if (row == nullptr || row->rowBounds.isEmpty())
+            continue;
+
+        foundVisibleRow = true;
+        if (y < row->rowBounds.getCentreY())
+            return row->effectIndex;
+
+        insertIndex = row->effectIndex + 1;
+    }
+
+    return foundVisibleRow ? insertIndex : currentTrack.vstFxChain.size();
+}
+
+int MixerComponent::ChannelStrip::fxInsertionLineY(int insertIndex) const
+{
+    const auto clampedIndex = juce::jlimit(0, currentTrack.vstFxChain.size(), insertIndex);
+
+    for (const auto& row : fxRows)
+    {
+        if (row == nullptr || row->rowBounds.isEmpty())
+            continue;
+
+        if (row->effectIndex == clampedIndex)
+            return row->rowBounds.getY();
+    }
+
+    for (auto rowIt = fxRows.rbegin(); rowIt != fxRows.rend(); ++rowIt)
+    {
+        const auto& row = *rowIt;
+        if (row == nullptr || row->rowBounds.isEmpty())
+            continue;
+
+        return row->rowBounds.getBottom();
+    }
+
+    return 0;
+}
+
+void MixerComponent::ChannelStrip::finishFxDrag(bool commitChanges)
+{
+    const auto sourceIndex = fxDragSourceIndex;
+    const auto insertIndex = fxDropInsertIndex;
+    const auto wasActive = fxDragActive;
+
+    fxDragActive = false;
+    fxDragSourceIndex = -1;
+    fxDropInsertIndex = -1;
+    repaint();
+
+    if (!commitChanges || !wasActive)
+        return;
+
+    moveEffectToInsertIndex(sourceIndex, insertIndex);
+}
+
+void MixerComponent::ChannelStrip::moveEffectToInsertIndex(int sourceIndex, int insertIndex)
+{
+    const auto effectCount = currentTrack.vstFxChain.size();
+    if (!juce::isPositiveAndBelow(sourceIndex, effectCount))
+        return;
+
+    auto adjustedInsertIndex = juce::jlimit(0, effectCount, insertIndex);
+    if (adjustedInsertIndex == sourceIndex || adjustedInsertIndex == sourceIndex + 1)
+        return;
+
+    const auto movedReference = currentTrack.vstFxChain[sourceIndex];
+    const auto movedBypassed = fxSlotBypassed(currentTrack.vstFxSlotBypassed, sourceIndex);
+
+    currentTrack.vstFxChain.remove(sourceIndex);
+    if (juce::isPositiveAndBelow(sourceIndex, static_cast<int>(currentTrack.vstFxSlotBypassed.size())))
+        currentTrack.vstFxSlotBypassed.erase(currentTrack.vstFxSlotBypassed.begin() + sourceIndex);
+
+    if (adjustedInsertIndex > sourceIndex)
+        --adjustedInsertIndex;
+
+    currentTrack.vstFxChain.insert(adjustedInsertIndex, movedReference);
+    currentTrack.vstFxSlotBypassed.insert(currentTrack.vstFxSlotBypassed.begin() + adjustedInsertIndex, movedBypassed);
+    ensureFxBypassStateSize(currentTrack.vstFxSlotBypassed, currentTrack.vstFxChain.size());
+    commitTrackEdit("Reorder Track FX");
+}
+
+void MixerComponent::ChannelStrip::mouseDown(const juce::MouseEvent& event)
+{
+    const auto* component = event.originalComponent != nullptr ? event.originalComponent : event.eventComponent;
+    const auto rowIndex = findFxRowIndexForComponent(component);
+    if (rowIndex < 0)
+        return;
+
+    fxDragActive = true;
+    fxDragSourceIndex = rowIndex;
+    fxDropInsertIndex = rowIndex;
+    repaint();
+}
+
+void MixerComponent::ChannelStrip::mouseDrag(const juce::MouseEvent& event)
+{
+    if (!fxDragActive)
+        return;
+
+    fxDropInsertIndex = findFxInsertIndexForY(juce::roundToInt(event.getEventRelativeTo(this).position.y));
+    repaint();
+}
+
+void MixerComponent::ChannelStrip::mouseUp(const juce::MouseEvent&)
+{
+    finishFxDrag(true);
 }
 
 void MixerComponent::ChannelStrip::commitTrackEdit(const juce::String& actionName)
@@ -802,6 +1124,31 @@ MixerComponent::MasterStrip::MasterStrip(ProjectGetter projectGetterIn,
     };
     addAndMakeVisible(fxBypassButton);
 
+    fxUpButton.setButtonText("^");
+    fxUpButton.setTooltip("Show higher FX slots");
+    configureSmallTextButton(fxUpButton);
+    fxUpButton.onClick = [this]
+    {
+        --fxScrollOffset;
+        clampFxScrollOffset();
+        resized();
+        repaint();
+    };
+    addAndMakeVisible(fxUpButton);
+
+    fxDownButton.setButtonText("v");
+    fxDownButton.setTooltip("Show lower FX slots");
+    configureSmallTextButton(fxDownButton);
+    fxDownButton.onClick = [this]
+    {
+        ++fxScrollOffset;
+        clampFxScrollOffset();
+        resized();
+        repaint();
+    };
+    addAndMakeVisible(fxDownButton);
+
+    addAndMakeVisible(meterScale);
     addAndMakeVisible(leftMeter);
     addAndMakeVisible(rightMeter);
 
@@ -814,13 +1161,16 @@ MixerComponent::MasterStrip::MasterStrip(ProjectGetter projectGetterIn,
             return;
 
         currentProject.masterVolume = volumeSlider.getValue() / 100.0;
-        volumeLabel.setText(juce::String(juce::roundToInt(volumeSlider.getValue())) + "%", juce::dontSendNotification);
+        volumeLabel.setText(gainDbLabel(currentProject.masterVolume), juce::dontSendNotification);
+        updateMeterTooltip();
     };
     volumeSlider.onDragStart = [this] { volumeDragging = true; };
     volumeSlider.onDragEnd = [this]
     {
         volumeDragging = false;
         currentProject.masterVolume = volumeSlider.getValue() / 100.0;
+        volumeLabel.setText(gainDbLabel(currentProject.masterVolume), juce::dontSendNotification);
+        updateMeterTooltip();
         commitProjectEdit("Change Master Volume");
     };
     addAndMakeVisible(volumeSlider);
@@ -829,6 +1179,11 @@ MixerComponent::MasterStrip::MasterStrip(ProjectGetter projectGetterIn,
     volumeLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(227, 234, 240));
     volumeLabel.setFont(ui::font());
     addAndMakeVisible(volumeLabel);
+
+    meterLabel.setJustificationType(juce::Justification::centred);
+    meterLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(227, 234, 240).withAlpha(0.76f));
+    meterLabel.setFont(ui::tinyFont(true));
+    addAndMakeVisible(meterLabel);
 }
 
 void MixerComponent::MasterStrip::applyProject(const ProjectState& project)
@@ -836,22 +1191,25 @@ void MixerComponent::MasterStrip::applyProject(const ProjectState& project)
     syncing = true;
     const auto liveVolume = volumeSlider.getValue() / 100.0;
     currentProject = project;
+    ensureFxBypassStateSize(currentProject.masterFxSlotBypassed, currentProject.masterFxChain.size());
     fxSummaryLabel.setText(project.masterFxChain.isEmpty() ? "No FX" : "FX chain", juce::dontSendNotification);
     syncFxRows();
 
     if (volumeDragging)
     {
         currentProject.masterVolume = liveVolume;
-        volumeLabel.setText(juce::String(juce::roundToInt(volumeSlider.getValue())) + "%", juce::dontSendNotification);
+        volumeLabel.setText(gainDbLabel(currentProject.masterVolume), juce::dontSendNotification);
     }
     else
     {
         volumeSlider.setValue(project.masterVolume * 100.0, juce::dontSendNotification);
-        volumeLabel.setText(juce::String(juce::roundToInt(project.masterVolume * 100.0)) + "%", juce::dontSendNotification);
+        volumeLabel.setText(gainDbLabel(project.masterVolume), juce::dontSendNotification);
     }
 
     const auto offColour = kStripBaseBackground.interpolatedWith(kMasterAccent, 0.22f);
     const auto onColour = kStripBaseBackground.interpolatedWith(kMasterAccent, 0.42f);
+    volumeLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(227, 234, 240));
+    meterLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(227, 234, 240).withAlpha(0.76f));
     fxButton.setColour(juce::TextButton::buttonColourId, offColour);
     fxButton.setColour(juce::TextButton::buttonOnColourId, onColour);
     fxButton.setColour(juce::TextButton::textColourOffId, trackTextColour(offColour));
@@ -860,6 +1218,14 @@ void MixerComponent::MasterStrip::applyProject(const ProjectState& project)
     fxAddButton.setColour(juce::TextButton::buttonOnColourId, onColour);
     fxAddButton.setColour(juce::TextButton::textColourOffId, trackTextColour(offColour));
     fxAddButton.setColour(juce::TextButton::textColourOnId, trackTextColour(onColour));
+    fxUpButton.setColour(juce::TextButton::buttonColourId, offColour);
+    fxUpButton.setColour(juce::TextButton::buttonOnColourId, onColour);
+    fxUpButton.setColour(juce::TextButton::textColourOffId, trackTextColour(offColour));
+    fxUpButton.setColour(juce::TextButton::textColourOnId, trackTextColour(onColour));
+    fxDownButton.setColour(juce::TextButton::buttonColourId, offColour);
+    fxDownButton.setColour(juce::TextButton::buttonOnColourId, onColour);
+    fxDownButton.setColour(juce::TextButton::textColourOffId, trackTextColour(offColour));
+    fxDownButton.setColour(juce::TextButton::textColourOnId, trackTextColour(onColour));
     fxBypassButton.setColour(juce::TextButton::buttonColourId, offColour);
     fxBypassButton.setColour(juce::TextButton::buttonOnColourId, kMasterAccent.withMultipliedBrightness(0.8f));
     fxBypassButton.setColour(juce::TextButton::textColourOffId, trackTextColour(offColour));
@@ -873,19 +1239,27 @@ void MixerComponent::MasterStrip::applyProject(const ProjectState& project)
         row->viewButton->setColour(juce::TextButton::buttonOnColourId, onColour);
         row->viewButton->setColour(juce::TextButton::textColourOffId, trackTextColour(offColour));
         row->viewButton->setColour(juce::TextButton::textColourOnId, trackTextColour(onColour));
+        row->bypassButton->setColour(juce::TextButton::buttonColourId, offColour);
+        row->bypassButton->setColour(juce::TextButton::buttonOnColourId, kMasterAccent.withMultipliedBrightness(0.8f));
+        row->bypassButton->setColour(juce::TextButton::textColourOffId, trackTextColour(offColour));
+        row->bypassButton->setColour(juce::TextButton::textColourOnId, juce::Colours::white);
         row->removeButton->setColour(juce::TextButton::buttonColourId, offColour);
         row->removeButton->setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(204, 74, 74));
         row->removeButton->setColour(juce::TextButton::textColourOffId, trackTextColour(offColour));
         row->removeButton->setColour(juce::TextButton::textColourOnId, juce::Colours::white);
     }
+    clampFxScrollOffset();
+    updateMeterTooltip();
     syncing = false;
 }
 
 void MixerComponent::MasterStrip::refreshMeter()
 {
-    const auto levels = masterMeterGetter != nullptr ? masterMeterGetter() : std::make_pair(0.0f, 0.0f);
-    leftMeter.setLevel(levels.first);
-    rightMeter.setLevel(levels.second);
+    currentMeterLevels = masterMeterGetter != nullptr ? masterMeterGetter() : std::make_pair(0.0f, 0.0f);
+    leftMeter.setLevel(currentMeterLevels.first);
+    rightMeter.setLevel(currentMeterLevels.second);
+    meterLabel.setText(peakDbfsLabel(juce::jmax(currentMeterLevels.first, currentMeterLevels.second)), juce::dontSendNotification);
+    updateMeterTooltip();
 }
 
 void MixerComponent::MasterStrip::syncFxRows()
@@ -899,6 +1273,8 @@ void MixerComponent::MasterStrip::syncFxRows()
         row->nameLabel = std::make_unique<juce::Label>();
         row->nameLabel->setJustificationType(juce::Justification::centredLeft);
         row->nameLabel->setFont(ui::strongFont());
+        row->nameLabel->setMouseCursor(juce::MouseCursor::DraggingHandCursor);
+        row->nameLabel->addMouseListener(this, false);
         addAndMakeVisible(*row->nameLabel);
 
         row->viewButton = std::make_unique<juce::TextButton>("V");
@@ -910,6 +1286,23 @@ void MixerComponent::MasterStrip::syncFxRows()
                 openEffectEditor(raw->effectIndex);
         };
         addAndMakeVisible(*row->viewButton);
+
+        row->bypassButton = std::make_unique<juce::TextButton>("B");
+        row->bypassButton->setTooltip("Bypass FX");
+        row->bypassButton->setClickingTogglesState(true);
+        configureSmallTextButton(*row->bypassButton);
+        row->bypassButton->onClick = [this, raw = row.get()]
+        {
+            if (syncing || raw == nullptr || !juce::isPositiveAndBelow(raw->effectIndex, currentProject.masterFxChain.size()))
+                return;
+
+            ensureFxBypassStateSize(currentProject.masterFxSlotBypassed, currentProject.masterFxChain.size());
+            if (juce::isPositiveAndBelow(raw->effectIndex, static_cast<int>(currentProject.masterFxSlotBypassed.size())))
+                currentProject.masterFxSlotBypassed[static_cast<size_t>(raw->effectIndex)] = raw->bypassButton->getToggleState();
+
+            commitProjectEdit("Toggle Master FX Slot Bypass");
+        };
+        addAndMakeVisible(*row->bypassButton);
 
         row->removeButton = std::make_unique<juce::TextButton>("-");
         row->removeButton->setTooltip("Remove FX");
@@ -929,6 +1322,7 @@ void MixerComponent::MasterStrip::syncFxRows()
         auto& row = fxRows.back();
         removeChildComponent(row->nameLabel.get());
         removeChildComponent(row->viewButton.get());
+        removeChildComponent(row->bypassButton.get());
         removeChildComponent(row->removeButton.get());
         fxRows.pop_back();
     }
@@ -946,13 +1340,16 @@ void MixerComponent::MasterStrip::syncFxRows()
             label = juce::File(reference).getFileNameWithoutExtension();
 
         row->nameLabel->setText(label, juce::dontSendNotification);
-        row->nameLabel->setTooltip(reference);
+        row->nameLabel->setTooltip(label + "  |  Drag to reorder");
         row->nameLabel->setVisible(true);
         row->viewButton->setVisible(true);
+        row->bypassButton->setToggleState(fxSlotBypassed(currentProject.masterFxSlotBypassed, index), juce::dontSendNotification);
+        row->bypassButton->setVisible(true);
         row->removeButton->setVisible(true);
     }
 
     fxSummaryLabel.setVisible(effectCount == 0);
+    clampFxScrollOffset();
 }
 
 void MixerComponent::MasterStrip::showAddFxMenu(juce::Component* target)
@@ -991,7 +1388,9 @@ void MixerComponent::MasterStrip::showAddFxMenu(juce::Component* target)
                                if (result != itemId)
                                    continue;
 
-                               safeThis->currentProject.masterFxChain.add(reference);
+                               appendFxSlot(safeThis->currentProject.masterFxChain,
+                                            safeThis->currentProject.masterFxSlotBypassed,
+                                            reference);
                                safeThis->commitProjectEdit("Add Master FX");
                                return;
                            }
@@ -1012,7 +1411,7 @@ void MixerComponent::MasterStrip::removeEffectAt(int effectIndex)
     if (!juce::isPositiveAndBelow(effectIndex, currentProject.masterFxChain.size()))
         return;
 
-    currentProject.masterFxChain.remove(effectIndex);
+    removeFxSlotAt(currentProject.masterFxChain, currentProject.masterFxSlotBypassed, effectIndex);
     commitProjectEdit("Remove Master FX");
 }
 
@@ -1028,58 +1427,132 @@ void MixerComponent::MasterStrip::paint(juce::Graphics& g)
     auto topGlow = getLocalBounds().toFloat();
     g.setColour(kMasterAccent.withAlpha(0.10f));
     g.fillRoundedRectangle(topGlow.removeFromTop(30.0f), 10.0f);
+
+    if (fxDragActive && fxDropInsertIndex >= 0)
+    {
+        const auto lineY = fxInsertionLineY(fxDropInsertIndex);
+        if (lineY > 0)
+        {
+            const auto left = static_cast<float>(getLocalBounds().getX() + 12);
+            const auto right = static_cast<float>(getLocalBounds().getRight() - 12);
+            g.setColour(kMasterAccent.withAlpha(0.95f));
+            g.fillRoundedRectangle(juce::Rectangle<float>(left, static_cast<float>(lineY - 1), right - left, 3.0f), 1.5f);
+        }
+    }
 }
 
 void MixerComponent::MasterStrip::resized()
 {
     auto area = getLocalBounds().reduced(7);
-    nameLabel.setBounds(area.removeFromTop(22));
+    nameLabel.setBounds(area.removeFromTop(18));
     area.removeFromTop(4);
 
-    auto bottomArea = area.removeFromBottom(204);
-    bottomArea.removeFromBottom(4);
-    volumeLabel.setBounds(bottomArea.removeFromBottom(16));
+    const int minimumFxAreaHeight = 44;
+    const int preferredBottomHeight = 182;
+    const auto maxBottomHeight = juce::jmax(0, area.getHeight() - minimumFxAreaHeight);
+    auto bottomArea = area.removeFromBottom(juce::jmin(preferredBottomHeight, maxBottomHeight));
+
+    fxListBounds = area;
+    fxSummaryLabel.setBounds(fxListBounds);
+
     bottomArea.removeFromBottom(2);
-    auto meterArea = bottomArea.removeFromBottom(154);
-    auto levelLane = meterArea.withSizeKeepingCentre(42, meterArea.getHeight());
+    volumeLabel.setBounds(bottomArea.removeFromBottom(14));
+    bottomArea.removeFromBottom(2);
+    meterLabel.setBounds(bottomArea.removeFromBottom(12));
+    bottomArea.removeFromBottom(2);
+    auto meterArea = bottomArea.removeFromBottom(118);
+    auto levelLane = meterArea.withSizeKeepingCentre(64, meterArea.getHeight());
+    meterScale.setBounds(levelLane.removeFromLeft(18));
     leftMeter.setBounds(levelLane.removeFromLeft(7));
     levelLane.removeFromLeft(2);
     rightMeter.setBounds(levelLane.removeFromLeft(7));
     levelLane.removeFromLeft(4);
     volumeSlider.setBounds(levelLane);
 
-    bottomArea.removeFromBottom(6);
+    bottomArea.removeFromBottom(4);
     auto fxRow = bottomArea.removeFromBottom(20);
-    const int fxButtonWidth = 24;
-    auto fxButtons = fxRow.withSizeKeepingCentre((fxButtonWidth * 3) + 12, fxRow.getHeight());
-    fxButton.setBounds(fxButtons.removeFromLeft(fxButtonWidth + 2));
+    auto fxButtons = fxRow.withSizeKeepingCentre(juce::jmin(fxRow.getWidth(), 116), fxRow.getHeight());
+    fxButton.setBounds(fxButtons.removeFromLeft(22));
     fxButtons.removeFromLeft(4);
-    fxAddButton.setBounds(fxButtons.removeFromLeft(fxButtonWidth));
+    fxAddButton.setBounds(fxButtons.removeFromLeft(18));
     fxButtons.removeFromLeft(4);
-    fxBypassButton.setBounds(fxButtons.removeFromLeft(fxButtonWidth + 10));
-
-    auto fxArea = area;
-    fxSummaryLabel.setBounds(fxArea);
+    fxUpButton.setBounds(fxButtons.removeFromLeft(18));
+    fxButtons.removeFromLeft(4);
+    fxDownButton.setBounds(fxButtons.removeFromLeft(18));
+    fxButtons.removeFromLeft(4);
+    fxBypassButton.setBounds(fxButtons.removeFromLeft(24));
 
     const int rowHeight = 18;
-    int y = fxArea.getY();
-    for (auto& row : fxRows)
+    const int rowGap = 2;
+    const int rowPitch = rowHeight + rowGap;
+    fxVisibleRowCount = juce::jmax(0, (fxListBounds.getHeight() + rowGap) / rowPitch);
+    clampFxScrollOffset();
+    const auto effectCount = static_cast<int>(fxRows.size());
+    const auto startIndex = juce::jlimit(0, juce::jmax(0, effectCount), fxScrollOffset);
+    const auto endIndex = juce::jmin(effectCount, startIndex + fxVisibleRowCount);
+
+    fxUpButton.setEnabled(startIndex > 0);
+    fxDownButton.setEnabled(endIndex < effectCount);
+
+    int y = fxListBounds.getY();
+    for (int index = 0; index < effectCount; ++index)
     {
-        const bool fits = y + rowHeight <= fxArea.getBottom();
-        row->nameLabel->setVisible(fits);
-        row->viewButton->setVisible(fits);
-        row->removeButton->setVisible(fits);
-        if (!fits)
+        auto& row = fxRows[static_cast<size_t>(index)];
+        const bool visible = index >= startIndex && index < endIndex && y + rowHeight <= fxListBounds.getBottom();
+        row->rowBounds = {};
+        row->nameLabel->setVisible(visible);
+        row->viewButton->setVisible(visible);
+        row->bypassButton->setVisible(visible);
+        row->removeButton->setVisible(visible);
+        if (!visible)
             continue;
 
-        auto rowBounds = juce::Rectangle<int>(fxArea.getX(), y, fxArea.getWidth(), rowHeight);
-        row->nameLabel->setBounds(rowBounds.removeFromLeft(juce::jmax(8, rowBounds.getWidth() - 40)));
-        rowBounds.removeFromLeft(2);
-        row->viewButton->setBounds(rowBounds.removeFromLeft(18));
-        rowBounds.removeFromLeft(2);
-        row->removeButton->setBounds(rowBounds.removeFromLeft(18));
-        y += rowHeight + 2;
+        auto rowBounds = juce::Rectangle<int>(fxListBounds.getX(), y, fxListBounds.getWidth(), rowHeight);
+        row->rowBounds = rowBounds;
+        auto rowButtons = rowBounds.removeFromRight(58);
+        row->nameLabel->setBounds(rowBounds);
+        row->viewButton->setBounds(rowButtons.removeFromLeft(18));
+        rowButtons.removeFromLeft(2);
+        row->bypassButton->setBounds(rowButtons.removeFromLeft(18));
+        rowButtons.removeFromLeft(2);
+        row->removeButton->setBounds(rowButtons.removeFromLeft(18));
+        y += rowPitch;
     }
+}
+
+void MixerComponent::MasterStrip::mouseWheelMove(const juce::MouseEvent& event, const juce::MouseWheelDetails& wheel)
+{
+    if (!fxListBounds.contains(event.getEventRelativeTo(this).getPosition()) || fxRows.size() <= static_cast<size_t>(fxVisibleRowCount))
+    {
+        juce::Component::mouseWheelMove(event, wheel);
+        return;
+    }
+
+    if (std::abs(wheel.deltaY) < 0.001f)
+        return;
+
+    fxScrollOffset += wheel.deltaY < 0.0f ? 1 : -1;
+    clampFxScrollOffset();
+    resized();
+    repaint();
+}
+
+void MixerComponent::MasterStrip::updateMeterTooltip()
+{
+    const auto tooltip = stereoMeterTooltipText(currentProject.masterVolume,
+                                                currentMeterLevels.first,
+                                                currentMeterLevels.second);
+    leftMeter.setTooltip(tooltip);
+    rightMeter.setTooltip(tooltip);
+    meterScale.setTooltip("Meter scale in dBFS");
+    meterLabel.setTooltip("Peak level: " + peakDbfsLabel(juce::jmax(currentMeterLevels.first, currentMeterLevels.second)));
+    volumeSlider.setTooltip("Fader: " + gainDbLabel(currentProject.masterVolume));
+}
+
+void MixerComponent::MasterStrip::clampFxScrollOffset()
+{
+    const auto maxOffset = juce::jmax(0, static_cast<int>(fxRows.size()) - juce::jmax(1, fxVisibleRowCount));
+    fxScrollOffset = juce::jlimit(0, maxOffset, fxScrollOffset);
 }
 
 void MixerComponent::MasterStrip::showFxMenu()
@@ -1128,6 +1601,7 @@ void MixerComponent::MasterStrip::showFxMenu()
                                    return;
 
                                safeThis->currentProject.masterFxChain.clear();
+                               safeThis->currentProject.masterFxSlotBypassed.clear();
                                safeThis->commitProjectEdit("Clear Master FX");
                                return;
                            }
@@ -1137,15 +1611,154 @@ void MixerComponent::MasterStrip::showFxMenu()
                                if (result != itemId)
                                    continue;
 
-                               if (safeThis->currentProject.masterFxChain.contains(reference))
-                                   safeThis->currentProject.masterFxChain.removeString(reference);
+                               int existingIndex = -1;
+                               for (int index = 0; index < safeThis->currentProject.masterFxChain.size(); ++index)
+                               {
+                                   if (safeThis->currentProject.masterFxChain[index].equalsIgnoreCase(reference))
+                                   {
+                                       existingIndex = index;
+                                       break;
+                                   }
+                               }
+
+                               if (existingIndex >= 0)
+                                   removeFxSlotAt(safeThis->currentProject.masterFxChain, safeThis->currentProject.masterFxSlotBypassed, existingIndex);
                                else
-                                   safeThis->currentProject.masterFxChain.add(reference);
+                                   appendFxSlot(safeThis->currentProject.masterFxChain, safeThis->currentProject.masterFxSlotBypassed, reference);
 
                                safeThis->commitProjectEdit("Update Master FX Chain");
                                return;
                            }
                        });
+}
+
+int MixerComponent::MasterStrip::findFxRowIndexForComponent(const juce::Component* component) const
+{
+    if (component == nullptr)
+        return -1;
+
+    for (const auto& row : fxRows)
+    {
+        if (row != nullptr && row->nameLabel.get() == component)
+            return row->effectIndex;
+    }
+
+    return -1;
+}
+
+int MixerComponent::MasterStrip::findFxInsertIndexForY(int y) const
+{
+    int insertIndex = 0;
+    bool foundVisibleRow = false;
+
+    for (const auto& row : fxRows)
+    {
+        if (row == nullptr || row->rowBounds.isEmpty())
+            continue;
+
+        foundVisibleRow = true;
+        if (y < row->rowBounds.getCentreY())
+            return row->effectIndex;
+
+        insertIndex = row->effectIndex + 1;
+    }
+
+    return foundVisibleRow ? insertIndex : currentProject.masterFxChain.size();
+}
+
+int MixerComponent::MasterStrip::fxInsertionLineY(int insertIndex) const
+{
+    const auto clampedIndex = juce::jlimit(0, currentProject.masterFxChain.size(), insertIndex);
+
+    for (const auto& row : fxRows)
+    {
+        if (row == nullptr || row->rowBounds.isEmpty())
+            continue;
+
+        if (row->effectIndex == clampedIndex)
+            return row->rowBounds.getY();
+    }
+
+    for (auto rowIt = fxRows.rbegin(); rowIt != fxRows.rend(); ++rowIt)
+    {
+        const auto& row = *rowIt;
+        if (row == nullptr || row->rowBounds.isEmpty())
+            continue;
+
+        return row->rowBounds.getBottom();
+    }
+
+    return 0;
+}
+
+void MixerComponent::MasterStrip::finishFxDrag(bool commitChanges)
+{
+    const auto sourceIndex = fxDragSourceIndex;
+    const auto insertIndex = fxDropInsertIndex;
+    const auto wasActive = fxDragActive;
+
+    fxDragActive = false;
+    fxDragSourceIndex = -1;
+    fxDropInsertIndex = -1;
+    repaint();
+
+    if (!commitChanges || !wasActive)
+        return;
+
+    moveEffectToInsertIndex(sourceIndex, insertIndex);
+}
+
+void MixerComponent::MasterStrip::moveEffectToInsertIndex(int sourceIndex, int insertIndex)
+{
+    const auto effectCount = currentProject.masterFxChain.size();
+    if (!juce::isPositiveAndBelow(sourceIndex, effectCount))
+        return;
+
+    auto adjustedInsertIndex = juce::jlimit(0, effectCount, insertIndex);
+    if (adjustedInsertIndex == sourceIndex || adjustedInsertIndex == sourceIndex + 1)
+        return;
+
+    const auto movedReference = currentProject.masterFxChain[sourceIndex];
+    const auto movedBypassed = fxSlotBypassed(currentProject.masterFxSlotBypassed, sourceIndex);
+
+    currentProject.masterFxChain.remove(sourceIndex);
+    if (juce::isPositiveAndBelow(sourceIndex, static_cast<int>(currentProject.masterFxSlotBypassed.size())))
+        currentProject.masterFxSlotBypassed.erase(currentProject.masterFxSlotBypassed.begin() + sourceIndex);
+
+    if (adjustedInsertIndex > sourceIndex)
+        --adjustedInsertIndex;
+
+    currentProject.masterFxChain.insert(adjustedInsertIndex, movedReference);
+    currentProject.masterFxSlotBypassed.insert(currentProject.masterFxSlotBypassed.begin() + adjustedInsertIndex, movedBypassed);
+    ensureFxBypassStateSize(currentProject.masterFxSlotBypassed, currentProject.masterFxChain.size());
+    commitProjectEdit("Reorder Master FX");
+}
+
+void MixerComponent::MasterStrip::mouseDown(const juce::MouseEvent& event)
+{
+    const auto* component = event.originalComponent != nullptr ? event.originalComponent : event.eventComponent;
+    const auto rowIndex = findFxRowIndexForComponent(component);
+    if (rowIndex < 0)
+        return;
+
+    fxDragActive = true;
+    fxDragSourceIndex = rowIndex;
+    fxDropInsertIndex = rowIndex;
+    repaint();
+}
+
+void MixerComponent::MasterStrip::mouseDrag(const juce::MouseEvent& event)
+{
+    if (!fxDragActive)
+        return;
+
+    fxDropInsertIndex = findFxInsertIndexForY(juce::roundToInt(event.getEventRelativeTo(this).position.y));
+    repaint();
+}
+
+void MixerComponent::MasterStrip::mouseUp(const juce::MouseEvent&)
+{
+    finishFxDrag(true);
 }
 
 void MixerComponent::MasterStrip::commitProjectEdit(const juce::String& actionName)
@@ -1172,9 +1785,7 @@ void MixerComponent::ensureStripCount(int trackCount)
         addAndMakeVisible(strip);
     }
 
-    const int stripWidth = 118;
-    const int gap = 8;
-    const auto width = juce::jmax(760, ((trackCount + 1) * stripWidth) + (juce::jmax(0, trackCount) * gap) + 18);
+    const auto width = juce::jmax(760, ((trackCount + 1) * kStripWidth) + (juce::jmax(0, trackCount) * kStripGap) + 18);
     setSize(width, juce::jmax(360, getHeight()));
 }
 

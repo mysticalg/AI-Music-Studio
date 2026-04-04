@@ -3966,7 +3966,7 @@ private:
             }
             if (graphTransportEnabled.load())
                 processPersistentPluginGraphTransport(buffer, numSamples, renderedSampleFrames.load());
-            if (audioEngine.running || audioEngine.tailStopping)
+            if (audioEngine.running || audioEngine.tailStopping || audioEngineHasLivePreviewActivity())
                 processAudioEngine(buffer, numSamples);
             refreshRealtimeTransportSnapshot();
         }
@@ -5699,8 +5699,6 @@ private:
             );
             const auto statePath = fxObject->getProperty("state_path").toString().trim();
             const auto parameterSignature = parameterPayloadSignature(fxObject->getProperty("parameters"));
-            const auto bypassed = fxObject->hasProperty("bypassed")
-                && static_cast<bool>(fxObject->getProperty("bypassed"));
             const auto name = fxObject->hasProperty("name")
                 ? fxObject->getProperty("name").toString().trim()
                 : juce::String();
@@ -6547,10 +6545,6 @@ private:
             lane.parameter->setValue(juce::jlimit(0.0f, 1.0f, value / 100.0f));
             lane.lastAppliedValue = value;
         }
-        track.livePreviewMessages.clear();
-        track.livePreviewActiveNotes = 0;
-        track.livePreviewTailActive = false;
-        track.livePreviewTailSilentBlocks = 0;
     }
 
     static void applyAudioEngineTrackMixAutomation(const AudioEngineState& engineState,
@@ -7903,14 +7897,20 @@ private:
 
         key = normaliseVst3PathForSettings(key);
 
-        editorWindow = std::make_unique<PluginEditorWindow>(
-            *pluginInstance,
-            "editor_" + key,
-            appSettings,
-            [this](const juce::String& command)
-            {
-                dispatchShortcutCallback(command);
-            });
+        {
+            // Serialize editor lifetime against processBlock. Repeated editor
+            // open/close cycles on some plugins are not safe if UI creation or
+            // destruction races the realtime processor instance.
+            const juce::ScopedLock lock(pluginLock);
+            editorWindow = std::make_unique<PluginEditorWindow>(
+                *pluginInstance,
+                "editor_" + key,
+                appSettings,
+                [this](const juce::String& command)
+                {
+                    dispatchShortcutCallback(command);
+                });
+        }
         editorWindow->onWindowClosed = [safeThis = juce::Component::SafePointer<HostComponent>(this)]
         {
             if (safeThis == nullptr)
@@ -7925,7 +7925,10 @@ private:
                     return;
 
                 if (safeThis->editorWindow != nullptr && !safeThis->editorWindow->isVisible())
+                {
+                    const juce::ScopedLock lock(safeThis->pluginLock);
                     safeThis->editorWindow.reset();
+                }
             });
         };
         if (bridgeMode)
@@ -7963,14 +7966,17 @@ private:
         if (key.isEmpty())
             key = "graph_slot_" + juce::String(slotIndex + 1);
 
-        graphEditorWindow = std::make_unique<PluginEditorWindow>(
-            *slot.plugin,
-            "graph_editor_" + key + "_" + juce::String(slotIndex + 1),
-            appSettings,
-            [this](const juce::String& command)
-            {
-                dispatchShortcutCallback(command);
-            });
+        {
+            const juce::ScopedLock lock(pluginLock);
+            graphEditorWindow = std::make_unique<PluginEditorWindow>(
+                *slot.plugin,
+                "graph_editor_" + key + "_" + juce::String(slotIndex + 1),
+                appSettings,
+                [this](const juce::String& command)
+                {
+                    dispatchShortcutCallback(command);
+                });
+        }
         graphEditorSlotIndex = slotIndex;
         graphEditorWindow->onWindowClosed = [safeThis = juce::Component::SafePointer<HostComponent>(this)]
         {
@@ -7986,6 +7992,7 @@ private:
 
                 if (safeThis->graphEditorWindow != nullptr && !safeThis->graphEditorWindow->isVisible())
                 {
+                    const juce::ScopedLock lock(safeThis->pluginLock);
                     safeThis->graphEditorWindow.reset();
                     safeThis->graphEditorSlotIndex = -1;
                 }
@@ -8049,12 +8056,15 @@ private:
 
     void removeAudioEngineTrackEditorWindow(int trackIndex)
     {
-        audioEngineTrackEditorWindows.erase(
-            std::remove_if(
-                audioEngineTrackEditorWindows.begin(),
-                audioEngineTrackEditorWindows.end(),
-                [trackIndex](const auto& entry) { return entry.trackIndex == trackIndex; }),
-            audioEngineTrackEditorWindows.end());
+        {
+            const juce::ScopedLock lock(pluginLock);
+            audioEngineTrackEditorWindows.erase(
+                std::remove_if(
+                    audioEngineTrackEditorWindows.begin(),
+                    audioEngineTrackEditorWindows.end(),
+                    [trackIndex](const auto& entry) { return entry.trackIndex == trackIndex; }),
+                audioEngineTrackEditorWindows.end());
+        }
         notifyEditorStateChanged(anyEditorWindowVisible());
         refreshRealtimeTransportSnapshot();
     }
@@ -8076,17 +8086,20 @@ private:
 
     void removeAudioEngineEffectEditorWindow(bool isMaster, int trackIndex, int effectIndex)
     {
-        audioEngineEffectEditorWindows.erase(
-            std::remove_if(
-                audioEngineEffectEditorWindows.begin(),
-                audioEngineEffectEditorWindows.end(),
-                [isMaster, trackIndex, effectIndex](const auto& entry)
-                {
-                    return entry.isMaster == isMaster
-                        && entry.trackIndex == trackIndex
-                        && entry.effectIndex == effectIndex;
-                }),
-            audioEngineEffectEditorWindows.end());
+        {
+            const juce::ScopedLock lock(pluginLock);
+            audioEngineEffectEditorWindows.erase(
+                std::remove_if(
+                    audioEngineEffectEditorWindows.begin(),
+                    audioEngineEffectEditorWindows.end(),
+                    [isMaster, trackIndex, effectIndex](const auto& entry)
+                    {
+                        return entry.isMaster == isMaster
+                            && entry.trackIndex == trackIndex
+                            && entry.effectIndex == effectIndex;
+                    }),
+                audioEngineEffectEditorWindows.end());
+        }
         notifyEditorStateChanged(anyEditorWindowVisible());
         refreshRealtimeTransportSnapshot();
     }
@@ -8114,14 +8127,17 @@ private:
 
         AudioEngineTrackEditorWindowEntry entry;
         entry.trackIndex = trackIndex;
-        entry.window = std::make_unique<PluginEditorWindow>(
-            *track.plugin,
-            "audio_engine_editor_" + key + "_" + juce::String(trackIndex + 1),
-            appSettings,
-            [this](const juce::String& command)
-            {
-                dispatchShortcutCallback(command);
-            });
+        {
+            const juce::ScopedLock lock(pluginLock);
+            entry.window = std::make_unique<PluginEditorWindow>(
+                *track.plugin,
+                "audio_engine_editor_" + key + "_" + juce::String(trackIndex + 1),
+                appSettings,
+                [this](const juce::String& command)
+                {
+                    dispatchShortcutCallback(command);
+                });
+        }
 
         entry.window->onWindowClosed = [safeThis = juce::Component::SafePointer<HostComponent>(this), trackIndex]
         {
@@ -8184,14 +8200,17 @@ private:
         entry.isMaster = false;
         entry.trackIndex = trackIndex;
         entry.effectIndex = effectIndex;
-        entry.window = std::make_unique<PluginEditorWindow>(
-            *effectSlot.plugin,
-            "audio_engine_fx_editor_" + key + "_" + juce::String(trackIndex + 1) + "_" + juce::String(effectIndex + 1),
-            appSettings,
-            [this](const juce::String& command)
-            {
-                dispatchShortcutCallback(command);
-            });
+        {
+            const juce::ScopedLock lock(pluginLock);
+            entry.window = std::make_unique<PluginEditorWindow>(
+                *effectSlot.plugin,
+                "audio_engine_fx_editor_" + key + "_" + juce::String(trackIndex + 1) + "_" + juce::String(effectIndex + 1),
+                appSettings,
+                [this](const juce::String& command)
+                {
+                    dispatchShortcutCallback(command);
+                });
+        }
 
         entry.window->onWindowClosed = [safeThis = juce::Component::SafePointer<HostComponent>(this), trackIndex, effectIndex]
         {
@@ -8250,14 +8269,17 @@ private:
         entry.isMaster = true;
         entry.trackIndex = -1;
         entry.effectIndex = effectIndex;
-        entry.window = std::make_unique<PluginEditorWindow>(
-            *effectSlot.plugin,
-            "audio_engine_master_fx_editor_" + key + "_" + juce::String(effectIndex + 1),
-            appSettings,
-            [this](const juce::String& command)
-            {
-                dispatchShortcutCallback(command);
-            });
+        {
+            const juce::ScopedLock lock(pluginLock);
+            entry.window = std::make_unique<PluginEditorWindow>(
+                *effectSlot.plugin,
+                "audio_engine_master_fx_editor_" + key + "_" + juce::String(effectIndex + 1),
+                appSettings,
+                [this](const juce::String& command)
+                {
+                    dispatchShortcutCallback(command);
+                });
+        }
 
         entry.window->onWindowClosed = [safeThis = juce::Component::SafePointer<HostComponent>(this), effectIndex]
         {
@@ -8298,7 +8320,10 @@ private:
             if (it->trackIndex != trackIndex)
                 continue;
 
-            it->window.reset();
+            {
+                const juce::ScopedLock lock(pluginLock);
+                it->window.reset();
+            }
             audioEngineTrackEditorWindows.erase(it);
             notifyEditorStateChanged(anyEditorWindowVisible());
             refreshRealtimeTransportSnapshot();
@@ -8311,8 +8336,11 @@ private:
         if (audioEngineTrackEditorWindows.empty())
             return;
 
-        for (auto& entry : audioEngineTrackEditorWindows)
-            entry.window.reset();
+        {
+            const juce::ScopedLock lock(pluginLock);
+            for (auto& entry : audioEngineTrackEditorWindows)
+                entry.window.reset();
+        }
         audioEngineTrackEditorWindows.clear();
         notifyEditorStateChanged(anyEditorWindowVisible());
         refreshRealtimeTransportSnapshot();
@@ -8329,7 +8357,10 @@ private:
                 continue;
             }
 
-            it->window.reset();
+            {
+                const juce::ScopedLock lock(pluginLock);
+                it->window.reset();
+            }
             it = audioEngineEffectEditorWindows.erase(it);
             removedAny = true;
         }
@@ -8352,7 +8383,10 @@ private:
                 continue;
             }
 
-            it->window.reset();
+            {
+                const juce::ScopedLock lock(pluginLock);
+                it->window.reset();
+            }
             it = audioEngineEffectEditorWindows.erase(it);
             removedAny = true;
         }
@@ -8369,8 +8403,11 @@ private:
         if (audioEngineEffectEditorWindows.empty())
             return;
 
-        for (auto& entry : audioEngineEffectEditorWindows)
-            entry.window.reset();
+        {
+            const juce::ScopedLock lock(pluginLock);
+            for (auto& entry : audioEngineEffectEditorWindows)
+                entry.window.reset();
+        }
         audioEngineEffectEditorWindows.clear();
         notifyEditorStateChanged(anyEditorWindowVisible());
         refreshRealtimeTransportSnapshot();
@@ -8467,7 +8504,10 @@ private:
     {
         if (editorWindow != nullptr)
         {
-            editorWindow.reset();
+            {
+                const juce::ScopedLock lock(pluginLock);
+                editorWindow.reset();
+            }
             notifyEditorStateChanged(anyEditorWindowVisible());
             refreshRealtimeTransportSnapshot();
         }
@@ -8476,7 +8516,10 @@ private:
     void closeGraphEditorWindow()
     {
         if (graphEditorWindow != nullptr)
+        {
+            const juce::ScopedLock lock(pluginLock);
             graphEditorWindow.reset();
+        }
         graphEditorSlotIndex = -1;
         notifyEditorStateChanged(anyEditorWindowVisible());
         refreshRealtimeTransportSnapshot();
@@ -8618,8 +8661,6 @@ private:
                                                         std::memory_order_release);
         transportSnapshotPluginOutputPeakLevel.store(juce::jlimit(0.0f, 1.0f, pluginOutputPeakLevel),
                                                      std::memory_order_release);
-        transportSnapshotEditorOpen.store(anyEditorWindowVisible() ? 1 : 0,
-                                          std::memory_order_release);
         audioEngineTrackCount.store(static_cast<int>(audioEngine.tracks.size()), std::memory_order_release);
 
         const juce::SpinLock::ScopedLockType peakLock(transportSnapshotTrackPeaksLock);

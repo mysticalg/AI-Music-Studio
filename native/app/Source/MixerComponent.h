@@ -36,7 +36,8 @@ public:
     void resized() override;
 
 private:
-    class MeterComponent final : public juce::Component
+    class MeterComponent final : public juce::Component,
+                                 public juce::SettableTooltipClient
     {
     public:
         void setLevel(float newLevel);
@@ -47,7 +48,8 @@ private:
         float level = 0.0f;
     };
 
-    class MeterScaleComponent final : public juce::Component
+    class MeterScaleComponent final : public juce::Component,
+                                      public juce::SettableTooltipClient
     {
     public:
         void paint(juce::Graphics& g) override;
@@ -66,6 +68,7 @@ private:
         void refreshMeter();
         void paint(juce::Graphics& g) override;
         void resized() override;
+        void mouseWheelMove(const juce::MouseEvent& event, const juce::MouseWheelDetails& wheel) override;
 
     private:
         struct FxRowWidgets
@@ -75,6 +78,7 @@ private:
             std::unique_ptr<juce::TextButton> viewButton;
             std::unique_ptr<juce::TextButton> bypassButton;
             std::unique_ptr<juce::TextButton> removeButton;
+            juce::Rectangle<int> rowBounds;
         };
 
         void showFxMenu();
@@ -82,10 +86,18 @@ private:
         void syncFxRows();
         void openEffectEditor(int effectIndex);
         void removeEffectAt(int effectIndex);
+        int findFxRowIndexForComponent(const juce::Component* component) const;
+        int findFxInsertIndexForY(int y) const;
+        int fxInsertionLineY(int insertIndex) const;
+        void finishFxDrag(bool commitChanges);
+        void moveEffectToInsertIndex(int sourceIndex, int insertIndex);
         void updateMeterTooltip();
         void clampFxScrollOffset();
         void updateButtonColours(const juce::Colour& accentColour);
         void commitTrackEdit(const juce::String& actionName);
+        void mouseDown(const juce::MouseEvent& event) override;
+        void mouseDrag(const juce::MouseEvent& event) override;
+        void mouseUp(const juce::MouseEvent& event) override;
 
         const int trackIndex;
         ProjectGetter projectGetter;
@@ -99,6 +111,7 @@ private:
 
         juce::Label nameLabel;
         juce::Label fxSummaryLabel;
+        juce::Label meterLabel;
         juce::TextButton fxButton;
         juce::TextButton fxAddButton;
         juce::TextButton fxBypassButton;
@@ -115,6 +128,10 @@ private:
         float currentMeterLevel = 0.0f;
         int fxScrollOffset = 0;
         int fxVisibleRowCount = 0;
+        juce::Rectangle<int> fxListBounds;
+        bool fxDragActive = false;
+        int fxDragSourceIndex = -1;
+        int fxDropInsertIndex = -1;
 
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ChannelStrip)
     };
@@ -131,6 +148,7 @@ private:
         void refreshMeter();
         void paint(juce::Graphics& g) override;
         void resized() override;
+        void mouseWheelMove(const juce::MouseEvent& event, const juce::MouseWheelDetails& wheel) override;
 
     private:
         struct FxRowWidgets
@@ -140,6 +158,7 @@ private:
             std::unique_ptr<juce::TextButton> viewButton;
             std::unique_ptr<juce::TextButton> bypassButton;
             std::unique_ptr<juce::TextButton> removeButton;
+            juce::Rectangle<int> rowBounds;
         };
 
         void showFxMenu();
@@ -147,9 +166,17 @@ private:
         void syncFxRows();
         void openEffectEditor(int effectIndex);
         void removeEffectAt(int effectIndex);
+        int findFxRowIndexForComponent(const juce::Component* component) const;
+        int findFxInsertIndexForY(int y) const;
+        int fxInsertionLineY(int insertIndex) const;
+        void finishFxDrag(bool commitChanges);
+        void moveEffectToInsertIndex(int sourceIndex, int insertIndex);
         void updateMeterTooltip();
         void clampFxScrollOffset();
         void commitProjectEdit(const juce::String& actionName);
+        void mouseDown(const juce::MouseEvent& event) override;
+        void mouseDrag(const juce::MouseEvent& event) override;
+        void mouseUp(const juce::MouseEvent& event) override;
 
         ProjectGetter projectGetter;
         ProjectWriter projectWriter;
@@ -161,6 +188,7 @@ private:
 
         juce::Label nameLabel;
         juce::Label fxSummaryLabel;
+        juce::Label meterLabel;
         juce::TextButton fxButton;
         juce::TextButton fxAddButton;
         juce::TextButton fxBypassButton;
@@ -175,6 +203,10 @@ private:
         std::pair<float, float> currentMeterLevels { 0.0f, 0.0f };
         int fxScrollOffset = 0;
         int fxVisibleRowCount = 0;
+        juce::Rectangle<int> fxListBounds;
+        bool fxDragActive = false;
+        int fxDragSourceIndex = -1;
+        int fxDropInsertIndex = -1;
 
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MasterStrip)
     };

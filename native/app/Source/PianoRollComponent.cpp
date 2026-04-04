@@ -139,6 +139,60 @@ bool noteRangesTouchOrOverlap(const MidiNote& lhs, const MidiNote& rhs)
     return lhsEndTick >= rhs.startTick && rhsEndTick >= lhs.startTick;
 }
 
+juce::MouseCursor createGlueToolCursor()
+{
+    constexpr int cursorSize = 24;
+    auto image = juce::Image(juce::Image::ARGB, cursorSize, cursorSize, true);
+    juce::Graphics g(image);
+
+    const auto bottleColour = juce::Colour::fromRGB(244, 245, 247);
+    const auto accentColour = juce::Colour::fromRGB(255, 209, 102);
+    const auto outlineColour = juce::Colour::fromRGBA(10, 12, 16, 180);
+
+    juce::Path body;
+    body.startNewSubPath(9.0f, 3.0f);
+    body.lineTo(14.5f, 3.0f);
+    body.lineTo(14.5f, 7.0f);
+    body.lineTo(17.4f, 10.2f);
+    body.lineTo(15.8f, 12.2f);
+    body.lineTo(17.0f, 17.8f);
+    body.lineTo(10.0f, 20.8f);
+    body.lineTo(6.6f, 13.4f);
+    body.lineTo(9.0f, 11.9f);
+    body.lineTo(9.0f, 3.0f);
+    body.closeSubPath();
+
+    g.setColour(outlineColour);
+    g.fillPath(body, juce::AffineTransform::translation(1.0f, 1.0f));
+    g.setColour(bottleColour);
+    g.fillPath(body);
+    g.setColour(outlineColour.withAlpha(0.55f));
+    g.strokePath(body, juce::PathStrokeType(1.1f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+
+    juce::Path label;
+    label.addRoundedRectangle(8.6f, 10.1f, 5.0f, 5.0f, 1.5f);
+    g.setColour(accentColour.withAlpha(0.95f));
+    g.fillPath(label);
+
+    juce::Path nozzle;
+    nozzle.addTriangle(12.5f, 18.2f, 16.6f, 20.6f, 11.2f, 21.4f);
+    g.setColour(accentColour.brighter(0.12f));
+    g.fillPath(nozzle);
+
+    juce::Path glueDrop;
+    glueDrop.addEllipse(17.2f, 19.6f, 2.8f, 2.8f);
+    g.setColour(accentColour.withAlpha(0.8f));
+    g.fillPath(glueDrop);
+
+    return juce::MouseCursor(image, 16, 20);
+}
+
+const juce::MouseCursor& glueToolCursor()
+{
+    static const auto cursor = createGlueToolCursor();
+    return cursor;
+}
+
 juce::String pencilDrawModeLabel(PianoRollComponent::PencilDrawMode mode)
 {
     switch (mode)
@@ -284,6 +338,11 @@ void PianoRollComponent::setNotePreviewCallbacks(NotePreviewCallback noteOnCallb
 void PianoRollComponent::setToolModeChangeCallback(ToolModeChangeCallback toolModeChangeCallbackIn)
 {
     toolModeChangeCallback = std::move(toolModeChangeCallbackIn);
+}
+
+void PianoRollComponent::setKeyHandlerCallback(KeyHandlerCallback keyHandlerCallbackIn)
+{
+    keyHandlerCallback = std::move(keyHandlerCallbackIn);
 }
 
 int PianoRollComponent::viewPositionYForPitch(int pitch, int viewportHeight) const
@@ -1455,6 +1514,11 @@ void PianoRollComponent::stopPreviewNote()
 
 bool PianoRollComponent::keyPressed(const juce::KeyPress& key)
 {
+    const auto tryExternalKeyHandler = [this, &key]
+    {
+        return keyHandlerCallback != nullptr ? keyHandlerCallback(key) : false;
+    };
+
     if (key.getModifiers().isCommandDown()
         && (key.getTextCharacter() == 'c' || key.getTextCharacter() == 'C'))
         return copySelected();
@@ -1486,7 +1550,7 @@ bool PianoRollComponent::keyPressed(const juce::KeyPress& key)
     auto updatedProject = project();
     auto* pattern = patternForSection(updatedProject, sectionIndex);
     if (pattern == nullptr || !hasSelectedNotes(*pattern))
-        return false;
+        return tryExternalKeyHandler();
 
     const auto tickStep = gridTick();
     int deltaTick = 0;
@@ -1501,7 +1565,7 @@ bool PianoRollComponent::keyPressed(const juce::KeyPress& key)
     else if (key.getKeyCode() == juce::KeyPress::downKey)
         deltaRows = 1;
     else
-        return false;
+        return tryExternalKeyHandler();
 
     for (auto& note : pattern->notes)
     {
@@ -2208,9 +2272,49 @@ bool PianoRollComponent::glueSelectedOrClickedNotes(int noteIndex)
 
     std::vector<int> candidateIndices;
     const auto clickedNote = pattern->notes[static_cast<size_t>(noteIndex)];
-    const bool clickedWasSelected = clickedNote.selected && hasSelectedNotes(*pattern);
+    const auto findNextRightIndex = [&]() -> int
+    {
+        int nextIndex = -1;
+        int nextStartTick = std::numeric_limits<int>::max();
+        int nextEndTick = std::numeric_limits<int>::max();
 
-    if (clickedWasSelected)
+        for (int index = 0; index < static_cast<int>(pattern->notes.size()); ++index)
+        {
+            if (index == noteIndex)
+                continue;
+
+            const auto& candidate = pattern->notes[static_cast<size_t>(index)];
+            if (candidate.pitch != clickedNote.pitch)
+                continue;
+
+            if (candidate.startTick <= clickedNote.startTick)
+                continue;
+
+            const auto candidateEndTick = candidate.startTick + candidate.durationTick;
+            if (candidate.startTick < nextStartTick
+                || (candidate.startTick == nextStartTick && candidateEndTick < nextEndTick)
+                || (candidate.startTick == nextStartTick && candidateEndTick == nextEndTick
+                    && (nextIndex < 0 || index < nextIndex)))
+            {
+                nextIndex = index;
+                nextStartTick = candidate.startTick;
+                nextEndTick = candidateEndTick;
+            }
+        }
+
+        return nextIndex;
+    };
+
+    int selectedCount = 0;
+    for (const auto& note : pattern->notes)
+    {
+        if (note.selected)
+            ++selectedCount;
+    }
+
+    const bool clickedWasSelected = clickedNote.selected && selectedCount > 0;
+
+    if (clickedWasSelected && selectedCount > 1)
     {
         for (int index = 0; index < static_cast<int>(pattern->notes.size()); ++index)
         {
@@ -2220,35 +2324,11 @@ bool PianoRollComponent::glueSelectedOrClickedNotes(int noteIndex)
     }
     else
     {
-        std::vector<bool> included(pattern->notes.size(), false);
         candidateIndices.push_back(noteIndex);
-        included[static_cast<size_t>(noteIndex)] = true;
+        const auto nextIndex = findNextRightIndex();
 
-        bool expanded = true;
-        while (expanded)
-        {
-            expanded = false;
-            for (int index = 0; index < static_cast<int>(pattern->notes.size()); ++index)
-            {
-                if (included[static_cast<size_t>(index)])
-                    continue;
-
-                const auto& candidate = pattern->notes[static_cast<size_t>(index)];
-                if (candidate.pitch != clickedNote.pitch)
-                    continue;
-
-                for (const auto connectedIndex : candidateIndices)
-                {
-                    if (noteRangesTouchOrOverlap(candidate, pattern->notes[static_cast<size_t>(connectedIndex)]))
-                    {
-                        included[static_cast<size_t>(index)] = true;
-                        candidateIndices.push_back(index);
-                        expanded = true;
-                        break;
-                    }
-                }
-            }
-        }
+        if (nextIndex >= 0)
+            candidateIndices.push_back(nextIndex);
     }
 
     if (candidateIndices.size() < 2)
@@ -2294,7 +2374,30 @@ bool PianoRollComponent::glueSelectedOrClickedNotes(int noteIndex)
     }
 
     if (mergeCount == 0)
-        return false;
+    {
+        const auto nextIndex = findNextRightIndex();
+        if (nextIndex < 0)
+            return false;
+
+        std::fill(shouldRemove.begin(), shouldRemove.end(), false);
+        mergedNotes.clear();
+
+        const auto& nextNote = pattern->notes[static_cast<size_t>(nextIndex)];
+        const auto clickedEndTick = clickedNote.startTick + clickedNote.durationTick;
+        const auto nextEndTick = nextNote.startTick + nextNote.durationTick;
+
+        MidiNote merged;
+        merged.pitch = clickedNote.pitch;
+        merged.velocity = juce::jmax(clickedNote.velocity, nextNote.velocity);
+        merged.selected = true;
+        merged.startTick = juce::jmax(0, juce::jmin(clickedNote.startTick, nextNote.startTick));
+        merged.durationTick = juce::jmax(1, juce::jmax(clickedEndTick, nextEndTick) - merged.startTick);
+
+        shouldRemove[static_cast<size_t>(noteIndex)] = true;
+        shouldRemove[static_cast<size_t>(nextIndex)] = true;
+        mergedNotes.push_back(merged);
+        mergeCount = 1;
+    }
 
     std::vector<MidiNote> replacementNotes;
     replacementNotes.reserve(pattern->notes.size() - static_cast<size_t>(mergeCount) + mergedNotes.size());
@@ -2814,7 +2917,7 @@ void PianoRollComponent::updateCursorForPosition(juce::Point<float> position)
 
     if (toolMode == EditorToolMode::glue)
     {
-        setMouseCursor(juce::MouseCursor::PointingHandCursor);
+        setMouseCursor(glueToolCursor());
         return;
     }
 

@@ -37,6 +37,139 @@ juce::File nativeSessionStateFile()
         .getChildFile("last-session.aims");
 }
 
+constexpr const char* kMidiInputSelectionDisabled = "__mutagen_midi_input_disabled__";
+constexpr const char* kOllamaSiteUrl = "https://ollama.com/";
+constexpr const char* kOllamaWindowsDownloadUrl = "https://ollama.com/download/windows";
+
+juce::String midiInputDisplayName(const juce::MidiDeviceInfo& device)
+{
+    return device.name.trim().isNotEmpty() ? device.name.trim() : device.identifier.trim();
+}
+
+juce::String describeMidiInputSelection(const juce::String& selectedIdentifier,
+                                        const juce::Array<juce::MidiDeviceInfo>& availableDevices,
+                                        const juce::StringArray& activeDeviceNames)
+{
+    if (selectedIdentifier == kMidiInputSelectionDisabled)
+        return "MIDI input disabled.";
+
+    if (selectedIdentifier.isEmpty())
+    {
+        return activeDeviceNames.isEmpty()
+            ? "No MIDI input devices detected."
+            : "Listening to all MIDI inputs: " + activeDeviceNames.joinIntoString(", ");
+    }
+
+    for (const auto& device : availableDevices)
+    {
+        if (device.identifier == selectedIdentifier)
+            return "Listening to MIDI input: " + midiInputDisplayName(device);
+    }
+
+    return "Selected MIDI input is unavailable.";
+}
+
+juce::File detectedOllamaExecutable()
+{
+    juce::StringArray candidates;
+
+    const auto localAppData = juce::SystemStats::getEnvironmentVariable("LOCALAPPDATA", {}).trim();
+    if (localAppData.isNotEmpty())
+    {
+        const juce::File localBase(localAppData);
+        candidates.add(localBase.getChildFile("Programs").getChildFile("Ollama").getChildFile("ollama.exe").getFullPathName());
+        candidates.add(localBase.getChildFile("Programs").getChildFile("Ollama").getChildFile("Ollama app.exe").getFullPathName());
+    }
+
+    const auto programFiles = juce::SystemStats::getEnvironmentVariable("ProgramFiles", {}).trim();
+    if (programFiles.isNotEmpty())
+    {
+        const juce::File programFilesBase(programFiles);
+        candidates.add(programFilesBase.getChildFile("Ollama").getChildFile("ollama.exe").getFullPathName());
+        candidates.add(programFilesBase.getChildFile("Ollama").getChildFile("Ollama app.exe").getFullPathName());
+    }
+
+    const auto pathEntries = juce::StringArray::fromTokens(juce::SystemStats::getEnvironmentVariable("PATH", {}),
+                                                           ";",
+                                                           "\"");
+    for (const auto& entry : pathEntries)
+    {
+        const auto trimmed = entry.trim();
+        if (trimmed.isEmpty())
+            continue;
+
+        candidates.add(juce::File(trimmed).getChildFile("ollama.exe").getFullPathName());
+        candidates.add(juce::File(trimmed).getChildFile("Ollama app.exe").getFullPathName());
+    }
+
+    for (const auto& candidate : candidates)
+    {
+        const juce::File file(candidate);
+        if (file.existsAsFile())
+            return file;
+    }
+
+    return {};
+}
+
+bool isOllamaInstalledLocally()
+{
+    return detectedOllamaExecutable().existsAsFile();
+}
+
+juce::StringArray detectedOllamaModelChoices(const AIClient& aiClient,
+                                             const juce::String& baseUrl,
+                                             const juce::String& preferredModel = {})
+{
+    juce::StringArray choices;
+
+    try
+    {
+        choices = aiClient.availableOllamaModels(baseUrl);
+    }
+    catch (const std::exception&)
+    {
+    }
+
+    const auto trimmedPreferredModel = preferredModel.trim();
+    if (trimmedPreferredModel.isNotEmpty() && !choices.contains(trimmedPreferredModel))
+        choices.insert(0, trimmedPreferredModel);
+
+    return choices;
+}
+
+void refreshOllamaModelCombo(juce::AlertWindow& dialog,
+                             const AIClient& aiClient,
+                             const juce::String& baseUrl,
+                             const juce::String& preferredModel = {})
+{
+    auto* modelBox = dialog.getComboBoxComponent("ollamaModel");
+    if (modelBox == nullptr)
+        return;
+
+    modelBox->setEditableText(true);
+    modelBox->clear(juce::dontSendNotification);
+
+    const auto resolvedBaseUrl = baseUrl.trim().isNotEmpty() ? baseUrl.trim() : aiClient.getOllamaBaseUrl();
+    const auto choices = detectedOllamaModelChoices(aiClient, resolvedBaseUrl, preferredModel);
+
+    int itemId = 1;
+    for (const auto& choice : choices)
+        modelBox->addItem(choice, itemId++);
+
+    const auto desiredModel = preferredModel.trim();
+    if (desiredModel.isNotEmpty())
+        modelBox->setText(desiredModel, juce::dontSendNotification);
+    else if (!choices.isEmpty())
+        modelBox->setSelectedItemIndex(0, juce::dontSendNotification);
+    else
+        modelBox->setText({}, juce::dontSendNotification);
+
+    modelBox->setTooltip(choices.isEmpty()
+                             ? "No Ollama models were detected at the configured endpoint. You can still type a model tag manually."
+                             : "Detected Ollama models from " + resolvedBaseUrl + ". You can still type a custom model tag.");
+}
+
 juce::Image loadMutagenLogoBinaryData(bool preferSmallLogo)
 {
     const auto loadFromBinary = [] (const void* data, int dataSize)
@@ -449,33 +582,120 @@ juce::StringArray buildUiFontChoices()
     juce::StringArray choices;
     choices.add("Default System");
 
-    const auto installedFonts = juce::Font::findAllTypefaceNames();
-    constexpr std::array<const char*, 12> preferredFonts
+    auto installedFonts = juce::Font::findAllTypefaceNames();
+    installedFonts.sort(true);
+
+    const auto addInstalledFont = [&choices, &installedFonts] (const juce::String& requestedName)
     {
+        for (const auto& installedFont : installedFonts)
+        {
+            if (!installedFont.equalsIgnoreCase(requestedName))
+                continue;
+
+            choices.addIfNotAlreadyThere(installedFont);
+            return;
+        }
+
+        for (const auto& installedFont : installedFonts)
+        {
+            if (!installedFont.startsWithIgnoreCase(requestedName)
+                && !installedFont.containsIgnoreCase(requestedName))
+                continue;
+
+            choices.addIfNotAlreadyThere(installedFont);
+            return;
+        }
+    };
+
+    // Prefer compact, broadcast-style sans fonts that fit a DAW UI.
+    constexpr std::array<const char*, 20> preferredFonts
+    {
+        "Bahnschrift SemiCondensed",
+        "Bahnschrift Condensed",
+        "Bahnschrift SemiBold SemiConden",
         "Bahnschrift",
+        "Agency FB",
+        "Franklin Gothic Medium",
+        "Franklin Gothic Demi",
+        "Gill Sans MT Condensed",
+        "Gill Sans MT",
+        "Arial Narrow",
         "Segoe UI",
+        "Trebuchet MS",
         "Verdana",
         "Tahoma",
-        "Trebuchet MS",
-        "Franklin Gothic Medium",
         "Century Gothic",
         "Calibri",
         "Corbel",
         "Candara",
-        "Arial",
-        "Consolas"
+        "Consolas",
+        "Cascadia Mono"
     };
 
     for (const auto* preferredFont : preferredFonts)
-    {
-        for (const auto& installedFont : installedFonts)
-        {
-            if (!installedFont.equalsIgnoreCase(preferredFont))
-                continue;
+        addInstalledFont(preferredFont);
 
-            choices.addIfNotAlreadyThere(installedFont);
-            break;
+    const auto looksLikeDawFont = [] (const juce::String& fontName)
+    {
+        constexpr std::array<const char*, 16> allowedTokens
+        {
+            "bahnschrift",
+            "agency",
+            "gothic",
+            "segoe",
+            "arial",
+            "verdana",
+            "tahoma",
+            "trebuchet",
+            "calibri",
+            "corbel",
+            "candara",
+            "consolas",
+            "cascadia",
+            "dubai",
+            "dejavu sans",
+            "sans"
+        };
+
+        constexpr std::array<const char*, 13> rejectedTokens
+        {
+            "script",
+            "hand",
+            "blackadder",
+            "brush",
+            "comic",
+            "curlz",
+            "chiller",
+            "broadway",
+            "gigi",
+            "harrington",
+            "jokerman",
+            "symbol",
+            "wingding"
+        };
+
+        for (const auto* rejectedToken : rejectedTokens)
+        {
+            if (fontName.containsIgnoreCase(rejectedToken))
+                return false;
         }
+
+        for (const auto* allowedToken : allowedTokens)
+        {
+            if (fontName.containsIgnoreCase(allowedToken))
+                return true;
+        }
+
+        return false;
+    };
+
+    for (const auto& installedFont : installedFonts)
+    {
+        if (choices.size() >= 15)
+            break;
+
+        if (looksLikeDawFont(installedFont))
+            choices.addIfNotAlreadyThere(installedFont);
     }
 
     return choices;
@@ -1214,7 +1434,7 @@ private:
         }
         else
         {
-            g.setFont(juce::FontOptions(useVirus ? 10.8f : 10.4f, juce::Font::bold));
+            g.setFont(ui::strongFont());
             g.setColour(ghostColour);
             g.drawText(ghostText, valueArea, juce::Justification::centredLeft, false);
             g.setColour(valueColour);
@@ -1378,7 +1598,7 @@ public:
         folderList.setColour(juce::ListBox::outlineColourId, juce::Colour::fromRGB(62, 71, 86));
         addAndMakeVisible(folderList);
 
-        helperLabel.setText("The bundled folder is scanned automatically. Add project-specific user folders below.",
+        helperLabel.setText("The default VST folder is always scanned. Add any extra plugin folders below.",
                             juce::dontSendNotification);
         helperLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(150, 159, 170));
         addAndMakeVisible(helperLabel);
@@ -1548,7 +1768,8 @@ public:
                             std::function<void(int)> setRightLocatorTickIn,
                             std::function<void(int)> setTempoIn,
                             std::function<void(bool)> setLoopEnabledIn,
-                            std::function<void(bool)> setMetronomeEnabledIn)
+                            std::function<void(bool)> setMetronomeEnabledIn,
+                            std::function<void(bool)> setRecordEnabledIn)
         : jumpToStart(std::move(jumpToStartIn)),
           playProject(std::move(playProjectIn)),
           playTrack(std::move(playTrackIn)),
@@ -1558,7 +1779,8 @@ public:
           setRightLocatorTick(std::move(setRightLocatorTickIn)),
           setTempo(std::move(setTempoIn)),
           setLoopEnabled(std::move(setLoopEnabledIn)),
-          setMetronomeEnabled(std::move(setMetronomeEnabledIn))
+          setMetronomeEnabled(std::move(setMetronomeEnabledIn)),
+          setRecordEnabled(std::move(setRecordEnabledIn))
     {
         configureButton(homeButton, "Home");
         homeButton.onClick = [this] { if (jumpToStart != nullptr) jumpToStart(); };
@@ -1603,6 +1825,20 @@ public:
         };
         addAndMakeVisible(metronomeToggle);
 
+        recordToggle.setButtonText("Rec");
+        recordToggle.setClickingTogglesState(true);
+        recordToggle.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(58, 34, 40));
+        recordToggle.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(184, 62, 74));
+        recordToggle.setColour(juce::TextButton::textColourOffId, juce::Colours::white);
+        recordToggle.setColour(juce::TextButton::textColourOnId, juce::Colours::white);
+        recordToggle.setTooltip("Record incoming MIDI to the selected track during project playback.");
+        recordToggle.onClick = [this]
+        {
+            if (!syncing && setRecordEnabled != nullptr)
+                setRecordEnabled(recordToggle.getToggleState());
+        };
+        addAndMakeVisible(recordToggle);
+
         configureButton(setLeftButton, "Set L");
         setLeftButton.setTooltip("Set the left locator to the current playhead.");
         setLeftButton.onClick = [this]
@@ -1640,6 +1876,7 @@ public:
                           bool hasTrackSelection,
                           bool rackPlaying,
                           bool projectPlaying,
+                          bool recordEnabled,
                           const juce::String& statusText,
                           double cpuUsagePercent,
                           float masterPeakLeftIn,
@@ -1657,6 +1894,7 @@ public:
         tempoSlider.setValue(transportDisplayProject.bpm, juce::dontSendNotification);
         loopToggle.setToggleState(transportDisplayProject.loopEnabled, juce::dontSendNotification);
         metronomeToggle.setToggleState(transportDisplayProject.metronomeEnabled, juce::dontSendNotification);
+        recordToggle.setToggleState(recordEnabled, juce::dontSendNotification);
         syncing = false;
         masterPeakLeft = juce::jlimit(0.0f, 1.0f, masterPeakLeftIn);
         masterPeakRight = juce::jlimit(0.0f, 1.0f, masterPeakRightIn);
@@ -1664,6 +1902,7 @@ public:
 
         playTrackButton.setEnabled(hasTrackSelection);
         stopButton.setEnabled(rackPlaying || projectPlaying);
+        recordToggle.setEnabled(hasTrackSelection || !project.tracks.empty());
 
         const auto playheadSec = tickToSeconds(transportDisplayProject.playheadTick, transportDisplayProject.bpm);
         playheadLabel.setText("Playhead: tick "
@@ -1678,7 +1917,9 @@ public:
                               juce::dontSendNotification);
 
         juce::String transportState;
-        if (projectPlaying)
+        if (projectPlaying && recordEnabled)
+            transportState = "Project recording active";
+        else if (projectPlaying)
             transportState = "Project playback active";
         else if (rackPlaying)
             transportState = "Track playback active";
@@ -1718,6 +1959,8 @@ public:
         homeButton.setBounds(controls.removeFromLeft(72));
         controls.removeFromLeft(6);
         playProjectButton.setBounds(controls.removeFromLeft(116));
+        controls.removeFromLeft(6);
+        recordToggle.setBounds(controls.removeFromLeft(60));
         controls.removeFromLeft(6);
         playTrackButton.setBounds(controls.removeFromLeft(96));
         controls.removeFromLeft(6);
@@ -1875,7 +2118,7 @@ private:
         auto cap = juce::Rectangle<float>(x - 10.0f, strip.getY() + 2.0f, 20.0f, 12.0f);
         g.fillRoundedRectangle(cap, 4.0f);
         g.setColour(juce::Colours::black.withAlpha(0.85f));
-        g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
+        g.setFont(ui::strongFont());
         g.drawText(label, cap.toNearestInt(), juce::Justification::centred);
 
         juce::Path pointer;
@@ -1995,10 +2238,12 @@ private:
     std::function<void(int)> setTempo;
     std::function<void(bool)> setLoopEnabled;
     std::function<void(bool)> setMetronomeEnabled;
+    std::function<void(bool)> setRecordEnabled;
     bool syncing = false;
 
     juce::TextButton homeButton;
     juce::TextButton playProjectButton;
+    juce::TextButton recordToggle;
     juce::TextButton playTrackButton;
     juce::TextButton stopButton;
     juce::Label tempoLabel;
@@ -2026,8 +2271,10 @@ public:
                                                            const juce::String&,
                                                            int,
                                                            int)> applySettingsIn,
+                                std::function<juce::Result(const juce::String&)> applyMidiInputSettingIn,
                                 std::function<void()> refreshStatusIn)
         : applySettings(std::move(applySettingsIn)),
+          applyMidiInputSetting(std::move(applyMidiInputSettingIn)),
           refreshStatus(std::move(refreshStatusIn))
     {
         summaryLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(230, 235, 242));
@@ -2036,6 +2283,7 @@ public:
 
         configureCombo(driverTypeLabel, driverTypeCombo, "Driver Backend");
         configureCombo(outputDeviceLabel, outputDeviceCombo, "Output Device");
+        configureCombo(midiInputLabel, midiInputCombo, "MIDI Input");
         configureCombo(sampleRateLabel, sampleRateCombo, "Sample Rate");
         configureCombo(bufferSizeLabel, bufferSizeCombo, "Buffer Size");
 
@@ -2049,6 +2297,12 @@ public:
         {
             if (!syncing)
                 applyOutputDeviceSelection();
+        };
+
+        midiInputCombo.onChange = [this]
+        {
+            if (!syncing)
+                applyMidiInputSelectionChange();
         };
 
         sampleRateCombo.onChange = [this]
@@ -2077,7 +2331,8 @@ public:
 
         footerLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(156, 199, 239));
         footerLabel.setJustificationType(juce::Justification::topLeft);
-        footerLabel.setText("Playback and preview use the shared JUCE host output device.", juce::dontSendNotification);
+        footerLabel.setText("Playback uses the shared JUCE host output device. MIDI input selection controls live audition and note insert.",
+                            juce::dontSendNotification);
         addAndMakeVisible(footerLabel);
     }
 
@@ -2154,6 +2409,57 @@ public:
         setStatusMessage("Native audio settings ready.", false);
     }
 
+    void applyMidiInputSnapshot(const juce::Array<juce::MidiDeviceInfo>& devices,
+                                const juce::String& selectedIdentifier)
+    {
+        syncing = true;
+        midiInputCombo.clear(juce::dontSendNotification);
+        midiInputIdentifiers.clear();
+
+        int itemId = 1;
+        int selectedId = 0;
+
+        midiInputCombo.addItem("All MIDI Inputs", itemId);
+        midiInputIdentifiers.add({});
+        if (selectedIdentifier.isEmpty())
+            selectedId = itemId;
+        ++itemId;
+
+        midiInputCombo.addItem("No MIDI Input", itemId);
+        midiInputIdentifiers.add(kMidiInputSelectionDisabled);
+        if (selectedIdentifier == kMidiInputSelectionDisabled)
+            selectedId = itemId;
+        ++itemId;
+
+        for (const auto& device : devices)
+        {
+            const auto label = midiInputDisplayName(device);
+            if (label.isEmpty())
+                continue;
+
+            midiInputCombo.addItem(label, itemId);
+            midiInputIdentifiers.add(device.identifier);
+            if (device.identifier == selectedIdentifier)
+                selectedId = itemId;
+            ++itemId;
+        }
+
+        if (selectedId == 0 && selectedIdentifier.isNotEmpty() && selectedIdentifier != kMidiInputSelectionDisabled)
+        {
+            midiInputCombo.addItem("Unavailable MIDI Device", itemId);
+            midiInputIdentifiers.add(selectedIdentifier);
+            selectedId = itemId;
+        }
+
+        if (selectedId != 0)
+            midiInputCombo.setSelectedId(selectedId, juce::dontSendNotification);
+        else if (midiInputCombo.getNumItems() > 0)
+            midiInputCombo.setSelectedItemIndex(0, juce::dontSendNotification);
+
+        appliedMidiInputIdentifier = selectedIdentifier;
+        syncing = false;
+    }
+
     void setStatusMessage(const juce::String& message, bool isError)
     {
         footerLabel.setColour(juce::Label::textColourId,
@@ -2177,6 +2483,8 @@ public:
         layoutRow(area, driverTypeLabel, driverTypeCombo);
         area.removeFromTop(8);
         layoutRow(area, outputDeviceLabel, outputDeviceCombo);
+        area.removeFromTop(8);
+        layoutRow(area, midiInputLabel, midiInputCombo);
         area.removeFromTop(8);
         layoutRow(area, sampleRateLabel, sampleRateCombo);
         area.removeFromTop(8);
@@ -2372,6 +2680,29 @@ private:
                          result.failed());
     }
 
+    juce::String selectedMidiInputIdentifier() const
+    {
+        const auto index = midiInputCombo.getSelectedItemIndex();
+        if (!juce::isPositiveAndBelow(index, midiInputIdentifiers.size()))
+            return appliedMidiInputIdentifier;
+        return midiInputIdentifiers[index];
+    }
+
+    void applyMidiInputSelectionChange()
+    {
+        if (applyMidiInputSetting == nullptr)
+            return;
+
+        const auto requestedIdentifier = selectedMidiInputIdentifier();
+        if (requestedIdentifier == appliedMidiInputIdentifier)
+            return;
+
+        const auto result = applyMidiInputSetting(requestedIdentifier);
+        setStatusMessage(result.wasOk() ? "Updated MIDI input selection."
+                                        : result.getErrorMessage(),
+                         result.failed());
+    }
+
     void applyFormatSelection()
     {
         if (applySettings == nullptr)
@@ -2421,6 +2752,24 @@ private:
             changed = true;
         }
 
+        const auto requestedMidiInput = selectedMidiInputIdentifier();
+        if (requestedMidiInput != appliedMidiInputIdentifier)
+        {
+            if (applyMidiInputSetting == nullptr)
+            {
+                setStatusMessage("MIDI input settings are unavailable.", true);
+                return;
+            }
+
+            const auto result = applyMidiInputSetting(requestedMidiInput);
+            if (result.failed())
+            {
+                setStatusMessage(result.getErrorMessage(), true);
+                return;
+            }
+            changed = true;
+        }
+
         const auto selectedRate = selectedIntValue(sampleRateCombo);
         const auto selectedBuffer = selectedIntValue(bufferSizeCombo);
         if ((selectedRate > 0 || selectedBuffer > 0)
@@ -2441,18 +2790,23 @@ private:
     }
 
     std::function<juce::Result(const juce::String&, const juce::String&, int, int)> applySettings;
+    std::function<juce::Result(const juce::String&)> applyMidiInputSetting;
     std::function<void()> refreshStatus;
     bool syncing = false;
     juce::String appliedDriverType;
     juce::String appliedOutputDevice;
+    juce::String appliedMidiInputIdentifier;
     int appliedSampleRate = 0;
     int appliedBufferSize = 0;
+    juce::StringArray midiInputIdentifiers;
 
     juce::Label summaryLabel;
     juce::Label driverTypeLabel;
     juce::ComboBox driverTypeCombo;
     juce::Label outputDeviceLabel;
     juce::ComboBox outputDeviceCombo;
+    juce::Label midiInputLabel;
+    juce::ComboBox midiInputCombo;
     juce::Label sampleRateLabel;
     juce::ComboBox sampleRateCombo;
     juce::Label bufferSizeLabel;
@@ -2476,6 +2830,7 @@ public:
                                   std::function<void(int)> setTempoIn,
                                   std::function<void(bool)> setLoopEnabledIn,
                                   std::function<void(bool)> setMetronomeEnabledIn,
+                                  std::function<void(bool)> setRecordEnabledIn,
                                   std::function<void()> exportMixIn,
                                   std::function<void()> exportStemsIn,
                                   MixerComponent::ProjectGetter projectGetterIn,
@@ -2525,7 +2880,8 @@ public:
                                                                    std::move(setRightLocatorTickIn),
                                                                    std::move(setTempoIn),
                                                                    std::move(setLoopEnabledIn),
-                                                                   std::move(setMetronomeEnabledIn));
+                                                                   std::move(setMetronomeEnabledIn),
+                                                                   std::move(setRecordEnabledIn));
         addAndMakeVisible(*transportPanel);
 
         mixer = std::make_unique<MixerComponent>(std::move(projectGetterIn),
@@ -2542,6 +2898,7 @@ public:
                           bool hasTrackSelection,
                           bool rackPlaying,
                           bool projectPlaying,
+                          bool recordEnabled,
                           const juce::String& statusText,
                           double cpuUsagePercent,
                           float masterPeakLeft,
@@ -2553,6 +2910,7 @@ public:
                                              hasTrackSelection,
                                              rackPlaying,
                                              projectPlaying,
+                                             recordEnabled,
                                              statusText,
                                              cpuUsagePercent,
                                              masterPeakLeft,
@@ -2768,6 +3126,12 @@ public:
                                                    std::move(noteOffCallback),
                                                    std::move(stopPreviewCallback));
         }
+    }
+
+    void setKeyHandlerCallback(PianoRollComponent::KeyHandlerCallback keyHandlerCallback)
+    {
+        if (pianoRollView != nullptr)
+            pianoRollView->setKeyHandlerCallback(std::move(keyHandlerCallback));
     }
 
     void setArrangementViewScale(float pixelsPerBar, float laneHeightPixels)
@@ -3306,6 +3670,15 @@ public:
                                                       std::move(noteOffCallback),
                                                       std::move(stopPreviewCallback));
         }
+    }
+
+    void setKeyHandlerCallback(PianoRollComponent::KeyHandlerCallback keyHandlerCallback)
+    {
+        if (noteEditor != nullptr)
+            noteEditor->setKeyHandlerCallback(keyHandlerCallback);
+
+        if (controllerEditor != nullptr)
+            controllerEditor->setKeyHandlerCallback(std::move(keyHandlerCallback));
     }
 
     void setViewScale(float pixelsPerBeat, float rowHeightPixels)
@@ -5049,7 +5422,7 @@ private:
                                                  : juce::Colour::fromRGB(86, 92, 104)));
             g.fillRoundedRectangle(badgeBounds.toFloat(), 5.0f);
             g.setColour(juce::Colours::white);
-            g.setFont(juce::FontOptions(10.2f, juce::Font::bold));
+            g.setFont(ui::strongFont());
             g.drawFittedText(renderReady ? "READY" : (hasRender ? "MISSING" : "EMPTY"),
                              badgeBounds,
                              juce::Justification::centred,
@@ -5260,54 +5633,6 @@ juce::File defaultSystemVstDirectory()
 #else
     return {};
 #endif
-}
-
-std::vector<VstInstrument> discoverBundledVstCatalog()
-{
-    std::vector<VstInstrument> entries;
-    juce::Array<juce::File> scanDirectories;
-    const auto defaultDirectory = defaultSystemVstDirectory();
-    if (defaultDirectory != juce::File())
-        scanDirectories.add(defaultDirectory);
-
-    const auto bundledDirectory = findBundledVstDirectory();
-    if (bundledDirectory != juce::File())
-    {
-        bool alreadyAdded = false;
-        for (const auto& directory : scanDirectories)
-        {
-            if (directory.getFullPathName().equalsIgnoreCase(bundledDirectory.getFullPathName()))
-            {
-                alreadyAdded = true;
-                break;
-            }
-        }
-
-        if (!alreadyAdded)
-            scanDirectories.add(bundledDirectory);
-    }
-
-    for (const auto& directory : scanDirectories)
-    {
-        if (directory.isDirectory())
-            discoverBundledVstEntriesRecursive(directory, entries);
-    }
-
-    std::sort(entries.begin(),
-              entries.end(),
-              [] (const VstInstrument& lhs, const VstInstrument& rhs)
-              {
-                  return lhs.name.compareIgnoreCase(rhs.name) < 0;
-              });
-
-    entries.erase(std::unique(entries.begin(),
-                              entries.end(),
-                              [] (const VstInstrument& lhs, const VstInstrument& rhs)
-                              {
-                                  return lhs.path.equalsIgnoreCase(rhs.path);
-                              }),
-                  entries.end());
-    return entries;
 }
 
 std::vector<VstInstrument> discoverVstCatalogInDirectory(const juce::File& directory)
@@ -6433,6 +6758,10 @@ StudioShellComponent::StudioShellComponent()
                                          {
                                              setEditorToolMode(mode);
                                          });
+    pianoRoll->setKeyHandlerCallback([this] (const juce::KeyPress& key)
+                                     {
+                                         return keyPressed(key);
+                                     });
     pianoRollViewport.setViewedComponent(pianoRoll.get(), false);
     pianoRollViewport.setScrollBarsShown(true, true);
     addAndMakeVisible(pianoRollViewport);
@@ -6450,6 +6779,7 @@ StudioShellComponent::StudioShellComponent()
     createToolbarButton(aiSettingsButton, "AI Settings");
     createToolbarButton(aiComposeButton, "Compose");
     createToolbarButton(playProjectButton, "Play");
+    createToolbarButton(recordToggle, "Rec");
     createToolbarButton(undoButton, "Undo");
     createToolbarButton(redoButton, "Redo");
 
@@ -6471,12 +6801,18 @@ StudioShellComponent::StudioShellComponent()
         else
             playFullProjectThroughNativeEngine();
     };
+    recordToggle.setClickingTogglesState(true);
+    recordToggle.setToggleState(transportRecordEnabled, juce::dontSendNotification);
+    recordToggle.setTooltip("Record incoming MIDI to the selected track during project playback.");
+    recordToggle.setLookAndFeel(compactHeaderLookAndFeel.get());
+    recordToggle.onClick = [this] { setTransportRecordEnabled(recordToggle.getToggleState()); };
     undoButton.onClick = [this] { undo(); };
     redoButton.onClick = [this] { redo(); };
 
     aiComposeButton.setTooltip("AI Compose");
 
     playProjectButton.setLookAndFeel(compactHeaderLookAndFeel.get());
+    recordToggle.setLookAndFeel(compactHeaderLookAndFeel.get());
     aiComposeButton.setLookAndFeel(compactHeaderLookAndFeel.get());
     refreshPlaybackToggleButton();
 
@@ -6618,6 +6954,17 @@ StudioShellComponent::StudioShellComponent()
     metronomeToggle.setLookAndFeel(compactHeaderLookAndFeel.get());
     metronomeToggle.onClick = [this] { setTransportMetronomeEnabled(metronomeToggle.getToggleState()); };
 
+    createToolbarButton(midiInsertToggle, "MIDI In");
+    midiInsertToggle.setClickingTogglesState(true);
+    midiInsertToggle.setToggleState(midiInsertEnabled, juce::dontSendNotification);
+    midiInsertToggle.setTooltip("Insert incoming MIDI notes into the selected pattern instead of audition-only.");
+    midiInsertToggle.setLookAndFeel(compactHeaderLookAndFeel.get());
+    midiInsertToggle.onClick = [this]
+    {
+        midiInsertEnabled = midiInsertToggle.getToggleState();
+        persistSessionState();
+    };
+
     trackTable.getHeader().addColumn("Mute", kColumnMute, 58, 52, 72);
     trackTable.getHeader().addColumn("Solo", kColumnSolo, 58, 52, 72);
     trackTable.getHeader().addColumn("VST", kColumnVstView, 54, 48, 68);
@@ -6635,6 +6982,17 @@ StudioShellComponent::StudioShellComponent()
     trackTable.setOutlineThickness(1);
     addAndMakeVisible(trackTable);
 
+    midiInputDeviceConnection = juce::MidiDeviceListConnection::make(
+        [safeThis = juce::Component::SafePointer<StudioShellComponent>(this)]
+        {
+            juce::MessageManager::callAsync([safeThis]
+            {
+                if (safeThis != nullptr)
+                    safeThis->refreshMidiInputDevices();
+            });
+        });
+    refreshMidiInputDevices();
+
     setupFloatingWindows();
     applyEditorViewScaleState();
     setWantsKeyboardFocus(true);
@@ -6651,10 +7009,15 @@ StudioShellComponent::StudioShellComponent()
 StudioShellComponent::~StudioShellComponent()
 {
     persistSessionState();
+    cancelPendingUpdate();
+    midiInputDeviceConnection.reset();
+    midiInputs.clear();
     playProjectButton.setLookAndFeel(nullptr);
+    recordToggle.setLookAndFeel(nullptr);
     aiComposeButton.setLookAndFeel(nullptr);
     loopToggle.setLookAndFeel(nullptr);
     metronomeToggle.setLookAndFeel(nullptr);
+    midiInsertToggle.setLookAndFeel(nullptr);
     tempoSlider.setLookAndFeel(nullptr);
     timeSignatureNumeratorBox.setLookAndFeel(nullptr);
     timeSignatureDenominatorBox.setLookAndFeel(nullptr);
@@ -6747,6 +7110,10 @@ void StudioShellComponent::restorePersistedSessionState()
                                             static_cast<float>(windowStateSettings->getDoubleValue("session_piano_roll_row_height_pixels",
                                                                                                    pianoRollRowHeightPixels)));
     leftPaneWidthPixels = juce::jmax(0, windowStateSettings->getIntValue("session_left_pane_width_pixels", leftPaneWidthPixels));
+    midiInsertEnabled = windowStateSettings->getBoolValue("session_midi_insert_enabled", midiInsertEnabled);
+    transportRecordEnabled = windowStateSettings->getBoolValue("session_transport_record_enabled", transportRecordEnabled);
+    preferredMidiInputIdentifier = windowStateSettings->getValue("session_midi_input_identifier",
+                                                                 preferredMidiInputIdentifier).trim();
 
     ProjectFileData restored;
     const auto sessionFile = nativeSessionStateFile();
@@ -6773,6 +7140,9 @@ void StudioShellComponent::persistSessionState() const
     windowStateSettings->setValue("session_piano_roll_zoom_pixels_per_beat", pianoRollZoomPixelsPerBeat);
     windowStateSettings->setValue("session_piano_roll_row_height_pixels", pianoRollRowHeightPixels);
     windowStateSettings->setValue("session_left_pane_width_pixels", leftPaneWidthPixels);
+    windowStateSettings->setValue("session_midi_insert_enabled", midiInsertEnabled);
+    windowStateSettings->setValue("session_transport_record_enabled", transportRecordEnabled);
+    windowStateSettings->setValue("session_midi_input_identifier", preferredMidiInputIdentifier);
 
     const auto sessionFile = nativeSessionStateFile();
     ignoreUnused(saveProjectFile(sessionFile, documentState));
@@ -6786,6 +7156,11 @@ void StudioShellComponent::refreshPlaybackToggleButton()
     playProjectButton.setTooltip(playbackRunning ? "Stop Playback" : "Play Project");
     playProjectButton.setToggleState(playbackRunning, juce::dontSendNotification);
     playProjectButton.setEnabled(playbackRunning || !documentState.project.tracks.empty() || documentState.project.metronomeEnabled);
+    recordToggle.setToggleState(transportRecordEnabled, juce::dontSendNotification);
+    recordToggle.setEnabled(!documentState.project.tracks.empty());
+    recordToggle.setTooltip(projectPreviewRunning && transportRecordEnabled
+                                ? "Recording incoming MIDI to the selected track."
+                                : "Record incoming MIDI to the selected track during project playback.");
 }
 
 int StudioShellComponent::getCurrentThemeIndex() const noexcept
@@ -7085,11 +7460,15 @@ void StudioShellComponent::resized()
     auto toolbar1 = headerContent.removeFromTop(22);
     playProjectButton.setBounds(toolbar1.removeFromLeft(72));
     toolbar1.removeFromLeft(4);
+    recordToggle.setBounds(toolbar1.removeFromLeft(50));
+    toolbar1.removeFromLeft(4);
     aiComposeButton.setBounds(toolbar1.removeFromLeft(82));
     toolbar1.removeFromLeft(8);
     loopToggle.setBounds(toolbar1.removeFromLeft(54));
     toolbar1.removeFromLeft(6);
     metronomeToggle.setBounds(toolbar1.removeFromLeft(58));
+    toolbar1.removeFromLeft(6);
+    midiInsertToggle.setBounds(toolbar1.removeFromLeft(68));
 
     headerContent.removeFromTop(3);
     auto toolbar2 = headerContent.removeFromTop(22);
@@ -7406,6 +7785,7 @@ void StudioShellComponent::timerCallback()
 {
     const ScopedAppProfileSample profileSample(AppProfileSection::timerCallback);
     const auto nowMs = juce::Time::getMillisecondCounter();
+    dispatchPendingMidiInputMessages();
     pollAiComposeFuture();
 
     const bool hasSharedRackHost = nativeVstHost.isReady();
@@ -7435,7 +7815,11 @@ void StudioShellComponent::timerCallback()
         return;
     }
 
-    const bool shouldRefreshTrackMetersThisTick = rackPreviewRunning || ((playbackUiTickCounter % 3) == 0);
+    const bool hasVisibleTrackMeterConsumers = trackTable.isShowing()
+        || (mixerComponent != nullptr && mixerComponent->isShowing())
+        || (floatingMixerComponent != nullptr && mixerWindow != nullptr && mixerWindow->isVisible());
+    const bool shouldRefreshTrackMetersThisTick = hasVisibleTrackMeterConsumers
+        && (rackPreviewRunning || ((playbackUiTickCounter % 3) == 0));
     NativeVstHostSession::TransportSnapshot transportSnapshot;
     const auto snapshotResult = hasSharedRackHost
         ? nativeVstHost.queryTransportSnapshot(transportSnapshot, shouldRefreshTrackMetersThisTick)
@@ -7527,6 +7911,8 @@ void StudioShellComponent::timerCallback()
 
     if (!stillRunning)
     {
+        if (!activeRealtimeRecordedNotes.empty())
+            finishActiveRealtimeRecordedNotes(documentState.project.playheadTick);
         rackPreviewRunning = false;
         projectPreviewRunning = false;
         playbackUiTickCounter = 0;
@@ -7586,6 +7972,12 @@ void StudioShellComponent::refreshUi()
     timeSignatureDenominatorBox.setSelectedId(documentState.project.timeSigDenominator, juce::dontSendNotification);
     loopToggle.setToggleState(documentState.project.loopEnabled, juce::dontSendNotification);
     metronomeToggle.setToggleState(documentState.project.metronomeEnabled, juce::dontSendNotification);
+    recordToggle.setToggleState(transportRecordEnabled, juce::dontSendNotification);
+    midiInsertToggle.setToggleState(midiInsertEnabled, juce::dontSendNotification);
+    midiInsertToggle.setTooltip(activeMidiInputNames.isEmpty()
+                                    ? "No MIDI input devices detected. Connect one to audition or insert notes."
+                                    : "Insert incoming MIDI notes into the selected pattern. Listening to: "
+                                        + activeMidiInputNames.joinIntoString(", "));
     refreshProjectSummaryLabels();
 
     const auto trackCount = static_cast<int>(documentState.project.tracks.size());
@@ -7864,6 +8256,291 @@ void StudioShellComponent::persistWindowVisibilityState() const
     windowStateSettings->setValue("window_virtual_piano_visible", virtualPianoWindowVisible);
     windowStateSettings->setValue("window_activity_log_visible", activityLogWindowVisible);
     windowStateSettings->saveIfNeeded();
+}
+
+void StudioShellComponent::refreshMidiInputDevices()
+{
+    cancelPendingUpdate();
+
+    {
+        const juce::ScopedLock lock(midiInputQueueLock);
+        pendingMidiInputMessages.clear();
+    }
+
+    midiInputs.clear();
+    activeMidiInputNames.clear();
+    const auto availableDevices = juce::MidiInput::getAvailableDevices();
+
+    for (const auto& device : availableDevices)
+    {
+        if (preferredMidiInputIdentifier == kMidiInputSelectionDisabled)
+            break;
+
+        if (preferredMidiInputIdentifier.isNotEmpty()
+            && preferredMidiInputIdentifier != device.identifier)
+        {
+            continue;
+        }
+
+        auto input = juce::MidiInput::openDevice(device.identifier, this);
+        if (input == nullptr)
+            continue;
+
+        activeMidiInputNames.add(midiInputDisplayName(device));
+        input->start();
+        midiInputs.push_back(std::move(input));
+    }
+
+    const auto midiTooltip = describeMidiInputSelection(preferredMidiInputIdentifier,
+                                                        availableDevices,
+                                                        activeMidiInputNames)
+        + " Use MIDI In to insert notes into the selected pattern.";
+    midiInsertToggle.setTooltip(midiTooltip);
+
+    if (audioSettingsPanel != nullptr)
+        audioSettingsPanel->applyMidiInputSnapshot(availableDevices, preferredMidiInputIdentifier);
+}
+
+void StudioShellComponent::dispatchPendingMidiInputMessages()
+{
+    std::vector<juce::MidiMessage> messages;
+
+    {
+        const juce::ScopedLock lock(midiInputQueueLock);
+        if (pendingMidiInputMessages.empty())
+            return;
+
+        messages.swap(pendingMidiInputMessages);
+    }
+
+    const bool allowNoteOn = juce::Process::isForegroundProcess();
+
+    for (const auto& message : messages)
+    {
+        if (message.isNoteOn())
+        {
+            if (!allowNoteOn)
+                continue;
+
+            handleMidiKeyboardNoteOn(message.getNoteNumber(),
+                                     juce::jlimit(1, 127, static_cast<int>(message.getVelocity())));
+        }
+        else if (message.isNoteOff())
+        {
+            handleMidiKeyboardNoteOff(message.getNoteNumber(),
+                                      juce::jlimit(0, 127, static_cast<int>(message.getVelocity())));
+        }
+    }
+}
+
+void StudioShellComponent::handleMidiKeyboardNoteOn(int pitch, int velocity)
+{
+    if (documentState.project.tracks.empty())
+        addTrack();
+
+    if (getSelectedTrackIndex() < 0 && !documentState.project.tracks.empty())
+        setSelectedTrackIndex(0);
+
+    if (projectPreviewRunning && transportRecordEnabled)
+    {
+        handleRealtimeMidiRecordingNoteOn(pitch, velocity);
+    }
+    else if (midiInsertEnabled)
+    {
+        if (activeMidiInsertHeldPitches.contains(pitch))
+            return;
+
+        activeMidiInsertHeldPitches.add(pitch);
+        insertLiveMidiNote(pitch, velocity, true, false);
+    }
+    else
+        ignoreUnused(previewSelectedTrackMidiNoteOn(pitch, velocity));
+}
+
+void StudioShellComponent::handleMidiKeyboardNoteOff(int pitch, int velocity)
+{
+    previewSelectedTrackMidiNoteOff(pitch, velocity);
+
+    if (projectPreviewRunning && transportRecordEnabled)
+    {
+        handleRealtimeMidiRecordingNoteOff(pitch);
+    }
+    else if (midiInsertEnabled)
+    {
+        activeMidiInsertHeldPitches.removeFirstMatchingValue(pitch);
+        if (activeMidiInsertHeldPitches.isEmpty())
+        {
+            activeMidiInsertPatternId.clear();
+            activeMidiInsertTrackIndex = -1;
+            activeMidiInsertChordStartTick = -1;
+        }
+    }
+}
+
+void StudioShellComponent::insertLiveMidiNote(int pitch,
+                                              int velocity,
+                                              bool flashVirtualKey,
+                                              bool autoStopPreview)
+{
+    if (documentState.project.tracks.empty())
+        addTrack();
+
+    if (getSelectedTrackIndex() < 0 && !documentState.project.tracks.empty())
+        setSelectedTrackIndex(0);
+
+    const auto trackIndex = getSelectedTrackIndex();
+    if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(documentState.project.tracks.size())))
+        return;
+
+    auto sectionIndex = getSelectedMidiSectionIndex();
+    if (!juce::isPositiveAndBelow(sectionIndex, static_cast<int>(documentState.project.midiSections.size()))
+        || documentState.project.midiSections[static_cast<size_t>(sectionIndex)].trackIndex != trackIndex)
+    {
+        ensureSelectedMidiSectionForTrack(trackIndex);
+        sectionIndex = getSelectedMidiSectionIndex();
+    }
+
+    auto createdSection = false;
+    if (!juce::isPositiveAndBelow(sectionIndex, static_cast<int>(documentState.project.midiSections.size())))
+    {
+        auto updatedProject = documentState.project;
+        const auto patternLength = defaultPatternLengthTicks(updatedProject);
+        const auto snapTicks = arrangementSnapTickLength(updatedProject);
+
+        MidiPattern pattern;
+        pattern.id = juce::Uuid().toString();
+        pattern.name = updatedProject.tracks[static_cast<size_t>(trackIndex)].name.trim().isNotEmpty()
+            ? updatedProject.tracks[static_cast<size_t>(trackIndex)].name.trim() + " Pattern"
+            : "Pattern " + juce::String(static_cast<int>(updatedProject.midiPatterns.size()) + 1);
+        pattern.lengthTicks = patternLength;
+
+        MidiSection section;
+        section.trackIndex = trackIndex;
+        section.startTick = snapTicks > 0
+            ? (updatedProject.playheadTick / snapTicks) * snapTicks
+            : updatedProject.playheadTick;
+        section.lengthTicks = patternLength;
+        section.name = pattern.name;
+        section.patternId = pattern.id;
+
+        updatedProject.midiPatterns.push_back(std::move(pattern));
+        updatedProject.midiSections.push_back(std::move(section));
+        updatedProject.recalculateTimeFields();
+        sectionIndex = static_cast<int>(updatedProject.midiSections.size()) - 1;
+        applyProjectStateEdit(updatedProject, "Create Pattern");
+        setSelectedTrackIndex(trackIndex);
+        setSelectedMidiSectionIndex(sectionIndex, true);
+        createdSection = true;
+    }
+
+    auto updatedProject = documentState.project;
+    auto* pattern = findMidiPattern(updatedProject,
+                                    updatedProject.midiSections[static_cast<size_t>(sectionIndex)].patternId);
+    if (pattern == nullptr)
+        return;
+
+    const auto clampedPitch = juce::jlimit(kEditableMidiPitchMin, kEditableMidiPitchMax, pitch);
+    const auto clampedVelocity = juce::jlimit(1, 127, velocity);
+    const auto durationTick = kTicksPerBeat / 2;
+    const bool allowChordInsertGrouping = !autoStopPreview;
+    auto cursorTick = 0;
+    if (allowChordInsertGrouping
+        && activeMidiInsertChordStartTick >= 0
+        && activeMidiInsertTrackIndex == trackIndex
+        && activeMidiInsertPatternId == pattern->id
+        && !activeMidiInsertHeldPitches.isEmpty())
+    {
+        cursorTick = activeMidiInsertChordStartTick;
+    }
+    else
+    {
+        for (const auto& note : pattern->notes)
+            cursorTick = juce::jmax(cursorTick, note.startTick + note.durationTick);
+
+        if (allowChordInsertGrouping)
+        {
+            activeMidiInsertTrackIndex = trackIndex;
+            activeMidiInsertPatternId = pattern->id;
+            activeMidiInsertChordStartTick = cursorTick;
+        }
+    }
+
+    for (const auto& existingNote : pattern->notes)
+    {
+        if (existingNote.startTick == cursorTick
+            && existingNote.pitch == clampedPitch
+            && allowChordInsertGrouping)
+        {
+            ignoreUnused(previewSelectedTrackMidiNoteOn(clampedPitch, clampedVelocity));
+            return;
+        }
+    }
+
+    MidiNote note;
+    note.startTick = cursorTick;
+    note.durationTick = durationTick;
+    note.pitch = clampedPitch;
+    note.velocity = clampedVelocity;
+    pattern->notes.push_back(note);
+    pattern->lengthTicks = juce::jmax(pattern->lengthTicks, note.startTick + note.durationTick);
+    updatedProject.recalculateTimeFields();
+
+    applyProjectStateEdit(updatedProject, "Insert Live Note");
+    setSelectedTrackIndex(trackIndex);
+    setSelectedMidiSectionIndex(sectionIndex, true);
+
+    if (flashVirtualKey && virtualPianoWindowContent != nullptr)
+        virtualPianoWindowContent->flashPitch(clampedPitch);
+
+    ignoreUnused(previewSelectedTrackMidiNoteOn(clampedPitch, clampedVelocity));
+
+    if (autoStopPreview)
+    {
+        juce::Timer::callAfterDelay(juce::jlimit(90,
+                                                 600,
+                                                 juce::roundToInt(tickToSeconds(durationTick, documentState.project.bpm) * 1000.0)),
+                                    [safeThis = juce::Component::SafePointer<StudioShellComponent>(this),
+                                     trackIndex,
+                                     clampedPitch]
+                                    {
+                                        if (safeThis == nullptr
+                                            || !safeThis->nativeVstHost.isReady()
+                                            || !juce::isPositiveAndBelow(trackIndex,
+                                                                        static_cast<int>(safeThis->documentState.project.tracks.size())))
+                                            return;
+
+                                        const auto midiChannel = juce::jlimit(1,
+                                                                              16,
+                                                                              safeThis->documentState.project.tracks[static_cast<size_t>(trackIndex)].midiChannel + 1);
+                                        safeThis->nativeVstHost.noteOffAudioEngineTrack(trackIndex,
+                                                                                       clampedPitch,
+                                                                                       midiChannel,
+                                                                                       0.0f);
+                                    });
+    }
+
+    if (createdSection)
+        statusLabel.setText("Created a new pattern and inserted " + noteNameLabel(clampedPitch) + ".", juce::dontSendNotification);
+}
+
+void StudioShellComponent::handleIncomingMidiMessage(juce::MidiInput* source, const juce::MidiMessage& message)
+{
+    juce::ignoreUnused(source);
+
+    if (!message.isNoteOn() && !message.isNoteOff())
+        return;
+
+    {
+        const juce::ScopedLock lock(midiInputQueueLock);
+        pendingMidiInputMessages.push_back(message);
+    }
+
+    triggerAsyncUpdate();
+}
+
+void StudioShellComponent::handleAsyncUpdate()
+{
+    dispatchPendingMidiInputMessages();
 }
 
 void StudioShellComponent::appendActivityLog(const juce::String& title, const juce::String& body)
@@ -8240,7 +8917,8 @@ void StudioShellComponent::setupFloatingWindows()
                                                           [this] (int tick) { setTransportRightLocatorTick(tick); },
                                                           [this] (int bpm) { setTransportTempo(bpm); },
                                                           [this] (bool enabled) { setTransportLoopEnabled(enabled); },
-                                                          [this] (bool enabled) { setTransportMetronomeEnabled(enabled); });
+                                                          [this] (bool enabled) { setTransportMetronomeEnabled(enabled); },
+                                                          [this] (bool enabled) { setTransportRecordEnabled(enabled); });
     transportPanel = newTransportPanel;
     transportWindow->setContentOwned(newTransportPanel, true);
     transportWindow->setBounds(displayArea.getX() + juce::jmax(24, (displayArea.getWidth() - 980) / 2),
@@ -8267,6 +8945,7 @@ void StudioShellComponent::setupFloatingWindows()
                                                                         [this] (int bpm) { setTransportTempo(bpm); },
                                                                         [this] (bool enabled) { setTransportLoopEnabled(enabled); },
                                                                         [this] (bool enabled) { setTransportMetronomeEnabled(enabled); },
+                                                                        [this] (bool enabled) { setTransportRecordEnabled(enabled); },
                                                                         [this] { promptExportWav(); },
                                                                         [this] { promptExportProjectStems(); },
                                                                         [this] () -> const ProjectState& { return documentState.project; },
@@ -8617,6 +9296,10 @@ void StudioShellComponent::setupFloatingWindows()
                                                   {
                                                       stopSelectedTrackMidiPreview();
                                                   });
+    newFloatingPianoRoll->setKeyHandlerCallback([this] (const juce::KeyPress& key)
+                                                {
+                                                    return keyPressed(key);
+                                                });
     floatingPianoRollWorkspace = newFloatingPianoRoll;
     pianoRollWindow->setContentOwned(newFloatingPianoRoll, true);
     pianoRollWindow->setBounds(displayArea.getX() + 146,
@@ -8724,6 +9407,10 @@ void StudioShellComponent::setupFloatingWindows()
                                                     {
                                                         stopSelectedTrackMidiPreview();
                                                     });
+    newPanelsWindowContent->setKeyHandlerCallback([this] (const juce::KeyPress& key)
+                                                  {
+                                                      return keyPressed(key);
+                                                  });
     panelsWindowContent = newPanelsWindowContent;
     panelsWindow->setContentOwned(newPanelsWindowContent, true);
     panelsWindow->setBounds(displayArea.getX() + juce::jmax(40, displayArea.getWidth() / 8),
@@ -8744,13 +9431,17 @@ void StudioShellComponent::setupFloatingWindows()
                                                                                                      sampleRate,
                                                                                                      bufferSize);
                                                                  },
+                                                                 [this] (const juce::String& midiInputIdentifier)
+                                                                 {
+                                                                     return setPreferredMidiInputDevice(midiInputIdentifier);
+                                                                 },
                                                                  [this] { refreshAudioSettingsFromHost(true); });
     audioSettingsPanel = newAudioSettingsPanel;
     audioSettingsWindow->setContentOwned(newAudioSettingsPanel, true);
     audioSettingsWindow->setBounds(displayArea.getCentreX() - 260,
-                                   displayArea.getCentreY() - 170,
+                                   displayArea.getCentreY() - 190,
                                    520,
-                                   300);
+                                   340);
     audioSettingsWindow->setVisible(false);
 
     vstFolderManagerWindow = std::make_unique<FloatingPanelWindow>("VST Folder Manager");
@@ -8799,6 +9490,7 @@ void StudioShellComponent::refreshFloatingWindows(bool includeEditorRefresh)
                                          getSelectedTrack() != nullptr,
                                          rackPreviewRunning,
                                          projectPreviewRunning,
+                                         transportRecordEnabled,
                                          statusLabel.getText(),
                                          transportCpuUsagePercent,
                                          transportMasterPeakLeft,
@@ -8811,6 +9503,7 @@ void StudioShellComponent::refreshFloatingWindows(bool includeEditorRefresh)
                                                  getSelectedTrack() != nullptr,
                                                  rackPreviewRunning,
                                                  projectPreviewRunning,
+                                                 transportRecordEnabled,
                                                  statusLabel.getText(),
                                                  transportCpuUsagePercent,
                                                  transportMasterPeakLeft,
@@ -8962,6 +9655,335 @@ void StudioShellComponent::setTransportMetronomeEnabled(bool enabled)
     if (projectPreviewRunning && nativeVstHost.isReady())
         nativeVstHost.updateAudioEngineTransport(documentState.project);
     statusLabel.setText("Updated metronome setting.", juce::dontSendNotification);
+}
+
+void StudioShellComponent::setTransportRecordEnabled(bool enabled)
+{
+    if (transportRecordEnabled == enabled)
+        return;
+
+    if (!enabled)
+        finishActiveRealtimeRecordedNotes();
+
+    transportRecordEnabled = enabled;
+    refreshPlaybackToggleButton();
+    refreshFloatingWindows(false);
+    persistSessionState();
+    statusLabel.setText(enabled
+                            ? "Transport record armed for incoming MIDI on the selected track."
+                            : "Transport record disarmed.",
+                        juce::dontSendNotification);
+}
+
+int StudioShellComponent::currentAudioEngineTransportTick() const
+{
+    if (!projectPreviewRunning || !nativeVstHost.isReady())
+        return juce::jmax(0, documentState.project.playheadTick);
+
+    NativeVstHostSession::TransportSnapshot snapshot;
+    if (nativeVstHost.queryTransportSnapshot(snapshot, false).failed())
+        return juce::jmax(0, documentState.project.playheadTick);
+
+    const auto sampleRate = juce::jmax(1.0, snapshot.sampleRate);
+    return juce::jmax(0,
+                      frameToTick(documentState.project,
+                                  snapshot.audioEnginePositionFrame,
+                                  sampleRate));
+}
+
+int StudioShellComponent::ensureMidiSectionForTrackAtTick(ProjectState& project,
+                                                          int trackIndex,
+                                                          int tick,
+                                                          bool& createdSection)
+{
+    createdSection = false;
+    if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(project.tracks.size())))
+        return -1;
+
+    const auto targetTick = juce::jmax(0, tick);
+
+    for (int sectionIndex = 0; sectionIndex < static_cast<int>(project.midiSections.size()); ++sectionIndex)
+    {
+        const auto& section = project.midiSections[static_cast<size_t>(sectionIndex)];
+        if (section.trackIndex != trackIndex)
+            continue;
+
+        const auto sectionEndTick = section.startTick + juce::jmax(kMinSequenceSnapTicks, section.lengthTicks);
+        if (targetTick >= section.startTick && targetTick < sectionEndTick)
+            return sectionIndex;
+    }
+
+    const auto patternLength = defaultPatternLengthTicks(project);
+    MidiPattern pattern;
+    pattern.id = juce::Uuid().toString();
+    pattern.name = project.tracks[static_cast<size_t>(trackIndex)].name.trim().isNotEmpty()
+        ? project.tracks[static_cast<size_t>(trackIndex)].name.trim() + " Pattern"
+        : "Pattern " + juce::String(static_cast<int>(project.midiPatterns.size()) + 1);
+    pattern.lengthTicks = juce::jmax(kMinSequenceSnapTicks, patternLength);
+
+    MidiSection section;
+    section.trackIndex = trackIndex;
+    section.startTick = targetTick;
+    section.lengthTicks = pattern.lengthTicks;
+    section.name = pattern.name;
+    section.patternId = pattern.id;
+
+    project.midiPatterns.push_back(std::move(pattern));
+    project.midiSections.push_back(std::move(section));
+    project.recalculateTimeFields();
+    createdSection = true;
+    return static_cast<int>(project.midiSections.size()) - 1;
+}
+
+void StudioShellComponent::commitRealtimeRecordedProjectState(ProjectState updatedProject,
+                                                              const juce::Array<int>& changedTrackIndices,
+                                                              int preferredTrackIndex,
+                                                              int preferredSectionIndex)
+{
+    if (changedTrackIndices.isEmpty())
+        return;
+
+    markDirty();
+    documentState.project = std::move(updatedProject);
+    normaliseProject(documentState.project);
+
+    if (juce::isPositiveAndBelow(preferredTrackIndex, static_cast<int>(documentState.project.tracks.size())))
+        setSelectedTrackIndex(preferredTrackIndex);
+    if (juce::isPositiveAndBelow(preferredSectionIndex, static_cast<int>(documentState.project.midiSections.size())))
+        setSelectedMidiSectionIndex(preferredSectionIndex, false);
+
+    refreshProjectSummaryLabels();
+    trackTable.repaint();
+    if (preferredTrackIndex == getSelectedTrackIndex())
+        refreshInspector();
+    updateEditorState();
+    if (arrangementOverview != nullptr && !arrangementViewport.getBounds().isEmpty())
+        arrangementOverview->repaint();
+    if (pianoRoll != nullptr && !pianoRollViewport.getBounds().isEmpty())
+        pianoRoll->repaint();
+    refreshFloatingWindows(false);
+
+    if ((projectPreviewRunning || rackPreviewRunning) && nativeVstHost.isReady())
+    {
+        juce::Result result = juce::Result::ok();
+        bool usedIncrementalUpdate = false;
+
+        if (changedTrackIndices.size() == 1)
+        {
+            const auto trackIndex = changedTrackIndices.getFirst();
+            if (juce::isPositiveAndBelow(trackIndex, static_cast<int>(documentState.project.tracks.size())))
+            {
+                result = nativeVstHost.setAudioEngineTrackNotes(trackIndex,
+                                                                documentState.project,
+                                                                documentState.project.tracks[static_cast<size_t>(trackIndex)]);
+                usedIncrementalUpdate = result.wasOk();
+            }
+        }
+
+        if (!usedIncrementalUpdate)
+            result = nativeVstHost.setAudioEngineState(documentState.project, true);
+
+        if (result.failed())
+        {
+            audioEngineStateValid = false;
+            audioEngineStateDirty = true;
+            statusLabel.setText("Live record sync failed: " + result.getErrorMessage(),
+                                juce::dontSendNotification);
+        }
+        else
+        {
+            pendingLiveRackParameterEngineSyncTrack = -1;
+            audioEngineStateValid = true;
+            audioEngineStateDirty = false;
+        }
+    }
+}
+
+void StudioShellComponent::handleRealtimeMidiRecordingNoteOn(int pitch, int velocity)
+{
+    if (!projectPreviewRunning)
+    {
+        ignoreUnused(previewSelectedTrackMidiNoteOn(pitch, velocity));
+        return;
+    }
+
+    if (documentState.project.tracks.empty())
+        addTrack();
+
+    if (getSelectedTrackIndex() < 0 && !documentState.project.tracks.empty())
+        setSelectedTrackIndex(0);
+
+    const auto trackIndex = getSelectedTrackIndex();
+    if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(documentState.project.tracks.size())))
+        return;
+
+    const auto clampedPitch = juce::jlimit(kEditableMidiPitchMin, kEditableMidiPitchMax, pitch);
+    const auto clampedVelocity = juce::jlimit(1, 127, velocity);
+
+    for (const auto& activeNote : activeRealtimeRecordedNotes)
+    {
+        if (activeNote.trackIndex == trackIndex && activeNote.pitch == clampedPitch)
+            return;
+    }
+
+    const auto recordTick = currentAudioEngineTransportTick();
+    auto updatedProject = documentState.project;
+    bool createdSection = false;
+    const auto sectionIndex = ensureMidiSectionForTrackAtTick(updatedProject, trackIndex, recordTick, createdSection);
+    if (!juce::isPositiveAndBelow(sectionIndex, static_cast<int>(updatedProject.midiSections.size())))
+        return;
+
+    const auto& section = updatedProject.midiSections[static_cast<size_t>(sectionIndex)];
+    auto* pattern = findMidiPattern(updatedProject, section.patternId);
+    if (pattern == nullptr)
+        return;
+
+    MidiNote note;
+    note.startTick = juce::jmax(0, recordTick - section.startTick);
+    note.durationTick = kMinSequenceSnapTicks;
+    note.pitch = clampedPitch;
+    note.velocity = clampedVelocity;
+    pattern->notes.push_back(note);
+    pattern->lengthTicks = juce::jmax(pattern->lengthTicks, note.startTick + note.durationTick);
+
+    auto& mutableSection = updatedProject.midiSections[static_cast<size_t>(sectionIndex)];
+    mutableSection.lengthTicks = juce::jmax(mutableSection.lengthTicks, pattern->lengthTicks);
+    updatedProject.recalculateTimeFields();
+
+    const auto patternId = pattern->id;
+    const auto sectionStartTick = section.startTick;
+    const auto patternNoteStartTick = note.startTick;
+    juce::Array<int> changedTracks;
+    changedTracks.add(trackIndex);
+    commitRealtimeRecordedProjectState(std::move(updatedProject), changedTracks, trackIndex, sectionIndex);
+
+    activeRealtimeRecordedNotes.push_back({ trackIndex,
+                                            patternId,
+                                            sectionStartTick,
+                                            patternNoteStartTick,
+                                            recordTick,
+                                            clampedPitch });
+
+    ignoreUnused(previewSelectedTrackMidiNoteOn(clampedPitch, clampedVelocity));
+    statusLabel.setText(createdSection
+                            ? "Recording MIDI into a new pattern on " + documentState.project.tracks[static_cast<size_t>(trackIndex)].name + "."
+                            : "Recording MIDI into " + documentState.project.tracks[static_cast<size_t>(trackIndex)].name + ".",
+                        juce::dontSendNotification);
+}
+
+void StudioShellComponent::handleRealtimeMidiRecordingNoteOff(int pitch)
+{
+    const auto clampedPitch = juce::jlimit(kEditableMidiPitchMin, kEditableMidiPitchMax, pitch);
+    auto activeIt = std::find_if(activeRealtimeRecordedNotes.rbegin(),
+                                 activeRealtimeRecordedNotes.rend(),
+                                 [clampedPitch] (const ActiveRealtimeRecordedNote& note)
+                                 {
+                                     return note.pitch == clampedPitch;
+                                 });
+    if (activeIt == activeRealtimeRecordedNotes.rend())
+        return;
+
+    const auto activeNote = *activeIt;
+    activeRealtimeRecordedNotes.erase(std::next(activeIt).base());
+
+    auto updatedProject = documentState.project;
+    auto* pattern = findMidiPattern(updatedProject, activeNote.patternId);
+    if (pattern == nullptr)
+        return;
+
+    auto endTick = currentAudioEngineTransportTick();
+    const auto loopSpan = updatedProject.loopEnabled
+        ? juce::jmax(0, updatedProject.rightLocatorTick - updatedProject.leftLocatorTick)
+        : 0;
+    while (loopSpan > 0 && endTick < activeNote.absoluteStartTick)
+        endTick += loopSpan;
+
+    const auto relativeEndTick = juce::jmax(activeNote.patternNoteStartTick + kMinSequenceSnapTicks,
+                                            endTick - activeNote.sectionStartTick);
+
+    for (auto& note : pattern->notes)
+    {
+        if (note.pitch != activeNote.pitch || note.startTick != activeNote.patternNoteStartTick)
+            continue;
+
+        note.durationTick = juce::jmax(kMinSequenceSnapTicks, relativeEndTick - note.startTick);
+        pattern->lengthTicks = juce::jmax(pattern->lengthTicks, note.startTick + note.durationTick);
+        break;
+    }
+
+    for (auto& section : updatedProject.midiSections)
+    {
+        if (section.trackIndex != activeNote.trackIndex
+            || section.patternId != activeNote.patternId
+            || section.startTick != activeNote.sectionStartTick)
+            continue;
+
+        section.lengthTicks = juce::jmax(section.lengthTicks, pattern->lengthTicks);
+        break;
+    }
+
+    updatedProject.recalculateTimeFields();
+    juce::Array<int> changedTracks;
+    changedTracks.add(activeNote.trackIndex);
+    commitRealtimeRecordedProjectState(std::move(updatedProject), changedTracks, activeNote.trackIndex, -1);
+}
+
+void StudioShellComponent::finishActiveRealtimeRecordedNotes(int endTick)
+{
+    if (activeRealtimeRecordedNotes.empty())
+        return;
+
+    auto updatedProject = documentState.project;
+    const auto resolvedEndTick = endTick >= 0 ? endTick : currentAudioEngineTransportTick();
+    const auto loopSpan = updatedProject.loopEnabled
+        ? juce::jmax(0, updatedProject.rightLocatorTick - updatedProject.leftLocatorTick)
+        : 0;
+
+    juce::Array<int> changedTracks;
+    int preferredTrackIndex = -1;
+
+    for (const auto& activeNote : activeRealtimeRecordedNotes)
+    {
+        auto* pattern = findMidiPattern(updatedProject, activeNote.patternId);
+        if (pattern == nullptr)
+            continue;
+
+        auto noteEndTick = resolvedEndTick;
+        while (loopSpan > 0 && noteEndTick < activeNote.absoluteStartTick)
+            noteEndTick += loopSpan;
+
+        const auto relativeEndTick = juce::jmax(activeNote.patternNoteStartTick + kMinSequenceSnapTicks,
+                                                noteEndTick - activeNote.sectionStartTick);
+
+        for (auto& note : pattern->notes)
+        {
+            if (note.pitch != activeNote.pitch || note.startTick != activeNote.patternNoteStartTick)
+                continue;
+
+            note.durationTick = juce::jmax(kMinSequenceSnapTicks, relativeEndTick - note.startTick);
+            pattern->lengthTicks = juce::jmax(pattern->lengthTicks, note.startTick + note.durationTick);
+            break;
+        }
+
+        for (auto& section : updatedProject.midiSections)
+        {
+            if (section.trackIndex != activeNote.trackIndex
+                || section.patternId != activeNote.patternId
+                || section.startTick != activeNote.sectionStartTick)
+                continue;
+
+            section.lengthTicks = juce::jmax(section.lengthTicks, pattern->lengthTicks);
+            break;
+        }
+
+        changedTracks.addIfNotAlreadyThere(activeNote.trackIndex);
+        if (preferredTrackIndex < 0)
+            preferredTrackIndex = activeNote.trackIndex;
+    }
+
+    activeRealtimeRecordedNotes.clear();
+    updatedProject.recalculateTimeFields();
+    commitRealtimeRecordedProjectState(std::move(updatedProject), changedTracks, preferredTrackIndex, -1);
 }
 
 void StudioShellComponent::selectAllNotesFromMenu()
@@ -9205,6 +10227,9 @@ void StudioShellComponent::refreshAudioSettingsFromHost(bool forceCreate)
     if (!forceCreate && (audioSettingsWindow == nullptr || !audioSettingsWindow->isVisible()))
         return;
 
+    audioSettingsPanel->applyMidiInputSnapshot(juce::MidiInput::getAvailableDevices(),
+                                               preferredMidiInputIdentifier);
+
     const auto createResult = nativeVstHost.ensureCreated();
     if (createResult.failed())
     {
@@ -9251,6 +10276,41 @@ juce::Result StudioShellComponent::applyAudioDeviceSettings(const juce::String& 
     audioEngineStateDirty = true;
     statusLabel.setText("Updated native audio device settings.", juce::dontSendNotification);
     refreshFloatingWindows();
+    return juce::Result::ok();
+}
+
+juce::Result StudioShellComponent::setPreferredMidiInputDevice(const juce::String& deviceIdentifier)
+{
+    const auto requestedIdentifier = deviceIdentifier.trim();
+    const auto availableDevices = juce::MidiInput::getAvailableDevices();
+
+    if (requestedIdentifier != kMidiInputSelectionDisabled && requestedIdentifier.isNotEmpty())
+    {
+        bool found = false;
+        for (const auto& device : availableDevices)
+        {
+            if (device.identifier == requestedIdentifier)
+            {
+                found = true;
+                break;
+            }
+        }
+
+        if (!found)
+            return juce::Result::fail("The selected MIDI input device is unavailable.");
+    }
+
+    preferredMidiInputIdentifier = requestedIdentifier;
+    refreshMidiInputDevices();
+    persistSessionState();
+
+    statusLabel.setText(describeMidiInputSelection(preferredMidiInputIdentifier,
+                                                   availableDevices,
+                                                   activeMidiInputNames),
+                        juce::dontSendNotification);
+    if (audioSettingsPanel != nullptr)
+        audioSettingsPanel->applyMidiInputSnapshot(availableDevices, preferredMidiInputIdentifier);
+
     return juce::Result::ok();
 }
 
@@ -10544,6 +11604,9 @@ void StudioShellComponent::placeSelectedTrackRenderAtPlayhead()
 
 void StudioShellComponent::showAiSettingsDialog()
 {
+    const auto installedOllama = detectedOllamaExecutable();
+    const bool ollamaDetected = installedOllama.existsAsFile();
+
     auto* dialog = new juce::AlertWindow("Native AI Settings",
                                          "Configure the native C++ AI provider. Saved Python preferences and auth are reused when available.",
                                          juce::AlertWindow::NoIcon);
@@ -10556,11 +11619,56 @@ void StudioShellComponent::showAiSettingsDialog()
     if (auto* apiKeyEditor = dialog->getTextEditor("apiKey"))
         apiKeyEditor->setPasswordCharacter(0x2022);
     dialog->addTextEditor("ollamaBaseUrl", aiClient.getOllamaBaseUrl(), "Ollama endpoint");
-    dialog->addTextEditor("ollamaModel", aiClient.getOllamaModel(), "Ollama model");
+    dialog->addComboBox("ollamaModel", {}, "Ollama model");
+    dialog->addTextBlock("Ollama models are detected from the configured endpoint. The dropdown stays editable if you want to type a custom model tag.");
     dialog->addTextEditor("timeoutSeconds", juce::String(aiClient.getRequestTimeoutSeconds()), "Request timeout (seconds)");
+
+    if (auto* ollamaModelBox = dialog->getComboBoxComponent("ollamaModel"))
+        ollamaModelBox->setEditableText(true);
+
+    if (!ollamaDetected)
+    {
+        dialog->addTextBlock("Ollama was not detected on this system. Install Ollama to use the local provider.\n\nDownload for Windows: "
+                             + juce::String(kOllamaWindowsDownloadUrl));
+    }
+    else
+    {
+        dialog->addTextBlock("Detected local Ollama at:\n" + installedOllama.getFullPathName());
+    }
+
+    auto safeThisForRefresh = juce::Component::SafePointer<StudioShellComponent>(this);
+    auto safeDialogForRefresh = juce::Component::SafePointer<juce::AlertWindow>(dialog);
+    const auto refreshDetectedModels = [safeThisForRefresh, safeDialogForRefresh]
+    {
+        if (safeThisForRefresh == nullptr || safeDialogForRefresh == nullptr)
+            return;
+
+        auto currentModel = safeThisForRefresh->aiClient.getOllamaModel().trim();
+        if (auto* modelBox = safeDialogForRefresh->getComboBoxComponent("ollamaModel"))
+        {
+            const auto typedModel = modelBox->getText().trim();
+            if (typedModel.isNotEmpty())
+                currentModel = typedModel;
+        }
+
+        refreshOllamaModelCombo(*safeDialogForRefresh,
+                                safeThisForRefresh->aiClient,
+                                safeDialogForRefresh->getTextEditorContents("ollamaBaseUrl"),
+                                currentModel);
+    };
+
+    refreshDetectedModels();
+
+    if (auto* ollamaBaseUrlEditor = dialog->getTextEditor("ollamaBaseUrl"))
+    {
+        ollamaBaseUrlEditor->onReturnKey = refreshDetectedModels;
+        ollamaBaseUrlEditor->onFocusLost = refreshDetectedModels;
+    }
 
     dialog->addButton("Save", 1, juce::KeyPress(juce::KeyPress::returnKey));
     dialog->addButton("Clear Auth", 2);
+    if (!ollamaDetected)
+        dialog->addButton("Download Ollama", 3);
     dialog->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
     auto safeThis = juce::Component::SafePointer<StudioShellComponent>(this);
     auto safeDialog = juce::Component::SafePointer<juce::AlertWindow>(dialog);
@@ -10579,6 +11687,14 @@ void StudioShellComponent::showAiSettingsDialog()
                                     return;
                                 }
 
+                                if (result == 3)
+                                {
+                                    juce::URL(kOllamaWindowsDownloadUrl).launchInDefaultBrowser();
+                                    safeThis->statusLabel.setText("Opened Ollama download page.", juce::dontSendNotification);
+                                    safeThis->appendActivityLog("AI Settings", "Opened Ollama Windows download page.");
+                                    return;
+                                }
+
                                 const auto providerText = safeDialog->getComboBoxComponent("provider") != nullptr
                                     ? safeDialog->getComboBoxComponent("provider")->getText().trim()
                                     : juce::String("OpenAI");
@@ -10586,7 +11702,9 @@ void StudioShellComponent::showAiSettingsDialog()
                                                                                                        : AIClient::Provider::openAI);
                                 safeThis->aiClient.setRemoteModel(safeDialog->getTextEditorContents("remoteModel"));
                                 safeThis->aiClient.setOllamaConnection(safeDialog->getTextEditorContents("ollamaBaseUrl"),
-                                                                       safeDialog->getTextEditorContents("ollamaModel"));
+                                                                       safeDialog->getComboBoxComponent("ollamaModel") != nullptr
+                                                                           ? safeDialog->getComboBoxComponent("ollamaModel")->getText()
+                                                                           : juce::String());
                                 safeThis->aiClient.setRequestTimeoutSeconds(safeDialog->getTextEditorContents("timeoutSeconds").getIntValue());
                                 safeThis->aiClient.saveSettings();
 
@@ -11257,112 +12375,112 @@ void StudioShellComponent::applyAiComposeResult(const AIComposeResult& result, i
 
 void StudioShellComponent::syncBundledRackCatalogInProject()
 {
-    auto discoveredEntries = discoverBundledVstCatalog();
-    for (const auto& folderPath : userManagedVstFolderPaths())
+    juce::StringArray scanFolderPaths;
+    const auto addScanFolder = [&scanFolderPaths] (const juce::String& rawFolder)
     {
-        const auto extraEntries = discoverVstCatalogInDirectory(juce::File(folderPath));
-        discoveredEntries.insert(discoveredEntries.end(), extraEntries.begin(), extraEntries.end());
+        auto normalisedFolder = rawFolder.trim();
+        if (normalisedFolder.isEmpty())
+            return;
+
+        normalisedFolder = juce::File(normalisedFolder).getFullPathName();
+        for (const auto& existing : scanFolderPaths)
+        {
+            if (existing.equalsIgnoreCase(normalisedFolder))
+                return;
+        }
+
+        scanFolderPaths.add(normalisedFolder);
+    };
+
+    addScanFolder(defaultVstFolderPath());
+    for (const auto& folderPath : userManagedVstFolderPaths())
+        addScanFolder(folderPath);
+
+    std::vector<VstInstrument> discoveredEntries;
+    for (const auto& folderPath : scanFolderPaths)
+    {
+        const auto folderEntries = discoverVstCatalogInDirectory(juce::File(folderPath));
+        discoveredEntries.insert(discoveredEntries.end(), folderEntries.begin(), folderEntries.end());
     }
 
-    std::sort(discoveredEntries.begin(),
-              discoveredEntries.end(),
+    auto dedupeEntriesByPath = [] (std::vector<VstInstrument>& entries)
+    {
+        std::sort(entries.begin(),
+                  entries.end(),
+                  [] (const VstInstrument& lhs, const VstInstrument& rhs)
+                  {
+                      return lhs.path.compareIgnoreCase(rhs.path) < 0;
+                  });
+
+        entries.erase(std::unique(entries.begin(),
+                                  entries.end(),
+                                  [] (const VstInstrument& lhs, const VstInstrument& rhs)
+                                  {
+                                      return lhs.path.equalsIgnoreCase(rhs.path);
+                                  }),
+                      entries.end());
+    };
+
+    dedupeEntriesByPath(discoveredEntries);
+
+    std::vector<VstInstrument> mergedEntries = discoveredEntries;
+    std::sort(mergedEntries.begin(),
+              mergedEntries.end(),
               [] (const VstInstrument& lhs, const VstInstrument& rhs)
               {
-                  return lhs.path.compareIgnoreCase(rhs.path) < 0;
+                  return lhs.name.compareIgnoreCase(rhs.name) < 0;
               });
 
-    discoveredEntries.erase(std::unique(discoveredEntries.begin(),
-                                        discoveredEntries.end(),
-                                        [] (const VstInstrument& lhs, const VstInstrument& rhs)
-                                        {
-                                            return lhs.path.equalsIgnoreCase(rhs.path);
-                                        }),
-                            discoveredEntries.end());
-
-    if (discoveredEntries.empty())
-        return;
-
-    bool changed = false;
-    for (const auto& entry : discoveredEntries)
+    juce::StringArray updatedPaths;
+    for (const auto& entry : mergedEntries)
     {
-        documentState.project.vstiPaths.addIfNotAlreadyThere(entry.path);
-
-        const auto existingIndex = findRackInstrumentIndexByReference(documentState.project, entry.path);
-        if (existingIndex >= 0)
-        {
-            auto& existing = documentState.project.vstRack[static_cast<size_t>(existingIndex)];
-            if (!existing.path.equalsIgnoreCase(entry.path))
-            {
-                existing.path = entry.path;
-                changed = true;
-            }
-            if (existing.name != entry.name && entry.name.isNotEmpty())
-            {
-                existing.name = entry.name;
-                changed = true;
-            }
-            if (existing.pluginName != entry.pluginName && entry.pluginName.isNotEmpty())
-            {
-                existing.pluginName = entry.pluginName;
-                changed = true;
-            }
-            if (existing.isInstrument != entry.isInstrument
-                || existing.isEffect != entry.isEffect
-                || existing.category != entry.category
-                || existing.hostSupported != entry.hostSupported
-                || existing.hostError != entry.hostError)
-            {
-                existing.isInstrument = entry.isInstrument;
-                existing.isEffect = entry.isEffect;
-                existing.category = entry.category;
-                existing.hostSupported = entry.hostSupported;
-                existing.hostError = entry.hostError;
-                changed = true;
-            }
-            continue;
-        }
-
-        const auto nameIndex = findRackInstrumentIndexByReference(documentState.project, entry.name);
-        if (nameIndex >= 0)
-        {
-            auto& existing = documentState.project.vstRack[static_cast<size_t>(nameIndex)];
-            if (!existing.path.equalsIgnoreCase(entry.path))
-            {
-                existing.path = entry.path;
-                changed = true;
-            }
-            if (existing.name != entry.name && entry.name.isNotEmpty())
-            {
-                existing.name = entry.name;
-                changed = true;
-            }
-            if (existing.pluginName != entry.pluginName && entry.pluginName.isNotEmpty())
-            {
-                existing.pluginName = entry.pluginName;
-                changed = true;
-            }
-            if (existing.isInstrument != entry.isInstrument
-                || existing.isEffect != entry.isEffect
-                || existing.category != entry.category
-                || existing.hostSupported != entry.hostSupported
-                || existing.hostError != entry.hostError)
-            {
-                existing.isInstrument = entry.isInstrument;
-                existing.isEffect = entry.isEffect;
-                existing.category = entry.category;
-                existing.hostSupported = entry.hostSupported;
-                existing.hostError = entry.hostError;
-                changed = true;
-            }
-            continue;
-        }
-
-        documentState.project.vstRack.push_back(entry);
-        changed = true;
+        const auto entryPath = entry.path.trim();
+        if (entryPath.isNotEmpty())
+            updatedPaths.addIfNotAlreadyThere(entryPath);
     }
 
-    if (changed)
-        normaliseProject(documentState.project);
+    bool changed = documentState.project.vstRack.size() != mergedEntries.size()
+        || documentState.project.vstiPaths.size() != updatedPaths.size();
+
+    if (!changed)
+    {
+        for (int index = 0; index < static_cast<int>(mergedEntries.size()); ++index)
+        {
+            const auto& existing = documentState.project.vstRack[static_cast<size_t>(index)];
+            const auto& updated = mergedEntries[static_cast<size_t>(index)];
+            if (!existing.path.equalsIgnoreCase(updated.path)
+                || existing.name != updated.name
+                || existing.pluginName != updated.pluginName
+                || existing.isInstrument != updated.isInstrument
+                || existing.isEffect != updated.isEffect
+                || existing.category != updated.category
+                || existing.hostSupported != updated.hostSupported
+                || existing.hostError != updated.hostError)
+            {
+                changed = true;
+                break;
+            }
+        }
+    }
+
+    if (!changed)
+    {
+        for (int index = 0; index < updatedPaths.size(); ++index)
+        {
+            if (!documentState.project.vstiPaths[index].equalsIgnoreCase(updatedPaths[index]))
+            {
+                changed = true;
+                break;
+            }
+        }
+    }
+
+    if (!changed)
+        return;
+
+    documentState.project.vstRack = std::move(mergedEntries);
+    documentState.project.vstiPaths = updatedPaths;
+    normaliseProject(documentState.project);
 }
 
 void StudioShellComponent::refreshRackCatalog()
@@ -11562,99 +12680,7 @@ bool StudioShellComponent::tryHandleVirtualPianoShortcut(const juce::KeyPress& k
 
 void StudioShellComponent::insertVirtualKeyboardNote(int pitch, bool fromShortcut)
 {
-    juce::ignoreUnused(fromShortcut);
-
-    if (documentState.project.tracks.empty())
-        addTrack();
-
-    if (getSelectedTrackIndex() < 0 && !documentState.project.tracks.empty())
-        setSelectedTrackIndex(0);
-
-    const auto trackIndex = getSelectedTrackIndex();
-    if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(documentState.project.tracks.size())))
-        return;
-
-    auto sectionIndex = getSelectedMidiSectionIndex();
-    if (!juce::isPositiveAndBelow(sectionIndex, static_cast<int>(documentState.project.midiSections.size()))
-        || documentState.project.midiSections[static_cast<size_t>(sectionIndex)].trackIndex != trackIndex)
-    {
-        ensureSelectedMidiSectionForTrack(trackIndex);
-        sectionIndex = getSelectedMidiSectionIndex();
-    }
-
-    auto createdSection = false;
-    if (!juce::isPositiveAndBelow(sectionIndex, static_cast<int>(documentState.project.midiSections.size())))
-    {
-        auto updatedProject = documentState.project;
-        const auto patternLength = defaultPatternLengthTicks(updatedProject);
-        const auto snapTicks = arrangementSnapTickLength(updatedProject);
-
-        MidiPattern pattern;
-        pattern.id = juce::Uuid().toString();
-        pattern.name = updatedProject.tracks[static_cast<size_t>(trackIndex)].name.trim().isNotEmpty()
-            ? updatedProject.tracks[static_cast<size_t>(trackIndex)].name.trim() + " Pattern"
-            : "Pattern " + juce::String(static_cast<int>(updatedProject.midiPatterns.size()) + 1);
-        pattern.lengthTicks = patternLength;
-
-        MidiSection section;
-        section.trackIndex = trackIndex;
-        section.startTick = snapTicks > 0
-            ? (updatedProject.playheadTick / snapTicks) * snapTicks
-            : updatedProject.playheadTick;
-        section.lengthTicks = patternLength;
-        section.name = pattern.name;
-        section.patternId = pattern.id;
-
-        updatedProject.midiPatterns.push_back(std::move(pattern));
-        updatedProject.midiSections.push_back(std::move(section));
-        updatedProject.recalculateTimeFields();
-        sectionIndex = static_cast<int>(updatedProject.midiSections.size()) - 1;
-        applyProjectStateEdit(updatedProject, "Create Pattern");
-        setSelectedTrackIndex(trackIndex);
-        setSelectedMidiSectionIndex(sectionIndex, true);
-        createdSection = true;
-    }
-
-    auto updatedProject = documentState.project;
-    auto* pattern = findMidiPattern(updatedProject,
-                                    updatedProject.midiSections[static_cast<size_t>(sectionIndex)].patternId);
-    if (pattern == nullptr)
-        return;
-
-    const auto clampedPitch = juce::jlimit(kEditableMidiPitchMin, kEditableMidiPitchMax, pitch);
-    const auto durationTick = kTicksPerBeat / 2;
-    auto cursorTick = 0;
-    for (const auto& note : pattern->notes)
-        cursorTick = juce::jmax(cursorTick, note.startTick + note.durationTick);
-
-    MidiNote note;
-    note.startTick = cursorTick;
-    note.durationTick = durationTick;
-    note.pitch = clampedPitch;
-    note.velocity = 100;
-    pattern->notes.push_back(note);
-    pattern->lengthTicks = juce::jmax(pattern->lengthTicks, note.startTick + note.durationTick);
-    updatedProject.recalculateTimeFields();
-
-    applyProjectStateEdit(updatedProject, "Insert Live Note");
-    setSelectedTrackIndex(trackIndex);
-    setSelectedMidiSectionIndex(sectionIndex, true);
-
-    if (fromShortcut && virtualPianoWindowContent != nullptr)
-        virtualPianoWindowContent->flashPitch(clampedPitch);
-
-    previewSelectedTrackMidiNoteOn(clampedPitch, 100);
-    juce::Timer::callAfterDelay(juce::jlimit(90,
-                                             600,
-                                             juce::roundToInt(tickToSeconds(durationTick, documentState.project.bpm) * 1000.0)),
-                                [safeThis = juce::Component::SafePointer<StudioShellComponent>(this)]
-                                {
-                                    if (safeThis != nullptr)
-                                        safeThis->stopSelectedTrackMidiPreview();
-                                });
-
-    if (createdSection)
-        statusLabel.setText("Created a new pattern and inserted " + noteNameLabel(clampedPitch) + ".", juce::dontSendNotification);
+    insertLiveMidiNote(pitch, 100, fromShortcut, true);
 }
 
 juce::Result StudioShellComponent::previewSelectedTrackMidiNoteOn(int pitch, int velocity)
@@ -12023,9 +13049,12 @@ void StudioShellComponent::playFullProjectThroughNativeEngine()
 
 void StudioShellComponent::stopRackPreview()
 {
+    if (projectPreviewRunning && !activeRealtimeRecordedNotes.empty())
+        finishActiveRealtimeRecordedNotes(currentAudioEngineTransportTick());
+
     juce::Result result = juce::Result::ok();
     if (projectPreviewRunning || rackPreviewRunning)
-        result = nativeVstHost.stopAudioEngine();
+        result = nativeVstHost.stopAudioEngine(true);
 
     if (result.failed())
     {
@@ -12039,8 +13068,13 @@ void StudioShellComponent::stopRackPreview()
     projectPreviewRunning = false;
     playbackUiTickCounter = 0;
     pendingLiveRackParameterEngineSyncTrack = -1;
-    audioEngineStateValid = false;
-    audioEngineStateDirty = true;
+    activeRealtimeRecordedNotes.clear();
+    activeMidiInsertHeldPitches.clear();
+    activeMidiInsertPatternId.clear();
+    activeMidiInsertTrackIndex = -1;
+    activeMidiInsertChordStartTick = -1;
+    audioEngineStateValid = nativeVstHost.isReady();
+    audioEngineStateDirty = false;
     refreshPollingTimerState();
     std::fill(trackMeterLevels.begin(), trackMeterLevels.end(), 0.0f);
     if (mixerComponent != nullptr)
@@ -12656,6 +13690,7 @@ juce::PopupMenu MainWindow::getMenuForIndex(int topLevelMenuIndex, const juce::S
 
         case 4:
             menu.addItem(menuHelpSite, "Open Mutagen Site");
+            menu.addItem(menuHelpOllama, "Open Ollama Site");
             menu.addSeparator();
             menu.addItem(menuHelpAbout, "About Mutagen");
             break;
@@ -12774,6 +13809,9 @@ void MainWindow::menuItemSelected(int menuItemID, int topLevelMenuIndex)
             break;
         case menuHelpSite:
             juce::URL("https://mysticalg.github.io/AI-Music-Studio/").launchInDefaultBrowser();
+            break;
+        case menuHelpOllama:
+            juce::URL(kOllamaSiteUrl).launchInDefaultBrowser();
             break;
         case menuHelpAbout:
             shell->showAboutDialog();

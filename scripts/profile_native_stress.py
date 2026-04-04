@@ -8,8 +8,12 @@ import sys
 import time
 from pathlib import Path
 
-from pywinauto import Application
-from pywinauto.keyboard import send_keys
+try:
+    from pywinauto import Application
+    from pywinauto.keyboard import send_keys as pywinauto_send_keys
+except Exception:  # pragma: no cover - optional dependency fallback
+    Application = None
+    pywinauto_send_keys = None
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -152,7 +156,41 @@ def make_project(track_count: int, bar_count: int) -> dict:
     }
 
 
+def _powershell_activate_and_send(process_id: int, keys: str) -> bool:
+    script = f"""
+$wshell = New-Object -ComObject WScript.Shell
+if (-not $wshell.AppActivate({process_id})) {{ exit 2 }}
+Start-Sleep -Milliseconds 150
+$wshell.SendKeys('{keys}')
+"""
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", script],
+        cwd=str(ROOT),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+def send_keys_to_process(process_id: int, keys: str) -> None:
+    if pywinauto_send_keys is not None and _powershell_activate_and_send(process_id, ""):
+        pywinauto_send_keys(keys)
+        return
+
+    if not _powershell_activate_and_send(process_id, keys):
+        raise RuntimeError(f"Could not activate Mutagen window for process {process_id}")
+
+
 def wait_for_window(process: subprocess.Popen[str], timeout: float = 30.0):
+    if Application is None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if _powershell_activate_and_send(process.pid, ""):
+                return None
+            time.sleep(0.4)
+        raise RuntimeError("Could not activate native window via PowerShell automation.")
+
     deadline = time.time() + timeout
     last_error: Exception | None = None
     while time.time() < deadline:
@@ -186,13 +224,14 @@ def run_profile(exe_path: Path, track_count: int, bar_count: int, playback_secon
 
     window = wait_for_window(process)
     time.sleep(2.0)
-    window.set_focus()
-    window.click_input()
-    send_keys("{SPACE}")
+    if window is not None:
+        window.set_focus()
+        window.click_input()
+    send_keys_to_process(process.pid, "{SPACE}")
     time.sleep(playback_seconds)
-    send_keys("{SPACE}")
+    send_keys_to_process(process.pid, "{SPACE}")
     time.sleep(2.0)
-    send_keys("%{F4}")
+    send_keys_to_process(process.pid, "%{F4}")
 
     try:
         process.wait(timeout=20)

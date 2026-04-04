@@ -38,6 +38,7 @@ public:
     using NotePreviewCallback = std::function<void(int pitch, int velocity)>;
     using PreviewStopCallback = std::function<void()>;
     using ToolModeChangeCallback = std::function<void(EditorToolMode mode)>;
+    using KeyHandlerCallback = std::function<bool(const juce::KeyPress&)>;
 
     PianoRollComponent(ProjectGetter projectGetterIn,
                        TrackIndexGetter trackIndexGetterIn,
@@ -56,6 +57,7 @@ public:
                                  NotePreviewCallback noteOffCallbackIn,
                                  PreviewStopCallback stopPreviewCallbackIn = {});
     void setToolModeChangeCallback(ToolModeChangeCallback toolModeChangeCallbackIn);
+    void setKeyHandlerCallback(KeyHandlerCallback keyHandlerCallbackIn);
     int viewPositionYForPitch(int pitch, int viewportHeight) const;
 
     bool copySelected() const;
@@ -195,6 +197,7 @@ private:
     NotePreviewCallback notePreviewOff;
     PreviewStopCallback stopPreviewCallback;
     ToolModeChangeCallback toolModeChangeCallback;
+    KeyHandlerCallback keyHandlerCallback;
 
     ProjectState previewProject;
     ProjectState beforeProject;

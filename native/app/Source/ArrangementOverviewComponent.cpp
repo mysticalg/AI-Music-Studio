@@ -23,6 +23,195 @@ const char* kClipboardType = "aims.native.pattern_clip";
 constexpr float kTransportHandleWidth = 16.0f;
 constexpr float kTransportHandleHeight = 10.0f;
 
+juce::Image createToolMenuIcon(EditorToolMode toolMode)
+{
+    constexpr int iconSize = 18;
+    auto image = juce::Image(juce::Image::ARGB, iconSize, iconSize, true);
+    juce::Graphics g(image);
+
+    const auto strokeColour = juce::Colour::fromRGB(229, 233, 240);
+    const auto accentColour = [toolMode, strokeColour]()
+    {
+        switch (toolMode)
+        {
+            case EditorToolMode::pencil:
+                return juce::Colour::fromRGB(126, 213, 140);
+            case EditorToolMode::selection:
+                return juce::Colour::fromRGB(120, 212, 255);
+            case EditorToolMode::glue:
+                return juce::Colour::fromRGB(255, 209, 102);
+            case EditorToolMode::eraser:
+                return juce::Colour::fromRGB(255, 128, 128);
+        }
+
+        return strokeColour;
+    }();
+
+    g.setColour(accentColour.withAlpha(0.15f));
+    g.fillRoundedRectangle(1.0f, 1.0f, static_cast<float>(iconSize - 2), static_cast<float>(iconSize - 2), 4.0f);
+
+    switch (toolMode)
+    {
+        case EditorToolMode::pencil:
+        {
+            juce::Path shaft;
+            shaft.startNewSubPath(4.5f, 13.5f);
+            shaft.lineTo(10.8f, 7.2f);
+            g.setColour(strokeColour);
+            g.strokePath(shaft, juce::PathStrokeType(2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+
+            juce::Path body;
+            body.addRoundedRectangle(5.2f, 11.0f, 6.8f, 2.4f, 1.0f);
+            auto rotation = juce::AffineTransform::rotation(juce::degreesToRadians(-45.0f), 5.2f, 12.2f);
+            body.applyTransform(rotation);
+            g.fillPath(body);
+
+            juce::Path tip;
+            tip.addTriangle(11.8f, 6.2f, 14.3f, 3.7f, 13.0f, 7.7f);
+            g.setColour(accentColour.brighter(0.15f));
+            g.fillPath(tip);
+            break;
+        }
+
+        case EditorToolMode::selection:
+        {
+            g.setColour(accentColour);
+            const float left = 4.0f;
+            const float top = 4.0f;
+            const float right = 12.0f;
+            const float bottom = 12.0f;
+            const float segment = 2.0f;
+            const float strokeWidth = 1.5f;
+            g.drawLine(left, top, left + segment, top, strokeWidth);
+            g.drawLine(left + 3.0f, top, right - 3.0f, top, strokeWidth);
+            g.drawLine(right - segment, top, right, top, strokeWidth);
+            g.drawLine(left, bottom, left + segment, bottom, strokeWidth);
+            g.drawLine(left + 3.0f, bottom, right - 3.0f, bottom, strokeWidth);
+            g.drawLine(right - segment, bottom, right, bottom, strokeWidth);
+            g.drawLine(left, top, left, top + segment, strokeWidth);
+            g.drawLine(left, top + 3.0f, left, bottom - 3.0f, strokeWidth);
+            g.drawLine(left, bottom - segment, left, bottom, strokeWidth);
+            g.drawLine(right, top, right, top + segment, strokeWidth);
+            g.drawLine(right, top + 3.0f, right, bottom - 3.0f, strokeWidth);
+            g.drawLine(right, bottom - segment, right, bottom, strokeWidth);
+
+            juce::Path cursor;
+            cursor.startNewSubPath(9.8f, 9.2f);
+            cursor.lineTo(14.2f, 14.8f);
+            cursor.lineTo(11.8f, 14.4f);
+            cursor.lineTo(10.9f, 16.2f);
+            cursor.lineTo(9.7f, 15.7f);
+            cursor.lineTo(10.6f, 13.8f);
+            cursor.lineTo(8.9f, 13.5f);
+            cursor.closeSubPath();
+            g.setColour(strokeColour);
+            g.fillPath(cursor);
+            break;
+        }
+
+        case EditorToolMode::glue:
+        {
+            g.setColour(strokeColour);
+            juce::Path leftLoop;
+            leftLoop.addRoundedRectangle(3.8f, 6.0f, 5.8f, 4.6f, 2.2f);
+            leftLoop.applyTransform(juce::AffineTransform::rotation(juce::degreesToRadians(-28.0f), 6.7f, 8.3f));
+            g.strokePath(leftLoop, juce::PathStrokeType(1.7f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+
+            juce::Path rightLoop;
+            rightLoop.addRoundedRectangle(8.6f, 7.3f, 5.8f, 4.6f, 2.2f);
+            rightLoop.applyTransform(juce::AffineTransform::rotation(juce::degreesToRadians(-28.0f), 11.5f, 9.6f));
+            g.strokePath(rightLoop, juce::PathStrokeType(1.7f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+
+            juce::Path join;
+            join.startNewSubPath(7.2f, 10.4f);
+            join.lineTo(10.9f, 7.9f);
+            g.setColour(accentColour);
+            g.strokePath(join, juce::PathStrokeType(2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+            break;
+        }
+
+        case EditorToolMode::eraser:
+        {
+            juce::Path eraser;
+            eraser.startNewSubPath(5.0f, 12.4f);
+            eraser.lineTo(9.3f, 7.2f);
+            eraser.lineTo(13.8f, 11.5f);
+            eraser.lineTo(9.4f, 15.7f);
+            eraser.closeSubPath();
+            g.setColour(strokeColour);
+            g.fillPath(eraser);
+
+            juce::Path accent;
+            accent.startNewSubPath(7.6f, 9.2f);
+            accent.lineTo(11.3f, 13.0f);
+            g.setColour(accentColour);
+            g.strokePath(accent, juce::PathStrokeType(1.7f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+
+            juce::Path dust;
+            dust.startNewSubPath(10.0f, 14.6f);
+            dust.lineTo(13.9f, 14.6f);
+            g.strokePath(dust, juce::PathStrokeType(1.3f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+            break;
+        }
+    }
+
+    return image;
+}
+
+juce::MouseCursor createGlueToolCursor()
+{
+    constexpr int cursorSize = 24;
+    auto image = juce::Image(juce::Image::ARGB, cursorSize, cursorSize, true);
+    juce::Graphics g(image);
+
+    const auto bottleColour = juce::Colour::fromRGB(244, 245, 247);
+    const auto accentColour = juce::Colour::fromRGB(255, 209, 102);
+    const auto outlineColour = juce::Colour::fromRGBA(10, 12, 16, 180);
+
+    juce::Path body;
+    body.startNewSubPath(9.0f, 3.0f);
+    body.lineTo(14.5f, 3.0f);
+    body.lineTo(14.5f, 7.0f);
+    body.lineTo(17.4f, 10.2f);
+    body.lineTo(15.8f, 12.2f);
+    body.lineTo(17.0f, 17.8f);
+    body.lineTo(10.0f, 20.8f);
+    body.lineTo(6.6f, 13.4f);
+    body.lineTo(9.0f, 11.9f);
+    body.lineTo(9.0f, 3.0f);
+    body.closeSubPath();
+
+    g.setColour(outlineColour);
+    g.fillPath(body, juce::AffineTransform::translation(1.0f, 1.0f));
+    g.setColour(bottleColour);
+    g.fillPath(body);
+    g.setColour(outlineColour.withAlpha(0.55f));
+    g.strokePath(body, juce::PathStrokeType(1.1f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+
+    juce::Path label;
+    label.addRoundedRectangle(8.6f, 10.1f, 5.0f, 5.0f, 1.5f);
+    g.setColour(accentColour.withAlpha(0.95f));
+    g.fillPath(label);
+
+    juce::Path nozzle;
+    nozzle.addTriangle(12.5f, 18.2f, 16.6f, 20.6f, 11.2f, 21.4f);
+    g.setColour(accentColour.brighter(0.12f));
+    g.fillPath(nozzle);
+
+    juce::Path glueDrop;
+    glueDrop.addEllipse(17.2f, 19.6f, 2.8f, 2.8f);
+    g.setColour(accentColour.withAlpha(0.8f));
+    g.fillPath(glueDrop);
+
+    return juce::MouseCursor(image, 16, 20);
+}
+
+const juce::MouseCursor& glueToolCursor()
+{
+    static const auto cursor = createGlueToolCursor();
+    return cursor;
+}
+
 juce::String serialiseClipClipboard(const MidiSection& section, const MidiPattern& pattern)
 {
     auto root = juce::var(new juce::DynamicObject());
@@ -239,6 +428,21 @@ void shiftPatternForLeftResize(MidiPattern& pattern, int shiftTicks)
 bool tickRangesTouchOrOverlap(int startTick, int endTick, int otherStartTick, int otherEndTick)
 {
     return endTick >= otherStartTick && otherEndTick >= startTick;
+}
+
+bool tickRangesMergeableWithGap(int startTick,
+                                int endTick,
+                                int otherStartTick,
+                                int otherEndTick,
+                                int allowedGapTicks)
+{
+    if (tickRangesTouchOrOverlap(startTick, endTick, otherStartTick, otherEndTick))
+        return true;
+
+    const auto gapTicks = startTick < otherStartTick
+        ? otherStartTick - endTick
+        : startTick - otherEndTick;
+    return gapTicks <= juce::jmax(0, allowedGapTicks);
 }
 
 void sortPatternNotes(std::vector<MidiNote>& notes)
@@ -539,10 +743,18 @@ void ArrangementOverviewComponent::mouseDown(const juce::MouseEvent& event)
 
     if (hitSectionIndex >= 0)
     {
-        selectedSectionIndices.clear();
-        selectedSectionIndices.push_back(hitSectionIndex);
-        if (sectionSelectCallback != nullptr)
-            sectionSelectCallback(hitSectionIndex, event.getNumberOfClicks() > 1);
+        const bool preserveGlueSelection = toolMode == EditorToolMode::glue
+            && event.mods.isLeftButtonDown()
+            && selectedSectionIndices.size() > 1
+            && std::find(selectedSectionIndices.begin(), selectedSectionIndices.end(), hitSectionIndex) != selectedSectionIndices.end();
+
+        if (!preserveGlueSelection)
+        {
+            selectedSectionIndices.clear();
+            selectedSectionIndices.push_back(hitSectionIndex);
+            if (sectionSelectCallback != nullptr)
+                sectionSelectCallback(hitSectionIndex, event.getNumberOfClicks() > 1);
+        }
 
         if (event.getNumberOfClicks() > 1)
             return;
@@ -1100,7 +1312,7 @@ void ArrangementOverviewComponent::updateCursorForPosition(juce::Point<float> po
 
         if (toolMode == EditorToolMode::glue)
         {
-            setMouseCursor(juce::MouseCursor::PointingHandCursor);
+            setMouseCursor(glueToolCursor());
             return;
         }
 
@@ -1163,46 +1375,74 @@ bool ArrangementOverviewComponent::pasteClipboardAt(ProjectState& updatedProject
 
 bool ArrangementOverviewComponent::glueSectionsAtIndex(int sectionIndex)
 {
-    const auto& sourceProject = project();
+    const auto sourceProject = project();
     if (!juce::isPositiveAndBelow(sectionIndex, static_cast<int>(sourceProject.midiSections.size())))
         return false;
 
-    const auto& clickedSection = sourceProject.midiSections[static_cast<size_t>(sectionIndex)];
-    std::vector<int> cluster { sectionIndex };
-    std::vector<bool> included(sourceProject.midiSections.size(), false);
-    included[static_cast<size_t>(sectionIndex)] = true;
-
-    bool expanded = true;
-    while (expanded)
+    const auto clickedSection = sourceProject.midiSections[static_cast<size_t>(sectionIndex)];
+    std::vector<int> cluster;
+    const auto clickedSelected = std::find(selectedSectionIndices.begin(), selectedSectionIndices.end(), sectionIndex)
+        != selectedSectionIndices.end();
+    if (clickedSelected && selectedSectionIndices.size() > 1)
     {
-        expanded = false;
-        int clusterStartTick = std::numeric_limits<int>::max();
-        int clusterEndTick = 0;
-
-        for (const auto index : cluster)
+        for (const auto selectedIndex : selectedSectionIndices)
         {
-            const auto& section = sourceProject.midiSections[static_cast<size_t>(index)];
-            clusterStartTick = juce::jmin(clusterStartTick, section.startTick);
-            clusterEndTick = juce::jmax(clusterEndTick,
-                                        section.startTick + clipLengthTicks(section, sourceProject));
+            if (!juce::isPositiveAndBelow(selectedIndex, static_cast<int>(sourceProject.midiSections.size())))
+                continue;
+
+            const auto& selectedSection = sourceProject.midiSections[static_cast<size_t>(selectedIndex)];
+            if (selectedSection.trackIndex != clickedSection.trackIndex)
+                continue;
+
+            cluster.push_back(selectedIndex);
         }
+    }
+
+    const auto findNextRightSectionIndex = [&]() -> int
+    {
+        int nextIndex = -1;
+        int nextStartTick = std::numeric_limits<int>::max();
+        int nextEndTick = std::numeric_limits<int>::max();
 
         for (int index = 0; index < static_cast<int>(sourceProject.midiSections.size()); ++index)
         {
-            if (included[static_cast<size_t>(index)])
+            if (index == sectionIndex)
                 continue;
 
             const auto& section = sourceProject.midiSections[static_cast<size_t>(index)];
             if (section.trackIndex != clickedSection.trackIndex)
                 continue;
 
-            const auto sectionEndTick = section.startTick + clipLengthTicks(section, sourceProject);
-            if (!tickRangesTouchOrOverlap(clusterStartTick, clusterEndTick, section.startTick, sectionEndTick))
+            if (section.startTick < clickedSection.startTick)
                 continue;
 
-            included[static_cast<size_t>(index)] = true;
-            cluster.push_back(index);
-            expanded = true;
+            const auto sectionEndTick = section.startTick + clipLengthTicks(section, sourceProject);
+            if (section.startTick < nextStartTick
+                || (section.startTick == nextStartTick && sectionEndTick < nextEndTick)
+                || (section.startTick == nextStartTick && sectionEndTick == nextEndTick
+                    && (nextIndex < 0 || index < nextIndex)))
+            {
+                nextIndex = index;
+                nextStartTick = section.startTick;
+                nextEndTick = sectionEndTick;
+            }
+        }
+
+        return nextIndex;
+    };
+
+    if (cluster.empty())
+        cluster.push_back(sectionIndex);
+
+    if (cluster.size() < 2)
+    {
+        const auto nextIndex = findNextRightSectionIndex();
+        if (nextIndex >= 0
+            && std::find(cluster.begin(), cluster.end(), nextIndex) == cluster.end())
+        {
+            cluster.clear();
+            cluster.push_back(sectionIndex);
+            cluster.push_back(nextIndex);
         }
     }
 
@@ -1224,14 +1464,16 @@ bool ArrangementOverviewComponent::glueSectionsAtIndex(int sectionIndex)
     if (clickedPattern == nullptr)
         return false;
 
+    const auto clickedPatternName = clickedPattern->name.trim();
+
     const auto newStartTick = sourceProject.midiSections[static_cast<size_t>(cluster.front())].startTick;
     int newEndTick = newStartTick + clipLengthTicks(sourceProject.midiSections[static_cast<size_t>(cluster.front())],
                                                     sourceProject);
 
     MidiPattern gluedPattern;
     gluedPattern.id = juce::Uuid().toString();
-    gluedPattern.name = clickedPattern->name.trim().isNotEmpty() ? clickedPattern->name.trim()
-                                                                 : clickedSection.name.trim();
+    gluedPattern.name = clickedPatternName.isNotEmpty() ? clickedPatternName
+                                                        : clickedSection.name.trim();
 
     for (const auto index : cluster)
     {
@@ -1263,15 +1505,29 @@ bool ArrangementOverviewComponent::glueSectionsAtIndex(int sectionIndex)
     auto updatedProject = sourceProject;
     const auto insertionIndex = *std::min_element(cluster.begin(), cluster.end());
     for (auto iter = cluster.rbegin(); iter != cluster.rend(); ++iter)
+    {
+        if (!juce::isPositiveAndBelow(*iter, static_cast<int>(updatedProject.midiSections.size())))
+            return false;
         updatedProject.midiSections.erase(updatedProject.midiSections.begin() + *iter);
+    }
 
-    updatedProject.midiPatterns.push_back(gluedPattern);
+    updatedProject.midiPatterns.push_back(std::move(gluedPattern));
 
     const auto boundedInsertIndex = juce::jlimit(0,
                                                  static_cast<int>(updatedProject.midiSections.size()),
                                                  insertionIndex);
     updatedProject.midiSections.insert(updatedProject.midiSections.begin() + boundedInsertIndex,
-                                       gluedSection);
+                                       std::move(gluedSection));
+    updatedProject.recalculateTimeFields();
+
+    previewActive = false;
+    previewDirty = false;
+    dragMode = DragMode::none;
+    draggedSectionIndex = -1;
+    erasedSectionIndices.clear();
+    selectedSectionIndices.clear();
+    selectedSectionIndices.push_back(boundedInsertIndex);
+
     projectWriter(updatedProject, true, "Glue Pattern Clips");
     if (sectionSelectCallback != nullptr)
         sectionSelectCallback(boundedInsertIndex, false);
@@ -1309,10 +1565,10 @@ void ArrangementOverviewComponent::showSectionContextMenu(int sectionIndex,
     const auto toolMode = toolGetter != nullptr ? toolGetter() : EditorToolMode::pencil;
 
     menu.addSectionHeader("Tools");
-    menu.addItem(menuToolPencil, "Pencil", true, toolMode == EditorToolMode::pencil);
-    menu.addItem(menuToolSelect, "Select", true, toolMode == EditorToolMode::selection);
-    menu.addItem(menuToolGlue, "Glue", true, toolMode == EditorToolMode::glue);
-    menu.addItem(menuToolEraser, "Eraser", true, toolMode == EditorToolMode::eraser);
+    menu.addItem(menuToolPencil, "Pencil", true, toolMode == EditorToolMode::pencil, createToolMenuIcon(EditorToolMode::pencil));
+    menu.addItem(menuToolSelect, "Select", true, toolMode == EditorToolMode::selection, createToolMenuIcon(EditorToolMode::selection));
+    menu.addItem(menuToolGlue, "Glue", true, toolMode == EditorToolMode::glue, createToolMenuIcon(EditorToolMode::glue));
+    menu.addItem(menuToolEraser, "Eraser", true, toolMode == EditorToolMode::eraser, createToolMenuIcon(EditorToolMode::eraser));
     menu.addSeparator();
     menu.addSectionHeader("Clips");
     menu.addItem(menuOpen, "Open Pattern", hasSection);

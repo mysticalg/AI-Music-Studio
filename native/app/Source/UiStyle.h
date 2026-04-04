@@ -4,11 +4,11 @@
 
 namespace aims::ui
 {
-constexpr float kTinyTextSize = 9.6f;
 constexpr float kBodyTextSize = 10.4f;
-constexpr float kStrongTextSize = 10.8f;
-constexpr float kSectionTextSize = 11.2f;
-constexpr float kTitleTextSize = 11.6f;
+constexpr float kTinyTextSize = kBodyTextSize;
+constexpr float kStrongTextSize = kBodyTextSize;
+constexpr float kSectionTextSize = kBodyTextSize;
+constexpr float kTitleTextSize = kBodyTextSize;
 
 inline juce::FontOptions font(float size = kBodyTextSize)
 {
