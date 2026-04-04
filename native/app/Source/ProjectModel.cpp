@@ -431,6 +431,30 @@ juce::var serialiseTrack(const TrackState& track)
     setObjectProperty(value, "theme_track_colour", track.followThemeTrackColour);
     setObjectProperty(value, "theme_colour_slot", track.themeColourSlot);
     setObjectProperty(value, "automation_lanes", juce::var(automationLanes));
+    setObjectProperty(value,
+                      "arrangement_visible_automation_targets",
+                      makeStringArrayVar(track.arrangementVisibleAutomationTargets));
+    setObjectProperty(value, "routing_target", track.routingTarget);
+    return value;
+}
+
+juce::var serialiseSharedEffectBus(const SharedEffectBusState& bus)
+{
+    auto value = makeObjectVar();
+    auto parametersVar = makeObjectVar();
+    for (int index = 0; index < bus.parameters.size(); ++index)
+    {
+        const auto key = bus.parameters.getName(index).toString();
+        setObjectProperty(parametersVar, key, bus.parameters.getValueAt(index));
+    }
+
+    setObjectProperty(value, "id", bus.id);
+    setObjectProperty(value, "name", bus.name);
+    setObjectProperty(value, "effect", bus.effect);
+    setObjectProperty(value, "output_targets", makeStringArrayVar(bus.outputTargets));
+    setObjectProperty(value, "parameters", parametersVar);
+    setObjectProperty(value, "state_path", bus.statePath);
+    setObjectProperty(value, "bypassed", bus.bypassed);
     return value;
 }
 
@@ -465,6 +489,8 @@ juce::var serialiseSampleClip(const SampleClip& clip)
     setObjectProperty(value, "track_index", clip.trackIndex);
     setObjectProperty(value, "start_sec", clip.startSec);
     setObjectProperty(value, "duration_sec", clip.durationSec);
+    setObjectProperty(value, "source_offset_sec", clip.sourceOffsetSec);
+    setObjectProperty(value, "source_file_duration_sec", clip.sourceFileDurationSec);
     setObjectProperty(value, "sample_rate", clip.sampleRate);
     setObjectProperty(value, "waveform_preview", makeFloatArrayVar(clip.waveformPreview));
     return value;
@@ -494,6 +520,7 @@ juce::var serialiseProjectState(const ProjectState& project)
     juce::Array<juce::var> patternArray;
     juce::Array<juce::var> sectionArray;
     juce::Array<juce::var> tempoMarkerArray;
+    juce::Array<juce::var> sharedFxBusArray;
     const auto projectBarTicks = ticksPerBar(project);
 
     for (const auto& track : project.tracks)
@@ -516,6 +543,9 @@ juce::var serialiseProjectState(const ProjectState& project)
 
     for (const auto& marker : project.tempoMarkers)
         tempoMarkerArray.add(serialiseTempoMarker(marker));
+
+    for (const auto& bus : project.sharedFxBuses)
+        sharedFxBusArray.add(serialiseSharedEffectBus(bus));
 
     setObjectProperty(value, "bpm", project.bpm);
     setObjectProperty(value, "time_signature_numerator", project.timeSigNumerator);
@@ -543,6 +573,7 @@ juce::var serialiseProjectState(const ProjectState& project)
     setObjectProperty(value, "master_fx_bypassed", project.masterFxBypassed);
     setObjectProperty(value, "master_fx_slot_bypassed",
                       makeBoolArrayVar(project.masterFxSlotBypassed, project.masterFxChain.size()));
+    setObjectProperty(value, "shared_fx_buses", juce::var(sharedFxBusArray));
     setObjectProperty(value, "tempo_markers", juce::var(tempoMarkerArray));
     setObjectProperty(value, "tracks", juce::var(trackArray));
     setObjectProperty(value, "vsti_paths", makeStringArrayVar(project.vstiPaths));
@@ -1127,6 +1158,7 @@ juce::String editorToolModeLabel(EditorToolMode mode)
     {
         case EditorToolMode::pencil: return "Pencil";
         case EditorToolMode::selection: return "Select";
+        case EditorToolMode::scissors: return "Scissors";
         case EditorToolMode::glue: return "Glue";
         case EditorToolMode::eraser: return "Eraser";
     }
@@ -1358,6 +1390,38 @@ juce::StringArray availableAutomationTargets(const TrackState& track)
     return targets;
 }
 
+juce::StringArray usedAutomationTargets(const TrackState& track)
+{
+    juce::StringArray targets;
+    for (const auto& lane : track.automationLanes)
+    {
+        const auto target = lane.target.trim();
+        if (target.isEmpty() || lane.points.empty())
+            continue;
+
+        targets.addIfNotAlreadyThere(target);
+    }
+
+    return targets;
+}
+
+juce::StringArray visibleArrangementAutomationTargets(const TrackState& track)
+{
+    juce::StringArray visibleTargets;
+    const auto usedTargets = usedAutomationTargets(track);
+
+    for (const auto& entry : track.arrangementVisibleAutomationTargets)
+    {
+        const auto target = entry.trim();
+        if (target.isEmpty() || !usedTargets.contains(target, true))
+            continue;
+
+        visibleTargets.addIfNotAlreadyThere(target);
+    }
+
+    return visibleTargets;
+}
+
 void sanitiseAutomationLanes(TrackState& track)
 {
     std::vector<AutomationLane> sanitised;
@@ -1409,6 +1473,11 @@ void sanitiseAutomationLanes(TrackState& track)
     }
 
     track.automationLanes = std::move(sanitised);
+}
+
+void sanitiseArrangementAutomationLaneVisibility(TrackState& track)
+{
+    track.arrangementVisibleAutomationTargets = visibleArrangementAutomationTargets(track);
 }
 
 void sanitisePatternControllerLanes(MidiPattern& pattern)
@@ -1665,7 +1734,7 @@ int defaultInstrumentIndex(const ProjectState& project)
     return -1;
 }
 
-int nativeInstrumentIndexForTrack(const ProjectState& project, const TrackState& track)
+int suggestedNativeInstrumentIndexForTrack(const ProjectState& project, const TrackState& track)
 {
     if (!track.trackType.trim().equalsIgnoreCase("instrument"))
         return -1;
@@ -1729,8 +1798,16 @@ int nativeInstrumentIndexForTrack(const ProjectState& project, const TrackState&
         preferredNames.addArray(juce::StringArray{ "AI Piano", "AI Strings", "AI Lead Synth", "AI Pad Synth", "AI String Synth", "AI Bass Synth" });
     }
 
-    if (const auto preferredIndex = preferredInstrumentIndexByNames(project, preferredNames); preferredIndex >= 0)
-        return preferredIndex;
+    return preferredInstrumentIndexByNames(project, preferredNames);
+}
+
+int nativeInstrumentIndexForTrack(const ProjectState& project, const TrackState& track)
+{
+    if (const auto suggestedIndex = suggestedNativeInstrumentIndexForTrack(project, track); suggestedIndex >= 0)
+        return suggestedIndex;
+
+    if (!track.trackType.trim().equalsIgnoreCase("instrument"))
+        return -1;
 
     return defaultInstrumentIndex(project);
 }
@@ -1935,6 +2012,38 @@ void ProjectState::recalculateTimeFields()
     rightLocatorTick = juce::jmax(leftLocatorTick + 1, rightLocatorTick);
     playheadTick = clampValue(playheadTick, leftLocatorTick, rightLocatorTick);
 
+    juce::StringArray validRoutingTargets;
+    validRoutingTargets.add("master");
+    validRoutingTargets.add("none");
+    for (auto& bus : sharedFxBuses)
+    {
+        if (bus.id.trim().isEmpty())
+            bus.id = juce::Uuid().toString();
+        if (bus.name.trim().isEmpty())
+            bus.name = "FX Bus";
+        validRoutingTargets.addIfNotAlreadyThere(bus.id);
+    }
+    for (auto& bus : sharedFxBuses)
+    {
+        juce::StringArray sanitisedTargets;
+        for (const auto& target : bus.outputTargets)
+        {
+            const auto trimmedTarget = target.trim();
+            if (trimmedTarget.isEmpty() || trimmedTarget.equalsIgnoreCase(bus.id))
+                continue;
+            if (validRoutingTargets.contains(trimmedTarget, true))
+                sanitisedTargets.addIfNotAlreadyThere(trimmedTarget);
+        }
+        bus.outputTargets = sanitisedTargets;
+    }
+    for (auto& track : tracks)
+    {
+        const auto target = track.routingTarget.trim();
+        track.routingTarget = target.isEmpty()
+            ? juce::String("none")
+            : (validRoutingTargets.contains(target, true) ? target : "master");
+    }
+
     for (auto& pattern : midiPatterns)
     {
         if (pattern.id.trim().isEmpty())
@@ -2115,6 +2224,9 @@ juce::Result loadProjectFile(const juce::File& file, ProjectFileData& outProject
                                                            "theme_track_colour",
                                                            track.colorHex.trim().isEmpty() || isLegacyAutoTrackColour(track.colorHex));
             track.themeColourSlot = getIntProperty(trackVar, "theme_colour_slot", trackIndex, 0, 4096);
+            track.arrangementVisibleAutomationTargets = readStringArray(getObjectProperty(trackVar,
+                                                                                          "arrangement_visible_automation_targets"));
+            track.routingTarget = getStringProperty(trackVar, "routing_target", "master");
 
             if (auto* notesArray = getObjectProperty(trackVar, "notes").getArray())
             {
@@ -2133,6 +2245,7 @@ juce::Result loadProjectFile(const juce::File& file, ProjectFileData& outProject
 
             readAutomationLanes(getObjectProperty(trackVar, "automation_lanes"), track.automationLanes);
             sanitiseAutomationLanes(track);
+            sanitiseArrangementAutomationLaneVisibility(track);
             loaded.project.tracks.push_back(std::move(track));
         }
     }
@@ -2148,6 +2261,26 @@ juce::Result loadProjectFile(const juce::File& file, ProjectFileData& outProject
     loaded.project.masterFxBypassed = getBoolProperty(projectRoot, "master_fx_bypassed", false);
     loaded.project.masterFxSlotBypassed = normaliseBoolVector(readBoolVector(getObjectProperty(projectRoot, "master_fx_slot_bypassed")),
                                                               loaded.project.masterFxChain.size());
+    loaded.project.sharedFxBuses.clear();
+    if (auto* sharedFxBusArray = getObjectProperty(projectRoot, "shared_fx_buses").getArray())
+    {
+        loaded.project.sharedFxBuses.reserve(static_cast<size_t>(sharedFxBusArray->size()));
+        for (const auto& item : *sharedFxBusArray)
+        {
+            SharedEffectBusState bus;
+            bus.id = getStringProperty(item, "id", juce::Uuid().toString());
+            bus.name = getStringProperty(item, "name", bus.name);
+            bus.effect = getStringProperty(item, "effect");
+            if (item.hasProperty("output_targets"))
+                bus.outputTargets = readStringArray(getObjectProperty(item, "output_targets"));
+            else
+                bus.outputTargets.add("master");
+            readVstParameters(getObjectProperty(item, "parameters"), bus.parameters);
+            bus.statePath = getStringProperty(item, "state_path");
+            bus.bypassed = getBoolProperty(item, "bypassed", false);
+            loaded.project.sharedFxBuses.push_back(std::move(bus));
+        }
+    }
 
     loaded.project.vstRack.clear();
     if (auto* rackArray = getObjectProperty(projectRoot, "vsti_rack").getArray())
@@ -2194,8 +2327,15 @@ juce::Result loadProjectFile(const juce::File& file, ProjectFileData& outProject
             clip.trackIndex = getIntProperty(item, "track_index", 0, 0);
             clip.startSec = getDoubleProperty(item, "start_sec", 0.0, 0.0);
             clip.durationSec = getDoubleProperty(item, "duration_sec", 0.0, 0.0);
+            clip.sourceOffsetSec = getDoubleProperty(item, "source_offset_sec", 0.0, 0.0);
+            clip.sourceFileDurationSec = getDoubleProperty(item,
+                                                           "source_file_duration_sec",
+                                                           clip.durationSec,
+                                                           0.0);
             clip.sampleRate = getIntProperty(item, "sample_rate", 44100, 1000, 384000);
             clip.waveformPreview = readFloatVector(getObjectProperty(item, "waveform_preview"));
+            if (clip.sourceFileDurationSec <= 0.0)
+                clip.sourceFileDurationSec = clip.durationSec;
             loaded.project.sampleClips.push_back(std::move(clip));
         }
     }
@@ -2351,6 +2491,12 @@ juce::Result saveProjectFile(const juce::File& file, const ProjectFileData& proj
     setObjectProperty(projectVar, "master_fx_bypassed", normalisedProject.masterFxBypassed);
     setObjectProperty(projectVar, "master_fx_slot_bypassed",
                       makeBoolArrayVar(normalisedProject.masterFxSlotBypassed, normalisedProject.masterFxChain.size()));
+    {
+        juce::Array<juce::var> sharedFxBusArray;
+        for (const auto& bus : normalisedProject.sharedFxBuses)
+            sharedFxBusArray.add(serialiseSharedEffectBus(bus));
+        setObjectProperty(projectVar, "shared_fx_buses", juce::var(sharedFxBusArray));
+    }
     setObjectProperty(projectVar, "tracks", juce::var(trackArray));
     setObjectProperty(projectVar, "vsti_paths", makeStringArrayVar(normalisedProject.vstiPaths));
     setObjectProperty(projectVar, "vsti_folder_paths", makeStringArrayVar(normalisedProject.vstiFolderPaths));

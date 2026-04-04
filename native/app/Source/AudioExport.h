@@ -33,8 +33,19 @@ struct AudioExportBatchSummary
     std::vector<AudioExportStemFile> exportedFiles;
 };
 
+juce::Result exportProjectRangeToAudioFile(const juce::File& file,
+                                           const ProjectState& project,
+                                           NativeVstHostSession& nativeVstHost,
+                                           AudioExportSummary& outSummary,
+                                           int sampleRate = 44100);
 juce::Result exportProjectRangeToWavFile(const juce::File& file,
                                          const ProjectState& project,
+                                         NativeVstHostSession& nativeVstHost,
+                                         AudioExportSummary& outSummary,
+                                         int sampleRate = 44100);
+juce::Result exportTrackRangeToAudioFile(const juce::File& file,
+                                         const ProjectState& project,
+                                         int trackIndex,
                                          NativeVstHostSession& nativeVstHost,
                                          AudioExportSummary& outSummary,
                                          int sampleRate = 44100);

@@ -80,18 +80,18 @@ public:
 
         auto titleArea = area.removeFromTop(56);
         g.setColour(juce::Colour::fromRGB(194, 250, 202));
-        g.setFont(juce::FontOptions(34.0f, juce::Font::bold));
+        g.setFont(juce::FontOptions(aims::ui::scaleValue(34.0f), juce::Font::bold));
         g.drawFittedText("Mutagen", titleArea, juce::Justification::centred, 1);
 
         auto versionArea = area.removeFromTop(22);
         g.setColour(juce::Colour::fromRGB(150, 164, 182));
-        g.setFont(juce::FontOptions(15.0f));
+        g.setFont(juce::FontOptions(aims::ui::scaleValue(15.0f)));
         g.drawFittedText("Version " + version, versionArea, juce::Justification::centred, 1);
 
         area.removeFromTop(10);
         auto statusArea = area.removeFromTop(28);
         g.setColour(juce::Colour::fromRGB(118, 222, 170));
-        g.setFont(juce::FontOptions(16.0f, juce::Font::bold));
+        g.setFont(juce::FontOptions(aims::ui::scaleValue(16.0f), juce::Font::bold));
         g.drawFittedText(status, statusArea, juce::Justification::centred, 1);
     }
 
@@ -140,8 +140,8 @@ public:
 
     juce::Font getTextButtonFont(juce::TextButton&, int buttonHeight) override
     {
-        return juce::FontOptions(juce::jlimit(aims::ui::kTinyTextSize,
-                                              aims::ui::kStrongTextSize,
+        return juce::FontOptions(juce::jlimit(aims::ui::scaleValue(aims::ui::kTinyTextSize),
+                                              aims::ui::scaleValue(aims::ui::kStrongTextSize),
                                               static_cast<float>(buttonHeight) * 0.38f),
                                  juce::Font::bold);
     }
@@ -168,7 +168,7 @@ public:
 
     int getDefaultMenuBarHeight() override
     {
-        return 24;
+        return juce::roundToInt(juce::jmax(24.0f, aims::ui::scaleValue(24.0f)));
     }
 
     juce::Font getAlertWindowTitleFont() override
@@ -210,7 +210,7 @@ class AIMusicStudioNativeApplication final : public juce::JUCEApplication
 {
 public:
     const juce::String getApplicationName() override      { return "Mutagen"; }
-    const juce::String getApplicationVersion() override   { return "0.3.1"; }
+    const juce::String getApplicationVersion() override   { return "0.3.2"; }
     bool moreThanOneInstanceAllowed() override            { return true; }
 
     void initialise(const juce::String&) override

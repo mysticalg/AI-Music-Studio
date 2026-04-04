@@ -71,10 +71,12 @@ public:
     juce::Result noteOffAudioEngineTrack(int trackIndex, int note, int channel, float velocity = 0.0f);
     juce::Result allNotesOffAudioEngineTrack(int trackIndex, int channel = 0);
     juce::Result startAudioEngine(int startTick);
+    juce::Result seekAudioEngine(int startTick);
     juce::Result stopAudioEngine(bool allowTail = false);
     void setEditorStateCallback(std::function<void(bool)> callback);
     juce::Result openAudioEngineTrackEditor(int trackIndex);
     juce::Result openAudioEngineTrackEffectEditor(int trackIndex, int effectIndex);
+    juce::Result openAudioEngineSharedEffectBusEditor(const juce::String& busId);
     juce::Result openAudioEngineMasterEffectEditor(int effectIndex);
     juce::Result closeAudioEngineTrackEditor(int trackIndex);
     juce::Result queryAudioEngineTrackEditorOpen(int trackIndex, bool& isOpen) const;

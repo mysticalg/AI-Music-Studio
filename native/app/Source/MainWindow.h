@@ -38,6 +38,7 @@ class SampleWorkspaceWindowComponent;
 class PianoRollWindowComponent;
 class VirtualPianoWindowComponent;
 class TracksWorkspaceWindowComponent;
+class ModulationMatrixWindowComponent;
 class RackBrowserWindowComponent;
 class RenderManagerWindowComponent;
 class HeaderLcdDisplay;
@@ -114,6 +115,22 @@ private:
         int pitch = 60;
     };
 
+    struct StemSeparationStem
+    {
+        juce::String name;
+        SampleAsset asset;
+    };
+
+    struct StemSeparationResult
+    {
+        bool success = false;
+        juce::String errorMessage;
+        SampleClip sourceClip;
+        juce::String sourceTrackName;
+        juce::File outputDirectory;
+        std::vector<StemSeparationStem> stems;
+    };
+
     void createToolbarButton(juce::TextButton& button, const juce::String& text);
     void configureInspectorTextEditor(juce::TextEditor& editor, const juce::String& placeholder);
     void configureInspectorSlider(juce::Slider& slider, double minimum, double maximum, double step, const juce::String& suffix);
@@ -136,6 +153,7 @@ private:
     void setTransportMetronomeEnabled(bool enabled);
     void setTransportRecordEnabled(bool enabled);
     void addTrack();
+    void addSampleTrack();
     void duplicateSelectedTrack();
     void removeSelectedTrack();
     void handleTempoChanged();
@@ -147,9 +165,13 @@ private:
     void handleArrangementLaneHeightChanged();
     void handlePianoRollZoomChanged();
     void handlePianoRollRowHeightChanged();
+    void promptImportJson();
     void promptImportMidi();
+    void promptExportJson();
     void promptExportMidi();
+    void promptExportMp3();
     void promptExportWav();
+    void promptExportSelectedTrackMp3();
     void promptExportSelectedTrackWav();
     void promptExportProjectStems();
     void promptImportSample();
@@ -158,10 +180,13 @@ private:
     void placeSelectedSampleAtPlayhead();
     void importSelectedTrackRenderToSampleLibrary();
     void placeSelectedTrackRenderAtPlayhead();
+    void showTemplateSettingsDialog();
     void showAiSettingsDialog();
     void composeWithAi();
     void openSelectedTrackRackEditor();
+    void openTrackRackEditor(int trackIndex);
     void openTrackEffectEditorFromMixer(int trackIndex, int effectIndex);
+    void openSharedEffectBusEditor(const juce::String& busId);
     void openMasterEffectEditorFromMixer(int effectIndex);
     void saveSelectedTrackRackState();
     void playSelectedTrackThroughRack();
@@ -169,6 +194,7 @@ private:
     void stopRackPreview();
     void undo();
     void redo();
+    bool selectAllFromFocusedEditor(juce::String* statusTextOut = nullptr);
     void selectAllNotesFromMenu();
     void copyNotesFromMenu();
     void cutNotesFromMenu();
@@ -181,6 +207,7 @@ private:
     void focusAutomationPanel();
     void focusSamplesPanel();
     void focusTracksPanel();
+    void focusModulationMatrixPanel();
     void focusRackBrowserPanel();
     void focusRenderManagerPanel();
     void focusAudioPanel();
@@ -205,6 +232,8 @@ private:
     bool isPanelsWindowVisible() const noexcept;
     void setTracksWindowVisible(bool shouldBeVisible);
     bool isTracksWindowVisible() const noexcept;
+    void setModulationMatrixWindowVisible(bool shouldBeVisible);
+    bool isModulationMatrixWindowVisible() const noexcept;
     void setRackBrowserWindowVisible(bool shouldBeVisible);
     bool isRackBrowserWindowVisible() const noexcept;
     void setRenderManagerWindowVisible(bool shouldBeVisible);
@@ -241,6 +270,14 @@ private:
     void promptAddUserVstFolder();
     void removeUserVstFolder(const juce::String& folderPath);
     void assignSelectedTrackRackByReference(const juce::String& reference);
+    void addInstrumentTrackFromReference(const juce::String& reference);
+    void addSharedEffectBusFromReference(const juce::String& reference, int inputTrackIndex = -1);
+    void replaceSharedEffectBusReference(const juce::String& busId, const juce::String& reference);
+    void removeSharedEffectBus(const juce::String& busId);
+    void ensureModulationMatrixWindowCreated();
+    void routeTrackToTarget(int trackIndex, const juce::String& targetId);
+    void clearSharedEffectBusOutputTargets(const juce::String& busId);
+    void setSharedEffectBusOutputTargetEnabled(const juce::String& busId, const juce::String& targetId, bool enabled);
     void clearSelectedTrackRackAssignment();
     void materialiseSelectedTrackRackAssignment();
     void clearSelectedTrackRenderedAudioPath();
@@ -269,6 +306,8 @@ private:
     void handleRealtimeMidiRecordingNoteOn(int pitch, int velocity);
     void handleRealtimeMidiRecordingNoteOff(int pitch);
     void finishActiveRealtimeRecordedNotes(int endTick = -1);
+    void separateSampleClipToStems(int clipIndex);
+    void pollStemSeparationFuture();
     void insertLiveMidiNote(int pitch,
                             int velocity = 100,
                             bool flashVirtualKey = false,
@@ -278,6 +317,7 @@ private:
     juce::String buildAboutDetails() const;
     void persistThemeSelection() const;
     void persistFontSelection() const;
+    juce::String currentDefaultTemplateIdentifier() const;
     void applyTheme();
     void applyUiFont();
     void appendActivityLog(const juce::String& title, const juce::String& body);
@@ -303,6 +343,16 @@ private:
     bool tryHandleVirtualPianoShortcut(const juce::KeyPress& key);
     bool virtualPianoShortcutsEnabled() const;
     juce::Result ensureSampleAssetForFile(const juce::File& file, int& outAssetIndex);
+    juce::Result placeSampleAssetOnTrackAtTick(int assetIndex,
+                                               int trackIndex,
+                                               int startTick,
+                                               const juce::String& actionName,
+                                               juce::String& outTrackName);
+    juce::Result placeSampleFileOnTrackAtTick(const juce::File& file,
+                                              int trackIndex,
+                                              int startTick,
+                                              const juce::String& actionName,
+                                              juce::String& outTrackName);
     juce::Result placeSampleAssetAtPlayhead(int assetIndex,
                                             const juce::String& actionName,
                                             juce::String& outTrackName);
@@ -339,6 +389,10 @@ private:
     int getFontCount() const noexcept;
     juce::String getFontName(int index) const;
     void setFontIndex(int index);
+    int getCurrentFontSizeIndex() const noexcept;
+    int getFontSizeCount() const noexcept;
+    juce::String getFontSizeLabel(int index) const;
+    void setFontSizeIndex(int index);
     TrackState* getSelectedTrack();
     const TrackState* getSelectedTrack() const;
 
@@ -349,6 +403,8 @@ private:
 
     TrackTableModel tableModel;
     juce::TableListBox trackTable;
+    juce::Viewport inspectorViewport;
+    juce::Component inspectorContent;
     SampleAssetListModel sampleAssetListModel;
     juce::ListBox sampleAssetList;
 
@@ -442,6 +498,7 @@ private:
     float transportMasterPeakLeft = 0.0f;
     float transportMasterPeakRight = 0.0f;
     std::future<AIComposeResult> aiComposeFuture;
+    std::future<StemSeparationResult> stemSeparationFuture;
     juce::String aiComposeBusyDetail;
     juce::String aiComposeDefaultPrompt;
     int aiComposeDefaultBars = 8;
@@ -456,6 +513,7 @@ private:
     std::vector<int> aiComposeRequestedTargetTracks;
     int aiComposeRequestedInsertTick = 0;
     bool aiComposeBusy = false;
+    bool stemSeparationBusy = false;
     std::vector<std::unique_ptr<RackEditorSession>> rackEditorSessions;
     bool loadedRackEditorOpen = false;
     bool rackPreviewWarmupPending = false;
@@ -473,6 +531,7 @@ private:
     float pianoRollRowHeightPixels = 16.0f;
     int currentThemeIndex = 0;
     int currentFontIndex = 0;
+    int currentFontSizeIndex = 2;
     juce::StringArray availableUiFonts;
     std::unique_ptr<juce::LookAndFeel_V4> compactHeaderLookAndFeel;
     juce::uint32 lastSharedRackParameterSyncMs = 0;
@@ -484,6 +543,10 @@ private:
     int leftPaneDragStartWidth = 0;
     bool leftPaneResizeDragging = false;
     juce::Rectangle<int> leftPaneResizeHandleBounds;
+    int leftPaneTrackListHeightPixels = 0;
+    int leftPaneTrackListDragStartHeight = 0;
+    bool leftPaneTrackListResizeDragging = false;
+    juce::Rectangle<int> leftPaneTrackListResizeHandleBounds;
     juce::String preferredMidiInputIdentifier;
     juce::StringArray activeMidiInputNames;
     std::vector<std::unique_ptr<juce::MidiInput>> midiInputs;
@@ -504,6 +567,7 @@ private:
     bool audioWindowVisible = true;
     bool panelsWindowVisible = false;
     bool tracksWindowVisible = false;
+    bool modulationMatrixWindowVisible = false;
     bool rackBrowserWindowVisible = false;
     bool renderManagerWindowVisible = false;
     bool arrangementWindowVisible = true;
@@ -524,6 +588,8 @@ private:
     PanelsWindowComponent* panelsWindowContent = nullptr;
     std::unique_ptr<FloatingPanelWindow> tracksWindow;
     TracksWorkspaceWindowComponent* floatingTracksWorkspace = nullptr;
+    std::unique_ptr<FloatingPanelWindow> modulationMatrixWindow;
+    ModulationMatrixWindowComponent* floatingModulationMatrix = nullptr;
     std::unique_ptr<FloatingPanelWindow> rackBrowserWindow;
     RackBrowserWindowComponent* floatingRackBrowser = nullptr;
     std::unique_ptr<FloatingPanelWindow> renderManagerWindow;
@@ -565,9 +631,15 @@ private:
         menuFileOpen,
         menuFileSave,
         menuFileSaveAs,
+        menuFileAddTrack,
+        menuFileAddSampleTrack,
+        menuFileImportJson,
         menuFileImportMidi,
         menuFileImportSample,
+        menuFileExportJson,
+        menuFileExportMp3,
         menuFileExportWav,
+        menuFileExportTrackMp3,
         menuFileExportTrackWav,
         menuFileExportStems,
         menuFileExportMidi,
@@ -582,12 +654,14 @@ private:
         menuEditPaste,
         menuSettingsAudio,
         menuSettingsVstFolders,
+        menuSettingsTemplates,
         menuSettingsAi,
         menuWindowsPanels = 2100,
         menuWindowsTransport,
         menuWindowsMixer,
         menuWindowsAudio,
         menuWindowsTracks,
+        menuWindowsModulationMatrix,
         menuWindowsRackBrowser,
         menuWindowsRenderManager,
         menuWindowsArrangement,
@@ -601,7 +675,8 @@ private:
         menuHelpOllama,
         menuHelpAbout,
         menuThemeBase = 4000,
-        menuFontChoiceBase = 5000
+        menuFontChoiceBase = 5000,
+        menuFontSizeBase = 6000
     };
 
     juce::StringArray getMenuBarNames() override;

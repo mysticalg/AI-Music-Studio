@@ -36,6 +36,40 @@ const juce::Colour kControllerLanePoint = juce::Colour::fromRGB(232, 242, 255);
 constexpr float kTransportHandleWidth = 16.0f;
 constexpr float kTransportHandleHeight = 10.0f;
 
+bool matchesCommandShortcut(const juce::KeyPress& key, char letter)
+{
+    if (!key.getModifiers().isCommandDown())
+        return false;
+
+    const auto normalisedLetter = juce::CharacterFunctions::toLowerCase(static_cast<wchar_t>(letter));
+    const auto normalisedKeyCode = juce::CharacterFunctions::toLowerCase(static_cast<wchar_t>(key.getKeyCode()));
+    const auto normalisedTextCharacter = juce::CharacterFunctions::toLowerCase(static_cast<wchar_t>(key.getTextCharacter()));
+    return normalisedKeyCode == normalisedLetter || normalisedTextCharacter == normalisedLetter;
+}
+
+bool isZoomWheelGesture(const juce::MouseEvent& event, const juce::MouseWheelDetails& wheel)
+{
+    return (event.mods.isCtrlDown() || event.mods.isCommandDown()) && std::abs(wheel.deltaY) > 0.0001f;
+}
+
+bool isRowHeightWheelGesture(const juce::MouseEvent& event, const juce::MouseWheelDetails& wheel)
+{
+    return event.mods.isAltDown()
+        && !event.mods.isCtrlDown()
+        && !event.mods.isCommandDown()
+        && std::abs(wheel.deltaY) > 0.0001f;
+}
+
+float zoomScaleFromWheelDelta(float deltaY)
+{
+    return std::pow(1.12f, juce::jlimit(-6.0f, 6.0f, deltaY * 4.0f));
+}
+
+float rowHeightDeltaFromWheel(float deltaY)
+{
+    return juce::jlimit(-6.0f, 6.0f, deltaY * 12.0f);
+}
+
 bool isBlackPitch(int pitch)
 {
     switch (pitch % 12)
@@ -187,9 +221,54 @@ juce::MouseCursor createGlueToolCursor()
     return juce::MouseCursor(image, 16, 20);
 }
 
+juce::MouseCursor createScissorsToolCursor()
+{
+    constexpr int cursorSize = 24;
+    auto image = juce::Image(juce::Image::ARGB, cursorSize, cursorSize, true);
+    juce::Graphics g(image);
+
+    const auto handleColour = juce::Colour::fromRGB(255, 171, 145);
+    const auto bladeColour = juce::Colour::fromRGB(244, 245, 247);
+    const auto outlineColour = juce::Colour::fromRGBA(10, 12, 16, 180);
+
+    juce::Path upperBlade;
+    upperBlade.startNewSubPath(8.0f, 10.2f);
+    upperBlade.lineTo(18.6f, 4.3f);
+    g.setColour(outlineColour.withAlpha(0.45f));
+    g.strokePath(upperBlade, juce::PathStrokeType(3.5f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+    g.setColour(bladeColour);
+    g.strokePath(upperBlade, juce::PathStrokeType(2.2f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+
+    juce::Path lowerBlade;
+    lowerBlade.startNewSubPath(8.0f, 11.2f);
+    lowerBlade.lineTo(18.7f, 17.4f);
+    g.setColour(outlineColour.withAlpha(0.45f));
+    g.strokePath(lowerBlade, juce::PathStrokeType(3.5f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+    g.setColour(bladeColour);
+    g.strokePath(lowerBlade, juce::PathStrokeType(2.2f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
+
+    g.setColour(handleColour);
+    g.fillEllipse(2.8f, 6.4f, 5.8f, 5.8f);
+    g.fillEllipse(2.8f, 12.0f, 5.8f, 5.8f);
+    g.setColour(outlineColour.withAlpha(0.6f));
+    g.drawEllipse(2.8f, 6.4f, 5.8f, 5.8f, 1.1f);
+    g.drawEllipse(2.8f, 12.0f, 5.8f, 5.8f, 1.1f);
+
+    g.setColour(outlineColour.withAlpha(0.75f));
+    g.fillEllipse(7.0f, 9.2f, 2.6f, 2.6f);
+
+    return juce::MouseCursor(image, 18, 11);
+}
+
 const juce::MouseCursor& glueToolCursor()
 {
     static const auto cursor = createGlueToolCursor();
+    return cursor;
+}
+
+const juce::MouseCursor& scissorsToolCursor()
+{
+    static const auto cursor = createScissorsToolCursor();
     return cursor;
 }
 
@@ -243,19 +322,16 @@ PianoRollComponent::PianoRollComponent(ProjectGetter projectGetterIn,
     controllerTargetLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(210, 218, 228));
     addAndMakeVisible(controllerTargetLabel);
 
-    controllerTargetBox.setColour(juce::ComboBox::backgroundColourId, juce::Colour::fromRGB(35, 40, 48));
-    controllerTargetBox.setColour(juce::ComboBox::outlineColourId, juce::Colour::fromRGB(74, 83, 99));
-    controllerTargetBox.setColour(juce::ComboBox::textColourId, juce::Colour::fromRGB(233, 238, 246));
-    controllerTargetBox.onChange = [this]
+    controllerTargetButton.setClickingTogglesState(false);
+    controllerTargetButton.setColour(juce::TextButton::buttonColourId, juce::Colour::fromRGB(35, 40, 48));
+    controllerTargetButton.setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(44, 52, 63));
+    controllerTargetButton.setColour(juce::TextButton::textColourOffId, juce::Colour::fromRGB(233, 238, 246));
+    controllerTargetButton.setColour(juce::TextButton::textColourOnId, juce::Colour::fromRGB(233, 238, 246));
+    controllerTargetButton.onClick = [this]
     {
-        const auto index = controllerTargetBox.getSelectedItemIndex();
-        if (juce::isPositiveAndBelow(index, static_cast<int>(controllerTargetOptions.size())))
-        {
-            selectedControllerTarget = controllerTargetOptions[static_cast<size_t>(index)];
-            repaint();
-        }
+        showControllerTargetMenu();
     };
-    addAndMakeVisible(controllerTargetBox);
+    addAndMakeVisible(controllerTargetButton);
 
     refreshControllerTargetChoices();
     updateContentSize();
@@ -272,7 +348,7 @@ void PianoRollComponent::refreshFromModel()
     const auto hasPattern = currentPattern() != nullptr;
     const auto showControllerSelectors = hasPattern && showsControllerEditor();
     controllerTargetLabel.setVisible(showControllerSelectors);
-    controllerTargetBox.setVisible(showControllerSelectors);
+    controllerTargetButton.setVisible(showControllerSelectors);
     if (!previewActive)
         updateContentSize();
     repaint();
@@ -343,6 +419,16 @@ void PianoRollComponent::setToolModeChangeCallback(ToolModeChangeCallback toolMo
 void PianoRollComponent::setKeyHandlerCallback(KeyHandlerCallback keyHandlerCallbackIn)
 {
     keyHandlerCallback = std::move(keyHandlerCallbackIn);
+}
+
+void PianoRollComponent::setZoomChangedCallback(ZoomChangedCallback zoomChangedCallbackIn)
+{
+    zoomChangedCallback = std::move(zoomChangedCallbackIn);
+}
+
+void PianoRollComponent::setRowHeightChangedCallback(RowHeightChangedCallback rowHeightChangedCallbackIn)
+{
+    rowHeightChangedCallback = std::move(rowHeightChangedCallbackIn);
 }
 
 int PianoRollComponent::viewPositionYForPitch(int pitch, int viewportHeight) const
@@ -811,12 +897,12 @@ void PianoRollComponent::resized()
     {
         auto headerBounds = controllerHeaderBounds().toNearestInt().reduced(8, 4);
         controllerTargetLabel.setBounds(headerBounds.removeFromLeft(36));
-        controllerTargetBox.setBounds(headerBounds.removeFromLeft(260));
+        controllerTargetButton.setBounds(headerBounds.removeFromLeft(260));
     }
     else
     {
         controllerTargetLabel.setBounds({});
-        controllerTargetBox.setBounds({});
+        controllerTargetButton.setBounds({});
     }
 }
 
@@ -971,6 +1057,18 @@ void PianoRollComponent::mouseDown(const juce::MouseEvent& event)
 
     if (noteIndex >= 0)
     {
+        if (toolMode == EditorToolMode::scissors && event.mods.isLeftButtonDown())
+        {
+            previewActive = false;
+            previewDirty = false;
+            interaction = Interaction::none;
+            if (splitClickedNoteAtTick(noteIndex, xToGridStartTick(event.position.x)))
+                refreshFromModel();
+            else
+                repaint();
+            return;
+        }
+
         if (toolMode == EditorToolMode::glue && event.mods.isLeftButtonDown())
         {
             previewActive = false;
@@ -1079,6 +1177,7 @@ void PianoRollComponent::showContextMenu(juce::Point<int> screenPosition)
     {
         menuToolPencil = 1,
         menuToolSelect,
+        menuToolScissors,
         menuToolGlue,
         menuToolEraser,
         menuDrawSingle,
@@ -1115,6 +1214,7 @@ void PianoRollComponent::showContextMenu(juce::Point<int> screenPosition)
     menu.addSectionHeader("Tools");
     menu.addItem(menuToolPencil, "Pencil", true, toolMode == EditorToolMode::pencil);
     menu.addItem(menuToolSelect, "Select", true, toolMode == EditorToolMode::selection);
+    menu.addItem(menuToolScissors, "Scissors", true, toolMode == EditorToolMode::scissors);
     menu.addItem(menuToolGlue, "Glue", true, toolMode == EditorToolMode::glue);
     menu.addItem(menuToolEraser, "Eraser", true, toolMode == EditorToolMode::eraser);
     juce::PopupMenu drawMenu;
@@ -1175,6 +1275,14 @@ void PianoRollComponent::showContextMenu(juce::Point<int> screenPosition)
                                         safeThis->toolModeChangeCallback(EditorToolMode::selection);
                                     else
                                         safeThis->setToolMode(EditorToolMode::selection);
+                                    safeThis->refreshFromModel();
+                                    break;
+
+                                case menuToolScissors:
+                                    if (safeThis->toolModeChangeCallback != nullptr)
+                                        safeThis->toolModeChangeCallback(EditorToolMode::scissors);
+                                    else
+                                        safeThis->setToolMode(EditorToolMode::scissors);
                                     safeThis->refreshFromModel();
                                     break;
 
@@ -1403,6 +1511,75 @@ void PianoRollComponent::mouseExit(const juce::MouseEvent&)
     stopPreviewNote();
 }
 
+void PianoRollComponent::mouseWheelMove(const juce::MouseEvent& event, const juce::MouseWheelDetails& wheel)
+{
+    if (isRowHeightWheelGesture(event, wheel))
+    {
+        const auto oldCellHeight = cellHeight;
+        const auto newCellHeight = oldCellHeight + rowHeightDeltaFromWheel(wheel.deltaY);
+        if (std::abs(newCellHeight - oldCellHeight) < 0.01f)
+            return;
+
+        const auto mouseYInViewport = [this, &event]() -> float
+        {
+            if (auto* viewport = findParentComponentOfClass<juce::Viewport>())
+                return event.position.y - static_cast<float>(viewport->getViewPositionY());
+            return event.position.y;
+        }();
+        const auto noteAreaTop = rulerHeight();
+        const auto noteAreaBottom = noteAreaTop + noteRowsHeight();
+        const auto focusRow = event.position.y >= noteAreaTop && event.position.y <= noteAreaBottom
+            ? juce::jmax(0.0f, event.position.y - noteAreaTop) / juce::jmax(1.0f, oldCellHeight)
+            : -1.0f;
+
+        setNoteRowHeight(newCellHeight);
+        if (rowHeightChangedCallback != nullptr)
+            rowHeightChangedCallback(getNoteRowHeight());
+
+        if (focusRow >= 0.0f)
+        {
+            if (auto* viewport = findParentComponentOfClass<juce::Viewport>())
+            {
+                const auto newContentY = noteAreaTop + (focusRow * cellHeight);
+                viewport->setViewPosition(viewport->getViewPositionX(),
+                                          juce::jmax(0, juce::roundToInt(newContentY - mouseYInViewport)));
+            }
+        }
+        return;
+    }
+
+    if (!isZoomWheelGesture(event, wheel))
+    {
+        if (auto* viewport = findParentComponentOfClass<juce::Viewport>())
+            viewport->mouseWheelMove(event.getEventRelativeTo(viewport), wheel);
+        return;
+    }
+
+    const auto oldCellWidth = cellWidth;
+    const auto mouseXInViewport = [this, &event]() -> float
+    {
+        if (auto* viewport = findParentComponentOfClass<juce::Viewport>())
+            return event.position.x - static_cast<float>(viewport->getViewPositionX());
+        return event.position.x;
+    }();
+    const auto focusTick = juce::jmax(0.0,
+                                      (static_cast<double>(juce::jmax(0.0f, event.position.x - pitchLaneWidth()))
+                                       / static_cast<double>(juce::jmax(1.0f, oldCellWidth)))
+                                          * static_cast<double>(kTicksPerBeat));
+
+    setHorizontalZoom(oldCellWidth * zoomScaleFromWheelDelta(wheel.deltaY));
+    if (zoomChangedCallback != nullptr)
+        zoomChangedCallback(getHorizontalZoom());
+
+    if (auto* viewport = findParentComponentOfClass<juce::Viewport>())
+    {
+        const auto newContentX = pitchLaneWidth()
+            + (static_cast<float>(focusTick) / static_cast<float>(kTicksPerBeat)) * cellWidth;
+        viewport->setViewPosition(juce::jmax(0, juce::roundToInt(newContentX - mouseXInViewport)),
+                                  viewport->getViewPositionY());
+    }
+}
+
 void PianoRollComponent::mouseUp(const juce::MouseEvent&)
 {
     if (pitchLanePreviewActive)
@@ -1519,31 +1696,25 @@ bool PianoRollComponent::keyPressed(const juce::KeyPress& key)
         return keyHandlerCallback != nullptr ? keyHandlerCallback(key) : false;
     };
 
-    if (key.getModifiers().isCommandDown()
-        && (key.getTextCharacter() == 'c' || key.getTextCharacter() == 'C'))
+    if (matchesCommandShortcut(key, 'c'))
         return copySelected();
 
-    if (key.getModifiers().isCommandDown()
-        && (key.getTextCharacter() == 'x' || key.getTextCharacter() == 'X'))
+    if (matchesCommandShortcut(key, 'x'))
         return cutSelected();
 
-    if (key.getModifiers().isCommandDown()
-        && (key.getTextCharacter() == 'v' || key.getTextCharacter() == 'V'))
+    if (matchesCommandShortcut(key, 'v'))
         return pasteClipboard();
 
-    if (key.getModifiers().isCommandDown()
-        && (key.getTextCharacter() == 'a' || key.getTextCharacter() == 'A'))
+    if (matchesCommandShortcut(key, 'a'))
         return selectAllNotes();
 
     if (key == juce::KeyPress::deleteKey || key == juce::KeyPress::backspaceKey)
         return deleteSelected();
 
-    if (key.getModifiers().isCommandDown()
-        && (key.getTextCharacter() == 'q' || key.getTextCharacter() == 'Q'))
+    if (matchesCommandShortcut(key, 'q'))
         return quantizeSelected();
 
-    if (key.getModifiers().isCommandDown()
-        && (key.getTextCharacter() == 'd' || key.getTextCharacter() == 'D'))
+    if (matchesCommandShortcut(key, 'd'))
         return duplicateSelectedByGrid();
 
     const auto sectionIndex = currentSectionIndex();
@@ -1960,44 +2131,7 @@ void PianoRollComponent::refreshControllerTargetChoices()
     targets.removeDuplicates(true);
     if (!targets.contains(selectedControllerTarget, true))
         selectedControllerTarget = velocityControllerTarget();
-
-    const auto selectedTargetIndex = [&targets, this] () -> int
-    {
-        for (int index = 0; index < targets.size(); ++index)
-        {
-            if (targets[index].equalsIgnoreCase(selectedControllerTarget))
-                return index;
-        }
-        return 0;
-    }();
-
-    if (controllerTargetOptions.size() == static_cast<size_t>(targets.size()))
-    {
-        bool sameTargets = true;
-        for (int index = 0; index < targets.size(); ++index)
-        {
-            if (!controllerTargetOptions[static_cast<size_t>(index)].equalsIgnoreCase(targets[index]))
-            {
-                sameTargets = false;
-                break;
-            }
-        }
-
-        if (sameTargets)
-        {
-            controllerTargetBox.setSelectedItemIndex(selectedTargetIndex, juce::dontSendNotification);
-            return;
-        }
-    }
-
-    controllerTargetOptions.clear();
-    controllerTargetOptions.reserve(static_cast<size_t>(targets.size()));
-    for (const auto& target : targets)
-        controllerTargetOptions.push_back(target);
-    controllerTargetBox.clear(juce::dontSendNotification);
-    for (int index = 0; index < targets.size(); ++index)
-        controllerTargetBox.addItem(controllerTargetDisplayText(targets[index]), index + 1);
-    controllerTargetBox.setSelectedItemIndex(selectedTargetIndex, juce::dontSendNotification);
+    controllerTargetButton.setButtonText(controllerTargetDisplayText(selectedControllerTarget) + "  v");
 }
 
 juce::String PianoRollComponent::currentControllerTarget() const
@@ -2193,6 +2327,112 @@ juce::String PianoRollComponent::controllerTargetDisplayText(const juce::String&
     return target;
 }
 
+void PianoRollComponent::showControllerTargetMenu()
+{
+    juce::PopupMenu menu;
+    constexpr int menuVelocity = 1;
+    int nextMidiCcId = 100;
+    int nextTrackAutomationId = 200;
+    int nextVstAutomationId = 300;
+
+    std::vector<std::pair<int, juce::String>> midiCcTargets;
+    std::vector<std::pair<int, juce::String>> trackAutomationTargets;
+    std::vector<std::pair<int, juce::String>> vstAutomationTargets;
+
+    menu.addItem(menuVelocity,
+                 "Velocity",
+                 true,
+                 selectedControllerTarget.equalsIgnoreCase(velocityControllerTarget()));
+
+    juce::PopupMenu midiCcMenu;
+    for (const auto& target : defaultMidiControllerTargets())
+    {
+        const auto itemId = nextMidiCcId++;
+        midiCcMenu.addItem(itemId,
+                           midiControllerTargetLabel(target),
+                           true,
+                           selectedControllerTarget.equalsIgnoreCase(target));
+        midiCcTargets.emplace_back(itemId, target);
+    }
+    menu.addSubMenu("MIDI CC", midiCcMenu, !midiCcTargets.empty());
+
+    juce::PopupMenu trackAutomationMenu;
+    juce::PopupMenu vstAutomationMenu;
+    if (const auto* track = currentTrack())
+    {
+        const auto targets = availableAutomationTargets(*track);
+        for (const auto& target : targets)
+        {
+            if (automationTargetIsVstParameter(target))
+            {
+                const auto itemId = nextVstAutomationId++;
+                vstAutomationMenu.addItem(itemId,
+                                          automationTargetLabel(*track, target),
+                                          true,
+                                          selectedControllerTarget.equalsIgnoreCase(target));
+                vstAutomationTargets.emplace_back(itemId, target);
+                continue;
+            }
+
+            const auto itemId = nextTrackAutomationId++;
+            trackAutomationMenu.addItem(itemId,
+                                        automationTargetLabel(*track, target),
+                                        true,
+                                        selectedControllerTarget.equalsIgnoreCase(target));
+            trackAutomationTargets.emplace_back(itemId, target);
+        }
+    }
+
+    if (trackAutomationTargets.empty())
+        trackAutomationMenu.addItem(nextTrackAutomationId, "No Track Automation", false);
+    if (vstAutomationTargets.empty())
+        vstAutomationMenu.addItem(nextVstAutomationId, "No VST Parameters", false);
+
+    menu.addSubMenu("Track Automation", trackAutomationMenu, true);
+    menu.addSubMenu("VST Automation", vstAutomationMenu, true);
+
+    menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&controllerTargetButton),
+                       [safeThis = juce::Component::SafePointer<PianoRollComponent>(this),
+                        menuVelocity,
+                        midiCcTargets = std::move(midiCcTargets),
+                        trackAutomationTargets = std::move(trackAutomationTargets),
+                        vstAutomationTargets = std::move(vstAutomationTargets)] (int result)
+                       {
+                           if (safeThis == nullptr || result == 0)
+                               return;
+
+                           if (result == menuVelocity)
+                           {
+                               safeThis->selectedControllerTarget = velocityControllerTarget();
+                               safeThis->refreshControllerTargetChoices();
+                               safeThis->repaint();
+                               return;
+                           }
+
+                           const auto applySelection = [safeThis, result] (const std::vector<std::pair<int, juce::String>>& targets) -> bool
+                           {
+                               for (const auto& [itemId, target] : targets)
+                               {
+                                   if (itemId != result)
+                                       continue;
+
+                                   safeThis->selectedControllerTarget = target;
+                                   safeThis->refreshControllerTargetChoices();
+                                   safeThis->repaint();
+                                   return true;
+                               }
+
+                               return false;
+                           };
+
+                           if (applySelection(midiCcTargets))
+                               return;
+                           if (applySelection(trackAutomationTargets))
+                               return;
+                           applySelection(vstAutomationTargets);
+                       });
+}
+
 void PianoRollComponent::clearSelection(MidiPattern& pattern) const
 {
     for (auto& note : pattern.notes)
@@ -2260,6 +2500,37 @@ bool PianoRollComponent::eraseNotesAlongPath(MidiPattern& pattern,
     }
 
     return changed;
+}
+
+bool PianoRollComponent::splitClickedNoteAtTick(int noteIndex, int splitTick)
+{
+    const auto sectionIndex = currentSectionIndex();
+    auto updatedProject = project();
+    auto* pattern = patternForSection(updatedProject, sectionIndex);
+    if (pattern == nullptr || !juce::isPositiveAndBelow(noteIndex, static_cast<int>(pattern->notes.size())))
+        return false;
+
+    const auto sourceNote = pattern->notes[static_cast<size_t>(noteIndex)];
+    const auto noteEndTick = sourceNote.startTick + sourceNote.durationTick;
+    if (splitTick <= sourceNote.startTick || splitTick >= noteEndTick)
+        return false;
+
+    clearSelection(*pattern);
+
+    auto leftNote = sourceNote;
+    leftNote.durationTick = juce::jmax(1, splitTick - sourceNote.startTick);
+    leftNote.selected = false;
+
+    auto rightNote = sourceNote;
+    rightNote.startTick = splitTick;
+    rightNote.durationTick = juce::jmax(1, noteEndTick - splitTick);
+    rightNote.selected = true;
+
+    pattern->notes[static_cast<size_t>(noteIndex)] = std::move(leftNote);
+    pattern->notes.push_back(std::move(rightNote));
+    sortMidiNotes(pattern->notes);
+    projectWriter(updatedProject, true, "Split Note");
+    return true;
 }
 
 bool PianoRollComponent::glueSelectedOrClickedNotes(int noteIndex)
@@ -2918,6 +3189,12 @@ void PianoRollComponent::updateCursorForPosition(juce::Point<float> position)
     if (toolMode == EditorToolMode::glue)
     {
         setMouseCursor(glueToolCursor());
+        return;
+    }
+
+    if (toolMode == EditorToolMode::scissors)
+    {
+        setMouseCursor(scissorsToolCursor());
         return;
     }
 

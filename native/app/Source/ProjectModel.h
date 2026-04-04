@@ -10,7 +10,7 @@ namespace aims
 constexpr int kTicksPerBeat = 480;
 constexpr int kTicksPerBar = kTicksPerBeat * 4;
 constexpr int kDefaultBpm = 120;
-constexpr int kProjectFileVersion = 10;
+constexpr int kProjectFileVersion = 12;
 constexpr int kMinSequenceSnapTicks = kTicksPerBeat / 16;
 constexpr int kEditableMidiPitchMin = 12;
 constexpr int kEditableMidiPitchMax = 120;
@@ -23,6 +23,7 @@ enum class EditorToolMode
 {
     pencil,
     selection,
+    scissors,
     glue,
     eraser
 };
@@ -120,6 +121,19 @@ struct TrackState
     bool followThemeTrackColour = true;
     int themeColourSlot = -1;
     std::vector<AutomationLane> automationLanes;
+    juce::StringArray arrangementVisibleAutomationTargets;
+    juce::String routingTarget = "master";
+};
+
+struct SharedEffectBusState
+{
+    juce::String id;
+    juce::String name = "FX Bus";
+    juce::String effect;
+    juce::StringArray outputTargets { "master" };
+    juce::NamedValueSet parameters;
+    juce::String statePath;
+    bool bypassed = false;
 };
 
 struct VstInstrument
@@ -148,6 +162,8 @@ struct SampleClip
     int trackIndex = 0;
     double startSec = 0.0;
     double durationSec = 0.0;
+    double sourceOffsetSec = 0.0;
+    double sourceFileDurationSec = 0.0;
     int sampleRate = 44100;
     std::vector<float> waveformPreview;
 };
@@ -189,6 +205,7 @@ struct ProjectState
     juce::StringArray masterFxChain;
     bool masterFxBypassed = false;
     std::vector<bool> masterFxSlotBypassed;
+    std::vector<SharedEffectBusState> sharedFxBuses;
     std::vector<TempoMarker> tempoMarkers;
     std::vector<TrackState> tracks;
     juce::StringArray vstiPaths;
@@ -264,7 +281,10 @@ double automationTargetDefaultValue(const TrackState& track, const juce::String&
 std::pair<double, double> automationTargetBounds(const TrackState& track, const juce::String& target);
 juce::String automationTargetLabel(const TrackState& track, const juce::String& target);
 juce::StringArray availableAutomationTargets(const TrackState& track);
+juce::StringArray usedAutomationTargets(const TrackState& track);
+juce::StringArray visibleArrangementAutomationTargets(const TrackState& track);
 void sanitiseAutomationLanes(TrackState& track);
+void sanitiseArrangementAutomationLaneVisibility(TrackState& track);
 void sanitisePatternControllerLanes(MidiPattern& pattern);
 int patternLengthTicks(const MidiPattern& pattern);
 MidiPattern* findMidiPattern(ProjectState& project, const juce::String& patternId);
@@ -278,6 +298,7 @@ juce::String resolveRackPluginPath(const ProjectState& project, const TrackState
 juce::String displayRackName(const ProjectState& project, const TrackState& track);
 int preferredInstrumentIndexByNames(const ProjectState& project, const juce::StringArray& preferredNames);
 int defaultInstrumentIndex(const ProjectState& project);
+int suggestedNativeInstrumentIndexForTrack(const ProjectState& project, const TrackState& track);
 int nativeInstrumentIndexForTrack(const ProjectState& project, const TrackState& track);
 bool materialiseNativeInstrumentTrack(const ProjectState& project, TrackState& track);
 juce::var toVar(const TrackState& track);

@@ -39,6 +39,8 @@ public:
     using PreviewStopCallback = std::function<void()>;
     using ToolModeChangeCallback = std::function<void(EditorToolMode mode)>;
     using KeyHandlerCallback = std::function<bool(const juce::KeyPress&)>;
+    using ZoomChangedCallback = std::function<void(float pixelsPerBeat)>;
+    using RowHeightChangedCallback = std::function<void(float rowHeightPixels)>;
 
     PianoRollComponent(ProjectGetter projectGetterIn,
                        TrackIndexGetter trackIndexGetterIn,
@@ -58,6 +60,8 @@ public:
                                  PreviewStopCallback stopPreviewCallbackIn = {});
     void setToolModeChangeCallback(ToolModeChangeCallback toolModeChangeCallbackIn);
     void setKeyHandlerCallback(KeyHandlerCallback keyHandlerCallbackIn);
+    void setZoomChangedCallback(ZoomChangedCallback zoomChangedCallbackIn);
+    void setRowHeightChangedCallback(RowHeightChangedCallback rowHeightChangedCallbackIn);
     int viewPositionYForPitch(int pitch, int viewportHeight) const;
 
     bool copySelected() const;
@@ -75,6 +79,7 @@ public:
     void mouseDrag(const juce::MouseEvent& event) override;
     void mouseUp(const juce::MouseEvent& event) override;
     void mouseExit(const juce::MouseEvent& event) override;
+    void mouseWheelMove(const juce::MouseEvent& event, const juce::MouseWheelDetails& wheel) override;
     bool keyPressed(const juce::KeyPress& key) override;
 
 private:
@@ -158,6 +163,7 @@ private:
     std::vector<AutomationPoint> displayedControllerPoints() const;
     void rebuildControllerPreview(juce::Point<float> currentPosition, bool adjustFrequency);
     juce::String controllerTargetDisplayText(const juce::String& target) const;
+    void showControllerTargetMenu();
 
     void clearSelection(MidiPattern& pattern) const;
     void selectSingleNote(MidiPattern& pattern, int noteIndex) const;
@@ -166,6 +172,7 @@ private:
     bool eraseNotesAlongPath(MidiPattern& pattern,
                              juce::Point<float> startPosition,
                              juce::Point<float> endPosition) const;
+    bool splitClickedNoteAtTick(int noteIndex, int splitTick);
     bool glueSelectedOrClickedNotes(int noteIndex);
     std::vector<int> insertIntervals() const;
     void insertNotesForCurrentMode(MidiPattern& pattern,
@@ -198,6 +205,8 @@ private:
     PreviewStopCallback stopPreviewCallback;
     ToolModeChangeCallback toolModeChangeCallback;
     KeyHandlerCallback keyHandlerCallback;
+    ZoomChangedCallback zoomChangedCallback;
+    RowHeightChangedCallback rowHeightChangedCallback;
 
     ProjectState previewProject;
     ProjectState beforeProject;
@@ -229,8 +238,7 @@ private:
     PianoRollInsertMode insertMode = PianoRollInsertMode::singleNote;
     PencilDrawMode pencilDrawMode = PencilDrawMode::step;
     juce::Label controllerTargetLabel;
-    juce::ComboBox controllerTargetBox;
-    std::vector<juce::String> controllerTargetOptions;
+    juce::TextButton controllerTargetButton;
     juce::String selectedControllerTarget = "velocity";
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(PianoRollComponent)

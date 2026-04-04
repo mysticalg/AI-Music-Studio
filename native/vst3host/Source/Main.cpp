@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -1087,6 +1088,7 @@ public:
 
         auto tracksVar = payload;
         auto masterVolume = 1.0f;
+        juce::var sharedFxBusesVar(juce::Array<juce::var>{});
         juce::var masterFxChainVar(juce::Array<juce::var>{});
         bool masterFxBypassed = false;
         if (auto* payloadObject = payload.getDynamicObject())
@@ -1095,6 +1097,7 @@ public:
             masterVolume = payloadObject->hasProperty("master_volume")
                 ? static_cast<float>(static_cast<double>(payloadObject->getProperty("master_volume")))
                 : 1.0f;
+            sharedFxBusesVar = payloadObject->getProperty("shared_fx_buses");
             masterFxChainVar = payloadObject->getProperty("master_fx_chain");
             masterFxBypassed = payloadObject->hasProperty("master_fx_bypassed")
                 && static_cast<bool>(payloadObject->getProperty("master_fx_bypassed"));
@@ -1105,6 +1108,7 @@ public:
         {
             const juce::ScopedLock lock(pluginLock);
             if (!configureAudioEngine(tracksVar,
+                                      sharedFxBusesVar,
                                       masterVolume,
                                       masterFxChainVar,
                                       masterFxBypassed,
@@ -1138,14 +1142,19 @@ public:
         return juce::Result::ok();
     }
 
-    juce::Result updateAudioEngineTransportDirect(double bpm,
-                                                  int ticksPerBeat,
-                                                  bool loopEnabled,
-                                                  int64_t loopStartTick,
-                                                  int64_t loopEndTick,
-                                                  bool metronomeEnabled)
+    bool shouldDeferAudioEngineTransportMutation() const
     {
-        const juce::ScopedLock lock(pluginLock);
+        return transportSnapshotAudioEngineRunning.load(std::memory_order_acquire) != 0
+            || transportSnapshotAudioEngineTailing.load(std::memory_order_acquire) != 0;
+    }
+
+    void applyAudioEngineTransportUpdateLocked(double bpm,
+                                               int ticksPerBeat,
+                                               bool loopEnabled,
+                                               int64_t loopStartTick,
+                                               int64_t loopEndTick,
+                                               bool metronomeEnabled)
+    {
         const auto sampleRate = juce::jmax(1.0, currentSampleRate);
         const auto preservedTick = audioEngine.frameToTickDouble(audioEngine.positionFrame, sampleRate);
 
@@ -1162,6 +1171,44 @@ public:
         auto targetFrame = audioEngine.tickToFrame(static_cast<int64_t>(std::llround(preservedTick)), sampleRate);
         const auto loopStartFrame = audioEngine.tickToFrame(audioEngine.loopStartTick, sampleRate);
         const auto loopEndFrame = audioEngine.tickToFrame(audioEngine.loopEndTick, sampleRate);
+        bool clampedIntoLoop = false;
+        if (audioEngine.loopEnabled && loopEndFrame > loopStartFrame
+            && (targetFrame < loopStartFrame || targetFrame >= loopEndFrame))
+        {
+            targetFrame = loopStartFrame;
+            clampedIntoLoop = true;
+        }
+
+        audioEngine.positionFrame = juce::jmax<int64_t>(0, targetFrame);
+        clearAudioEngineTailState();
+        if (audioEngine.running && clampedIntoLoop)
+            markAudioEngineSoftSeekPendingLocked();
+    }
+
+    void markAudioEngineSoftSeekPendingLocked()
+    {
+        for (auto& track : audioEngine.tracks)
+        {
+            if (track.kind != AudioEngineTrackKind::instrument)
+                continue;
+
+            track.transportSeekFlushPending = true;
+            track.livePreviewMessages.clear();
+            track.livePreviewActiveNotes = 0;
+            track.livePreviewTailActive = false;
+            track.livePreviewTailSilentBlocks = 0;
+        }
+        audioEngine.bootstrapPending = true;
+    }
+
+    void applyAudioEngineSeekLocked(int64_t startTick)
+    {
+        if (currentSampleRate <= 0.0 || currentBlockSize <= 0)
+            return;
+
+        auto targetFrame = audioEngine.tickToFrame(startTick, currentSampleRate);
+        const auto loopStartFrame = audioEngine.tickToFrame(audioEngine.loopStartTick, currentSampleRate);
+        const auto loopEndFrame = audioEngine.tickToFrame(audioEngine.loopEndTick, currentSampleRate);
         if (audioEngine.loopEnabled && loopEndFrame > loopStartFrame
             && (targetFrame < loopStartFrame || targetFrame >= loopEndFrame))
         {
@@ -1171,10 +1218,92 @@ public:
         audioEngine.positionFrame = juce::jmax<int64_t>(0, targetFrame);
         clearAudioEngineTailState();
         if (audioEngine.running)
+            markAudioEngineSoftSeekPendingLocked();
+    }
+
+    void queueAudioEngineTransportUpdate(double bpm,
+                                         int ticksPerBeat,
+                                         bool loopEnabled,
+                                         int64_t loopStartTick,
+                                         int64_t loopEndTick,
+                                         bool metronomeEnabled)
+    {
+        pendingAudioEngineTransportBpm.store(juce::jmax(1.0, bpm), std::memory_order_release);
+        pendingAudioEngineTransportTicksPerBeat.store(juce::jmax(1, ticksPerBeat), std::memory_order_release);
+        pendingAudioEngineTransportLoopEnabled.store(loopEnabled ? 1 : 0, std::memory_order_release);
+        pendingAudioEngineTransportLoopStartTick.store(loopStartTick, std::memory_order_release);
+        pendingAudioEngineTransportLoopEndTick.store(loopEndTick, std::memory_order_release);
+        pendingAudioEngineTransportMetronomeEnabled.store(metronomeEnabled ? 1 : 0, std::memory_order_release);
+        pendingAudioEngineTransportRevision.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    void markAudioEngineTransportUpdateAppliedLocked(double bpm,
+                                                     int ticksPerBeat,
+                                                     bool loopEnabled,
+                                                     int64_t loopStartTick,
+                                                     int64_t loopEndTick,
+                                                     bool metronomeEnabled)
+    {
+        pendingAudioEngineTransportBpm.store(juce::jmax(1.0, bpm), std::memory_order_release);
+        pendingAudioEngineTransportTicksPerBeat.store(juce::jmax(1, ticksPerBeat), std::memory_order_release);
+        pendingAudioEngineTransportLoopEnabled.store(loopEnabled ? 1 : 0, std::memory_order_release);
+        pendingAudioEngineTransportLoopStartTick.store(loopStartTick, std::memory_order_release);
+        pendingAudioEngineTransportLoopEndTick.store(loopEndTick, std::memory_order_release);
+        pendingAudioEngineTransportMetronomeEnabled.store(metronomeEnabled ? 1 : 0, std::memory_order_release);
+        appliedAudioEngineTransportRevision = pendingAudioEngineTransportRevision.fetch_add(1, std::memory_order_acq_rel) + 1;
+    }
+
+    void queueAudioEngineSeek(int64_t startTick)
+    {
+        pendingAudioEngineSeekTick.store(juce::jmax<int64_t>(0, startTick), std::memory_order_release);
+        pendingAudioEngineSeekRevision.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    void markAudioEngineSeekAppliedLocked(int64_t startTick)
+    {
+        pendingAudioEngineSeekTick.store(juce::jmax<int64_t>(0, startTick), std::memory_order_release);
+        appliedAudioEngineSeekRevision = pendingAudioEngineSeekRevision.fetch_add(1, std::memory_order_acq_rel) + 1;
+    }
+
+    void applyPendingAudioEngineTransportMutationsLocked()
+    {
+        const auto transportRevision = pendingAudioEngineTransportRevision.load(std::memory_order_acquire);
+        if (transportRevision != appliedAudioEngineTransportRevision)
         {
-            resetAudioEngineProcessingState();
-            audioEngine.bootstrapPending = true;
+            applyAudioEngineTransportUpdateLocked(pendingAudioEngineTransportBpm.load(std::memory_order_acquire),
+                                                  pendingAudioEngineTransportTicksPerBeat.load(std::memory_order_acquire),
+                                                  pendingAudioEngineTransportLoopEnabled.load(std::memory_order_acquire) != 0,
+                                                  pendingAudioEngineTransportLoopStartTick.load(std::memory_order_acquire),
+                                                  pendingAudioEngineTransportLoopEndTick.load(std::memory_order_acquire),
+                                                  pendingAudioEngineTransportMetronomeEnabled.load(std::memory_order_acquire) != 0);
+            appliedAudioEngineTransportRevision = transportRevision;
         }
+
+        const auto seekRevision = pendingAudioEngineSeekRevision.load(std::memory_order_acquire);
+        if (seekRevision != appliedAudioEngineSeekRevision)
+        {
+            applyAudioEngineSeekLocked(pendingAudioEngineSeekTick.load(std::memory_order_acquire));
+            appliedAudioEngineSeekRevision = seekRevision;
+        }
+    }
+
+    juce::Result updateAudioEngineTransportDirect(double bpm,
+                                                  int ticksPerBeat,
+                                                  bool loopEnabled,
+                                                  int64_t loopStartTick,
+                                                  int64_t loopEndTick,
+                                                  bool metronomeEnabled)
+    {
+        if (shouldDeferAudioEngineTransportMutation())
+        {
+            queueAudioEngineTransportUpdate(bpm, ticksPerBeat, loopEnabled, loopStartTick, loopEndTick, metronomeEnabled);
+            return juce::Result::ok();
+        }
+
+        const juce::ScopedLock lock(pluginLock);
+        applyAudioEngineTransportUpdateLocked(bpm, ticksPerBeat, loopEnabled, loopStartTick, loopEndTick, metronomeEnabled);
+        markAudioEngineTransportUpdateAppliedLocked(bpm, ticksPerBeat, loopEnabled, loopStartTick, loopEndTick, metronomeEnabled);
+        refreshRealtimeTransportSnapshot();
 
         return juce::Result::ok();
     }
@@ -1295,6 +1424,8 @@ public:
         if (currentSampleRate <= 0.0 || currentBlockSize <= 0)
             return juce::Result::fail("Audio device is not ready");
 
+        applyPendingAudioEngineTransportMutationsLocked();
+
         const auto loopStartFrame = audioEngine.tickToFrame(audioEngine.loopStartTick, currentSampleRate);
         const auto loopEndFrame = audioEngine.tickToFrame(audioEngine.loopEndTick, currentSampleRate);
         auto targetFrame = audioEngine.tickToFrame(startTick, currentSampleRate);
@@ -1313,6 +1444,7 @@ public:
         audioEngine.running = true;
         audioEngine.bootstrapPending = true;
         renderedSampleFrames.store(0);
+        refreshRealtimeTransportSnapshot();
         return juce::Result::ok();
     }
 
@@ -1337,6 +1469,7 @@ public:
             resetAudioEngineProcessingState();
         }
 
+        refreshRealtimeTransportSnapshot();
         return juce::Result::ok();
     }
 
@@ -1451,6 +1584,7 @@ private:
         bool isMaster = false;
         int trackIndex = -1;
         int effectIndex = -1;
+        juce::String sharedBusId;
         std::unique_ptr<PluginEditorWindow> window;
     };
 
@@ -1677,6 +1811,8 @@ private:
     {
         juce::String path;
         int64_t startFrame = 0;
+        int64_t sourceOffsetFrames = 0;
+        int64_t clipFrameLength = 0;
         juce::AudioBuffer<float> audioData;
     };
 
@@ -1745,11 +1881,29 @@ private:
         int livePreviewActiveNotes = 0;
         bool livePreviewTailActive = false;
         int livePreviewTailSilentBlocks = 0;
+        bool transportSeekFlushPending = false;
+        juce::String routingTarget = "master";
+    };
+
+    struct AudioEngineSharedFxBus
+    {
+        juce::String id;
+        juce::String name;
+        juce::String pluginPath;
+        juce::StringArray outputTargets;
+        juce::String statePath;
+        juce::String parameterSignature;
+        bool bypassed = false;
+        std::unique_ptr<juce::AudioPluginInstance> plugin;
+        float peakLevel = 0.0f;
+        juce::AudioBuffer<float> processBuffer;
+        juce::AudioBuffer<float> stereoBuffer;
     };
 
     struct AudioEngineState
     {
         std::vector<AudioEngineTrack> tracks;
+        std::vector<AudioEngineSharedFxBus> sharedFxBuses;
         std::vector<AudioEngineTrack::EffectSlot> masterFxChain;
         double bpm = 120.0;
         int ticksPerBeat = 480;
@@ -1969,6 +2123,21 @@ private:
             auto response = makeResponse(true, "Master FX editor opened");
             appendStatusFields(response, true);
             setResponseField(response, "effect_index", effectIndex);
+            return response;
+        }
+
+        if (command == "open_audio_engine_shared_fx_bus_editor")
+        {
+            const auto busId = object->hasProperty("bus_id")
+                ? object->getProperty("bus_id").toString().trim()
+                : juce::String();
+            const auto result = openAudioEngineSharedFxBusEditorWindow(busId);
+            if (result.failed())
+                return makeResponse(false, result.getErrorMessage());
+
+            auto response = makeResponse(true, "Shared FX editor opened");
+            appendStatusFields(response, true);
+            setResponseField(response, "bus_id", busId);
             return response;
         }
 
@@ -2627,6 +2796,7 @@ private:
                 juce::ScopedLock lock(pluginLock);
                 if (!configureAudioEngine(
                         object->getProperty("tracks"),
+                        object->getProperty("shared_fx_buses"),
                         masterVolume,
                         object->getProperty("master_fx_chain"),
                         masterFxBypassed,
@@ -2842,24 +3012,23 @@ private:
                 ? static_cast<int64_t>(static_cast<double>(object->getProperty("start_tick")))
                 : int64_t(0);
 
+            if (shouldDeferAudioEngineTransportMutation())
+            {
+                queueAudioEngineSeek(startTick);
+
+                auto response = makeResponse(true, "Audio engine seek queued");
+                appendStatusFields(response, true);
+                setResponseField(response, "start_tick", static_cast<double>(startTick));
+                return response;
+            }
+
             {
                 juce::ScopedLock lock(pluginLock);
                 if (currentSampleRate <= 0.0 || currentBlockSize <= 0)
                     return makeResponse(false, "Audio device is not ready");
 
-                auto targetFrame = audioEngine.tickToFrame(startTick, currentSampleRate);
-                const auto loopStartFrame = audioEngine.tickToFrame(audioEngine.loopStartTick, currentSampleRate);
-                const auto loopEndFrame = audioEngine.tickToFrame(audioEngine.loopEndTick, currentSampleRate);
-                if (audioEngine.loopEnabled && loopEndFrame > loopStartFrame
-                    && (targetFrame < loopStartFrame || targetFrame >= loopEndFrame))
-                {
-                    targetFrame = loopStartFrame;
-                }
-
-                audioEngine.positionFrame = juce::jmax<int64_t>(0, targetFrame);
-                resetAudioEngineProcessingState();
-                clearAudioEngineTailState();
-                audioEngine.bootstrapPending = audioEngine.running;
+                applyAudioEngineSeekLocked(startTick);
+                markAudioEngineSeekAppliedLocked(startTick);
             }
 
             auto response = makeResponse(true, "Audio engine seek updated");
@@ -2900,6 +3069,7 @@ private:
                 audioEngine.running = true;
                 audioEngine.bootstrapPending = true;
                 renderedSampleFrames.store(0);
+                refreshRealtimeTransportSnapshot();
             }
 
             auto response = makeResponse(true, "Audio engine started");
@@ -2933,6 +3103,8 @@ private:
                     clearAudioEngineTailState();
                     resetAudioEngineProcessingState();
                 }
+
+                refreshRealtimeTransportSnapshot();
             }
 
             auto response = makeResponse(true, "Audio engine stopped");
@@ -4205,14 +4377,25 @@ private:
             if (clipSamples <= 0)
                 continue;
 
+            const auto sourceOffsetFrames = juce::jlimit<int64_t>(0,
+                                                                  clipSamples,
+                                                                  clip.sourceOffsetFrames);
+            const auto remainingSamples = juce::jmax<int64_t>(0,
+                                                              static_cast<int64_t>(clipSamples) - sourceOffsetFrames);
+            const auto clipRenderableSamples = clip.clipFrameLength > 0
+                ? juce::jmin<int64_t>(remainingSamples, clip.clipFrameLength)
+                : remainingSamples;
+            if (clipRenderableSamples <= 0)
+                continue;
+
             const auto clipStartFrame = clip.startFrame;
-            const auto clipEndFrame = clipStartFrame + static_cast<int64_t>(clipSamples);
+            const auto clipEndFrame = clipStartFrame + clipRenderableSamples;
             const auto overlapStart = juce::jmax(chunkStartFrame, clipStartFrame);
             const auto overlapEnd = juce::jmin(chunkEndFrame, clipEndFrame);
             if (overlapEnd <= overlapStart)
                 continue;
 
-            const auto sourceOffset = static_cast<int>(overlapStart - clipStartFrame);
+            const auto sourceOffset = static_cast<int>(sourceOffsetFrames + (overlapStart - clipStartFrame));
             const auto destinationOffset = static_cast<int>(overlapStart - chunkStartFrame);
             const auto overlapSamples = static_cast<int>(overlapEnd - overlapStart);
             track.stereoBuffer.addFrom(0, destinationOffset, clip.audioData, 0, sourceOffset, overlapSamples);
@@ -6340,6 +6523,24 @@ private:
         slot.parameterSignature.clear();
     }
 
+    void releaseAudioEngineSharedFxBus(AudioEngineSharedFxBus& bus)
+    {
+        if (bus.plugin != nullptr)
+        {
+            bus.plugin->suspendProcessing(true);
+            bus.plugin->releaseResources();
+        }
+        bus.plugin.reset();
+        bus.id.clear();
+        bus.name.clear();
+        bus.pluginPath.clear();
+        bus.statePath.clear();
+        bus.parameterSignature.clear();
+        bus.peakLevel = 0.0f;
+        bus.processBuffer.setSize(0, 0);
+        bus.stereoBuffer.setSize(0, 0);
+    }
+
     void releaseAudioEngineTrack(AudioEngineTrack& track)
     {
         if (track.plugin != nullptr)
@@ -6386,6 +6587,9 @@ private:
         for (auto& track : audioEngine.tracks)
             releaseAudioEngineTrack(track);
         audioEngine.tracks.clear();
+        for (auto& bus : audioEngine.sharedFxBuses)
+            releaseAudioEngineSharedFxBus(bus);
+        audioEngine.sharedFxBuses.clear();
         for (auto& effectSlot : audioEngine.masterFxChain)
             releaseAudioEngineEffectSlot(effectSlot);
         audioEngine.masterFxChain.clear();
@@ -6413,6 +6617,14 @@ private:
         for (auto& lane : track.automationLanes)
             lane.lastAppliedValue = std::numeric_limits<float>::quiet_NaN();
         track.peakLevel = 0.0f;
+        track.transportSeekFlushPending = false;
+    }
+
+    void resetAudioEngineSharedFxBusProcessingState(AudioEngineSharedFxBus& bus)
+    {
+        if (bus.plugin != nullptr)
+            bus.plugin->reset();
+        bus.peakLevel = 0.0f;
     }
 
     void resetAudioEngineMasterProcessingState()
@@ -6468,6 +6680,8 @@ private:
     {
         for (auto& track : audioEngine.tracks)
             resetAudioEngineTrackProcessingState(track);
+        for (auto& bus : audioEngine.sharedFxBuses)
+            resetAudioEngineSharedFxBusProcessingState(bus);
         resetAudioEngineMasterProcessingState();
     }
 
@@ -6645,6 +6859,31 @@ private:
         processAudioEngineEffectChain(audioEngine.masterFxChain, audioEngine.masterFxBypassed, stereoBuffer);
     }
 
+    void processAudioEngineSharedFxBus(AudioEngineSharedFxBus& bus, juce::AudioBuffer<float>& stereoBuffer)
+    {
+        if (stereoBuffer.getNumSamples() <= 0)
+            return;
+
+        if (bus.bypassed || bus.plugin == nullptr)
+        {
+            bus.peakLevel = peakLevelForBuffer(stereoBuffer);
+            return;
+        }
+
+        const auto channelCount = juce::jmax(
+            2,
+            juce::jmax(bus.plugin->getTotalNumInputChannels(), bus.plugin->getTotalNumOutputChannels())
+        );
+        bus.processBuffer.setSize(channelCount, stereoBuffer.getNumSamples(), false, false, true);
+        bus.processBuffer.clear();
+        copyStereoBufferToPluginInput(*bus.plugin, bus.processBuffer, stereoBuffer);
+
+        juce::MidiBuffer midi;
+        bus.plugin->processBlock(bus.processBuffer, midi);
+        extractPluginOutputToStereo(*bus.plugin, bus.processBuffer, stereoBuffer);
+        bus.peakLevel = peakLevelForBuffer(stereoBuffer);
+    }
+
     void updateAudioEngineEffectBypassStates(std::vector<AudioEngineTrack::EffectSlot>& fxChain,
                                              const juce::var& fxChainVar)
     {
@@ -6661,6 +6900,74 @@ private:
 
             fxChain[static_cast<size_t>(fxIndex)].bypassed = effectBypassed;
         }
+    }
+
+    int findAudioEngineSharedFxBusIndex(const juce::String& busId) const
+    {
+        const auto trimmedId = busId.trim();
+        if (trimmedId.isEmpty() || trimmedId.equalsIgnoreCase("master") || trimmedId.equalsIgnoreCase("none"))
+            return -1;
+
+        for (int index = 0; index < static_cast<int>(audioEngine.sharedFxBuses.size()); ++index)
+        {
+            if (audioEngine.sharedFxBuses[static_cast<size_t>(index)].id.equalsIgnoreCase(trimmedId))
+                return index;
+        }
+
+        return -1;
+    }
+
+    std::vector<int> computeAudioEngineSharedFxBusProcessOrder() const
+    {
+        const auto busCount = static_cast<int>(audioEngine.sharedFxBuses.size());
+        std::vector<int> indegrees(static_cast<size_t>(busCount), 0);
+        std::vector<std::vector<int>> adjacency(static_cast<size_t>(busCount));
+
+        for (int busIndex = 0; busIndex < busCount; ++busIndex)
+        {
+            for (const auto& target : audioEngine.sharedFxBuses[static_cast<size_t>(busIndex)].outputTargets)
+            {
+                const auto downstreamIndex = findAudioEngineSharedFxBusIndex(target);
+                if (!juce::isPositiveAndBelow(downstreamIndex, busCount) || downstreamIndex == busIndex)
+                    continue;
+
+                adjacency[static_cast<size_t>(busIndex)].push_back(downstreamIndex);
+                ++indegrees[static_cast<size_t>(downstreamIndex)];
+            }
+        }
+
+        std::vector<int> order;
+        order.reserve(static_cast<size_t>(busCount));
+        std::deque<int> ready;
+        for (int busIndex = 0; busIndex < busCount; ++busIndex)
+        {
+            if (indegrees[static_cast<size_t>(busIndex)] == 0)
+                ready.push_back(busIndex);
+        }
+
+        while (!ready.empty())
+        {
+            const auto busIndex = ready.front();
+            ready.pop_front();
+            order.push_back(busIndex);
+            for (const auto downstreamIndex : adjacency[static_cast<size_t>(busIndex)])
+            {
+                auto& indegree = indegrees[static_cast<size_t>(downstreamIndex)];
+                if (--indegree == 0)
+                    ready.push_back(downstreamIndex);
+            }
+        }
+
+        if (static_cast<int>(order.size()) < busCount)
+        {
+            for (int busIndex = 0; busIndex < busCount; ++busIndex)
+            {
+                if (std::find(order.begin(), order.end(), busIndex) == order.end())
+                    order.push_back(busIndex);
+            }
+        }
+
+        return order;
     }
 
     void prepareAudioEngineTrackForPlayback(AudioEngineTrack& track)
@@ -6699,11 +7006,25 @@ private:
         resetAudioEngineMasterProcessingState();
     }
 
+    void prepareAudioEngineSharedFxBusesForPlayback()
+    {
+        for (auto& bus : audioEngine.sharedFxBuses)
+        {
+            if (bus.plugin == nullptr)
+                continue;
+            bus.plugin->setRateAndBufferSizeDetails(currentSampleRate, currentBlockSize);
+            bus.plugin->prepareToPlay(currentSampleRate, currentBlockSize);
+            bus.plugin->suspendProcessing(false);
+            resetAudioEngineSharedFxBusProcessingState(bus);
+        }
+    }
+
     void prepareAudioEngineForPlayback()
     {
         prepareAudioEngineMetronome();
         for (auto& track : audioEngine.tracks)
             prepareAudioEngineTrackForPlayback(track);
+        prepareAudioEngineSharedFxBusesForPlayback();
         prepareAudioEngineMasterForPlayback();
     }
 
@@ -6723,6 +7044,14 @@ private:
                     effectSlot.plugin->suspendProcessing(true);
                     effectSlot.plugin->releaseResources();
                 }
+            }
+        }
+        for (auto& bus : audioEngine.sharedFxBuses)
+        {
+            if (bus.plugin != nullptr)
+            {
+                bus.plugin->suspendProcessing(true);
+                bus.plugin->releaseResources();
             }
         }
         for (auto& effectSlot : audioEngine.masterFxChain)
@@ -6898,6 +7227,96 @@ private:
         return true;
     }
 
+    bool configureAudioEngineSharedFxBuses(const juce::var& busesVar,
+                                           juce::Array<juce::var>& trackErrors)
+    {
+        for (auto& bus : audioEngine.sharedFxBuses)
+            releaseAudioEngineSharedFxBus(bus);
+        audioEngine.sharedFxBuses.clear();
+
+        auto* busArray = busesVar.getArray();
+        if (busArray == nullptr || busArray->isEmpty())
+            return true;
+
+        audioEngine.sharedFxBuses.reserve(static_cast<size_t>(busArray->size()));
+        for (int busIndex = 0; busIndex < busArray->size(); ++busIndex)
+        {
+            auto* busObject = busArray->getReference(busIndex).getDynamicObject();
+            if (busObject == nullptr)
+            {
+                auto* errorObject = new juce::DynamicObject();
+                errorObject->setProperty("bus_index", busIndex);
+                errorObject->setProperty("message", "Shared FX bus payload must be an object");
+                trackErrors.add(juce::var(errorObject));
+                continue;
+            }
+
+            AudioEngineSharedFxBus bus;
+            bus.id = busObject->getProperty("id").toString().trim();
+            bus.name = busObject->hasProperty("name")
+                ? busObject->getProperty("name").toString().trim()
+                : juce::String();
+            bus.pluginPath = normaliseVst3PathForSettings(busObject->getProperty("plugin_path").toString().trim());
+            bus.statePath = busObject->getProperty("state_path").toString().trim();
+            bus.parameterSignature = parameterPayloadSignature(busObject->getProperty("parameters"));
+            bus.bypassed = busObject->hasProperty("bypassed")
+                && static_cast<bool>(busObject->getProperty("bypassed"));
+            if (busObject->hasProperty("output_targets"))
+            {
+                if (auto* outputTargetsArray = busObject->getProperty("output_targets").getArray())
+                {
+                    for (const auto& item : *outputTargetsArray)
+                    {
+                        const auto target = item.toString().trim();
+                        if (target.isNotEmpty())
+                            bus.outputTargets.addIfNotAlreadyThere(target);
+                    }
+                }
+            }
+            else
+            {
+                bus.outputTargets.add("master");
+            }
+
+            if (bus.id.isEmpty())
+                bus.id = juce::Uuid().toString();
+            if (bus.name.isEmpty())
+                bus.name = "FX Bus " + juce::String(busIndex + 1);
+
+            if (bus.pluginPath.isEmpty())
+            {
+                auto* errorObject = new juce::DynamicObject();
+                errorObject->setProperty("bus_index", busIndex);
+                errorObject->setProperty("message", "Missing shared FX plugin path");
+                trackErrors.add(juce::var(errorObject));
+                continue;
+            }
+
+            juce::String createError;
+            auto instance = createPreparedGraphPluginInstance(
+                bus.pluginPath,
+                bus.statePath,
+                busObject->getProperty("parameters"),
+                createError
+            );
+            if (instance == nullptr)
+            {
+                auto* errorObject = new juce::DynamicObject();
+                errorObject->setProperty("bus_index", busIndex);
+                errorObject->setProperty("plugin_path", bus.pluginPath);
+                errorObject->setProperty("message", createError.isNotEmpty() ? createError : "Could not create shared FX instance");
+                trackErrors.add(juce::var(errorObject));
+                continue;
+            }
+
+            bus.plugin = std::move(instance);
+            audioEngine.sharedFxBuses.push_back(std::move(bus));
+        }
+
+        refreshRealtimeTransportSnapshot();
+        return true;
+    }
+
     std::vector<AudioEngineTrackNote> parseAudioEngineTrackNotes(const juce::var& notesVar) const
     {
         std::vector<AudioEngineTrackNote> notes;
@@ -6989,6 +7408,7 @@ private:
     }
 
     bool configureAudioEngine(const juce::var& tracksVar,
+                              const juce::var& sharedFxBusesVar,
                               float masterVolume,
                               const juce::var& masterFxChainVar,
                               bool masterFxBypassed,
@@ -7026,6 +7446,14 @@ private:
         {
             configureAudioEngineMasterEffectChain(masterFxChainVar, trackErrors);
             audioEngine.masterFxChainSignature = masterFxChainSignature;
+            structuralChange = true;
+        }
+        const auto previousSharedFxBusCount = static_cast<int>(audioEngine.sharedFxBuses.size());
+        configureAudioEngineSharedFxBuses(sharedFxBusesVar, trackErrors);
+        if (previousSharedFxBusCount != static_cast<int>(audioEngine.sharedFxBuses.size())
+            || previousSharedFxBusCount > 0
+            || !audioEngine.sharedFxBuses.empty())
+        {
             structuralChange = true;
         }
         audioEngine.masterVolume = juce::jlimit(0.0f, 2.0f, masterVolume);
@@ -7096,6 +7524,9 @@ private:
                 && static_cast<bool>(trackObject->getProperty("fx_bypassed"));
             const auto audible = !trackObject->hasProperty("audible")
                 || static_cast<bool>(trackObject->getProperty("audible"));
+            const auto requestedRoutingTarget = trackObject->hasProperty("routing_target")
+                ? trackObject->getProperty("routing_target").toString().trim()
+                : juce::String("master");
 
             auto notes = parseAudioEngineTrackNotes(trackObject->getProperty("notes"));
             auto controllerEvents = parseAudioEngineTrackControllerEvents(trackObject->getProperty("controller_events"));
@@ -7116,6 +7547,12 @@ private:
                         const auto startFrame = clipObject->hasProperty("start_frame")
                             ? static_cast<int64_t>(static_cast<double>(clipObject->getProperty("start_frame")))
                             : int64_t(0);
+                        const auto sourceOffsetFrames = clipObject->hasProperty("source_offset_frames")
+                            ? static_cast<int64_t>(static_cast<double>(clipObject->getProperty("source_offset_frames")))
+                            : int64_t(0);
+                        const auto clipFrameLength = clipObject->hasProperty("length_frames")
+                            ? static_cast<int64_t>(static_cast<double>(clipObject->getProperty("length_frames")))
+                            : int64_t(0);
                         if (clipPath.isEmpty())
                         {
                             auto* errorObject = new juce::DynamicObject();
@@ -7129,6 +7566,8 @@ private:
                         AudioEngineAudioClip clip;
                         clip.path = clipPath;
                         clip.startFrame = juce::jmax<int64_t>(0, startFrame);
+                        clip.sourceOffsetFrames = juce::jmax<int64_t>(0, sourceOffsetFrames);
+                        clip.clipFrameLength = juce::jmax<int64_t>(0, clipFrameLength);
                         juce::String clipError;
                         if (!loadAudioEngineClipBuffer(clipPath, clip.audioData, clipError))
                         {
@@ -7347,6 +7786,12 @@ private:
             track.baseOutputGainDb = outputGainDb;
             track.fxBypassed = fxBypassed;
             track.audible = audible;
+            if (requestedRoutingTarget.isEmpty() || requestedRoutingTarget.equalsIgnoreCase("none"))
+                track.routingTarget = "none";
+            else if (findAudioEngineSharedFxBusIndex(requestedRoutingTarget) >= 0)
+                track.routingTarget = requestedRoutingTarget;
+            else
+                track.routingTarget = "master";
             track.peakLevel = 0.0f;
             if (shouldPrepare && !canReuse)
                 prepareAudioEngineTrackForPlayback(track);
@@ -7473,7 +7918,8 @@ private:
                                      double sampleRate,
                                      bool bootstrapActive,
                                      bool wrapAfterChunk,
-                                     int64_t loopEndFrame)
+                                     int64_t loopEndFrame,
+                                     int zeroSampleEventOffset = 0)
     {
         if (track.notes.empty())
             return;
@@ -7497,14 +7943,17 @@ private:
             {
                 midi.addEvent(
                     juce::MidiMessage::noteOn(note.channel, note.pitch, static_cast<float>(note.velocity) / 127.0f),
-                    0
+                    zeroSampleEventOffset
                 );
             }
             else if (noteStartFrame >= chunkStartFrame && noteStartFrame < chunkEndFrame)
             {
+                auto samplePosition = static_cast<int>(noteStartFrame - chunkStartFrame);
+                if (samplePosition == 0)
+                    samplePosition = zeroSampleEventOffset;
                 midi.addEvent(
                     juce::MidiMessage::noteOn(note.channel, note.pitch, static_cast<float>(note.velocity) / 127.0f),
-                    static_cast<int>(noteStartFrame - chunkStartFrame)
+                    samplePosition
                 );
             }
 
@@ -7546,12 +7995,25 @@ private:
         }
     }
 
+    int appendAudioEngineTransportSeekFlushEvents(AudioEngineTrack& track,
+                                                  juce::MidiBuffer& midi,
+                                                  int chunkSamples) const
+    {
+        if (!track.transportSeekFlushPending)
+            return 0;
+
+        appendAudioEngineTailReleaseEvents(track, midi);
+        track.transportSeekFlushPending = false;
+        return chunkSamples > 1 ? 1 : 0;
+    }
+
     void appendAudioEngineControllerEvents(const AudioEngineTrack& track,
                                            juce::MidiBuffer& midi,
                                            int64_t chunkStartFrame,
                                            int chunkSamples,
                                            double sampleRate,
-                                           bool bootstrapActive)
+                                           bool bootstrapActive,
+                                           int zeroSampleEventOffset = 0)
     {
         if (track.controllerEvents.empty())
             return;
@@ -7569,10 +8031,13 @@ private:
 
             if (eventFrame >= chunkStartFrame && eventFrame < chunkEndFrame)
             {
+                auto samplePosition = static_cast<int>(eventFrame - chunkStartFrame);
+                if (samplePosition == 0)
+                    samplePosition = zeroSampleEventOffset;
                 midi.addEvent(juce::MidiMessage::controllerEvent(controllerEvent.channel,
                                                                  controllerEvent.controller,
                                                                  controllerEvent.value),
-                              static_cast<int>(eventFrame - chunkStartFrame));
+                              samplePosition);
             }
         }
 
@@ -7584,7 +8049,7 @@ private:
                 midi.addEvent(juce::MidiMessage::controllerEvent(controllerEvent.channel,
                                                                  controllerEvent.controller,
                                                                  controllerEvent.value),
-                              0);
+                              zeroSampleEventOffset);
             }
         }
     }
@@ -7686,6 +8151,7 @@ private:
     void processAudioEngine(juce::AudioBuffer<float>& buffer, int numSamples)
     {
         const ScopedProfileSample profileSample(HostProfileSection::processAudioEngine);
+        applyPendingAudioEngineTransportMutationsLocked();
         const bool transportRunning = audioEngine.running;
         const bool tailStopping = audioEngine.tailStopping;
         const bool livePreviewActive = audioEngineHasLivePreviewActivity();
@@ -7716,6 +8182,13 @@ private:
             const auto chunkStartFrame = audioEngine.positionFrame;
             const auto wrapAfterChunk = looping && (chunkStartFrame + chunkSamples) >= loopEndFrame;
             const auto bootstrapActive = transportRunning && audioEngine.bootstrapPending;
+            std::vector<juce::AudioBuffer<float>> sharedFxBusBuffers(audioEngine.sharedFxBuses.size());
+            for (auto& busBuffer : sharedFxBusBuffers)
+            {
+                busBuffer.setSize(2, chunkSamples, false, false, true);
+                busBuffer.clear();
+            }
+            const auto sharedFxBusProcessOrder = computeAudioEngineSharedFxBusProcessOrder();
 
             for (auto& track : audioEngine.tracks)
             {
@@ -7750,6 +8223,9 @@ private:
                     track.processBuffer.clear();
 
                     juce::MidiBuffer midi;
+                    const auto zeroSampleEventOffset = transportRunning
+                        ? appendAudioEngineTransportSeekFlushEvents(track, midi, chunkSamples)
+                        : 0;
                     if (transportRunning)
                     {
                         appendAudioEngineNoteEvents(
@@ -7760,7 +8236,8 @@ private:
                             sampleRate,
                             bootstrapActive,
                             wrapAfterChunk,
-                            loopEndFrame
+                            loopEndFrame,
+                            zeroSampleEventOffset
                         );
                         appendAudioEngineControllerEvents(
                             track,
@@ -7768,7 +8245,8 @@ private:
                             chunkStartFrame,
                             chunkSamples,
                             sampleRate,
-                            bootstrapActive
+                            bootstrapActive,
+                            zeroSampleEventOffset
                         );
                     }
                     else if (audioEngine.tailReleasePending)
@@ -7827,8 +8305,58 @@ private:
                     }
                 }
                 tailPeakLevel = juce::jmax(tailPeakLevel, track.peakLevel);
-                buffer.addFrom(0, sampleOffset, track.stereoBuffer, 0, 0, chunkSamples);
-                buffer.addFrom(1, sampleOffset, track.stereoBuffer, 1, 0, chunkSamples);
+                const auto sharedFxBusIndex = findAudioEngineSharedFxBusIndex(track.routingTarget);
+                if (juce::isPositiveAndBelow(sharedFxBusIndex, static_cast<int>(sharedFxBusBuffers.size())))
+                {
+                    sharedFxBusBuffers[static_cast<size_t>(sharedFxBusIndex)].addFrom(0, 0, track.stereoBuffer, 0, 0, chunkSamples);
+                    sharedFxBusBuffers[static_cast<size_t>(sharedFxBusIndex)].addFrom(1, 0, track.stereoBuffer, 1, 0, chunkSamples);
+                }
+                else if (!track.routingTarget.equalsIgnoreCase("none"))
+                {
+                    buffer.addFrom(0, sampleOffset, track.stereoBuffer, 0, 0, chunkSamples);
+                    buffer.addFrom(1, sampleOffset, track.stereoBuffer, 1, 0, chunkSamples);
+                }
+            }
+
+            for (const auto busIndex : sharedFxBusProcessOrder)
+            {
+                if (!juce::isPositiveAndBelow(busIndex, static_cast<int>(audioEngine.sharedFxBuses.size())))
+                    continue;
+
+                auto& bus = audioEngine.sharedFxBuses[static_cast<size_t>(busIndex)];
+                auto& busBuffer = sharedFxBusBuffers[static_cast<size_t>(busIndex)];
+                processAudioEngineSharedFxBus(bus, busBuffer);
+                tailPeakLevel = juce::jmax(tailPeakLevel, bus.peakLevel);
+
+                bool routedToAnything = false;
+                for (const auto& target : bus.outputTargets)
+                {
+                    const auto trimmedTarget = target.trim();
+                    if (trimmedTarget.isEmpty() || trimmedTarget.equalsIgnoreCase("master"))
+                    {
+                        buffer.addFrom(0, sampleOffset, busBuffer, 0, 0, chunkSamples);
+                        buffer.addFrom(1, sampleOffset, busBuffer, 1, 0, chunkSamples);
+                        routedToAnything = true;
+                        continue;
+                    }
+
+                    const auto downstreamBusIndex = findAudioEngineSharedFxBusIndex(trimmedTarget);
+                    if (!juce::isPositiveAndBelow(downstreamBusIndex, static_cast<int>(sharedFxBusBuffers.size()))
+                        || downstreamBusIndex == busIndex)
+                    {
+                        continue;
+                    }
+
+                    sharedFxBusBuffers[static_cast<size_t>(downstreamBusIndex)].addFrom(0, 0, busBuffer, 0, 0, chunkSamples);
+                    sharedFxBusBuffers[static_cast<size_t>(downstreamBusIndex)].addFrom(1, 0, busBuffer, 1, 0, chunkSamples);
+                    routedToAnything = true;
+                }
+
+                if (!routedToAnything && !bus.outputTargets.isEmpty())
+                {
+                    buffer.addFrom(0, sampleOffset, busBuffer, 0, 0, chunkSamples);
+                    buffer.addFrom(1, sampleOffset, busBuffer, 1, 0, chunkSamples);
+                }
             }
 
             if (transportRunning && audioEngine.metronomeEnabled)
@@ -8069,13 +8597,17 @@ private:
         refreshRealtimeTransportSnapshot();
     }
 
-    PluginEditorWindow* findAudioEngineEffectEditorWindow(bool isMaster, int trackIndex, int effectIndex)
+    PluginEditorWindow* findAudioEngineEffectEditorWindow(bool isMaster,
+                                                          int trackIndex,
+                                                          int effectIndex,
+                                                          const juce::String& sharedBusId = {})
     {
         for (auto& entry : audioEngineEffectEditorWindows)
         {
             if (entry.isMaster == isMaster
                 && entry.trackIndex == trackIndex
-                && entry.effectIndex == effectIndex)
+                && entry.effectIndex == effectIndex
+                && entry.sharedBusId.equalsIgnoreCase(sharedBusId))
             {
                 return entry.window.get();
             }
@@ -8084,7 +8616,10 @@ private:
         return nullptr;
     }
 
-    void removeAudioEngineEffectEditorWindow(bool isMaster, int trackIndex, int effectIndex)
+    void removeAudioEngineEffectEditorWindow(bool isMaster,
+                                             int trackIndex,
+                                             int effectIndex,
+                                             const juce::String& sharedBusId = {})
     {
         {
             const juce::ScopedLock lock(pluginLock);
@@ -8092,11 +8627,12 @@ private:
                 std::remove_if(
                     audioEngineEffectEditorWindows.begin(),
                     audioEngineEffectEditorWindows.end(),
-                    [isMaster, trackIndex, effectIndex](const auto& entry)
+                    [isMaster, trackIndex, effectIndex, sharedBusId](const auto& entry)
                     {
                         return entry.isMaster == isMaster
                             && entry.trackIndex == trackIndex
-                            && entry.effectIndex == effectIndex;
+                            && entry.effectIndex == effectIndex
+                            && entry.sharedBusId.equalsIgnoreCase(sharedBusId);
                     }),
                 audioEngineEffectEditorWindows.end());
         }
@@ -8296,6 +8832,81 @@ private:
                     return;
 
                 safeThis->removeAudioEngineEffectEditorWindow(true, -1, effectIndex);
+            });
+        };
+
+        if (bridgeMode)
+            entry.window->showBridgeEditorWindow();
+        else
+        {
+            entry.window->forceTopmostFront();
+            entry.window->beginTopmostWarmup();
+        }
+
+        audioEngineEffectEditorWindows.push_back(std::move(entry));
+        notifyEditorStateChanged(anyEditorWindowVisible());
+        refreshRealtimeTransportSnapshot();
+        return juce::Result::ok();
+    }
+
+    juce::Result openAudioEngineSharedFxBusEditorWindow(const juce::String& busId)
+    {
+        const auto trimmedBusId = busId.trim();
+        if (trimmedBusId.isEmpty())
+            return juce::Result::fail("Invalid shared FX bus id");
+
+        const auto busIndex = findAudioEngineSharedFxBusIndex(trimmedBusId);
+        if (!juce::isPositiveAndBelow(busIndex, static_cast<int>(audioEngine.sharedFxBuses.size())))
+            return juce::Result::fail("Shared FX bus not found");
+
+        auto& bus = audioEngine.sharedFxBuses[static_cast<size_t>(busIndex)];
+        if (bus.plugin == nullptr)
+            return juce::Result::fail("Shared FX bus has no live plugin instance");
+
+        if (auto* existingWindow = findAudioEngineEffectEditorWindow(false, -1, 0, trimmedBusId))
+        {
+            existingWindow->forceTopmostFront();
+            notifyEditorStateChanged(anyEditorWindowVisible());
+            refreshRealtimeTransportSnapshot();
+            return juce::Result::ok();
+        }
+
+        auto key = normaliseVst3PathForSettings(bus.pluginPath);
+        if (key.isEmpty())
+            key = "audio_engine_shared_fx_" + trimmedBusId;
+
+        AudioEngineEffectEditorWindowEntry entry;
+        entry.isMaster = false;
+        entry.trackIndex = -1;
+        entry.effectIndex = 0;
+        entry.sharedBusId = trimmedBusId;
+        {
+            const juce::ScopedLock lock(pluginLock);
+            entry.window = std::make_unique<PluginEditorWindow>(
+                *bus.plugin,
+                "audio_engine_shared_fx_editor_" + key + "_" + trimmedBusId,
+                appSettings,
+                [this](const juce::String& command)
+                {
+                    dispatchShortcutCallback(command);
+                });
+        }
+
+        entry.window->onWindowClosed = [safeThis = juce::Component::SafePointer<HostComponent>(this), trimmedBusId]
+        {
+            if (safeThis == nullptr)
+                return;
+
+            juce::MessageManager::callAsync([safeThis, trimmedBusId]
+            {
+                if (safeThis == nullptr)
+                    return;
+
+                const auto* window = safeThis->findAudioEngineEffectEditorWindow(false, -1, 0, trimmedBusId);
+                if (window == nullptr || window->isVisible())
+                    return;
+
+                safeThis->removeAudioEngineEffectEditorWindow(false, -1, 0, trimmedBusId);
             });
         };
 
@@ -8634,12 +9245,23 @@ private:
     std::atomic<int> transportSnapshotAudioEngineRunning { 0 };
     std::atomic<int> transportSnapshotAudioEngineTailing { 0 };
     std::atomic<double> transportSnapshotAudioEnginePositionFrame { 0.0 };
+    std::atomic<double> pendingAudioEngineTransportBpm { 120.0 };
+    std::atomic<int> pendingAudioEngineTransportTicksPerBeat { 480 };
+    std::atomic<int> pendingAudioEngineTransportLoopEnabled { 0 };
+    std::atomic<int64_t> pendingAudioEngineTransportLoopStartTick { 0 };
+    std::atomic<int64_t> pendingAudioEngineTransportLoopEndTick { 0 };
+    std::atomic<int> pendingAudioEngineTransportMetronomeEnabled { 0 };
+    std::atomic<uint64_t> pendingAudioEngineTransportRevision { 0 };
+    std::atomic<int64_t> pendingAudioEngineSeekTick { 0 };
+    std::atomic<uint64_t> pendingAudioEngineSeekRevision { 0 };
     std::atomic<float> transportSnapshotPluginOutputPeakLevel { 0.0f };
     std::atomic<float> transportSnapshotMasterPeakLeft { 0.0f };
     std::atomic<float> transportSnapshotMasterPeakRight { 0.0f };
     mutable std::atomic<int> transportSnapshotEditorOpen { 0 };
     mutable juce::SpinLock transportSnapshotTrackPeaksLock;
     std::vector<float> transportSnapshotTrackPeaks;
+    uint64_t appliedAudioEngineTransportRevision = 0;
+    uint64_t appliedAudioEngineSeekRevision = 0;
 
     void notifyEditorStateChanged(bool isOpen) const
     {
@@ -8657,7 +9279,24 @@ private:
                                                       std::memory_order_release);
         transportSnapshotAudioEngineRunning.store(audioEngine.running ? 1 : 0, std::memory_order_release);
         transportSnapshotAudioEngineTailing.store(audioEngine.tailStopping ? 1 : 0, std::memory_order_release);
-        transportSnapshotAudioEnginePositionFrame.store(static_cast<double>(audioEngine.positionFrame),
+        double effectiveAudioEnginePositionFrame = static_cast<double>(audioEngine.positionFrame);
+        const auto pendingSeekRevision = pendingAudioEngineSeekRevision.load(std::memory_order_acquire);
+        if (pendingSeekRevision != appliedAudioEngineSeekRevision)
+        {
+            const auto sampleRate = juce::jmax(1.0, currentSampleRate);
+            auto targetFrame = audioEngine.tickToFrame(pendingAudioEngineSeekTick.load(std::memory_order_acquire), sampleRate);
+            const auto loopStartFrame = audioEngine.tickToFrame(audioEngine.loopStartTick, sampleRate);
+            const auto loopEndFrame = audioEngine.tickToFrame(audioEngine.loopEndTick, sampleRate);
+            if (audioEngine.loopEnabled && loopEndFrame > loopStartFrame
+                && (targetFrame < loopStartFrame || targetFrame >= loopEndFrame))
+            {
+                targetFrame = loopStartFrame;
+            }
+
+            effectiveAudioEnginePositionFrame = static_cast<double>(juce::jmax<int64_t>(0, targetFrame));
+        }
+
+        transportSnapshotAudioEnginePositionFrame.store(effectiveAudioEnginePositionFrame,
                                                         std::memory_order_release);
         transportSnapshotPluginOutputPeakLevel.store(juce::jlimit(0.0f, 1.0f, pluginOutputPeakLevel),
                                                      std::memory_order_release);
@@ -10569,7 +11208,7 @@ class HostApplication final : public juce::JUCEApplication
 {
 public:
     const juce::String getApplicationName() override      { return "AI Music Studio VST Host"; }
-    const juce::String getApplicationVersion() override   { return "0.3.1"; }
+    const juce::String getApplicationVersion() override   { return "0.3.2"; }
     bool moreThanOneInstanceAllowed() override            { return true; }
 
     void initialise(const juce::String&) override

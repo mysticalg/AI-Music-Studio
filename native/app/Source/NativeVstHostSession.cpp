@@ -424,6 +424,12 @@ juce::Array<juce::var> buildClipPayload(const aims::ProjectState& project, int t
         auto* clipObject = new juce::DynamicObject();
         clipObject->setProperty("path", clip.path);
         clipObject->setProperty("start_frame", static_cast<double>(juce::jmax<int64_t>(0, static_cast<int64_t>(std::llround(clip.startSec * sampleRate)))));
+        clipObject->setProperty("source_offset_frames",
+                                static_cast<double>(juce::jmax<int64_t>(0,
+                                                                        static_cast<int64_t>(std::llround(clip.sourceOffsetSec * sampleRate)))));
+        clipObject->setProperty("length_frames",
+                                static_cast<double>(juce::jmax<int64_t>(0,
+                                                                        static_cast<int64_t>(std::llround(clip.durationSec * sampleRate)))));
         clips.add(juce::var(clipObject));
     }
 
@@ -435,6 +441,8 @@ juce::Array<juce::var> buildClipPayload(const aims::ProjectState& project, int t
             auto* clipObject = new juce::DynamicObject();
             clipObject->setProperty("path", track.renderedAudioPath);
             clipObject->setProperty("start_frame", 0.0);
+            clipObject->setProperty("source_offset_frames", 0.0);
+            clipObject->setProperty("length_frames", 0.0);
             clips.add(juce::var(clipObject));
         }
     }
@@ -483,6 +491,7 @@ juce::var buildAudioEngineTrackPayload(const aims::ProjectState& project, int tr
     payload->setProperty("output_gain_db", track.vstiOutputGainDb);
     payload->setProperty("pan", juce::jlimit(-1.0, 1.0, track.pan));
     payload->setProperty("audible", trackIsAudible(project, trackIndex));
+    payload->setProperty("routing_target", track.routingTarget.trim().isNotEmpty() ? track.routingTarget.trim() : "none");
     payload->setProperty("fx_chain", juce::var(buildFxChainPayload(project,
                                                                    track.vstFxChain,
                                                                    track.vstFxSlotBypassed)));
@@ -518,15 +527,46 @@ juce::var buildAudioEngineTrackPayload(const aims::ProjectState& project, int tr
     return juce::var(payload);
 }
 
+juce::var buildAudioEngineSharedFxBusPayload(const aims::ProjectState& project,
+                                             const aims::SharedEffectBusState& bus)
+{
+    auto* payload = new juce::DynamicObject();
+    auto parameters = buildParameterPayload(bus.parameters);
+    const auto* entry = findRackEntryByReference(project, bus.effect, true);
+
+    payload->setProperty("id", bus.id.trim());
+    payload->setProperty("name", bus.name.trim().isNotEmpty() ? bus.name.trim() : "FX Bus");
+    payload->setProperty("plugin_path",
+                         (entry != nullptr && entry->path.isNotEmpty() && juce::File(entry->path).exists())
+                             ? entry->path
+                             : juce::String());
+    juce::Array<juce::var> outputTargets;
+    for (const auto& target : bus.outputTargets)
+    {
+        const auto trimmedTarget = target.trim();
+        if (trimmedTarget.isNotEmpty())
+            outputTargets.add(trimmedTarget);
+    }
+    payload->setProperty("output_targets", juce::var(outputTargets));
+    payload->setProperty("state_path", bus.statePath);
+    payload->setProperty("parameters", parameters);
+    payload->setProperty("bypassed", bus.bypassed);
+    return juce::var(payload);
+}
+
 juce::var buildAudioEngineStatePayload(const aims::ProjectState& project, double sampleRate)
 {
     juce::Array<juce::var> tracks;
+    juce::Array<juce::var> sharedFxBuses;
     tracks.ensureStorageAllocated(static_cast<int>(project.tracks.size()));
     for (int index = 0; index < static_cast<int>(project.tracks.size()); ++index)
         tracks.add(buildAudioEngineTrackPayload(project, index, sampleRate));
+    for (const auto& bus : project.sharedFxBuses)
+        sharedFxBuses.add(buildAudioEngineSharedFxBusPayload(project, bus));
 
     auto* payload = new juce::DynamicObject();
     payload->setProperty("tracks", juce::var(tracks));
+    payload->setProperty("shared_fx_buses", juce::var(sharedFxBuses));
     payload->setProperty("master_volume", juce::jlimit(0.0, 2.0, project.masterVolume));
     payload->setProperty("master_fx_chain", juce::var(buildFxChainPayload(project,
                                                                           project.masterFxChain,
@@ -903,6 +943,20 @@ juce::Result NativeVstHostSession::startAudioEngine(int startTick)
     return juce::Result::fail(error.isNotEmpty() ? error : "Native audio engine start failed.");
 }
 
+juce::Result NativeVstHostSession::seekAudioEngine(int startTick)
+{
+    juce::DynamicObject::Ptr request = new juce::DynamicObject();
+    request->setProperty("command", "seek_audio_engine");
+    request->setProperty("start_tick", juce::jmax(0, startTick));
+
+    juce::var response;
+    const auto result = runCommand(juce::var(request.get()), response);
+    if (result.failed())
+        return result;
+
+    return resultFromResponse(response, "Native audio engine seek failed.");
+}
+
 juce::Result NativeVstHostSession::stopAudioEngine(bool allowTail)
 {
     if (handle == nullptr)
@@ -966,6 +1020,20 @@ juce::Result NativeVstHostSession::openAudioEngineTrackEffectEditor(int trackInd
         return result;
 
     return resultFromResponse(response, "Native host live track FX editor command failed.");
+}
+
+juce::Result NativeVstHostSession::openAudioEngineSharedEffectBusEditor(const juce::String& busId)
+{
+    juce::DynamicObject::Ptr request = new juce::DynamicObject();
+    request->setProperty("command", "open_audio_engine_shared_fx_bus_editor");
+    request->setProperty("bus_id", busId.trim());
+
+    juce::var response;
+    const auto result = runCommand(juce::var(request.get()), response);
+    if (result.failed())
+        return result;
+
+    return resultFromResponse(response, "Native host live shared FX editor command failed.");
 }
 
 juce::Result NativeVstHostSession::openAudioEngineMasterEffectEditor(int effectIndex)

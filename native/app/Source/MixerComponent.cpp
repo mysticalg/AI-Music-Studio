@@ -700,7 +700,9 @@ void MixerComponent::ChannelStrip::resized()
     area.removeFromTop(4);
 
     const int minimumFxAreaHeight = 44;
-    const int preferredBottomHeight = 214;
+    // Keep enough space for the full bottom control stack so the FX row
+    // never gets clipped off the bottom of normal-height mixer strips.
+    const int preferredBottomHeight = 240;
     const auto maxBottomHeight = juce::jmax(0, area.getHeight() - minimumFxAreaHeight);
     auto bottomArea = area.removeFromBottom(juce::jmin(preferredBottomHeight, maxBottomHeight));
 

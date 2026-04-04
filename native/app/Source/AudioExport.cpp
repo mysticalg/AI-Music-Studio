@@ -661,6 +661,52 @@ juce::Result writeStereoBufferToWavFile(const juce::File& file,
     return juce::Result::ok();
 }
 
+juce::Result writeStereoBufferToMp3File(const juce::File& file,
+                                        const juce::AudioBuffer<float>& buffer,
+                                        double sampleRate)
+{
+#if JUCE_USE_MP3AUDIOFORMAT
+    if (!file.getParentDirectory().createDirectory())
+        return juce::Result::fail("Could not create the export folder.");
+
+    auto fileStream = file.createOutputStream();
+    if (fileStream == nullptr)
+        return juce::Result::fail("Could not create the export file.");
+    std::unique_ptr<juce::OutputStream> stream(fileStream.release());
+
+    juce::MP3AudioFormat mp3Format;
+    const auto options = juce::AudioFormatWriterOptions()
+        .withSampleRate(sampleRate)
+        .withNumChannels(2)
+        .withBitsPerSample(16);
+    auto writer = mp3Format.createWriterFor(stream, options);
+    if (writer == nullptr)
+        return juce::Result::fail("Could not create the MP3 writer.");
+
+    if (!writer->writeFromAudioSampleBuffer(buffer, 0, buffer.getNumSamples()))
+        return juce::Result::fail("Could not write the MP3 export.");
+
+    return juce::Result::ok();
+#else
+    juce::ignoreUnused(file, buffer, sampleRate);
+    return juce::Result::fail("MP3 export is not enabled in this build.");
+#endif
+}
+
+juce::Result writeStereoBufferToAudioFile(const juce::File& file,
+                                          const juce::AudioBuffer<float>& buffer,
+                                          double sampleRate)
+{
+    const auto extension = file.getFileExtension().trim().toLowerCase();
+    if (extension == ".mp3")
+        return writeStereoBufferToMp3File(file, buffer, sampleRate);
+
+    if (extension == ".wav" || extension == ".bwf" || extension.isEmpty())
+        return writeStereoBufferToWavFile(file, buffer, sampleRate);
+
+    return juce::Result::fail("Unsupported export format: " + file.getFileExtension());
+}
+
 juce::Result renderTrackRangeToBuffer(const ProjectState& project,
                                       int trackIndex,
                                       NativeVstHostSession& nativeVstHost,
@@ -808,11 +854,11 @@ juce::Result renderTrackRangeToBuffer(const ProjectState& project,
 }
 } // namespace
 
-juce::Result exportProjectRangeToWavFile(const juce::File& file,
-                                         const ProjectState& project,
-                                         NativeVstHostSession& nativeVstHost,
-                                         AudioExportSummary& outSummary,
-                                         int sampleRate)
+juce::Result exportProjectRangeToAudioFile(const juce::File& file,
+                                           const ProjectState& project,
+                                           NativeVstHostSession& nativeVstHost,
+                                           AudioExportSummary& outSummary,
+                                           int sampleRate)
 {
     outSummary = {};
     outSummary.sampleRate = juce::jmax(1, sampleRate);
@@ -953,15 +999,24 @@ juce::Result exportProjectRangeToWavFile(const juce::File& file,
     if (!anyRenderedSource)
         return juce::Result::fail("No audible instrument or sample content was available inside the locator range.");
 
-    return writeStereoBufferToWavFile(file, finalMix, static_cast<double>(outSummary.sampleRate));
+    return writeStereoBufferToAudioFile(file, finalMix, static_cast<double>(outSummary.sampleRate));
 }
 
-juce::Result exportTrackRangeToWavFile(const juce::File& file,
-                                       const ProjectState& project,
-                                       int trackIndex,
-                                       NativeVstHostSession& nativeVstHost,
-                                       AudioExportSummary& outSummary,
-                                       int sampleRate)
+juce::Result exportProjectRangeToWavFile(const juce::File& file,
+                                         const ProjectState& project,
+                                         NativeVstHostSession& nativeVstHost,
+                                         AudioExportSummary& outSummary,
+                                         int sampleRate)
+{
+    return exportProjectRangeToAudioFile(file, project, nativeVstHost, outSummary, sampleRate);
+}
+
+juce::Result exportTrackRangeToAudioFile(const juce::File& file,
+                                         const ProjectState& project,
+                                         int trackIndex,
+                                         NativeVstHostSession& nativeVstHost,
+                                         AudioExportSummary& outSummary,
+                                         int sampleRate)
 {
     juce::AudioBuffer<float> trackBuffer;
     const auto result = renderTrackRangeToBuffer(project,
@@ -973,7 +1028,17 @@ juce::Result exportTrackRangeToWavFile(const juce::File& file,
     if (result.failed())
         return result;
 
-    return writeStereoBufferToWavFile(file, trackBuffer, static_cast<double>(outSummary.sampleRate));
+    return writeStereoBufferToAudioFile(file, trackBuffer, static_cast<double>(outSummary.sampleRate));
+}
+
+juce::Result exportTrackRangeToWavFile(const juce::File& file,
+                                       const ProjectState& project,
+                                       int trackIndex,
+                                       NativeVstHostSession& nativeVstHost,
+                                       AudioExportSummary& outSummary,
+                                       int sampleRate)
+{
+    return exportTrackRangeToAudioFile(file, project, trackIndex, nativeVstHost, outSummary, sampleRate);
 }
 
 juce::Result exportProjectStemsToFolder(const juce::File& folder,
