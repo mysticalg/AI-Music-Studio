@@ -8,6 +8,9 @@
 
 namespace aims
 {
+inline constexpr float kArrangementMinPixelsPerBar = 1.0f;
+inline constexpr float kArrangementMaxPixelsPerBar = 640.0f;
+inline constexpr int kArrangementMinimumVisibleSeconds = 600;
 
 class ArrangementOverviewComponent final : public juce::Component,
                                            public juce::FileDragAndDropTarget

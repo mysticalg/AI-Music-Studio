@@ -2704,6 +2704,7 @@ AppRuntimeProfiler& appRuntimeProfiler()
 constexpr juce::uint32 kPlaybackRackEditorSyncIntervalMs = 96;
 constexpr juce::uint32 kDeferredEngineParameterFlushIntervalMs = 24;
 constexpr int kPlaybackRefreshRateWithOpenEditorHz = 30;
+constexpr int kIdleRefreshRateWithOpenEditorHz = 2;
 constexpr int kPlaybackRefreshRateWithOpenPianoRollHz = 45;
 constexpr int kPlaybackHeavyUiRefreshDivisorWithOpenEditor = 2;
 constexpr int kPlaybackHeavyUiRefreshDivisorWithOpenPianoRoll = 2;
@@ -4853,6 +4854,27 @@ public:
             automationView->refreshFromModel();
         if (sampleTimelineView != nullptr)
             sampleTimelineView->refreshFromModel();
+        if (pianoRollView != nullptr)
+        {
+            if (toolModeGetter != nullptr)
+                pianoRollView->setToolMode(toolModeGetter());
+            pianoRollView->refreshFromModel();
+            focusInitialPianoRollViewportIfNeeded();
+        }
+    }
+
+    void refreshMidiEditState()
+    {
+        syncingKeyQuantizeControls = true;
+        const auto& currentProject = projectGetter();
+        keyQuantizeBox.setSelectedId(keyQuantizeOptionId(currentProject), juce::dontSendNotification);
+        noteRangeMinBox.setSelectedId(pianoRollPitchOptionId(currentProject.pianoRollVisiblePitchMin), juce::dontSendNotification);
+        noteRangeMaxBox.setSelectedId(pianoRollPitchOptionId(currentProject.pianoRollVisiblePitchMax), juce::dontSendNotification);
+        syncingKeyQuantizeControls = false;
+
+        if (arrangementView != nullptr)
+            arrangementView->refreshFromModel();
+
         if (pianoRollView != nullptr)
         {
             if (toolModeGetter != nullptr)
@@ -9011,6 +9033,50 @@ bool sameSharedEffectBuses(const std::vector<SharedEffectBusState>& lhs,
     return true;
 }
 
+bool sameMidiSections(const std::vector<MidiSection>& lhs, const std::vector<MidiSection>& rhs)
+{
+    if (lhs.size() != rhs.size())
+        return false;
+
+    for (size_t index = 0; index < lhs.size(); ++index)
+    {
+        const auto& a = lhs[index];
+        const auto& b = rhs[index];
+        if (a.trackIndex != b.trackIndex
+            || a.startTick != b.startTick
+            || a.lengthTicks != b.lengthTicks
+            || !a.name.equalsIgnoreCase(b.name)
+            || !a.patternId.equalsIgnoreCase(b.patternId))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool sameMidiPatterns(const std::vector<MidiPattern>& lhs, const std::vector<MidiPattern>& rhs)
+{
+    if (lhs.size() != rhs.size())
+        return false;
+
+    for (size_t index = 0; index < lhs.size(); ++index)
+    {
+        const auto& a = lhs[index];
+        const auto& b = rhs[index];
+        if (!a.id.equalsIgnoreCase(b.id)
+            || !a.name.equalsIgnoreCase(b.name)
+            || a.lengthTicks != b.lengthTicks
+            || noteTransportSignature(a.notes) != noteTransportSignature(b.notes)
+            || automationLaneSignature(a.controllerLanes) != automationLaneSignature(b.controllerLanes))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 struct TrackEngineDiff
 {
     bool rackBindingChanged = false;
@@ -10263,9 +10329,9 @@ StudioShellComponent::StudioShellComponent()
     arrangementZoomLabel.setFont(ui::font());
     addAndMakeVisible(arrangementZoomLabel);
     configureViewSlider(arrangementZoomSlider,
-                        48.0,
-                        640.0,
-                        4.0,
+                        kArrangementMinPixelsPerBar,
+                        kArrangementMaxPixelsPerBar,
+                        1.0,
                         "",
                         arrangementZoomPixelsPerBar,
                         [this] { handleArrangementZoomChanged(); });
@@ -10461,8 +10527,8 @@ void StudioShellComponent::restorePersistedSessionState()
     if (windowStateSettings == nullptr)
         return;
 
-    arrangementZoomPixelsPerBar = juce::jlimit(48.0f,
-                                               640.0f,
+    arrangementZoomPixelsPerBar = juce::jlimit(kArrangementMinPixelsPerBar,
+                                               kArrangementMaxPixelsPerBar,
                                                static_cast<float>(windowStateSettings->getDoubleValue("session_arrangement_zoom_pixels_per_bar",
                                                                                                       arrangementZoomPixelsPerBar)));
     arrangementLaneHeightPixels = juce::jlimit(22.0f,
@@ -11310,10 +11376,18 @@ void StudioShellComponent::timerCallback()
 
     const bool hasSharedRackHost = nativeVstHost.isReady();
     const bool hasOpenRackEditors = hasOpenRackEditorSessions();
+    const bool hasAnyOpenRackEditorWindow = loadedRackEditorOpen || hasOpenRackEditors;
 
     if (!hasSharedRackHost && !hasOpenRackEditors)
     {
         refreshFloatingWindows();
+        return;
+    }
+
+    if (!rackPreviewRunning && !projectPreviewRunning && hasAnyOpenRackEditorWindow)
+    {
+        syncOpenRackEditorSessions(false);
+        refreshFloatingWindows(false);
         return;
     }
 
@@ -11338,7 +11412,7 @@ void StudioShellComponent::timerCallback()
     const bool hasVisibleFloatingPianoRoll = floatingPianoRollWorkspace != nullptr
         && pianoRollWindow != nullptr
         && pianoRollWindow->isVisible();
-    const bool shouldThrottleForRackEditor = loadedRackEditorOpen || hasOpenRackEditors;
+    const bool shouldThrottleForRackEditor = hasAnyOpenRackEditorWindow;
     const bool shouldThrottleForPianoRoll = hasVisibleFloatingPianoRoll;
     const bool hasVisibleTrackMeterConsumers = trackTable.isShowing()
         || (mixerComponent != nullptr && mixerComponent->isShowing())
@@ -11755,6 +11829,35 @@ void StudioShellComponent::updateEditorState()
     undoButton.setEnabled(undoManager.canUndo());
     redoButton.setEnabled(undoManager.canRedo());
     refreshFloatingWindows();
+}
+
+void StudioShellComponent::refreshMidiEditState()
+{
+    auto patternBarsSelection = defaultPatternLengthTicks(documentState.project);
+    if (juce::isPositiveAndBelow(selectedMidiSectionIndex, static_cast<int>(documentState.project.midiSections.size())))
+    {
+        const auto& section = documentState.project.midiSections[static_cast<size_t>(selectedMidiSectionIndex)];
+        if (const auto* pattern = findMidiPattern(documentState.project, section.patternId))
+            patternBarsSelection = patternLengthTicks(*pattern);
+    }
+
+    patternBarsBox.setSelectedId(patternBarsSelection, juce::dontSendNotification);
+    if (patternBarsBox.getSelectedId() != patternBarsSelection)
+        patternBarsBox.setText(sequenceTickLabel(patternBarsSelection, documentState.project), juce::dontSendNotification);
+
+    if (arrangementOverview != nullptr)
+        arrangementOverview->refreshFromModel();
+
+    if (pianoRoll != nullptr)
+    {
+        pianoRoll->setToolMode(editorToolMode);
+        pianoRoll->refreshFromModel();
+    }
+
+    refreshPlaybackToggleButton();
+    undoButton.setEnabled(undoManager.canUndo());
+    redoButton.setEnabled(undoManager.canRedo());
+    refreshFloatingWindowsForMidiEdit();
 }
 
 void StudioShellComponent::markDirty()
@@ -13269,6 +13372,23 @@ void StudioShellComponent::refreshFloatingWindows(bool includeEditorRefresh)
 
     if (includeEditorRefresh && vstFolderManagerPanel != nullptr && vstFolderManagerWindow != nullptr && vstFolderManagerWindow->isVisible())
         vstFolderManagerPanel->refreshFromModel();
+}
+
+void StudioShellComponent::refreshFloatingWindowsForMidiEdit()
+{
+    if (floatingArrangementOverview != nullptr && arrangementWindow != nullptr && arrangementWindow->isVisible())
+        floatingArrangementOverview->refreshFromModel();
+
+    if (floatingPianoRollWorkspace != nullptr && pianoRollWindow != nullptr && pianoRollWindow->isVisible())
+    {
+        if (projectPreviewRunning || rackPreviewRunning)
+            floatingPianoRollWorkspace->refreshPlaybackState();
+        else
+            floatingPianoRollWorkspace->refreshFromModel();
+    }
+
+    if (panelsWindowContent != nullptr && panelsWindow != nullptr && panelsWindow->isVisible())
+        panelsWindowContent->refreshMidiEditState();
 }
 
 void StudioShellComponent::jumpPlayheadToStart()
@@ -17316,7 +17436,7 @@ void StudioShellComponent::refreshPollingTimerState()
     }
     else if (loadedRackEditorOpen || hasOpenRackEditors)
     {
-        targetHz = 4;
+        targetHz = kIdleRefreshRateWithOpenEditorHz;
     }
 
     if (targetHz <= 0)
@@ -19032,14 +19152,64 @@ void StudioShellComponent::setProjectStateInternal(const ProjectState& updatedPr
         || !sameStringArray(previousProject.samplePaths, documentState.project.samplePaths);
     const bool projectSharedFxStateChanged = !sameSharedEffectBuses(previousProject.sharedFxBuses,
                                                                     documentState.project.sharedFxBuses);
+    const bool projectTempoMapChanged = !sameTempoMarkers(previousProject.tempoMarkers, documentState.project.tempoMarkers);
+    const bool projectTransportPositionChanged = previousProject.playheadTick != documentState.project.playheadTick
+        || previousProject.leftLocatorTick != documentState.project.leftLocatorTick
+        || previousProject.rightLocatorTick != documentState.project.rightLocatorTick;
+    const bool projectMasterStateChanged = std::abs(previousProject.masterVolume - documentState.project.masterVolume) > 1.0e-6
+        || previousProject.masterFxBypassed != documentState.project.masterFxBypassed
+        || !sameStringArray(previousProject.masterFxChain, documentState.project.masterFxChain)
+        || !sameBoolVector(previousProject.masterFxSlotBypassed, documentState.project.masterFxSlotBypassed);
+    const bool projectClipStateChanged = !sameSampleClips(previousProject.sampleClips, documentState.project.sampleClips);
+    const bool projectMidiPatternStateChanged = !sameMidiPatterns(previousProject.midiPatterns, documentState.project.midiPatterns);
+    const bool projectMidiSectionStateChanged = !sameMidiSections(previousProject.midiSections, documentState.project.midiSections);
     const bool requiresFullUiRefresh = trackCountChanged
         || projectHeaderStateChanged
         || projectAssetCatalogChanged
         || projectSharedFxStateChanged;
+    std::vector<TrackEngineDiff> trackDiffs;
+    trackDiffs.reserve(documentState.project.tracks.size());
+    bool sawMidiTrackContentChange = false;
+    bool nonMidiTrackStateChanged = false;
+
+    if (!trackCountChanged)
+    {
+        for (int trackIndex = 0; trackIndex < static_cast<int>(documentState.project.tracks.size()); ++trackIndex)
+        {
+            auto diff = analyseTrackEngineDiff(previousProject, documentState.project, trackIndex);
+            sawMidiTrackContentChange = sawMidiTrackContentChange || diff.noteContentChanged || diff.controllerContentChanged;
+            nonMidiTrackStateChanged = nonMidiTrackStateChanged
+                || diff.rackBindingChanged
+                || diff.parameterContentChanged
+                || diff.mixStateChanged
+                || diff.fxStateChanged
+                || diff.automationContentChanged
+                || diff.renderedAudioChanged
+                || diff.instrumentActivationChanged
+                || diff.requiresFullEngineState;
+            trackDiffs.push_back(std::move(diff));
+        }
+    }
+
+    const bool canUseMidiEditUiRefresh = !requiresFullUiRefresh
+        && !projectTempoMapChanged
+        && !projectTransportPositionChanged
+        && !projectMasterStateChanged
+        && !projectClipStateChanged
+        && !nonMidiTrackStateChanged
+        && (projectMidiPatternStateChanged || projectMidiSectionStateChanged || sawMidiTrackContentChange);
 
     if (requiresFullUiRefresh)
     {
         refreshUi();
+    }
+    else if (canUseMidiEditUiRefresh)
+    {
+        refreshProjectSummaryLabels();
+        trackTable.repaint();
+        ensureSelectedMidiSectionForTrack(getSelectedTrackIndex());
+        refreshInspector();
+        refreshMidiEditState();
     }
     else
     {
@@ -19060,15 +19230,8 @@ void StudioShellComponent::setProjectStateInternal(const ProjectState& updatedPr
         const bool projectPlayheadChanged = previousProject.playheadTick != documentState.project.playheadTick;
         const bool projectTimelineStateChanged = previousProject.timeSigNumerator != documentState.project.timeSigNumerator
             || previousProject.timeSigDenominator != documentState.project.timeSigDenominator
-            || !sameTempoMarkers(previousProject.tempoMarkers, documentState.project.tempoMarkers);
-        const bool projectMasterStateChanged = std::abs(previousProject.masterVolume - documentState.project.masterVolume) > 1.0e-6
-            || previousProject.masterFxBypassed != documentState.project.masterFxBypassed
-            || !sameStringArray(previousProject.masterFxChain, documentState.project.masterFxChain)
-            || !sameBoolVector(previousProject.masterFxSlotBypassed, documentState.project.masterFxSlotBypassed);
-        const bool projectClipStateChanged = !sameSampleClips(previousProject.sampleClips, documentState.project.sampleClips);
+            || projectTempoMapChanged;
 
-        std::vector<TrackEngineDiff> trackDiffs;
-        trackDiffs.reserve(documentState.project.tracks.size());
         bool requiresFullEngineState = trackCountChanged
             || projectTimelineStateChanged
             || projectMasterStateChanged
@@ -19077,12 +19240,10 @@ void StudioShellComponent::setProjectStateInternal(const ProjectState& updatedPr
 
         if (!requiresFullEngineState)
         {
-            for (int trackIndex = 0; trackIndex < static_cast<int>(documentState.project.tracks.size()); ++trackIndex)
+            for (const auto& diff : trackDiffs)
             {
-                auto diff = analyseTrackEngineDiff(previousProject, documentState.project, trackIndex);
                 if (diff.requiresFullEngineState)
                     requiresFullEngineState = true;
-                trackDiffs.push_back(std::move(diff));
             }
         }
 

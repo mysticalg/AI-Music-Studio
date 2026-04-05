@@ -148,6 +148,7 @@ private:
     void refreshUi();
     void refreshInspector();
     void updateEditorState();
+    void refreshMidiEditState();
     void markDirty();
     void clearDirty();
 
@@ -300,6 +301,7 @@ private:
     void scheduleSelectedTrackRackPreviewWarmup(int delayMs = 180);
     void setupFloatingWindows();
     void refreshFloatingWindows(bool includeEditorRefresh = true);
+    void refreshFloatingWindowsForMidiEdit();
     void refreshProjectSummaryLabels();
     void applyEditorViewScaleState();
     void refreshPlaybackToggleButton();

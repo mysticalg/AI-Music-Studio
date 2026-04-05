@@ -22,6 +22,19 @@ const juce::Colour kLeftLocator = juce::Colour::fromRGB(120, 212, 255);
 const juce::Colour kRightLocator = juce::Colour::fromRGB(255, 209, 102);
 const char* kClipboardType = "aims.native.pattern_clip";
 constexpr float kTransportHandleWidth = 16.0f;
+
+int minimumArrangementVisibleBars(const ProjectState& state, int fallbackBars)
+{
+    const auto projectBarTicks = ticksPerBar(state);
+    if (projectBarTicks <= 0)
+        return fallbackBars;
+
+    const auto minimumVisibleTick = juce::jmax(0,
+                                               secondsToTick(state,
+                                                             static_cast<double>(kArrangementMinimumVisibleSeconds)));
+    const auto minimumVisibleBars = (minimumVisibleTick + projectBarTicks - 1) / projectBarTicks;
+    return juce::jmax(fallbackBars, minimumVisibleBars);
+}
 constexpr float kTransportHandleHeight = 10.0f;
 
 bool isSupportedAudioSampleFile(const juce::String& path)
@@ -705,7 +718,9 @@ void ArrangementOverviewComponent::refreshFromModel()
 
 void ArrangementOverviewComponent::setHorizontalZoom(float pixelsPerBarIn)
 {
-    const auto clamped = juce::jlimit(48.0f, 640.0f, pixelsPerBarIn);
+    const auto clamped = juce::jlimit(kArrangementMinPixelsPerBar,
+                                      kArrangementMaxPixelsPerBar,
+                                      pixelsPerBarIn);
     if (std::abs(pixelsPerBar - clamped) < 0.01f)
         return;
 
@@ -2293,7 +2308,8 @@ int ArrangementOverviewComponent::displayedBarCount() const
 {
     const auto& state = displayedProject();
     const auto projectBarTicks = ticksPerBar(state);
-    int lastTick = juce::jmax(projectBarTicks * minimumBars, state.rightLocatorTick + projectBarTicks);
+    const auto minimumVisibleBars = minimumArrangementVisibleBars(state, minimumBars);
+    int lastTick = juce::jmax(projectBarTicks * minimumVisibleBars, state.rightLocatorTick + projectBarTicks);
 
     for (const auto& section : state.midiSections)
         lastTick = juce::jmax(lastTick, section.startTick + clipLengthTicks(section, state));
@@ -2306,7 +2322,7 @@ int ArrangementOverviewComponent::displayedBarCount() const
         lastTick = juce::jmax(lastTick, startTick + projectBarTicks);
     }
 
-    return juce::jmax(minimumBars, (lastTick + projectBarTicks - 1) / projectBarTicks);
+    return juce::jmax(minimumVisibleBars, (lastTick + projectBarTicks - 1) / projectBarTicks);
 }
 
 int ArrangementOverviewComponent::clipLengthTicks(const MidiSection& section, const ProjectState& state) const
