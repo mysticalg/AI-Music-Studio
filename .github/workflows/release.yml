@@ -1,0 +1,287 @@
+name: Build Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Compute artifact ref
+        id: artifact_ref
+        shell: pwsh
+        run: |
+          $safeRef = "${{ github.ref_name }}" -replace '[<>:"/\\|?*\r\n]', '-'
+          $safeRef = $safeRef.Trim('-')
+          if (-not $safeRef) {
+            $safeRef = "ref"
+          }
+          "safe_ref=$safeRef" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Package portable Windows build
+        shell: pwsh
+        run: |
+          $archiveOutput = & python ./scripts/build_release_package.py --repo-root $PWD --release-version "${{ github.ref_name }}" 2>&1
+          $status = $LASTEXITCODE
+          $archiveOutput | ForEach-Object { Write-Host $_ }
+          if ($status -ne 0) {
+            exit $status
+          }
+          $archivePath = ($archiveOutput | Select-Object -Last 1).ToString().Trim()
+          if (-not $archivePath) {
+            throw "Packaging step did not return an archive path."
+          }
+          if (-not (Test-Path $archivePath)) {
+            throw "Archive path not found: $archivePath"
+          }
+          "ARCHIVE_PATH=$archivePath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Create SHA256 checksum
+        shell: pwsh
+        run: |
+          $hash = Get-FileHash -Path $env:ARCHIVE_PATH -Algorithm SHA256
+          $checksumPath = "$env:ARCHIVE_PATH.sha256"
+          Set-Content -Path $checksumPath -Value "$($hash.Hash.ToLower())  $(Split-Path $env:ARCHIVE_PATH -Leaf)" -Encoding ASCII
+          "CHECKSUM_PATH=$checksumPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Ensure Inno Setup
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+            "C:\Program Files\Inno Setup 6\ISCC.exe",
+            (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe")
+          ) | Where-Object { $_ }
+
+          $isccPath = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($isccPath) {
+            Write-Host "Found Inno Setup at $isccPath"
+            exit 0
+          }
+
+          winget install --id JRSoftware.InnoSetup -e --accept-package-agreements --accept-source-agreements --silent
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "winget returned exit code $LASTEXITCODE. Re-checking install paths before failing."
+          }
+
+          $isccPath = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $isccPath) {
+            throw "Inno Setup compiler not found after installation attempt."
+          }
+
+          Write-Host "Installed Inno Setup at $isccPath"
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          $installerOutput = ./scripts/build_windows_installer.ps1 -RepoRoot $PWD -ReleaseVersion "${{ github.ref_name }}"
+          $installerPath = ($installerOutput | Select-Object -Last 1).ToString().Trim()
+          if (-not $installerPath) {
+            throw "Installer step did not return a path."
+          }
+          if (-not (Test-Path $installerPath)) {
+            throw "Installer path not found: $installerPath"
+          }
+          "INSTALLER_PATH=$installerPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Create installer SHA256 checksum
+        shell: pwsh
+        run: |
+          $hash = Get-FileHash -Path $env:INSTALLER_PATH -Algorithm SHA256
+          $checksumPath = "$env:INSTALLER_PATH.sha256"
+          Set-Content -Path $checksumPath -Value "$($hash.Hash.ToLower())  $(Split-Path $env:INSTALLER_PATH -Leaf)" -Encoding ASCII
+          "INSTALLER_CHECKSUM_PATH=$checksumPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: Mutagen-${{ steps.artifact_ref.outputs.safe_ref }}-windows-x64
+          path: |
+            ${{ env.ARCHIVE_PATH }}
+            ${{ env.CHECKSUM_PATH }}
+            ${{ env.INSTALLER_PATH }}
+            ${{ env.INSTALLER_CHECKSUM_PATH }}
+          if-no-files-found: error
+
+  macos-release:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Compute artifact ref
+        id: artifact_ref
+        shell: pwsh
+        run: |
+          $safeRef = "${{ github.ref_name }}" -replace '[<>:"/\\|?*\r\n]', '-'
+          $safeRef = $safeRef.Trim('-')
+          if (-not $safeRef) {
+            $safeRef = "ref"
+          }
+          "safe_ref=$safeRef" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Package portable macOS build
+        run: |
+          set -euo pipefail
+          log_file="$(mktemp)"
+          python3 ./scripts/build_release_package.py --repo-root "$PWD" --release-version "${{ github.ref_name }}" 2>&1 | tee "$log_file"
+          archive_path="$(tail -n 1 "$log_file")"
+          if [ -z "$archive_path" ]; then
+            echo "Packaging step did not return an archive path." >&2
+            exit 1
+          fi
+          if [ ! -e "$archive_path" ]; then
+            echo "Archive path not found: $archive_path" >&2
+            exit 1
+          fi
+          rm -f "$log_file"
+          echo "ARCHIVE_PATH=$archive_path" >> "$GITHUB_ENV"
+
+      - name: Create SHA256 checksum
+        run: |
+          checksum_path="$ARCHIVE_PATH.sha256"
+          shasum -a 256 "$ARCHIVE_PATH" | awk '{print tolower($1) "  " $2}' > "$checksum_path"
+          echo "CHECKSUM_PATH=$checksum_path" >> "$GITHUB_ENV"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: Mutagen-${{ steps.artifact_ref.outputs.safe_ref }}-macos
+          path: |
+            ${{ env.ARCHIVE_PATH }}
+            ${{ env.CHECKSUM_PATH }}
+          if-no-files-found: error
+
+  linux-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev \
+            libjack-jackd2-dev \
+            libfreetype6-dev \
+            libfontconfig1-dev \
+            libx11-dev \
+            libxcomposite-dev \
+            libxcursor-dev \
+            libxext-dev \
+            libxinerama-dev \
+            libxrandr-dev \
+            libxrender-dev \
+            libglu1-mesa-dev \
+            mesa-common-dev
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Compute artifact ref
+        id: artifact_ref
+        shell: pwsh
+        run: |
+          $safeRef = "${{ github.ref_name }}" -replace '[<>:"/\\|?*\r\n]', '-'
+          $safeRef = $safeRef.Trim('-')
+          if (-not $safeRef) {
+            $safeRef = "ref"
+          }
+          "safe_ref=$safeRef" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Package portable Linux build
+        run: |
+          set -euo pipefail
+          log_file="$(mktemp)"
+          python3 ./scripts/build_release_package.py --repo-root "$PWD" --release-version "${{ github.ref_name }}" 2>&1 | tee "$log_file"
+          archive_path="$(tail -n 1 "$log_file")"
+          if [ -z "$archive_path" ]; then
+            echo "Packaging step did not return an archive path." >&2
+            exit 1
+          fi
+          if [ ! -e "$archive_path" ]; then
+            echo "Archive path not found: $archive_path" >&2
+            exit 1
+          fi
+          rm -f "$log_file"
+          echo "ARCHIVE_PATH=$archive_path" >> "$GITHUB_ENV"
+
+      - name: Create SHA256 checksum
+        run: |
+          checksum_path="$ARCHIVE_PATH.sha256"
+          sha256sum "$ARCHIVE_PATH" | awk '{print tolower($1) "  " $2}' > "$checksum_path"
+          echo "CHECKSUM_PATH=$checksum_path" >> "$GITHUB_ENV"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: Mutagen-${{ steps.artifact_ref.outputs.safe_ref }}-linux
+          path: |
+            ${{ env.ARCHIVE_PATH }}
+            ${{ env.CHECKSUM_PATH }}
+          if-no-files-found: error
+
+  publish-release:
+    if: github.ref_type == 'tag'
+    needs: [windows-release, macos-release, linux-release]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="${{ github.ref_name }}"
+          assets=()
+          while IFS= read -r -d '' file; do
+            assets+=("$file")
+          done < <(find release-assets -type f -print0)
+
+          if [ ${#assets[@]} -eq 0 ]; then
+            echo "No release assets found" >&2
+            exit 1
+          fi
+
+          if gh release view "$tag" --json tagName > /dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --clobber
+          else
+            gh release create "$tag" "${assets[@]}" --title "Mutagen $tag" --generate-notes
+          fi
