@@ -210,7 +210,7 @@ class AIMusicStudioNativeApplication final : public juce::JUCEApplication
 {
 public:
     const juce::String getApplicationName() override      { return "Mutagen"; }
-    const juce::String getApplicationVersion() override   { return "0.3.2"; }
+    const juce::String getApplicationVersion() override   { return "0.3.3"; }
     bool moreThanOneInstanceAllowed() override            { return true; }
 
     void initialise(const juce::String&) override

@@ -42,15 +42,27 @@ OutputBaseFilename=Mutagen-{#MyAppVersion}-setup
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
+[Types]
+Name: "full"; Description: "Full installation"
+Name: "minimal"; Description: "Minimal installation"
+Name: "custom"; Description: "Custom installation"; Flags: iscustom
+
+[Components]
+Name: "main"; Description: "Mutagen application"; Types: full minimal custom; Flags: fixed
+Name: "bundledvsti"; Description: "Bundled native VST instruments and sample libraries"; Types: full custom
+
 [Tasks]
-Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
+Name: "desktopicon"; Description: "Create a desktop shortcut for Mutagen"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
+Name: "installacestep"; Description: "Install ACE-Step local audio generation backend (downloads extra files)"; GroupDescription: "Optional components:"; Flags: unchecked
 
 [Files]
-Source: "{#SourceRoot}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceRoot}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "vsti\*"
+Source: "{#SourceRoot}\vsti\*"; DestDir: "{app}\vsti"; Flags: ignoreversion recursesubdirs createallsubdirs; Components: bundledvsti
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
+Filename: "powershell.exe"; Parameters: "-NoLogo -NoProfile -ExecutionPolicy Bypass -File ""{app}\support\install_ace_step_backend.ps1"""; StatusMsg: "Installing ACE-Step local audio generation backend..."; Flags: runascurrentuser waituntilterminated skipifsilent; Tasks: installacestep
+Filename: "{app}\{#MyAppExeName}"; Description: "Run {#MyAppName} now"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent

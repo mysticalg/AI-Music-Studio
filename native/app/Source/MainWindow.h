@@ -1,6 +1,7 @@
 #pragma once
 
 #include "AIClient.h"
+#include "AceStepClient.h"
 #include "AutomationEditorComponent.h"
 #include "ArrangementOverviewComponent.h"
 #include "MidiFileIO.h"
@@ -14,6 +15,7 @@
 #include <juce_audio_devices/juce_audio_devices.h>
 #include <juce_gui_extra/juce_gui_extra.h>
 
+#include <cstdint>
 #include <future>
 
 namespace aims
@@ -131,6 +133,15 @@ private:
         std::vector<StemSeparationStem> stems;
     };
 
+    struct AceStepTrackGenerationResult
+    {
+        bool success = false;
+        juce::String errorMessage;
+        int trackIndex = -1;
+        int insertTick = 0;
+        AceStepGenerationResult generation;
+    };
+
     void createToolbarButton(juce::TextButton& button, const juce::String& text);
     void configureInspectorTextEditor(juce::TextEditor& editor, const juce::String& placeholder);
     void configureInspectorSlider(juce::Slider& slider, double minimum, double maximum, double step, const juce::String& suffix);
@@ -183,6 +194,7 @@ private:
     void showTemplateSettingsDialog();
     void showAiSettingsDialog();
     void composeWithAi();
+    void generateAudioWithAceStep();
     void openSelectedTrackRackEditor();
     void openTrackRackEditor(int trackIndex);
     void openTrackEffectEditorFromMixer(int trackIndex, int effectIndex);
@@ -261,6 +273,9 @@ private:
     void applySelectedTrackMutation(std::function<void(TrackState&)> mutation, const juce::String& actionName);
     void setAiComposeBusy(bool busy, const juce::String& detail = {});
     void pollAiComposeFuture();
+    void setAceStepGenerationBusy(bool busy, const juce::String& detail = {});
+    void pollAceStepServerOutput();
+    void pollAceStepGenerationFuture();
     void updateAiStatusSummary();
     void applyAiComposeResult(const AIComposeResult& result, int requestedBars);
     void syncBundledRackCatalogInProject();
@@ -356,6 +371,8 @@ private:
     juce::Result placeSampleAssetAtPlayhead(int assetIndex,
                                             const juce::String& actionName,
                                             juce::String& outTrackName);
+    juce::Result ensureAceStepServerLaunchRequested();
+    juce::File suggestAceStepGeneratedAudioFile(int trackIndex, const juce::String& audioFormat) const;
     void resetRackHostTracking();
     bool syncTrackRackParametersFromValues(int trackIndex,
                                            const juce::NamedValueSet& hostParameters,
@@ -461,6 +478,7 @@ private:
     juce::TextButton placeSampleButton;
     juce::TextButton aiSettingsButton;
     juce::TextButton aiComposeButton;
+    juce::TextButton aceStepGenerateButton;
     juce::TextButton openRackEditorButton;
     juce::TextButton saveRackStateButton;
     juce::TextButton playProjectButton;
@@ -492,16 +510,22 @@ private:
     juce::TextButton midiInsertToggle;
     std::unique_ptr<juce::FileChooser> activeFileChooser;
     AIClient aiClient;
+    AceStepClient aceStepClient;
     NativeVstHostSession nativeVstHost;
     std::vector<float> trackMeterLevels;
     double transportCpuUsagePercent = 0.0;
     float transportMasterPeakLeft = 0.0f;
     float transportMasterPeakRight = 0.0f;
     std::future<AIComposeResult> aiComposeFuture;
+    std::future<AceStepTrackGenerationResult> aceStepGenerationFuture;
     std::future<StemSeparationResult> stemSeparationFuture;
     juce::String aiComposeBusyDetail;
+    juce::String aceStepBusyDetail;
     juce::String aiComposeDefaultPrompt;
+    juce::String aceStepDefaultPrompt;
+    juce::String aceStepDefaultLyrics;
     int aiComposeDefaultBars = 8;
+    int aceStepDefaultBars = 8;
     int aiComposeRequestedBars = 8;
     AIComposeTargetMode aiComposeDefaultMode = AIComposeTargetMode::replaceAllTracks;
     AIComposeTargetMode aiComposeRequestedMode = AIComposeTargetMode::replaceAllTracks;
@@ -513,7 +537,15 @@ private:
     std::vector<int> aiComposeRequestedTargetTracks;
     int aiComposeRequestedInsertTick = 0;
     bool aiComposeBusy = false;
+    bool aceStepGenerationBusy = false;
+    bool aceStepBootstrapNoticeShown = false;
     bool stemSeparationBusy = false;
+    std::unique_ptr<juce::ChildProcess> aceStepServerProcess;
+    juce::File aceStepServerLogFile;
+    int64_t aceStepServerLogReadPosition = 0;
+    juce::String aceStepServerOutputCarry;
+    juce::String aceStepLastProgressLogLine;
+    juce::uint32 aceStepLastProgressLogMs = 0;
     std::vector<std::unique_ptr<RackEditorSession>> rackEditorSessions;
     bool loadedRackEditorOpen = false;
     bool rackPreviewWarmupPending = false;

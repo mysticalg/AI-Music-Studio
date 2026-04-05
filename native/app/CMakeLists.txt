@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(AIMusicStudioNative VERSION 0.3.2)
+project(AIMusicStudioNative VERSION 0.3.3)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -93,6 +93,8 @@ target_sources(AIMusicStudioNative
         Source/AudioExport.h
         Source/AIClient.cpp
         Source/AIClient.h
+        Source/AceStepClient.cpp
+        Source/AceStepClient.h
         Source/AutomationEditorComponent.cpp
         Source/AutomationEditorComponent.h
         Source/ArrangementOverviewComponent.cpp

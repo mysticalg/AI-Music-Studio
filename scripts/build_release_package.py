@@ -82,6 +82,12 @@ def stage_release_tree(repo_root: Path, stage_dir: Path, app_artifact: Path, rel
     if bundled_vsti_dir.exists():
         copy_tree_filtered(bundled_vsti_dir, stage_dir / "vsti")
 
+    support_dir = stage_dir / "support"
+    support_dir.mkdir(parents=True, exist_ok=True)
+    ace_step_installer_script = repo_root / "scripts" / "install_ace_step_backend.ps1"
+    if ace_step_installer_script.exists():
+        shutil.copy2(ace_step_installer_script, support_dir / ace_step_installer_script.name)
+
     shutil.copy2(repo_root / "README.md", stage_dir / "README.md")
     guide_path = repo_root / "GUIDE.md"
     if guide_path.exists():

@@ -34,6 +34,10 @@ public:
     enum class Provider
     {
         openAI,
+        anthropic,
+        xAI,
+        gemini,
+        openAICompatible,
         ollama
     };
 
@@ -45,18 +49,24 @@ public:
 
     Provider getProvider() const noexcept;
     juce::String getProviderKey() const;
+    juce::String getProviderDisplayName() const;
     juce::String getRemoteModel() const;
+    juce::String getRemoteBaseUrl() const;
     juce::String getOllamaBaseUrl() const;
     juce::String getOllamaModel() const;
     int getRequestTimeoutSeconds() const noexcept;
     bool hasSavedCredential() const noexcept;
     bool isEnabled() const noexcept;
     juce::String authStatus() const;
-    juce::StringArray remoteModelChoices() const;
+    juce::StringArray remoteModelChoices(Provider providerOverride) const;
     juce::StringArray availableOllamaModels(const juce::String& baseUrl = {}) const;
+    static juce::String providerDisplayName(Provider provider);
+    static juce::String defaultRemoteModelForProvider(Provider provider);
+    static juce::String defaultRemoteBaseUrlForProvider(Provider provider);
 
     void setProvider(Provider newProvider);
     void setRemoteModel(const juce::String& newModel);
+    void setRemoteBaseUrl(const juce::String& newBaseUrl);
     void setOllamaConnection(const juce::String& newBaseUrl, const juce::String& newModel = {});
     void setRequestTimeoutSeconds(int timeoutSeconds);
     void saveSettings() const;
@@ -69,8 +79,10 @@ public:
 
 private:
     static Provider normaliseProvider(const juce::String& rawProvider);
+    static juce::String normaliseRemoteBaseUrl(Provider provider, const juce::String& baseUrl);
     static juce::String normaliseOllamaBaseUrl(const juce::String& baseUrl);
     static int normaliseRequestTimeoutSeconds(int timeoutSeconds);
+    static bool isRemoteProvider(Provider provider) noexcept;
 
     juce::File appDataDirectory() const;
     juce::File logsDirectory() const;
@@ -81,6 +93,7 @@ private:
     void loadSavedAuth();
     void saveAuth() const;
     juce::String authorizationHeaderValue() const;
+    juce::String remoteChatCompletionsUrl() const;
     juce::String ollamaEndpoint(const juce::String& endpoint, const juce::String& overrideBaseUrl = {}) const;
     juce::var requestJson(const juce::String& url,
                           const juce::var* payload,
@@ -89,12 +102,14 @@ private:
                           int timeoutSeconds,
                           const juce::String& errorPrefix) const;
     juce::var runOpenAiJsonPrompt(const juce::String& systemInstruction, const juce::String& userInstruction) const;
+    juce::var runOpenAiCompatibleJsonPrompt(const juce::String& systemInstruction, const juce::String& userInstruction) const;
     juce::var runOllamaJsonPrompt(const juce::String& systemInstruction, const juce::String& userInstruction) const;
     void emitActivityLog(const juce::String& title, const juce::String& body) const;
     void appendDebugLog(const juce::String& title, const juce::String& body) const;
 
     Provider provider = Provider::openAI;
     juce::String remoteModel;
+    juce::String remoteBaseUrl;
     juce::String ollamaBaseUrl;
     juce::String ollamaModel;
     int requestTimeoutSeconds = defaultRequestTimeoutSeconds;

@@ -31,6 +31,11 @@ juce::File nativeLogsDirectory()
         .getChildFile("logs");
 }
 
+juce::File nativeAceStepServerLogFile()
+{
+    return nativeLogsDirectory().getChildFile("ace-step-server.log");
+}
+
 juce::File nativeSessionStateFile()
 {
     return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
@@ -52,12 +57,114 @@ juce::File nativeStemSeparationDirectory()
         .getChildFile("stem-separation");
 }
 
+juce::File nativeGeneratedAudioDirectory()
+{
+    return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+        .getChildFile("Mutagen")
+        .getChildFile("generated-audio");
+}
+
 constexpr const char* kMidiInputSelectionDisabled = "__mutagen_midi_input_disabled__";
+constexpr const char* kAceStepGitHubUrl = "https://github.com/ace-step/ACE-Step-1.5";
 constexpr const char* kOllamaSiteUrl = "https://ollama.com/";
 constexpr const char* kOllamaWindowsDownloadUrl = "https://ollama.com/download/windows";
 constexpr const char* kDemucsInstallUrl = "https://github.com/facebookresearch/demucs";
 constexpr const char* kBuiltInDefaultTemplateId = "__mutagen_builtin_default_template__";
 constexpr const char* kProjectTemplateWildcard = "*.aimstpl";
+
+bool aceStepBootstrapMessageMatches(const juce::String& text)
+{
+    const auto normalised = text.toLowerCase();
+    return normalised.contains("first-run model setup in progress")
+        || normalised.contains("still initializing models")
+        || normalised.contains("still preparing first-run models")
+        || normalised.contains("downloading or loading required models")
+        || normalised.contains("downloading/loading models for first use")
+        || normalised.contains("ace-step is listening on");
+}
+
+juce::String aceStepBootstrapUserMessage()
+{
+    return "ACE-Step is downloading or loading required models for first use.\n\n"
+           "Leave ACE-Step and Mutagen running while setup finishes, then try Generate Audio again.\n\n"
+           "Open Activity Log if you want to watch progress.";
+}
+
+juce::String aceStepBootstrapStatusText()
+{
+    return "ACE-Step is downloading/loading models for first use. Leave it running.";
+}
+
+juce::String sanitiseAceStepServerOutput(const juce::String& rawText)
+{
+    juce::String cleaned;
+    cleaned.preallocateBytes(rawText.getNumBytesAsUTF8());
+
+    bool insideEscapeSequence = false;
+    auto characters = rawText.getCharPointer();
+    while (!characters.isEmpty())
+    {
+        const auto character = characters.getAndAdvance();
+
+        if (insideEscapeSequence)
+        {
+            if ((character >= '@' && character <= '~') || character == 'm' || character == 'K')
+                insideEscapeSequence = false;
+            continue;
+        }
+
+        if (character == 0x1b)
+        {
+            insideEscapeSequence = true;
+            continue;
+        }
+
+        if (character == '\r')
+        {
+            cleaned << '\n';
+            continue;
+        }
+
+        if (character != 0)
+            cleaned << character;
+    }
+
+    return cleaned;
+}
+
+bool isAceStepProgressLine(const juce::String& text)
+{
+    const auto trimmed = text.trim();
+    if (trimmed.isEmpty())
+        return false;
+
+    return trimmed.containsChar('%')
+        || trimmed.containsIgnoreCase("model.safetensors:")
+        || trimmed.containsIgnoreCase("diffusion_pytorch_model.safetensors:")
+        || trimmed.containsIgnoreCase("tokenizer.json:")
+        || trimmed.containsIgnoreCase("Downloading unified repo")
+        || trimmed.containsIgnoreCase("Downloading ")
+        || trimmed.containsIgnoreCase("already exists at ");
+}
+
+bool isAceStepInformationalLine(const juce::String& text)
+{
+    const auto trimmed = text.trim();
+    if (trimmed.isEmpty())
+        return false;
+
+    if (trimmed.startsWith("INFO:") && trimmed.contains("HTTP/1.1"))
+        return false;
+
+    return trimmed.containsIgnoreCase("[API Server]")
+        || trimmed.containsIgnoreCase("[Model Download]")
+        || trimmed.containsIgnoreCase("Downloading Model from ")
+        || trimmed.containsIgnoreCase("Started server process")
+        || trimmed.containsIgnoreCase("Application startup complete")
+        || trimmed.containsIgnoreCase("Uvicorn running on ")
+        || trimmed.containsIgnoreCase("WARNING")
+        || trimmed.containsIgnoreCase("ERROR");
+}
 
 enum class MidiImportAssignmentMode
 {
@@ -328,6 +435,69 @@ bool isOllamaInstalledLocally()
     return detectedOllamaExecutable().existsAsFile();
 }
 
+juce::File detectedAceStepInstallDirectory()
+{
+    juce::Array<juce::File> candidates;
+    const auto currentWorkingDirectory = juce::File::getCurrentWorkingDirectory();
+    candidates.add(currentWorkingDirectory.getChildFile("ACE-Step-1.5"));
+    candidates.add(currentWorkingDirectory.getChildFile("tmp").getChildFile("ACE-Step-1.5"));
+
+    const auto executableDirectory = juce::File::getSpecialLocation(juce::File::currentExecutableFile).getParentDirectory();
+    candidates.add(executableDirectory.getChildFile("ACE-Step-1.5"));
+    candidates.add(executableDirectory.getParentDirectory().getChildFile("ACE-Step-1.5"));
+
+    const auto userHome = juce::File::getSpecialLocation(juce::File::userHomeDirectory);
+    candidates.add(userHome.getChildFile("Documents").getChildFile("GitHub").getChildFile("ACE-Step-1.5"));
+    candidates.add(userHome.getChildFile("OneDrive").getChildFile("Documents").getChildFile("GitHub").getChildFile("ACE-Step-1.5"));
+    candidates.add(userHome.getChildFile("Downloads").getChildFile("ACE-Step-1.5"));
+    candidates.add(userHome.getChildFile("ACE-Step-1.5"));
+    const auto localAppData = juce::SystemStats::getEnvironmentVariable("LOCALAPPDATA", {}).trim();
+    if (localAppData.isNotEmpty())
+        candidates.add(juce::File(localAppData).getChildFile("Mutagen").getChildFile("ACE-Step-1.5"));
+
+    for (const auto& candidate : candidates)
+    {
+        if (!candidate.isDirectory())
+            continue;
+
+       #if JUCE_WINDOWS
+        if (candidate.getChildFile("mutagen-start-api-server.bat").existsAsFile())
+            return candidate;
+        if (candidate.getChildFile("start_api_server.bat").existsAsFile())
+            return candidate;
+       #elif JUCE_MAC
+        if (candidate.getChildFile("start_api_server_macos.sh").existsAsFile())
+            return candidate;
+       #else
+        if (candidate.getChildFile("start_api_server.sh").existsAsFile())
+            return candidate;
+       #endif
+    }
+
+    return {};
+}
+
+juce::String aceStepTimeSignatureValue(const ProjectState& project)
+{
+    if (project.timeSigNumerator == 2 && project.timeSigDenominator == 4)
+        return "2";
+    if (project.timeSigNumerator == 3 && project.timeSigDenominator == 4)
+        return "3";
+    if (project.timeSigNumerator == 4 && project.timeSigDenominator == 4)
+        return "4";
+    if (project.timeSigNumerator == 6 && project.timeSigDenominator == 8)
+        return "6";
+    return {};
+}
+
+juce::String aceStepKeyScaleValue(const ProjectState& project)
+{
+    const auto display = keyQuantizeDisplayName(project.keyQuantizeRoot, project.keyQuantizeScale).trim();
+    if (display.equalsIgnoreCase("All Notes (Chromatic)"))
+        return {};
+    return display;
+}
+
 juce::StringArray detectedOllamaModelChoices(const AIClient& aiClient,
                                              const juce::String& baseUrl,
                                              const juce::String& preferredModel = {})
@@ -349,36 +519,1227 @@ juce::StringArray detectedOllamaModelChoices(const AIClient& aiClient,
     return choices;
 }
 
-void refreshOllamaModelCombo(juce::AlertWindow& dialog,
+void populateComboBoxChoices(juce::ComboBox& comboBox,
+                             const juce::StringArray& choices,
+                             const juce::String& preferredText = {})
+{
+    comboBox.setEditableText(true);
+    comboBox.clear(juce::dontSendNotification);
+
+    int itemId = 1;
+    for (const auto& choice : choices)
+        comboBox.addItem(choice, itemId++);
+
+    const auto desiredText = preferredText.trim();
+    if (desiredText.isNotEmpty())
+        comboBox.setText(desiredText, juce::dontSendNotification);
+    else if (!choices.isEmpty())
+        comboBox.setSelectedItemIndex(0, juce::dontSendNotification);
+    else
+        comboBox.setText({}, juce::dontSendNotification);
+}
+
+void refreshOllamaModelCombo(juce::ComboBox& modelBox,
                              const AIClient& aiClient,
                              const juce::String& baseUrl,
                              const juce::String& preferredModel = {})
 {
-    auto* modelBox = dialog.getComboBoxComponent("ollamaModel");
-    if (modelBox == nullptr)
-        return;
-
-    modelBox->setEditableText(true);
-    modelBox->clear(juce::dontSendNotification);
-
     const auto resolvedBaseUrl = baseUrl.trim().isNotEmpty() ? baseUrl.trim() : aiClient.getOllamaBaseUrl();
     const auto choices = detectedOllamaModelChoices(aiClient, resolvedBaseUrl, preferredModel);
+    populateComboBoxChoices(modelBox, choices, preferredModel);
 
-    int itemId = 1;
-    for (const auto& choice : choices)
-        modelBox->addItem(choice, itemId++);
+    modelBox.setTooltip(choices.isEmpty()
+                            ? "No Ollama models were detected at the configured endpoint. You can still type a model tag manually."
+                            : "Detected Ollama models from " + resolvedBaseUrl + ". You can still type a custom model tag.");
+}
 
-    const auto desiredModel = preferredModel.trim();
-    if (desiredModel.isNotEmpty())
-        modelBox->setText(desiredModel, juce::dontSendNotification);
-    else if (!choices.isEmpty())
-        modelBox->setSelectedItemIndex(0, juce::dontSendNotification);
-    else
-        modelBox->setText({}, juce::dontSendNotification);
+const std::array<AIClient::Provider, 6>& aiSettingsProviderOrder()
+{
+    static const std::array<AIClient::Provider, 6> providers
+    {
+        AIClient::Provider::openAI,
+        AIClient::Provider::anthropic,
+        AIClient::Provider::xAI,
+        AIClient::Provider::gemini,
+        AIClient::Provider::openAICompatible,
+        AIClient::Provider::ollama
+    };
 
-    modelBox->setTooltip(choices.isEmpty()
-                             ? "No Ollama models were detected at the configured endpoint. You can still type a model tag manually."
-                             : "Detected Ollama models from " + resolvedBaseUrl + ". You can still type a custom model tag.");
+    return providers;
+}
+
+juce::StringArray aiSettingsProviderLabels()
+{
+    juce::StringArray labels;
+    for (const auto provider : aiSettingsProviderOrder())
+        labels.add(AIClient::providerDisplayName(provider));
+    return labels;
+}
+
+AIClient::Provider aiProviderFromDisplayLabel(const juce::String& label)
+{
+    for (const auto provider : aiSettingsProviderOrder())
+    {
+        if (label.equalsIgnoreCase(AIClient::providerDisplayName(provider)))
+            return provider;
+    }
+
+    return AIClient::Provider::openAI;
+}
+
+juce::String aiProviderHelpText(AIClient::Provider provider)
+{
+    switch (provider)
+    {
+        case AIClient::Provider::openAI:
+            return "Uses OpenAI's native Responses API.";
+        case AIClient::Provider::anthropic:
+            return "Uses Claude's OpenAI-compatible endpoint.";
+        case AIClient::Provider::xAI:
+            return "Uses xAI's chat-completions API.";
+        case AIClient::Provider::gemini:
+            return "Uses Gemini's OpenAI compatibility endpoint.";
+        case AIClient::Provider::openAICompatible:
+            return "Enter any OpenAI-compatible /v1 endpoint.";
+        case AIClient::Provider::ollama:
+            break;
+    }
+
+    return {};
+}
+
+class AiSettingsContentComponent final : public juce::Component
+{
+public:
+    AiSettingsContentComponent(const AIClient& aiClientIn,
+                               const AceStepClient& aceStepClientIn,
+                               bool ollamaDetectedIn,
+                               const juce::File& installedOllamaIn,
+                               const juce::File& detectedAceStepIn)
+        : aiClient(aiClientIn),
+          ollamaDetected(ollamaDetectedIn),
+          installedOllama(installedOllamaIn)
+    {
+        const auto configureLabel = [this] (juce::Label& label, const juce::String& text, bool bold = false)
+        {
+            label.setText(text, juce::dontSendNotification);
+            label.setJustificationType(juce::Justification::centredLeft);
+            if (bold)
+                label.setFont(label.getFont().boldened());
+            addAndMakeVisible(label);
+        };
+
+        const auto configureEditor = [this] (juce::TextEditor& editor, const juce::String& text)
+        {
+            editor.setText(text, juce::dontSendNotification);
+            editor.setSelectAllWhenFocused(true);
+            addAndMakeVisible(editor);
+        };
+
+        configureLabel(providerSectionLabel, "Composition Provider", true);
+        configureLabel(providerLabel, "Provider");
+        providerBox.addItemList(aiSettingsProviderLabels(), 1);
+        providerBox.onChange = [this] { handleProviderChanged(); };
+        addAndMakeVisible(providerBox);
+
+        configureLabel(remoteModelLabel, "Remote model");
+        remoteModelBox.setEditableText(true);
+        addAndMakeVisible(remoteModelBox);
+        configureLabel(remoteApiKeyLabel, "API key");
+        configureEditor(remoteApiKeyEditor, {});
+        remoteApiKeyEditor.setPasswordCharacter(0x2022);
+        configureLabel(remoteEndpointLabel, "Custom endpoint");
+        configureEditor(remoteEndpointEditor, aiClient.getRemoteBaseUrl());
+        configureLabel(remoteHelpLabel, {});
+
+        configureLabel(ollamaSectionLabel, "Ollama", true);
+        configureLabel(ollamaBaseUrlLabel, "Ollama endpoint");
+        configureEditor(ollamaBaseUrlEditor, aiClient.getOllamaBaseUrl());
+        ollamaBaseUrlEditor.onReturnKey = [this] { refreshOllamaModels(); };
+        ollamaBaseUrlEditor.onFocusLost = [this] { refreshOllamaModels(); };
+        configureLabel(ollamaModelLabel, "Ollama model");
+        ollamaModelBox.setEditableText(true);
+        addAndMakeVisible(ollamaModelBox);
+        refreshOllamaButton.setButtonText("Refresh");
+        refreshOllamaButton.onClick = [this] { refreshOllamaModels(); };
+        addAndMakeVisible(refreshOllamaButton);
+        configureLabel(ollamaStatusLabel,
+                       ollamaDetected
+                           ? "Detected local Ollama at " + installedOllama.getFullPathName()
+                           : "Ollama was not detected on this system.");
+        ollamaDownloadButton.setButtonText("Download Ollama");
+        ollamaDownloadButton.onClick = []
+        {
+            juce::URL(kOllamaWindowsDownloadUrl).launchInDefaultBrowser();
+        };
+        addAndMakeVisible(ollamaDownloadButton);
+
+        configureLabel(timeoutLabel, "Request timeout (seconds)");
+        configureEditor(timeoutEditor, juce::String(aiClient.getRequestTimeoutSeconds()));
+
+        configureLabel(aceStepSectionLabel, "ACE-Step Audio Generation", true);
+        configureLabel(aceStepBaseUrlLabel, "ACE-Step endpoint");
+        configureEditor(aceStepBaseUrlEditor, aceStepClientIn.getBaseUrl());
+        configureLabel(aceStepApiKeyLabel, "ACE-Step API key");
+        configureEditor(aceStepApiKeyEditor, {});
+        aceStepApiKeyEditor.setPasswordCharacter(0x2022);
+        configureLabel(aceStepInstallDirLabel, "ACE-Step install folder");
+        configureEditor(aceStepInstallDirEditor,
+                        aceStepClientIn.getInstallDirectory().trim().isNotEmpty()
+                            ? aceStepClientIn.getInstallDirectory()
+                            : detectedAceStepIn.getFullPathName());
+        configureLabel(aceStepAutoStartLabel, "ACE-Step auto-start");
+        aceStepAutoStartBox.addItemList({ "Enabled", "Disabled" }, 1);
+        aceStepAutoStartBox.setSelectedItemIndex(aceStepClientIn.getAutoStartServer() ? 0 : 1, juce::dontSendNotification);
+        addAndMakeVisible(aceStepAutoStartBox);
+        configureLabel(aceStepDefaultModelLabel, "ACE-Step default model");
+        configureEditor(aceStepDefaultModelEditor, aceStepClientIn.getDefaultModel());
+        configureLabel(aceStepAudioFormatLabel, "ACE-Step output format");
+        aceStepAudioFormatBox.addItemList({ "wav", "flac", "mp3" }, 1);
+        aceStepAudioFormatBox.setSelectedItemIndex(juce::jmax(0,
+                                                              juce::StringArray{ "wav", "flac", "mp3" }.indexOf(aceStepClientIn.getDefaultAudioFormat())),
+                                                   juce::dontSendNotification);
+        addAndMakeVisible(aceStepAudioFormatBox);
+        configureLabel(aceStepStartupTimeoutLabel, "Startup timeout (seconds)");
+        configureEditor(aceStepStartupTimeoutEditor, juce::String(aceStepClientIn.getStartupTimeoutSeconds()));
+        configureLabel(aceStepJobTimeoutLabel, "Job timeout (seconds)");
+        configureEditor(aceStepJobTimeoutEditor, juce::String(aceStepClientIn.getJobTimeoutSeconds()));
+        configureLabel(aceStepHelpLabel, "Only set the install folder when Mutagen should launch ACE-Step for you.");
+        aceStepRepoButton.setButtonText("Open ACE-Step Repository");
+        aceStepRepoButton.onClick = []
+        {
+            juce::URL(kAceStepGitHubUrl).launchInDefaultBrowser();
+        };
+        addAndMakeVisible(aceStepRepoButton);
+
+        int providerIndex = 0;
+        for (int index = 0; index < static_cast<int>(aiSettingsProviderOrder().size()); ++index)
+        {
+            if (aiSettingsProviderOrder()[static_cast<size_t>(index)] == aiClient.getProvider())
+            {
+                providerIndex = index;
+                break;
+            }
+        }
+
+        providerBox.setSelectedItemIndex(providerIndex, juce::dontSendNotification);
+        lastProvider = selectedProvider();
+        remoteModelBox.setText(aiClient.getRemoteModel(), juce::dontSendNotification);
+        refreshOllamaModels();
+        handleProviderChanged();
+    }
+
+    int preferredDialogHeight() const
+    {
+        return juce::jlimit(620, 900, computeContentHeight() + 130);
+    }
+
+    AIClient::Provider selectedProvider() const
+    {
+        return aiProviderFromDisplayLabel(providerBox.getText());
+    }
+
+    juce::String remoteModel() const { return remoteModelBox.getText().trim(); }
+    juce::String remoteApiKey() const { return remoteApiKeyEditor.getText().trim(); }
+    juce::String remoteBaseUrl() const
+    {
+        return customRemoteEndpointVisible()
+            ? remoteEndpointEditor.getText().trim()
+            : AIClient::defaultRemoteBaseUrlForProvider(selectedProvider());
+    }
+    juce::String ollamaBaseUrl() const { return ollamaBaseUrlEditor.getText().trim(); }
+    juce::String ollamaModel() const { return ollamaModelBox.getText().trim(); }
+    int timeoutSeconds() const { return timeoutEditor.getText().getIntValue(); }
+    juce::String aceStepBaseUrl() const { return aceStepBaseUrlEditor.getText().trim(); }
+    juce::String aceStepApiKey() const { return aceStepApiKeyEditor.getText().trim(); }
+    juce::String aceStepInstallDirectory() const { return aceStepInstallDirEditor.getText().trim(); }
+    bool aceStepAutoStartEnabled() const { return aceStepAutoStartBox.getSelectedItemIndex() != 1; }
+    juce::String aceStepDefaultModel() const { return aceStepDefaultModelEditor.getText().trim(); }
+    juce::String aceStepAudioFormat() const { return aceStepAudioFormatBox.getText().trim(); }
+    int aceStepStartupTimeoutSeconds() const { return aceStepStartupTimeoutEditor.getText().getIntValue(); }
+    int aceStepJobTimeoutSeconds() const { return aceStepJobTimeoutEditor.getText().getIntValue(); }
+
+    void resized() override
+    {
+        auto area = getLocalBounds().reduced(12);
+        constexpr int labelWidth = 180;
+        constexpr int rowHeight = 28;
+        constexpr int sectionGap = 10;
+        constexpr int rowGap = 6;
+
+        const auto layoutSection = [&area, sectionGap] (juce::Label& label)
+        {
+            label.setBounds(area.removeFromTop(24));
+            area.removeFromTop(sectionGap);
+        };
+
+        const auto layoutRow = [&area, labelWidth, rowHeight, rowGap] (juce::Label& label, juce::Component& field)
+        {
+            auto row = area.removeFromTop(rowHeight);
+            label.setBounds(row.removeFromLeft(labelWidth));
+            field.setBounds(row);
+            area.removeFromTop(rowGap);
+        };
+
+        const auto layoutRowWithButton = [&area, labelWidth, rowHeight, rowGap] (juce::Label& label,
+                                                                                  juce::Component& field,
+                                                                                  juce::Component& button,
+                                                                                  int buttonWidth)
+        {
+            auto row = area.removeFromTop(rowHeight);
+            label.setBounds(row.removeFromLeft(labelWidth));
+            button.setBounds(row.removeFromRight(buttonWidth));
+            row.removeFromRight(6);
+            field.setBounds(row);
+            area.removeFromTop(rowGap);
+        };
+
+        const auto layoutStandalone = [&area, rowGap] (juce::Component& component, int height)
+        {
+            component.setBounds(area.removeFromTop(height));
+            area.removeFromTop(rowGap);
+        };
+
+        layoutSection(providerSectionLabel);
+        layoutRow(providerLabel, providerBox);
+
+        if (remoteSectionVisible())
+        {
+            layoutRow(remoteModelLabel, remoteModelBox);
+            layoutRow(remoteApiKeyLabel, remoteApiKeyEditor);
+            if (customRemoteEndpointVisible())
+                layoutRow(remoteEndpointLabel, remoteEndpointEditor);
+            layoutStandalone(remoteHelpLabel, 22);
+        }
+
+        if (ollamaSectionVisible())
+        {
+            layoutSection(ollamaSectionLabel);
+            layoutRow(ollamaBaseUrlLabel, ollamaBaseUrlEditor);
+            layoutRowWithButton(ollamaModelLabel, ollamaModelBox, refreshOllamaButton, 84);
+            layoutStandalone(ollamaStatusLabel, 22);
+            if (!ollamaDetected)
+                layoutStandalone(ollamaDownloadButton, 24);
+        }
+
+        layoutRow(timeoutLabel, timeoutEditor);
+        area.removeFromTop(sectionGap);
+        layoutSection(aceStepSectionLabel);
+        layoutRow(aceStepBaseUrlLabel, aceStepBaseUrlEditor);
+        layoutRow(aceStepApiKeyLabel, aceStepApiKeyEditor);
+        layoutRow(aceStepInstallDirLabel, aceStepInstallDirEditor);
+        layoutRow(aceStepAutoStartLabel, aceStepAutoStartBox);
+        layoutRow(aceStepDefaultModelLabel, aceStepDefaultModelEditor);
+        layoutRow(aceStepAudioFormatLabel, aceStepAudioFormatBox);
+        layoutRow(aceStepStartupTimeoutLabel, aceStepStartupTimeoutEditor);
+        layoutRow(aceStepJobTimeoutLabel, aceStepJobTimeoutEditor);
+        layoutStandalone(aceStepHelpLabel, 22);
+        layoutStandalone(aceStepRepoButton, 24);
+    }
+
+private:
+    bool remoteSectionVisible() const noexcept { return selectedProvider() != AIClient::Provider::ollama; }
+    bool ollamaSectionVisible() const noexcept { return selectedProvider() == AIClient::Provider::ollama; }
+    bool customRemoteEndpointVisible() const noexcept { return selectedProvider() == AIClient::Provider::openAICompatible; }
+
+    int computeContentHeight() const
+    {
+        int height = 24 + 10 + 28 + 6;
+
+        if (remoteSectionVisible())
+        {
+            height += 28 + 6;
+            height += 28 + 6;
+            if (customRemoteEndpointVisible())
+                height += 28 + 6;
+            height += 22 + 6;
+        }
+
+        if (ollamaSectionVisible())
+        {
+            height += 24 + 10;
+            height += 28 + 6;
+            height += 28 + 6;
+            height += 22 + 6;
+            if (!ollamaDetected)
+                height += 24 + 6;
+        }
+
+        height += 28 + 6;
+        height += 10;
+        height += 24 + 10;
+        height += (28 + 6) * 8;
+        height += 22 + 6;
+        height += 24 + 6;
+        return height + 24;
+    }
+
+    void refreshOllamaModels()
+    {
+        auto preferredModel = ollamaModelBox.getText().trim();
+        if (preferredModel.isEmpty())
+            preferredModel = aiClient.getOllamaModel().trim();
+        refreshOllamaModelCombo(ollamaModelBox, aiClient, ollamaBaseUrlEditor.getText().trim(), preferredModel);
+    }
+
+    void handleProviderChanged()
+    {
+        const auto newProvider = selectedProvider();
+        const auto previousDefaultModel = AIClient::defaultRemoteModelForProvider(lastProvider);
+        auto currentModel = remoteModelBox.getText().trim();
+        if (currentModel.isEmpty() || currentModel == previousDefaultModel)
+            currentModel = AIClient::defaultRemoteModelForProvider(newProvider);
+
+        remoteModelLabel.setText(AIClient::providerDisplayName(newProvider) + " model", juce::dontSendNotification);
+        remoteApiKeyLabel.setText(AIClient::providerDisplayName(newProvider) + " API key", juce::dontSendNotification);
+        remoteHelpLabel.setText(aiProviderHelpText(newProvider), juce::dontSendNotification);
+        populateComboBoxChoices(remoteModelBox, aiClient.remoteModelChoices(newProvider), currentModel);
+
+        const auto setVisibility = [] (bool visible, std::initializer_list<juce::Component*> components)
+        {
+            for (auto* component : components)
+                if (component != nullptr)
+                    component->setVisible(visible);
+        };
+
+        setVisibility(remoteSectionVisible(),
+                      { &remoteModelLabel, &remoteModelBox, &remoteApiKeyLabel, &remoteApiKeyEditor, &remoteHelpLabel });
+        setVisibility(customRemoteEndpointVisible(), { &remoteEndpointLabel, &remoteEndpointEditor });
+        setVisibility(ollamaSectionVisible(),
+                      { &ollamaSectionLabel, &ollamaBaseUrlLabel, &ollamaBaseUrlEditor, &ollamaModelLabel, &ollamaModelBox,
+                        &refreshOllamaButton, &ollamaStatusLabel });
+        ollamaDownloadButton.setVisible(ollamaSectionVisible() && !ollamaDetected);
+
+        lastProvider = newProvider;
+        resized();
+
+        if (auto* alertWindow = findParentComponentOfClass<juce::AlertWindow>())
+            alertWindow->setSize(alertWindow->getWidth(), preferredDialogHeight());
+    }
+
+    const AIClient& aiClient;
+    bool ollamaDetected = false;
+    juce::File installedOllama;
+    AIClient::Provider lastProvider = AIClient::Provider::openAI;
+
+    juce::Label providerSectionLabel;
+    juce::Label providerLabel;
+    juce::ComboBox providerBox;
+    juce::Label remoteModelLabel;
+    juce::ComboBox remoteModelBox;
+    juce::Label remoteApiKeyLabel;
+    juce::TextEditor remoteApiKeyEditor;
+    juce::Label remoteEndpointLabel;
+    juce::TextEditor remoteEndpointEditor;
+    juce::Label remoteHelpLabel;
+    juce::Label ollamaSectionLabel;
+    juce::Label ollamaBaseUrlLabel;
+    juce::TextEditor ollamaBaseUrlEditor;
+    juce::Label ollamaModelLabel;
+    juce::ComboBox ollamaModelBox;
+    juce::TextButton refreshOllamaButton;
+    juce::Label ollamaStatusLabel;
+    juce::TextButton ollamaDownloadButton;
+    juce::Label timeoutLabel;
+    juce::TextEditor timeoutEditor;
+    juce::Label aceStepSectionLabel;
+    juce::Label aceStepBaseUrlLabel;
+    juce::TextEditor aceStepBaseUrlEditor;
+    juce::Label aceStepApiKeyLabel;
+    juce::TextEditor aceStepApiKeyEditor;
+    juce::Label aceStepInstallDirLabel;
+    juce::TextEditor aceStepInstallDirEditor;
+    juce::Label aceStepAutoStartLabel;
+    juce::ComboBox aceStepAutoStartBox;
+    juce::Label aceStepDefaultModelLabel;
+    juce::TextEditor aceStepDefaultModelEditor;
+    juce::Label aceStepAudioFormatLabel;
+    juce::ComboBox aceStepAudioFormatBox;
+    juce::Label aceStepStartupTimeoutLabel;
+    juce::TextEditor aceStepStartupTimeoutEditor;
+    juce::Label aceStepJobTimeoutLabel;
+    juce::TextEditor aceStepJobTimeoutEditor;
+    juce::Label aceStepHelpLabel;
+    juce::TextButton aceStepRepoButton;
+};
+
+class TabbedAiSettingsContentComponent final : public juce::Component
+{
+public:
+    TabbedAiSettingsContentComponent(const AIClient& aiClientIn,
+                                     const AceStepClient& aceStepClientIn,
+                                     bool ollamaDetectedIn,
+                                     const juce::File& installedOllamaIn,
+                                     const juce::File& detectedAceStepIn);
+
+    int preferredDialogWidth() const noexcept;
+    int preferredDialogHeight() const noexcept;
+
+    AIClient::Provider selectedProvider() const;
+    juce::String remoteModel() const;
+    juce::String remoteApiKey() const;
+    juce::String remoteBaseUrl() const;
+    juce::String ollamaBaseUrl() const;
+    juce::String ollamaModel() const;
+    int timeoutSeconds() const;
+    juce::String aceStepBaseUrl() const;
+    juce::String aceStepApiKey() const;
+    juce::String aceStepInstallDirectory() const;
+    bool aceStepAutoStartEnabled() const;
+    juce::String aceStepDefaultModel() const;
+    juce::String aceStepAudioFormat() const;
+    juce::String aceStepQualityPreset() const;
+    juce::String aceStepVocalLanguage() const;
+    bool aceStepThinkingEnabled() const;
+    bool aceStepUseRandomSeed() const;
+    int aceStepSeed() const;
+    int aceStepInferenceSteps() const;
+    double aceStepGuidanceScale() const;
+    juce::String aceStepInferMethod() const;
+    int aceStepStartupTimeoutSeconds() const;
+    int aceStepJobTimeoutSeconds() const;
+
+    void resized() override;
+
+private:
+    static bool aceStepModelLooksTurbo(const juce::String& model) noexcept;
+    bool remoteSectionVisible() const noexcept;
+    bool ollamaSectionVisible() const noexcept;
+    bool customRemoteEndpointVisible() const noexcept;
+    bool aceStepCustomQualitySelected() const noexcept;
+    int aceStepPresetInferenceSteps(const juce::String& preset) const;
+    int computeCompositionContentHeight() const;
+    int computeAceStepContentHeight() const;
+    void layoutCompositionPage();
+    void layoutAceStepPage();
+    void refreshOllamaModels();
+    void applyAceStepQualityPreset(const juce::String& preset);
+    void updateAceStepFieldStates();
+    void handleAceStepQualityChanged();
+    void handleAceStepModelChanged();
+    void handleProviderChanged();
+
+    const AIClient& aiClient;
+    const AceStepClient& aceStepClient;
+    bool ollamaDetected = false;
+    bool updatingAceStepQualityControls = false;
+    juce::File installedOllama;
+    AIClient::Provider lastProvider = AIClient::Provider::openAI;
+    juce::TabbedComponent tabs;
+    juce::Viewport compositionViewport;
+    juce::Viewport aceStepViewport;
+    juce::Component compositionPage;
+    juce::Component aceStepPage;
+
+    juce::Label providerSectionLabel;
+    juce::Label providerLabel;
+    juce::ComboBox providerBox;
+    juce::Label remoteModelLabel;
+    juce::ComboBox remoteModelBox;
+    juce::Label remoteApiKeyLabel;
+    juce::TextEditor remoteApiKeyEditor;
+    juce::Label remoteEndpointLabel;
+    juce::TextEditor remoteEndpointEditor;
+    juce::Label remoteHelpLabel;
+    juce::Label ollamaSectionLabel;
+    juce::Label ollamaBaseUrlLabel;
+    juce::TextEditor ollamaBaseUrlEditor;
+    juce::Label ollamaModelLabel;
+    juce::ComboBox ollamaModelBox;
+    juce::TextButton refreshOllamaButton;
+    juce::Label ollamaStatusLabel;
+    juce::TextButton ollamaDownloadButton;
+    juce::Label requestSectionLabel;
+    juce::Label timeoutLabel;
+    juce::TextEditor timeoutEditor;
+
+    juce::Label aceStepConnectionSectionLabel;
+    juce::Label aceStepBaseUrlLabel;
+    juce::TextEditor aceStepBaseUrlEditor;
+    juce::Label aceStepApiKeyLabel;
+    juce::TextEditor aceStepApiKeyEditor;
+    juce::Label aceStepInstallDirLabel;
+    juce::TextEditor aceStepInstallDirEditor;
+    juce::Label aceStepAutoStartLabel;
+    juce::ComboBox aceStepAutoStartBox;
+    juce::Label aceStepStartupTimeoutLabel;
+    juce::TextEditor aceStepStartupTimeoutEditor;
+    juce::Label aceStepJobTimeoutLabel;
+    juce::TextEditor aceStepJobTimeoutEditor;
+    juce::Label aceStepHelpLabel;
+    juce::Label aceStepRenderSectionLabel;
+    juce::Label aceStepQualityLabel;
+    juce::ComboBox aceStepQualityBox;
+    juce::Label aceStepDefaultModelLabel;
+    juce::TextEditor aceStepDefaultModelEditor;
+    juce::Label aceStepAudioFormatLabel;
+    juce::ComboBox aceStepAudioFormatBox;
+    juce::Label aceStepLanguageLabel;
+    juce::TextEditor aceStepLanguageEditor;
+    juce::Label aceStepSeedModeLabel;
+    juce::ComboBox aceStepSeedModeBox;
+    juce::Label aceStepSeedLabel;
+    juce::TextEditor aceStepSeedEditor;
+    juce::Label aceStepAdvancedSectionLabel;
+    juce::Label aceStepThinkingLabel;
+    juce::ComboBox aceStepThinkingBox;
+    juce::Label aceStepInferenceStepsLabel;
+    juce::TextEditor aceStepInferenceStepsEditor;
+    juce::Label aceStepGuidanceScaleLabel;
+    juce::TextEditor aceStepGuidanceScaleEditor;
+    juce::Label aceStepInferMethodLabel;
+    juce::ComboBox aceStepInferMethodBox;
+    juce::Label aceStepAdvancedHelpLabel;
+    juce::TextButton aceStepRepoButton;
+};
+
+class AiSettingsDialogContainerComponent final : public juce::Component
+{
+public:
+    using SubmitHandler = std::function<void(int, const TabbedAiSettingsContentComponent&)>;
+
+    AiSettingsDialogContainerComponent(const AIClient& aiClientIn,
+                                       const AceStepClient& aceStepClientIn,
+                                       bool ollamaDetectedIn,
+                                       const juce::File& installedOllamaIn,
+                                       const juce::File& detectedAceStepIn,
+                                       SubmitHandler submitHandlerIn)
+        : settingsContent(aiClientIn,
+                          aceStepClientIn,
+                          ollamaDetectedIn,
+                          installedOllamaIn,
+                          detectedAceStepIn),
+          submitHandler(std::move(submitHandlerIn))
+    {
+        addAndMakeVisible(settingsContent);
+
+        saveButton.setButtonText("Save");
+        saveButton.onClick = [this] { closeWithResult(1); };
+        addAndMakeVisible(saveButton);
+
+        clearAuthButton.setButtonText("Clear Auth");
+        clearAuthButton.onClick = [this] { closeWithResult(2); };
+        addAndMakeVisible(clearAuthButton);
+
+        cancelButton.setButtonText("Cancel");
+        cancelButton.onClick = [this] { closeWithResult(0); };
+        addAndMakeVisible(cancelButton);
+
+        setSize(settingsContent.preferredDialogWidth() + 24,
+                settingsContent.preferredDialogHeight() + 72);
+    }
+
+    void paint(juce::Graphics& g) override
+    {
+        g.fillAll(juce::Colour::fromRGB(52, 63, 72));
+    }
+
+    void resized() override
+    {
+        auto area = getLocalBounds().reduced(12);
+        auto buttonsArea = area.removeFromBottom(44);
+        settingsContent.setBounds(area);
+
+        constexpr int buttonWidth = 132;
+        constexpr int buttonHeight = 38;
+        constexpr int buttonGap = 12;
+        const auto totalWidth = (buttonWidth * 3) + (buttonGap * 2);
+        auto row = buttonsArea.withSizeKeepingCentre(totalWidth, buttonHeight);
+        saveButton.setBounds(row.removeFromLeft(buttonWidth));
+        row.removeFromLeft(buttonGap);
+        clearAuthButton.setBounds(row.removeFromLeft(buttonWidth));
+        row.removeFromLeft(buttonGap);
+        cancelButton.setBounds(row.removeFromLeft(buttonWidth));
+    }
+
+private:
+    void closeWithResult(int result)
+    {
+        if ((result == 1 || result == 2) && submitHandler != nullptr)
+            submitHandler(result, settingsContent);
+
+        if (auto* dialogWindow = findParentComponentOfClass<juce::DialogWindow>())
+        {
+            dialogWindow->exitModalState(result);
+            dialogWindow->setVisible(false);
+        }
+    }
+
+    TabbedAiSettingsContentComponent settingsContent;
+    SubmitHandler submitHandler;
+    juce::TextButton saveButton;
+    juce::TextButton clearAuthButton;
+    juce::TextButton cancelButton;
+};
+
+TabbedAiSettingsContentComponent::TabbedAiSettingsContentComponent(const AIClient& aiClientIn,
+                                                                   const AceStepClient& aceStepClientIn,
+                                                                   bool ollamaDetectedIn,
+                                                                   const juce::File& installedOllamaIn,
+                                                                   const juce::File& detectedAceStepIn)
+    : aiClient(aiClientIn),
+      aceStepClient(aceStepClientIn),
+      ollamaDetected(ollamaDetectedIn),
+      installedOllama(installedOllamaIn),
+      tabs(juce::TabbedButtonBar::TabsAtTop)
+{
+    tabs.setTabBarDepth(32);
+    compositionViewport.setViewedComponent(&compositionPage, false);
+    compositionViewport.setScrollBarsShown(true, false);
+    aceStepViewport.setViewedComponent(&aceStepPage, false);
+    aceStepViewport.setScrollBarsShown(true, false);
+    tabs.addTab("Composition", juce::Colour::fromRGB(34, 46, 62), &compositionViewport, false);
+    tabs.addTab("ACE-Step", juce::Colour::fromRGB(34, 46, 62), &aceStepViewport, false);
+    addAndMakeVisible(tabs);
+
+    const auto configureLabel = [] (juce::Component& parent,
+                                    juce::Label& label,
+                                    const juce::String& text,
+                                    bool bold = false)
+    {
+        label.setText(text, juce::dontSendNotification);
+        label.setJustificationType(juce::Justification::centredLeft);
+        if (bold)
+            label.setFont(label.getFont().boldened());
+        parent.addAndMakeVisible(label);
+    };
+
+    const auto configureEditor = [] (juce::Component& parent,
+                                     juce::TextEditor& editor,
+                                     const juce::String& text)
+    {
+        editor.setText(text, juce::dontSendNotification);
+        editor.setSelectAllWhenFocused(true);
+        parent.addAndMakeVisible(editor);
+    };
+
+    configureLabel(compositionPage, providerSectionLabel, "Composition Provider", true);
+    configureLabel(compositionPage, providerLabel, "Provider");
+    providerBox.addItemList(aiSettingsProviderLabels(), 1);
+    providerBox.onChange = [this] { handleProviderChanged(); };
+    compositionPage.addAndMakeVisible(providerBox);
+
+    configureLabel(compositionPage, remoteModelLabel, "Remote model");
+    remoteModelBox.setEditableText(true);
+    compositionPage.addAndMakeVisible(remoteModelBox);
+    configureLabel(compositionPage, remoteApiKeyLabel, "API key");
+    configureEditor(compositionPage, remoteApiKeyEditor, {});
+    remoteApiKeyEditor.setPasswordCharacter(0x2022);
+    configureLabel(compositionPage, remoteEndpointLabel, "Custom endpoint");
+    configureEditor(compositionPage, remoteEndpointEditor, aiClient.getRemoteBaseUrl());
+    configureLabel(compositionPage, remoteHelpLabel, {});
+
+    configureLabel(compositionPage, ollamaSectionLabel, "Ollama", true);
+    configureLabel(compositionPage, ollamaBaseUrlLabel, "Ollama endpoint");
+    configureEditor(compositionPage, ollamaBaseUrlEditor, aiClient.getOllamaBaseUrl());
+    ollamaBaseUrlEditor.onReturnKey = [this] { refreshOllamaModels(); };
+    ollamaBaseUrlEditor.onFocusLost = [this] { refreshOllamaModels(); };
+    configureLabel(compositionPage, ollamaModelLabel, "Ollama model");
+    ollamaModelBox.setEditableText(true);
+    compositionPage.addAndMakeVisible(ollamaModelBox);
+    refreshOllamaButton.setButtonText("Refresh");
+    refreshOllamaButton.onClick = [this] { refreshOllamaModels(); };
+    compositionPage.addAndMakeVisible(refreshOllamaButton);
+    configureLabel(compositionPage,
+                   ollamaStatusLabel,
+                   ollamaDetected
+                       ? "Detected local Ollama installation."
+                       : "Ollama was not detected on this system.");
+    if (ollamaDetected)
+        ollamaStatusLabel.setTooltip(installedOllama.getFullPathName());
+    ollamaDownloadButton.setButtonText("Download Ollama");
+    ollamaDownloadButton.onClick = []
+    {
+        juce::URL(kOllamaWindowsDownloadUrl).launchInDefaultBrowser();
+    };
+    compositionPage.addAndMakeVisible(ollamaDownloadButton);
+
+    configureLabel(compositionPage, requestSectionLabel, "Request Handling", true);
+    configureLabel(compositionPage, timeoutLabel, "Request timeout (seconds)");
+    configureEditor(compositionPage, timeoutEditor, juce::String(aiClient.getRequestTimeoutSeconds()));
+
+    configureLabel(aceStepPage, aceStepConnectionSectionLabel, "Connection", true);
+    configureLabel(aceStepPage, aceStepBaseUrlLabel, "ACE-Step endpoint");
+    configureEditor(aceStepPage, aceStepBaseUrlEditor, aceStepClientIn.getBaseUrl());
+    configureLabel(aceStepPage, aceStepApiKeyLabel, "ACE-Step API key");
+    configureEditor(aceStepPage, aceStepApiKeyEditor, {});
+    aceStepApiKeyEditor.setPasswordCharacter(0x2022);
+    configureLabel(aceStepPage, aceStepInstallDirLabel, "ACE-Step install folder");
+    configureEditor(aceStepPage,
+                    aceStepInstallDirEditor,
+                    aceStepClientIn.getInstallDirectory().trim().isNotEmpty()
+                        ? aceStepClientIn.getInstallDirectory()
+                        : detectedAceStepIn.getFullPathName());
+    configureLabel(aceStepPage, aceStepAutoStartLabel, "Auto-start server");
+    aceStepAutoStartBox.addItemList({ "Enabled", "Disabled" }, 1);
+    aceStepAutoStartBox.setSelectedItemIndex(aceStepClientIn.getAutoStartServer() ? 0 : 1, juce::dontSendNotification);
+    aceStepPage.addAndMakeVisible(aceStepAutoStartBox);
+    configureLabel(aceStepPage, aceStepStartupTimeoutLabel, "Startup timeout (seconds)");
+    configureEditor(aceStepPage, aceStepStartupTimeoutEditor, juce::String(aceStepClientIn.getStartupTimeoutSeconds()));
+    configureLabel(aceStepPage, aceStepJobTimeoutLabel, "Job timeout (seconds)");
+    configureEditor(aceStepPage, aceStepJobTimeoutEditor, juce::String(aceStepClientIn.getJobTimeoutSeconds()));
+    configureLabel(aceStepPage, aceStepHelpLabel, "Install folder is only needed when Mutagen should launch ACE-Step for you.");
+
+    configureLabel(aceStepPage, aceStepRenderSectionLabel, "Render Defaults", true);
+    configureLabel(aceStepPage, aceStepQualityLabel, "Quality");
+    aceStepQualityBox.addItemList({ "Fast", "Balanced", "High", "Custom" }, 1);
+    aceStepQualityBox.onChange = [this] { handleAceStepQualityChanged(); };
+    aceStepPage.addAndMakeVisible(aceStepQualityBox);
+    configureLabel(aceStepPage, aceStepDefaultModelLabel, "Default model");
+    configureEditor(aceStepPage, aceStepDefaultModelEditor, aceStepClientIn.getDefaultModel());
+    aceStepDefaultModelEditor.onTextChange = [this] { handleAceStepModelChanged(); };
+    configureLabel(aceStepPage, aceStepAudioFormatLabel, "Output format");
+    aceStepAudioFormatBox.addItemList({ "wav", "flac", "mp3", "opus", "aac", "wav32" }, 1);
+    aceStepAudioFormatBox.setSelectedItemIndex(juce::jmax(0,
+                                                          juce::StringArray{ "wav", "flac", "mp3", "opus", "aac", "wav32" }
+                                                              .indexOf(aceStepClientIn.getDefaultAudioFormat())),
+                                               juce::dontSendNotification);
+    aceStepPage.addAndMakeVisible(aceStepAudioFormatBox);
+    configureLabel(aceStepPage, aceStepLanguageLabel, "Lyrics language");
+    configureEditor(aceStepPage, aceStepLanguageEditor, aceStepClientIn.getDefaultVocalLanguage());
+    configureLabel(aceStepPage, aceStepSeedModeLabel, "Seed");
+    aceStepSeedModeBox.addItemList({ "Random", "Fixed" }, 1);
+    aceStepSeedModeBox.setSelectedItemIndex(aceStepClientIn.getDefaultUseRandomSeed() ? 0 : 1, juce::dontSendNotification);
+    aceStepSeedModeBox.onChange = [this] { updateAceStepFieldStates(); };
+    aceStepPage.addAndMakeVisible(aceStepSeedModeBox);
+    configureLabel(aceStepPage, aceStepSeedLabel, "Fixed seed");
+    configureEditor(aceStepPage,
+                    aceStepSeedEditor,
+                    juce::String(aceStepClientIn.getDefaultUseRandomSeed() ? 0 : aceStepClientIn.getDefaultSeed()));
+
+    configureLabel(aceStepPage, aceStepAdvancedSectionLabel, "Advanced", true);
+    configureLabel(aceStepPage, aceStepThinkingLabel, "Thinking");
+    aceStepThinkingBox.addItemList({ "Enabled", "Disabled" }, 1);
+    aceStepThinkingBox.setSelectedItemIndex(aceStepClientIn.getDefaultThinking() ? 0 : 1, juce::dontSendNotification);
+    aceStepPage.addAndMakeVisible(aceStepThinkingBox);
+    configureLabel(aceStepPage, aceStepInferenceStepsLabel, "Inference steps");
+    configureEditor(aceStepPage, aceStepInferenceStepsEditor, juce::String(aceStepClientIn.getDefaultInferenceSteps()));
+    configureLabel(aceStepPage, aceStepGuidanceScaleLabel, "Guidance scale");
+    configureEditor(aceStepPage, aceStepGuidanceScaleEditor, juce::String(aceStepClientIn.getDefaultGuidanceScale(), 2));
+    configureLabel(aceStepPage, aceStepInferMethodLabel, "Infer method");
+    aceStepInferMethodBox.addItemList({ "ode", "sde" }, 1);
+    aceStepInferMethodBox.setSelectedItemIndex(juce::jmax(0,
+                                                          juce::StringArray{ "ode", "sde" }.indexOf(aceStepClientIn.getDefaultInferMethod())),
+                                               juce::dontSendNotification);
+    aceStepPage.addAndMakeVisible(aceStepInferMethodBox);
+    configureLabel(aceStepPage,
+                   aceStepAdvancedHelpLabel,
+                   "Switch Quality to Custom to edit thinking, inference steps, guidance, and infer method.");
+    aceStepRepoButton.setButtonText("Open ACE-Step Repository");
+    aceStepRepoButton.onClick = []
+    {
+        juce::URL(kAceStepGitHubUrl).launchInDefaultBrowser();
+    };
+    aceStepPage.addAndMakeVisible(aceStepRepoButton);
+
+    int providerIndex = 0;
+    for (int index = 0; index < static_cast<int>(aiSettingsProviderOrder().size()); ++index)
+    {
+        if (aiSettingsProviderOrder()[static_cast<size_t>(index)] == aiClient.getProvider())
+        {
+            providerIndex = index;
+            break;
+        }
+    }
+
+    providerBox.setSelectedItemIndex(providerIndex, juce::dontSendNotification);
+    lastProvider = selectedProvider();
+    remoteModelBox.setText(aiClient.getRemoteModel(), juce::dontSendNotification);
+    aceStepQualityBox.setSelectedItemIndex(juce::jmax(0,
+                                                      juce::StringArray{ "Fast", "Balanced", "High", "Custom" }
+                                                          .indexOf(aceStepClientIn.getDefaultQualityPreset())),
+                                           juce::dontSendNotification);
+    refreshOllamaModels();
+    handleProviderChanged();
+    applyAceStepQualityPreset(aceStepQualityPreset());
+    updateAceStepFieldStates();
+    setSize(preferredDialogWidth(), preferredDialogHeight());
+}
+
+int TabbedAiSettingsContentComponent::preferredDialogWidth() const noexcept
+{
+    return 860;
+}
+
+int TabbedAiSettingsContentComponent::preferredDialogHeight() const noexcept
+{
+    return 620;
+}
+
+AIClient::Provider TabbedAiSettingsContentComponent::selectedProvider() const
+{
+    return aiProviderFromDisplayLabel(providerBox.getText());
+}
+
+juce::String TabbedAiSettingsContentComponent::remoteModel() const { return remoteModelBox.getText().trim(); }
+juce::String TabbedAiSettingsContentComponent::remoteApiKey() const { return remoteApiKeyEditor.getText().trim(); }
+
+juce::String TabbedAiSettingsContentComponent::remoteBaseUrl() const
+{
+    return customRemoteEndpointVisible()
+        ? remoteEndpointEditor.getText().trim()
+        : AIClient::defaultRemoteBaseUrlForProvider(selectedProvider());
+}
+
+juce::String TabbedAiSettingsContentComponent::ollamaBaseUrl() const { return ollamaBaseUrlEditor.getText().trim(); }
+juce::String TabbedAiSettingsContentComponent::ollamaModel() const { return ollamaModelBox.getText().trim(); }
+int TabbedAiSettingsContentComponent::timeoutSeconds() const { return timeoutEditor.getText().getIntValue(); }
+juce::String TabbedAiSettingsContentComponent::aceStepBaseUrl() const { return aceStepBaseUrlEditor.getText().trim(); }
+juce::String TabbedAiSettingsContentComponent::aceStepApiKey() const { return aceStepApiKeyEditor.getText().trim(); }
+juce::String TabbedAiSettingsContentComponent::aceStepInstallDirectory() const { return aceStepInstallDirEditor.getText().trim(); }
+bool TabbedAiSettingsContentComponent::aceStepAutoStartEnabled() const { return aceStepAutoStartBox.getSelectedItemIndex() != 1; }
+juce::String TabbedAiSettingsContentComponent::aceStepDefaultModel() const { return aceStepDefaultModelEditor.getText().trim(); }
+juce::String TabbedAiSettingsContentComponent::aceStepAudioFormat() const { return aceStepAudioFormatBox.getText().trim(); }
+juce::String TabbedAiSettingsContentComponent::aceStepQualityPreset() const { return aceStepQualityBox.getText().trim(); }
+juce::String TabbedAiSettingsContentComponent::aceStepVocalLanguage() const { return aceStepLanguageEditor.getText().trim(); }
+bool TabbedAiSettingsContentComponent::aceStepThinkingEnabled() const { return aceStepThinkingBox.getSelectedItemIndex() != 1; }
+bool TabbedAiSettingsContentComponent::aceStepUseRandomSeed() const { return aceStepSeedModeBox.getSelectedItemIndex() != 1; }
+int TabbedAiSettingsContentComponent::aceStepSeed() const { return aceStepSeedEditor.getText().getIntValue(); }
+int TabbedAiSettingsContentComponent::aceStepInferenceSteps() const { return aceStepInferenceStepsEditor.getText().getIntValue(); }
+double TabbedAiSettingsContentComponent::aceStepGuidanceScale() const { return aceStepGuidanceScaleEditor.getText().getDoubleValue(); }
+juce::String TabbedAiSettingsContentComponent::aceStepInferMethod() const { return aceStepInferMethodBox.getText().trim(); }
+int TabbedAiSettingsContentComponent::aceStepStartupTimeoutSeconds() const { return aceStepStartupTimeoutEditor.getText().getIntValue(); }
+int TabbedAiSettingsContentComponent::aceStepJobTimeoutSeconds() const { return aceStepJobTimeoutEditor.getText().getIntValue(); }
+
+void TabbedAiSettingsContentComponent::resized()
+{
+    tabs.setBounds(getLocalBounds());
+    const auto compositionVisibleWidth = juce::jmax(compositionViewport.getMaximumVisibleWidth(),
+                                                    compositionViewport.getWidth() - compositionViewport.getScrollBarThickness() - 20);
+    const auto aceStepVisibleWidth = juce::jmax(aceStepViewport.getMaximumVisibleWidth(),
+                                                aceStepViewport.getWidth() - aceStepViewport.getScrollBarThickness() - 20);
+    const auto compositionPageWidth = juce::jmax(320, compositionVisibleWidth - 8);
+    const auto aceStepPageWidth = juce::jmax(320, aceStepVisibleWidth - 8);
+    compositionPage.setSize(compositionPageWidth, computeCompositionContentHeight());
+    aceStepPage.setSize(aceStepPageWidth, computeAceStepContentHeight());
+    layoutCompositionPage();
+    layoutAceStepPage();
+}
+
+bool TabbedAiSettingsContentComponent::aceStepModelLooksTurbo(const juce::String& model) noexcept
+{
+    return model.containsIgnoreCase("turbo");
+}
+
+bool TabbedAiSettingsContentComponent::remoteSectionVisible() const noexcept
+{
+    return selectedProvider() != AIClient::Provider::ollama;
+}
+
+bool TabbedAiSettingsContentComponent::ollamaSectionVisible() const noexcept
+{
+    return selectedProvider() == AIClient::Provider::ollama;
+}
+
+bool TabbedAiSettingsContentComponent::customRemoteEndpointVisible() const noexcept
+{
+    return selectedProvider() == AIClient::Provider::openAICompatible;
+}
+
+bool TabbedAiSettingsContentComponent::aceStepCustomQualitySelected() const noexcept
+{
+    return aceStepQualityPreset().equalsIgnoreCase("Custom");
+}
+
+int TabbedAiSettingsContentComponent::aceStepPresetInferenceSteps(const juce::String& preset) const
+{
+    if (preset.equalsIgnoreCase("Fast"))
+        return 4;
+
+    if (preset.equalsIgnoreCase("High"))
+    {
+        const auto effectiveModel = aceStepDefaultModel().isNotEmpty() ? aceStepDefaultModel() : aceStepClient.getDefaultModel();
+        return aceStepModelLooksTurbo(effectiveModel) || effectiveModel.isEmpty() ? 16 : 32;
+    }
+
+    return 8;
+}
+
+int TabbedAiSettingsContentComponent::computeCompositionContentHeight() const
+{
+    constexpr int rowHeight = 28;
+    constexpr int sectionGap = 10;
+    constexpr int rowGap = 6;
+
+    int height = 12 + 24 + sectionGap + rowHeight + rowGap;
+
+    if (remoteSectionVisible())
+    {
+        height += rowHeight + rowGap;
+        height += rowHeight + rowGap;
+        if (customRemoteEndpointVisible())
+            height += rowHeight + rowGap;
+        height += 22 + rowGap;
+    }
+
+    if (ollamaSectionVisible())
+    {
+        height += 24 + sectionGap;
+        height += rowHeight + rowGap;
+        height += rowHeight + rowGap;
+        height += 24 + rowGap;
+        height += 22 + rowGap;
+        if (!ollamaDetected)
+            height += 24 + rowGap;
+    }
+
+    height += 24 + sectionGap;
+    height += rowHeight + rowGap;
+    return height + 12;
+}
+
+int TabbedAiSettingsContentComponent::computeAceStepContentHeight() const
+{
+    constexpr int rowHeight = 28;
+    constexpr int sectionGap = 10;
+    constexpr int rowGap = 6;
+
+    int height = 12;
+    height += 24 + sectionGap;
+    height += (rowHeight + rowGap) * 6;
+    height += 22 + rowGap;
+
+    height += 24 + sectionGap;
+    height += (rowHeight + rowGap) * 5;
+    if (!aceStepUseRandomSeed())
+        height += rowHeight + rowGap;
+
+    height += 24 + sectionGap;
+    height += (rowHeight + rowGap) * 4;
+    height += 22 + rowGap;
+    height += 24 + rowGap;
+    return height + 12;
+}
+
+void TabbedAiSettingsContentComponent::layoutCompositionPage()
+{
+    auto area = compositionPage.getLocalBounds().reduced(16, 12);
+    constexpr int labelWidth = 170;
+    constexpr int fieldGap = 18;
+    constexpr int maxFieldWidth = 520;
+    constexpr int rowHeight = 28;
+    constexpr int sectionGap = 10;
+    constexpr int rowGap = 6;
+
+    const auto layoutSection = [&area, sectionGap] (juce::Label& label)
+    {
+        label.setBounds(area.removeFromTop(24));
+        area.removeFromTop(sectionGap);
+    };
+
+    const auto layoutRow = [&area, labelWidth, fieldGap, maxFieldWidth, rowHeight, rowGap] (juce::Label& label,
+                                                                                              juce::Component& field)
+    {
+        auto row = area.removeFromTop(rowHeight);
+        label.setBounds(row.removeFromLeft(labelWidth));
+        row.removeFromLeft(fieldGap);
+        field.setBounds(row.removeFromLeft(juce::jmin(maxFieldWidth, row.getWidth())));
+        area.removeFromTop(rowGap);
+    };
+
+    const auto layoutStandalone = [&area, rowGap] (juce::Component& component, int height)
+    {
+        component.setBounds(area.removeFromTop(height));
+        area.removeFromTop(rowGap);
+    };
+
+    const auto layoutIndentedButton = [&area, labelWidth, fieldGap, rowGap] (juce::Component& button, int width, int height)
+    {
+        auto row = area.removeFromTop(height);
+        row.removeFromLeft(labelWidth + fieldGap);
+        button.setBounds(row.removeFromLeft(width));
+        area.removeFromTop(rowGap);
+    };
+
+    layoutSection(providerSectionLabel);
+    layoutRow(providerLabel, providerBox);
+
+    if (remoteSectionVisible())
+    {
+        layoutRow(remoteModelLabel, remoteModelBox);
+        layoutRow(remoteApiKeyLabel, remoteApiKeyEditor);
+        if (customRemoteEndpointVisible())
+            layoutRow(remoteEndpointLabel, remoteEndpointEditor);
+        layoutStandalone(remoteHelpLabel, 22);
+    }
+
+    if (ollamaSectionVisible())
+    {
+        layoutSection(ollamaSectionLabel);
+        layoutRow(ollamaBaseUrlLabel, ollamaBaseUrlEditor);
+        layoutRow(ollamaModelLabel, ollamaModelBox);
+        layoutIndentedButton(refreshOllamaButton, 92, 24);
+        layoutStandalone(ollamaStatusLabel, 22);
+        if (!ollamaDetected)
+            layoutStandalone(ollamaDownloadButton, 24);
+    }
+
+    layoutSection(requestSectionLabel);
+    layoutRow(timeoutLabel, timeoutEditor);
+}
+
+void TabbedAiSettingsContentComponent::layoutAceStepPage()
+{
+    auto area = aceStepPage.getLocalBounds().reduced(16, 12);
+    constexpr int labelWidth = 175;
+    constexpr int fieldGap = 18;
+    constexpr int maxFieldWidth = 600;
+    constexpr int rowHeight = 28;
+    constexpr int sectionGap = 10;
+    constexpr int rowGap = 6;
+
+    const auto layoutSection = [&area, sectionGap] (juce::Label& label)
+    {
+        label.setBounds(area.removeFromTop(24));
+        area.removeFromTop(sectionGap);
+    };
+
+    const auto layoutRow = [&area, labelWidth, fieldGap, maxFieldWidth, rowHeight, rowGap] (juce::Label& label,
+                                                                                              juce::Component& field)
+    {
+        auto row = area.removeFromTop(rowHeight);
+        label.setBounds(row.removeFromLeft(labelWidth));
+        row.removeFromLeft(fieldGap);
+        field.setBounds(row.removeFromLeft(juce::jmin(maxFieldWidth, row.getWidth())));
+        area.removeFromTop(rowGap);
+    };
+
+    const auto layoutStandalone = [&area, rowGap] (juce::Component& component, int height)
+    {
+        component.setBounds(area.removeFromTop(height));
+        area.removeFromTop(rowGap);
+    };
+
+    const auto layoutIndentedButton = [&area, labelWidth, fieldGap, rowGap] (juce::Component& button, int width, int height)
+    {
+        auto row = area.removeFromTop(height);
+        row.removeFromLeft(labelWidth + fieldGap);
+        button.setBounds(row.removeFromLeft(width));
+        area.removeFromTop(rowGap);
+    };
+
+    layoutSection(aceStepConnectionSectionLabel);
+    layoutRow(aceStepBaseUrlLabel, aceStepBaseUrlEditor);
+    layoutRow(aceStepApiKeyLabel, aceStepApiKeyEditor);
+    layoutRow(aceStepInstallDirLabel, aceStepInstallDirEditor);
+    layoutRow(aceStepAutoStartLabel, aceStepAutoStartBox);
+    layoutRow(aceStepStartupTimeoutLabel, aceStepStartupTimeoutEditor);
+    layoutRow(aceStepJobTimeoutLabel, aceStepJobTimeoutEditor);
+    layoutStandalone(aceStepHelpLabel, 22);
+
+    layoutSection(aceStepRenderSectionLabel);
+    layoutRow(aceStepQualityLabel, aceStepQualityBox);
+    layoutRow(aceStepDefaultModelLabel, aceStepDefaultModelEditor);
+    layoutRow(aceStepAudioFormatLabel, aceStepAudioFormatBox);
+    layoutRow(aceStepLanguageLabel, aceStepLanguageEditor);
+    layoutRow(aceStepSeedModeLabel, aceStepSeedModeBox);
+    if (!aceStepUseRandomSeed())
+        layoutRow(aceStepSeedLabel, aceStepSeedEditor);
+
+    layoutSection(aceStepAdvancedSectionLabel);
+    layoutRow(aceStepThinkingLabel, aceStepThinkingBox);
+    layoutRow(aceStepInferenceStepsLabel, aceStepInferenceStepsEditor);
+    layoutRow(aceStepGuidanceScaleLabel, aceStepGuidanceScaleEditor);
+    layoutRow(aceStepInferMethodLabel, aceStepInferMethodBox);
+    layoutStandalone(aceStepAdvancedHelpLabel, 22);
+    layoutIndentedButton(aceStepRepoButton, 190, 24);
+}
+
+void TabbedAiSettingsContentComponent::refreshOllamaModels()
+{
+    auto preferredModel = ollamaModelBox.getText().trim();
+    if (preferredModel.isEmpty())
+        preferredModel = aiClient.getOllamaModel().trim();
+    refreshOllamaModelCombo(ollamaModelBox, aiClient, ollamaBaseUrlEditor.getText().trim(), preferredModel);
+}
+
+void TabbedAiSettingsContentComponent::applyAceStepQualityPreset(const juce::String& preset)
+{
+    if (preset.equalsIgnoreCase("Custom"))
+    {
+        updateAceStepFieldStates();
+        return;
+    }
+
+    const juce::ScopedValueSetter<bool> guard(updatingAceStepQualityControls, true);
+    aceStepThinkingBox.setSelectedItemIndex(preset.equalsIgnoreCase("Fast") ? 1 : 0, juce::dontSendNotification);
+    aceStepInferenceStepsEditor.setText(juce::String(aceStepPresetInferenceSteps(preset)), juce::dontSendNotification);
+    aceStepGuidanceScaleEditor.setText("7.0", juce::dontSendNotification);
+    aceStepInferMethodBox.setSelectedItemIndex(0, juce::dontSendNotification);
+    updateAceStepFieldStates();
+}
+
+void TabbedAiSettingsContentComponent::updateAceStepFieldStates()
+{
+    const auto customQuality = aceStepCustomQualitySelected();
+    for (auto* component : { static_cast<juce::Component*>(&aceStepThinkingLabel),
+                             static_cast<juce::Component*>(&aceStepThinkingBox),
+                             static_cast<juce::Component*>(&aceStepInferenceStepsLabel),
+                             static_cast<juce::Component*>(&aceStepInferenceStepsEditor),
+                             static_cast<juce::Component*>(&aceStepGuidanceScaleLabel),
+                             static_cast<juce::Component*>(&aceStepGuidanceScaleEditor),
+                             static_cast<juce::Component*>(&aceStepInferMethodLabel),
+                             static_cast<juce::Component*>(&aceStepInferMethodBox) })
+    {
+        component->setEnabled(customQuality);
+    }
+
+    aceStepSeedLabel.setVisible(!aceStepUseRandomSeed());
+    aceStepSeedEditor.setVisible(!aceStepUseRandomSeed());
+    aceStepAdvancedHelpLabel.setText(customQuality
+                                         ? "Custom mode is active. Guidance scale mainly affects base ACE-Step models."
+                                         : "Switch Quality to Custom to edit thinking, inference steps, guidance, and infer method.",
+                                     juce::dontSendNotification);
+    layoutAceStepPage();
+}
+
+void TabbedAiSettingsContentComponent::handleAceStepQualityChanged()
+{
+    if (updatingAceStepQualityControls)
+        return;
+
+    applyAceStepQualityPreset(aceStepQualityPreset());
+}
+
+void TabbedAiSettingsContentComponent::handleAceStepModelChanged()
+{
+    if (updatingAceStepQualityControls)
+        return;
+
+    if (!aceStepCustomQualitySelected())
+        applyAceStepQualityPreset(aceStepQualityPreset());
+}
+
+void TabbedAiSettingsContentComponent::handleProviderChanged()
+{
+    const auto newProvider = selectedProvider();
+    const auto previousDefaultModel = AIClient::defaultRemoteModelForProvider(lastProvider);
+    auto currentModel = remoteModelBox.getText().trim();
+    if (currentModel.isEmpty() || currentModel == previousDefaultModel)
+        currentModel = AIClient::defaultRemoteModelForProvider(newProvider);
+
+    remoteModelLabel.setText(AIClient::providerDisplayName(newProvider) + " model", juce::dontSendNotification);
+    remoteApiKeyLabel.setText(AIClient::providerDisplayName(newProvider) + " API key", juce::dontSendNotification);
+    remoteHelpLabel.setText(aiProviderHelpText(newProvider), juce::dontSendNotification);
+    populateComboBoxChoices(remoteModelBox, aiClient.remoteModelChoices(newProvider), currentModel);
+
+    const auto setVisibility = [] (bool visible, std::initializer_list<juce::Component*> components)
+    {
+        for (auto* component : components)
+            if (component != nullptr)
+                component->setVisible(visible);
+    };
+
+    setVisibility(remoteSectionVisible(),
+                  { &remoteModelLabel, &remoteModelBox, &remoteApiKeyLabel, &remoteApiKeyEditor, &remoteHelpLabel });
+    setVisibility(customRemoteEndpointVisible(), { &remoteEndpointLabel, &remoteEndpointEditor });
+    setVisibility(ollamaSectionVisible(),
+                  { &ollamaSectionLabel, &ollamaBaseUrlLabel, &ollamaBaseUrlEditor, &ollamaModelLabel, &ollamaModelBox,
+                    &refreshOllamaButton, &ollamaStatusLabel });
+    ollamaDownloadButton.setVisible(ollamaSectionVisible() && !ollamaDetected);
+
+    lastProvider = newProvider;
+    layoutCompositionPage();
 }
 
 juce::Image loadMutagenLogoBinaryData(bool preferSmallLogo)
@@ -8222,6 +9583,36 @@ StudioShellComponent::StudioShellComponent()
             safeThis->appendActivityLog(title, body);
         });
     });
+    aceStepClient.setActivityLogCallback([safeThis = juce::Component::SafePointer<StudioShellComponent>(this)] (const juce::String& title,
+                                                                                                                const juce::String& body)
+    {
+        juce::MessageManager::callAsync([safeThis, title, body]
+        {
+            if (safeThis == nullptr)
+                return;
+
+            safeThis->appendActivityLog(title, body);
+
+            if (title == "ACE-Step" && aceStepBootstrapMessageMatches(body))
+            {
+                safeThis->statusLabel.setText(aceStepBootstrapStatusText(), juce::dontSendNotification);
+
+                if (!safeThis->aceStepBootstrapNoticeShown)
+                {
+                    safeThis->aceStepBootstrapNoticeShown = true;
+                    juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::InfoIcon,
+                                                           "ACE-Step Setup In Progress",
+                                                           aceStepBootstrapUserMessage());
+                }
+            }
+        });
+    });
+    if (aceStepClient.getInstallDirectory().trim().isEmpty())
+    {
+        const auto detectedAceStep = detectedAceStepInstallDirectory();
+        if (detectedAceStep.isDirectory())
+            aceStepClient.setInstallDirectory(detectedAceStep.getFullPathName());
+    }
     nativeVstHost.setEditorStateCallback([safeThis = juce::Component::SafePointer<StudioShellComponent>(this)] (bool isOpen)
     {
         auto applyState = [safeThis, isOpen]
@@ -8730,6 +10121,7 @@ StudioShellComponent::StudioShellComponent()
     createToolbarButton(placeSampleButton, "Place At Playhead");
     createToolbarButton(aiSettingsButton, "AI Settings");
     createToolbarButton(aiComposeButton, "Compose");
+    createToolbarButton(aceStepGenerateButton, "Generate Audio");
     createToolbarButton(playProjectButton, "Play");
     createToolbarButton(recordToggle, "Rec");
     createToolbarButton(undoButton, "Undo");
@@ -8746,6 +10138,7 @@ StudioShellComponent::StudioShellComponent()
     placeSampleButton.onClick = [this] { placeSelectedSampleAtPlayhead(); };
     aiSettingsButton.onClick = [this] { showAiSettingsDialog(); };
     aiComposeButton.onClick = [this] { composeWithAi(); };
+    aceStepGenerateButton.onClick = [this] { generateAudioWithAceStep(); };
     playProjectButton.onClick = [this]
     {
         if (rackPreviewRunning || projectPreviewRunning)
@@ -8762,10 +10155,12 @@ StudioShellComponent::StudioShellComponent()
     redoButton.onClick = [this] { redo(); };
 
     aiComposeButton.setTooltip("AI Compose");
+    aceStepGenerateButton.setTooltip("Generate audio onto the selected sample track with ACE-Step.");
 
     playProjectButton.setLookAndFeel(compactHeaderLookAndFeel.get());
     recordToggle.setLookAndFeel(compactHeaderLookAndFeel.get());
     aiComposeButton.setLookAndFeel(compactHeaderLookAndFeel.get());
+    aceStepGenerateButton.setLookAndFeel(compactHeaderLookAndFeel.get());
     refreshPlaybackToggleButton();
 
     tempoLabel.setText("Tempo", juce::dontSendNotification);
@@ -8974,6 +10369,7 @@ StudioShellComponent::~StudioShellComponent()
     playProjectButton.setLookAndFeel(nullptr);
     recordToggle.setLookAndFeel(nullptr);
     aiComposeButton.setLookAndFeel(nullptr);
+    aceStepGenerateButton.setLookAndFeel(nullptr);
     loopToggle.setLookAndFeel(nullptr);
     metronomeToggle.setLookAndFeel(nullptr);
     midiInsertToggle.setLookAndFeel(nullptr);
@@ -9508,6 +10904,8 @@ void StudioShellComponent::resized()
     toolbar1.removeFromLeft(3);
     aiComposeButton.setBounds(toolbar1.removeFromLeft(76));
     toolbar1.removeFromLeft(6);
+    aceStepGenerateButton.setBounds(toolbar1.removeFromLeft(112));
+    toolbar1.removeFromLeft(6);
     loopToggle.setBounds(toolbar1.removeFromLeft(48));
     toolbar1.removeFromLeft(4);
     metronomeToggle.setBounds(toolbar1.removeFromLeft(52));
@@ -9905,7 +11303,9 @@ void StudioShellComponent::timerCallback()
     const ScopedAppProfileSample profileSample(AppProfileSection::timerCallback);
     const auto nowMs = juce::Time::getMillisecondCounter();
     dispatchPendingMidiInputMessages();
+    pollAceStepServerOutput();
     pollAiComposeFuture();
+    pollAceStepGenerationFuture();
     pollStemSeparationFuture();
 
     const bool hasSharedRackHost = nativeVstHost.isReady();
@@ -10346,8 +11746,12 @@ void StudioShellComponent::updateEditorState()
     placeSampleButton.setEnabled(sampleAssetList.getSelectedRow() >= 0 && findPreferredSampleTrackIndex() >= 0);
     refreshPlaybackToggleButton();
     exportWavButton.setEnabled(!documentState.project.tracks.empty() || !documentState.project.sampleClips.empty());
-    aiSettingsButton.setEnabled(!aiComposeBusy);
-    aiComposeButton.setEnabled(!aiComposeBusy);
+    const auto selectedTrack = getSelectedTrack();
+    const bool selectedTrackIsSample = selectedTrack != nullptr && selectedTrack->trackType.equalsIgnoreCase("sample");
+    const bool aiTaskBusy = aiComposeBusy || aceStepGenerationBusy;
+    aiSettingsButton.setEnabled(!aiTaskBusy);
+    aiComposeButton.setEnabled(!aiTaskBusy);
+    aceStepGenerateButton.setEnabled(!aiTaskBusy && selectedTrackIsSample);
     undoButton.setEnabled(undoManager.canUndo());
     redoButton.setEnabled(undoManager.canRedo());
     refreshFloatingWindows();
@@ -10963,6 +12367,7 @@ void StudioShellComponent::showTrackContextMenu(int rowNumber, juce::Point<int> 
     constexpr int menuRemoveTrack = 7;
     constexpr int menuShowAllAutomationLanes = 8;
     constexpr int menuHideAllAutomationLanes = 9;
+    constexpr int menuGenerateAceStepAudio = 10;
     int nextRackMenuId = 100;
     int nextAutomationMenuId = 200;
     std::vector<std::pair<int, juce::String>> rackAssignments;
@@ -11034,6 +12439,10 @@ void StudioShellComponent::showTrackContextMenu(int rowNumber, juce::Point<int> 
     menu.addSubMenu("Automation Lanes", automationLaneMenu, true);
     menu.addItem(menuAutoAssignRack, "Auto Assign Rack", canAssignRack);
     menu.addItem(menuClearRack, "Clear Rack Assignment", canAssignRack && hasAssignedRack);
+    menu.addSeparator();
+    menu.addItem(menuGenerateAceStepAudio,
+                 "Generate Audio With ACE-Step",
+                 track.trackType.equalsIgnoreCase("sample") && !aiComposeBusy && !aceStepGenerationBusy);
     menu.addSeparator();
     menu.addItem(menuAddTrack, "Add Instrument Track");
     menu.addItem(menuAddSampleTrack, "Add Sample Track");
@@ -11122,8 +12531,9 @@ void StudioShellComponent::showTrackContextMenu(int rowNumber, juce::Point<int> 
                                                                  "Hide Automation Lanes");
                                    break;
                                }
-                               case menuAutoAssignRack: safeThis->materialiseSelectedTrackRackAssignment(); break;
+                                case menuAutoAssignRack: safeThis->materialiseSelectedTrackRackAssignment(); break;
                                case menuClearRack: safeThis->clearSelectedTrackRackAssignment(); break;
+                               case menuGenerateAceStepAudio: safeThis->generateAudioWithAceStep(); break;
                                case menuAddTrack: safeThis->addTrack(); break;
                                case menuAddSampleTrack: safeThis->addSampleTrack(); break;
                                case menuDuplicateTrack: safeThis->duplicateSelectedTrack(); break;
@@ -15094,121 +16504,88 @@ void StudioShellComponent::showAiSettingsDialog()
 {
     const auto installedOllama = detectedOllamaExecutable();
     const bool ollamaDetected = installedOllama.existsAsFile();
-
-    auto* dialog = new juce::AlertWindow("Native AI Settings",
-                                         "Configure the native C++ AI provider. Saved Python preferences and auth are reused when available.",
-                                         juce::AlertWindow::NoIcon);
-    dialog->addComboBox("provider", juce::StringArray{ "OpenAI", "Ollama" }, "Provider");
-    if (auto* providerBox = dialog->getComboBoxComponent("provider"))
-        providerBox->setSelectedItemIndex(aiClient.getProvider() == AIClient::Provider::ollama ? 1 : 0);
-
-    dialog->addTextEditor("remoteModel", aiClient.getRemoteModel(), "OpenAI model");
-    dialog->addTextEditor("apiKey", {}, "OpenAI API key (leave blank to keep saved key)");
-    if (auto* apiKeyEditor = dialog->getTextEditor("apiKey"))
-        apiKeyEditor->setPasswordCharacter(0x2022);
-    dialog->addTextEditor("ollamaBaseUrl", aiClient.getOllamaBaseUrl(), "Ollama endpoint");
-    dialog->addComboBox("ollamaModel", {}, "Ollama model");
-    dialog->addTextBlock("Ollama models are detected from the configured endpoint. The dropdown stays editable if you want to type a custom model tag.");
-    dialog->addTextEditor("timeoutSeconds", juce::String(aiClient.getRequestTimeoutSeconds()), "Request timeout (seconds)");
-
-    if (auto* ollamaModelBox = dialog->getComboBoxComponent("ollamaModel"))
-        ollamaModelBox->setEditableText(true);
-
-    if (!ollamaDetected)
-    {
-        dialog->addTextBlock("Ollama was not detected on this system. Install Ollama to use the local provider.\n\nDownload for Windows: "
-                             + juce::String(kOllamaWindowsDownloadUrl));
-    }
-    else
-    {
-        dialog->addTextBlock("Detected local Ollama at:\n" + installedOllama.getFullPathName());
-    }
-
-    auto safeThisForRefresh = juce::Component::SafePointer<StudioShellComponent>(this);
-    auto safeDialogForRefresh = juce::Component::SafePointer<juce::AlertWindow>(dialog);
-    const auto refreshDetectedModels = [safeThisForRefresh, safeDialogForRefresh]
-    {
-        if (safeThisForRefresh == nullptr || safeDialogForRefresh == nullptr)
-            return;
-
-        auto currentModel = safeThisForRefresh->aiClient.getOllamaModel().trim();
-        if (auto* modelBox = safeDialogForRefresh->getComboBoxComponent("ollamaModel"))
-        {
-            const auto typedModel = modelBox->getText().trim();
-            if (typedModel.isNotEmpty())
-                currentModel = typedModel;
-        }
-
-        refreshOllamaModelCombo(*safeDialogForRefresh,
-                                safeThisForRefresh->aiClient,
-                                safeDialogForRefresh->getTextEditorContents("ollamaBaseUrl"),
-                                currentModel);
-    };
-
-    refreshDetectedModels();
-
-    if (auto* ollamaBaseUrlEditor = dialog->getTextEditor("ollamaBaseUrl"))
-    {
-        ollamaBaseUrlEditor->onReturnKey = refreshDetectedModels;
-        ollamaBaseUrlEditor->onFocusLost = refreshDetectedModels;
-    }
-
-    dialog->addButton("Save", 1, juce::KeyPress(juce::KeyPress::returnKey));
-    dialog->addButton("Clear Auth", 2);
-    if (!ollamaDetected)
-        dialog->addButton("Download Ollama", 3);
-    dialog->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+    const auto detectedAceStep = detectedAceStepInstallDirectory();
     auto safeThis = juce::Component::SafePointer<StudioShellComponent>(this);
-    auto safeDialog = juce::Component::SafePointer<juce::AlertWindow>(dialog);
-    dialog->enterModalState(true,
-                            juce::ModalCallbackFunction::create([safeThis, safeDialog] (int result)
-                            {
-                                if (safeThis == nullptr || safeDialog == nullptr || result == 0)
-                                    return;
+    auto dialogContent = std::make_unique<AiSettingsDialogContainerComponent>(aiClient,
+                                                                              aceStepClient,
+                                                                              ollamaDetected,
+                                                                              installedOllama,
+                                                                              detectedAceStep,
+                                                                              [safeThis] (int result,
+                                                                                          const TabbedAiSettingsContentComponent& content)
+                                                                              {
+                                                                                  if (safeThis == nullptr || result == 0)
+                                                                                      return;
 
-                                if (result == 2)
-                                {
-                                    safeThis->aiClient.clearAuth();
-                                    safeThis->updateAiStatusSummary();
-                                    safeThis->statusLabel.setText("Cleared native AI credentials.", juce::dontSendNotification);
-                                    safeThis->appendActivityLog("AI Settings", "Cleared saved AI credentials.");
-                                    return;
-                                }
+                                                                                  if (result == 2)
+                                                                                  {
+                                                                                      safeThis->aiClient.clearAuth();
+                                                                                      safeThis->aceStepClient.clearApiKey();
+                                                                                      safeThis->updateAiStatusSummary();
+                                                                                      safeThis->statusLabel.setText("Cleared saved AI credentials.", juce::dontSendNotification);
+                                                                                      safeThis->appendActivityLog("AI Settings", "Cleared saved AI credentials.");
+                                                                                      return;
+                                                                                  }
 
-                                if (result == 3)
-                                {
-                                    juce::URL(kOllamaWindowsDownloadUrl).launchInDefaultBrowser();
-                                    safeThis->statusLabel.setText("Opened Ollama download page.", juce::dontSendNotification);
-                                    safeThis->appendActivityLog("AI Settings", "Opened Ollama Windows download page.");
-                                    return;
-                                }
+                                                                                  const auto provider = content.selectedProvider();
+                                                                                  safeThis->aiClient.setProvider(provider);
+                                                                                  safeThis->aiClient.setRemoteModel(content.remoteModel());
+                                                                                  safeThis->aiClient.setRemoteBaseUrl(content.remoteBaseUrl());
+                                                                                  safeThis->aiClient.setOllamaConnection(content.ollamaBaseUrl(), content.ollamaModel());
+                                                                                  safeThis->aiClient.setRequestTimeoutSeconds(content.timeoutSeconds());
+                                                                                  safeThis->aiClient.saveSettings();
 
-                                const auto providerText = safeDialog->getComboBoxComponent("provider") != nullptr
-                                    ? safeDialog->getComboBoxComponent("provider")->getText().trim()
-                                    : juce::String("OpenAI");
-                                safeThis->aiClient.setProvider(providerText.equalsIgnoreCase("Ollama") ? AIClient::Provider::ollama
-                                                                                                       : AIClient::Provider::openAI);
-                                safeThis->aiClient.setRemoteModel(safeDialog->getTextEditorContents("remoteModel"));
-                                safeThis->aiClient.setOllamaConnection(safeDialog->getTextEditorContents("ollamaBaseUrl"),
-                                                                       safeDialog->getComboBoxComponent("ollamaModel") != nullptr
-                                                                           ? safeDialog->getComboBoxComponent("ollamaModel")->getText()
-                                                                           : juce::String());
-                                safeThis->aiClient.setRequestTimeoutSeconds(safeDialog->getTextEditorContents("timeoutSeconds").getIntValue());
-                                safeThis->aiClient.saveSettings();
+                                                                                  safeThis->aceStepClient.setBaseUrl(content.aceStepBaseUrl());
+                                                                                  safeThis->aceStepClient.setInstallDirectory(content.aceStepInstallDirectory());
+                                                                                  safeThis->aceStepClient.setAutoStartServer(content.aceStepAutoStartEnabled());
+                                                                                  safeThis->aceStepClient.setDefaultModel(content.aceStepDefaultModel());
+                                                                                  safeThis->aceStepClient.setDefaultAudioFormat(content.aceStepAudioFormat());
+                                                                                  safeThis->aceStepClient.setDefaultQualityPreset(content.aceStepQualityPreset());
+                                                                                  safeThis->aceStepClient.setDefaultVocalLanguage(content.aceStepVocalLanguage());
+                                                                                  safeThis->aceStepClient.setDefaultThinking(content.aceStepThinkingEnabled());
+                                                                                  safeThis->aceStepClient.setDefaultUseRandomSeed(content.aceStepUseRandomSeed());
+                                                                                  safeThis->aceStepClient.setDefaultSeed(content.aceStepSeed());
+                                                                                  safeThis->aceStepClient.setDefaultInferenceSteps(content.aceStepInferenceSteps());
+                                                                                  safeThis->aceStepClient.setDefaultGuidanceScale(content.aceStepGuidanceScale());
+                                                                                  safeThis->aceStepClient.setDefaultInferMethod(content.aceStepInferMethod());
+                                                                                  safeThis->aceStepClient.setStartupTimeoutSeconds(content.aceStepStartupTimeoutSeconds());
+                                                                                  safeThis->aceStepClient.setJobTimeoutSeconds(content.aceStepJobTimeoutSeconds());
+                                                                                  safeThis->aceStepClient.saveSettings();
 
-                                const auto apiKey = safeDialog->getTextEditorContents("apiKey").trim();
-                                if (apiKey.isNotEmpty())
-                                    safeThis->aiClient.setApiKey(apiKey);
+                                                                                  const auto apiKey = content.remoteApiKey();
+                                                                                  if (apiKey.isNotEmpty())
+                                                                                      safeThis->aiClient.setApiKey(apiKey);
 
-                                safeThis->updateAiStatusSummary();
-                                safeThis->statusLabel.setText("Updated native AI settings.", juce::dontSendNotification);
-                                safeThis->appendActivityLog("AI Settings",
-                                                            "Updated AI settings\nProvider: "
-                                                                + providerText
-                                                                + "\nStatus: "
-                                                                + safeThis->aiClient.authStatus());
-                            }),
-                            true);
+                                                                                  const auto aceStepApiKey = content.aceStepApiKey();
+                                                                                  if (aceStepApiKey.isNotEmpty())
+                                                                                      safeThis->aceStepClient.setApiKey(aceStepApiKey);
+
+                                                                                  safeThis->updateAiStatusSummary();
+                                                                                  safeThis->statusLabel.setText("Updated AI settings.", juce::dontSendNotification);
+                                                                                  safeThis->appendActivityLog("AI Settings",
+                                                                                                              "Updated AI settings\nProvider: "
+                                                                                                                  + AIClient::providerDisplayName(provider)
+                                                                                                                  + "\nStatus: "
+                                                                                                                  + safeThis->aiClient.authStatus()
+                                                                                                                  + "\nACE-Step: "
+                                                                                                                  + safeThis->aceStepClient.statusSummary());
+                                                                              });
+
+    juce::DialogWindow::LaunchOptions options;
+    options.dialogTitle = "AI Settings";
+    options.dialogBackgroundColour = juce::Colour::fromRGB(52, 63, 72);
+    options.componentToCentreAround = this;
+    options.escapeKeyTriggersCloseButton = true;
+    options.useNativeTitleBar = true;
+    options.resizable = true;
+    options.useBottomRightCornerResizer = true;
+    options.content.setOwned(dialogContent.release());
+    auto* dialog = options.launchAsync();
+    if (dialog != nullptr)
+    {
+        dialog->setResizable(true, true);
+        dialog->setResizeLimits(760, 540, 1200, 900);
+    }
 }
 
 juce::String StudioShellComponent::buildAboutDetails() const
@@ -15247,6 +16624,285 @@ void StudioShellComponent::showAboutDialog()
                                            buildAboutDetails());
 }
 
+juce::File StudioShellComponent::suggestAceStepGeneratedAudioFile(int trackIndex, const juce::String& audioFormat) const
+{
+    auto outputDirectory = currentProjectFile.existsAsFile()
+        ? currentProjectFile.getParentDirectory().getChildFile(currentProjectFile.getFileNameWithoutExtension() + "_generated_audio")
+        : nativeGeneratedAudioDirectory();
+
+    auto baseName = juce::String("sample-track");
+    if (juce::isPositiveAndBelow(trackIndex, static_cast<int>(documentState.project.tracks.size())))
+        baseName = documentState.project.tracks[static_cast<size_t>(trackIndex)].name.trim();
+    baseName = juce::File::createLegalFileName(baseName);
+    if (baseName.isEmpty())
+        baseName = "sample-track";
+
+    const auto safeExtension = audioFormat.trim().isNotEmpty()
+        ? audioFormat.trim().toLowerCase()
+        : juce::String("wav");
+    const auto timestamp = juce::Time::getCurrentTime().formatted("%Y%m%d-%H%M%S");
+    auto candidate = outputDirectory.getChildFile("ace-step-" + timestamp + "-" + baseName)
+        .withFileExtension("." + (safeExtension.isNotEmpty() ? safeExtension : juce::String("wav")));
+
+    int suffix = 2;
+    while (candidate.existsAsFile())
+    {
+        candidate = outputDirectory.getChildFile("ace-step-" + timestamp + "-" + baseName + "-" + juce::String(suffix++))
+            .withFileExtension("." + (safeExtension.isNotEmpty() ? safeExtension : juce::String("wav")));
+    }
+
+    return candidate;
+}
+
+juce::Result StudioShellComponent::ensureAceStepServerLaunchRequested()
+{
+    if (aceStepClient.isServerReachable(800))
+        return juce::Result::ok();
+
+    if (aceStepClient.isServerPortAcceptingConnections(250))
+    {
+        appendActivityLog("ACE-Step",
+                          "ACE-Step is already bound to "
+                              + aceStepClient.getBaseUrl()
+                              + "\nWaiting for the health endpoint instead of launching a second server.");
+        return juce::Result::ok();
+    }
+
+    if (!aceStepClient.getAutoStartServer())
+    {
+        return juce::Result::fail("ACE-Step is not reachable at "
+                                  + aceStepClient.getBaseUrl()
+                                  + ". Start the API server manually or enable auto-start in AI Settings.");
+    }
+
+    if (aceStepServerProcess != nullptr && aceStepServerProcess->isRunning())
+        return juce::Result::ok();
+
+    const auto launchScript = aceStepClient.launchScriptFile();
+    if (!launchScript.existsAsFile())
+    {
+        return juce::Result::fail("Mutagen could not find the ACE-Step launch script. Configure the ACE-Step install folder in AI Settings.");
+    }
+
+    aceStepServerProcess = std::make_unique<juce::ChildProcess>();
+    aceStepServerLogFile = nativeAceStepServerLogFile();
+    aceStepServerLogFile.getParentDirectory().createDirectory();
+    aceStepServerLogFile.deleteFile();
+    aceStepServerLogReadPosition = 0;
+    aceStepServerOutputCarry.clear();
+    aceStepLastProgressLogLine.clear();
+    aceStepLastProgressLogMs = 0;
+
+   #if JUCE_WINDOWS
+    const juce::StringArray command { "cmd", "/c", launchScript.getFullPathName() };
+   #else
+    const juce::StringArray command { "sh", launchScript.getFullPathName() };
+   #endif
+
+    if (!aceStepServerProcess->start(command, 0))
+    {
+        aceStepServerProcess.reset();
+        return juce::Result::fail("Mutagen could not launch ACE-Step from " + launchScript.getFullPathName());
+    }
+
+    appendActivityLog("ACE-Step", "Launched local ACE-Step API server\nScript: " + launchScript.getFullPathName());
+    return juce::Result::ok();
+}
+
+void StudioShellComponent::generateAudioWithAceStep()
+{
+    if (aiComposeBusy)
+    {
+        statusLabel.setText("Finish the current AI composition before starting ACE-Step audio generation.",
+                            juce::dontSendNotification);
+        return;
+    }
+
+    if (aceStepGenerationBusy)
+    {
+        statusLabel.setText("ACE-Step generation is already running in the background.", juce::dontSendNotification);
+        return;
+    }
+
+    const auto trackIndex = getSelectedTrackIndex();
+    if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(documentState.project.tracks.size()))
+        || !documentState.project.tracks[static_cast<size_t>(trackIndex)].trackType.equalsIgnoreCase("sample"))
+    {
+        juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::InfoIcon,
+                                               "Generate Audio",
+                                               "Select a sample track first. Add a sample track when you want ACE-Step to create audio directly in the DAW.");
+        return;
+    }
+
+    const auto& project = documentState.project;
+    auto* dialog = new juce::AlertWindow("Generate Audio With ACE-Step",
+                                         "Describe the audio you want on the selected sample track. Mutagen will render it in the background and insert the clip at the playhead.",
+                                         juce::AlertWindow::NoIcon);
+    dialog->addTextEditor("prompt", aceStepDefaultPrompt, "Prompt");
+    if (auto* promptEditor = dialog->getTextEditor("prompt"))
+    {
+        promptEditor->setMultiLine(true, true);
+        promptEditor->setReturnKeyStartsNewLine(true);
+        promptEditor->setSize(promptEditor->getWidth(), 140);
+    }
+
+    dialog->addTextEditor("lyrics", aceStepDefaultLyrics, "Lyrics (optional)");
+    if (auto* lyricsEditor = dialog->getTextEditor("lyrics"))
+    {
+        lyricsEditor->setMultiLine(true, true);
+        lyricsEditor->setReturnKeyStartsNewLine(true);
+        lyricsEditor->setSize(lyricsEditor->getWidth(), 120);
+    }
+
+    dialog->addTextEditor("bars", juce::String(aceStepDefaultBars), "Bars");
+    dialog->addTextBlock("Project context\nTempo: "
+                         + juce::String(project.bpm)
+                         + " BPM\nTime signature: "
+                         + timeSignatureDisplayName(project)
+                         + "\nKey: "
+                         + keyQuantizeDisplayName(project.keyQuantizeRoot, project.keyQuantizeScale)
+                         + "\nTrack: "
+                         + documentState.project.tracks[static_cast<size_t>(trackIndex)].name);
+    dialog->addTextBlock("ACE-Step defaults\nQuality: "
+                         + aceStepClient.getDefaultQualityPreset()
+                         + "\nModel: "
+                         + (aceStepClient.getDefaultModel().trim().isNotEmpty() ? aceStepClient.getDefaultModel().trim() : juce::String("Server default"))
+                         + "\nFormat: "
+                         + aceStepClient.getDefaultAudioFormat()
+                         + "\nLanguage: "
+                         + aceStepClient.getDefaultVocalLanguage()
+                         + "\nSeed: "
+                         + (aceStepClient.getDefaultUseRandomSeed()
+                                ? juce::String("Random")
+                                : juce::String("Fixed ") + juce::String(aceStepClient.getDefaultSeed()))
+                         + "\nThinking: "
+                         + (aceStepClient.getDefaultThinking() ? "Enabled" : "Disabled")
+                         + "\nInference steps: "
+                         + juce::String(aceStepClient.getDefaultInferenceSteps())
+                         + "\nInfer method: "
+                         + aceStepClient.getDefaultInferMethod());
+    dialog->setSize(620, 720);
+    dialog->addButton("Generate", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    dialog->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+
+    auto safeThis = juce::Component::SafePointer<StudioShellComponent>(this);
+    auto safeDialog = juce::Component::SafePointer<juce::AlertWindow>(dialog);
+    dialog->enterModalState(true,
+                            juce::ModalCallbackFunction::create([safeThis, safeDialog, trackIndex] (int result)
+                            {
+                                if (safeThis == nullptr || safeDialog == nullptr || result != 1)
+                                    return;
+
+                                if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(safeThis->documentState.project.tracks.size()))
+                                    || !safeThis->documentState.project.tracks[static_cast<size_t>(trackIndex)].trackType.equalsIgnoreCase("sample"))
+                                {
+                                    juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::InfoIcon,
+                                                                           "Generate Audio",
+                                                                           "The selected sample track is no longer available.");
+                                    return;
+                                }
+
+                                const auto prompt = safeDialog->getTextEditorContents("prompt").trim();
+                                const auto lyrics = safeDialog->getTextEditorContents("lyrics").trim();
+                                if (prompt.isEmpty() && lyrics.isEmpty())
+                                {
+                                    juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::InfoIcon,
+                                                                           "Generate Audio",
+                                                                           "Enter a prompt or lyrics for ACE-Step first.");
+                                    return;
+                                }
+
+                                const auto bars = juce::jlimit(1, 128, safeDialog->getTextEditorContents("bars").getIntValue());
+                                const auto launchResult = safeThis->ensureAceStepServerLaunchRequested();
+                                if (launchResult.failed())
+                                {
+                                    juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
+                                                                           "ACE-Step Unavailable",
+                                                                           launchResult.getErrorMessage());
+                                    return;
+                                }
+
+                                safeThis->aceStepDefaultPrompt = prompt;
+                                safeThis->aceStepDefaultLyrics = lyrics;
+                                safeThis->aceStepDefaultBars = bars;
+
+                                AceStepGenerationRequest request;
+                                request.prompt = prompt;
+                                request.lyrics = lyrics;
+                                request.model = safeThis->aceStepClient.getDefaultModel();
+                                request.bpm = safeThis->documentState.project.bpm;
+                                request.keyScale = aceStepKeyScaleValue(safeThis->documentState.project);
+                                request.timeSignature = aceStepTimeSignatureValue(safeThis->documentState.project);
+                                request.durationSeconds = juce::jmax(10.0,
+                                                                     tickToSeconds(safeThis->documentState.project,
+                                                                                   bars * ticksPerBar(safeThis->documentState.project)));
+                                request.thinking = safeThis->aceStepClient.getDefaultThinking();
+                                request.audioFormat = safeThis->aceStepClient.getDefaultAudioFormat();
+                                request.vocalLanguage = safeThis->aceStepClient.getDefaultVocalLanguage();
+                                request.useRandomSeed = safeThis->aceStepClient.getDefaultUseRandomSeed();
+                                request.seed = safeThis->aceStepClient.getDefaultSeed();
+                                request.inferenceSteps = safeThis->aceStepClient.getDefaultInferenceSteps();
+                                request.guidanceScale = safeThis->aceStepClient.getDefaultGuidanceScale();
+                                request.inferMethod = safeThis->aceStepClient.getDefaultInferMethod();
+
+                                const auto insertTick = safeThis->documentState.project.playheadTick;
+                                const auto targetFile = safeThis->suggestAceStepGeneratedAudioFile(trackIndex, request.audioFormat);
+                                const auto trackName = safeThis->documentState.project.tracks[static_cast<size_t>(trackIndex)].name;
+
+                                safeThis->setAceStepGenerationBusy(true, "ACE-Step generating audio...");
+                                safeThis->statusLabel.setText("ACE-Step is generating audio for " + trackName + ".",
+                                                              juce::dontSendNotification);
+                                safeThis->appendActivityLog("ACE-Step",
+                                                            "Audio generation requested\nTrack: "
+                                                                + trackName
+                                                                + "\nBars: "
+                                                                + juce::String(bars)
+                                                                + "\nDuration: "
+                                                                + juce::String(request.durationSeconds, 1)
+                                                                + " sec\nPrompt: "
+                                                                + prompt
+                                                                + "\nQuality: "
+                                                                + safeThis->aceStepClient.getDefaultQualityPreset()
+                                                                + "\nModel: "
+                                                                + (request.model.isNotEmpty() ? request.model : juce::String("Server default"))
+                                                                + "\nFormat: "
+                                                                + request.audioFormat
+                                                                + "\nLanguage: "
+                                                                + request.vocalLanguage
+                                                                + "\nSeed: "
+                                                                + (request.useRandomSeed ? juce::String("Random") : juce::String(request.seed))
+                                                                + "\nThinking: "
+                                                                + (request.thinking ? "Enabled" : "Disabled")
+                                                                + "\nInference steps: "
+                                                                + juce::String(request.inferenceSteps)
+                                                                + (lyrics.isNotEmpty() ? "\nLyrics:\n" + lyrics : juce::String()));
+
+                                auto clientCopy = safeThis->aceStepClient;
+                                safeThis->aceStepGenerationFuture = std::async(std::launch::async,
+                                                                               [client = std::move(clientCopy),
+                                                                                request,
+                                                                                targetFile,
+                                                                                trackIndex,
+                                                                                insertTick] () mutable
+                                                                               {
+                                                                                   AceStepTrackGenerationResult generationResult;
+                                                                                   generationResult.trackIndex = trackIndex;
+                                                                                   generationResult.insertTick = insertTick;
+                                                                                   try
+                                                                                   {
+                                                                                       generationResult.generation = client.generateToFile(request, targetFile);
+                                                                                       generationResult.success = true;
+                                                                                   }
+                                                                                   catch (const std::exception& exc)
+                                                                                   {
+                                                                                       generationResult.errorMessage = juce::String::fromUTF8(exc.what());
+                                                                                   }
+                                                                                   return generationResult;
+                                                                               });
+                            }),
+                            true);
+}
+
 void StudioShellComponent::composeWithAi()
 {
     if (aiComposeBusy)
@@ -15259,7 +16915,7 @@ void StudioShellComponent::composeWithAi()
     {
         juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::InfoIcon,
                                                "AI Not Configured",
-                                               "Open AI Settings first and connect either OpenAI or a local Ollama model.");
+                                               "Open AI Settings first and connect a remote provider or choose a local Ollama model.");
         return;
     }
 
@@ -15527,6 +17183,106 @@ void StudioShellComponent::setAiComposeBusy(bool busy, const juce::String& detai
     updateAiStatusSummary();
 }
 
+void StudioShellComponent::setAceStepGenerationBusy(bool busy, const juce::String& detail)
+{
+    aceStepGenerationBusy = busy;
+    aceStepBusyDetail = busy ? detail : juce::String();
+    aceStepBootstrapNoticeShown = false;
+    refreshPollingTimerState();
+    updateEditorState();
+    updateAiStatusSummary();
+}
+
+void StudioShellComponent::pollAceStepServerOutput()
+{
+    if (aceStepServerLogFile == juce::File() || !aceStepServerLogFile.existsAsFile())
+        return;
+
+    const auto fileSize = aceStepServerLogFile.getSize();
+    if (fileSize <= aceStepServerLogReadPosition)
+        return;
+
+    constexpr int maxBytesPerPoll = 8 * 1024;
+    const auto bytesToRead = static_cast<int> (juce::jmin<int64_t> (fileSize - aceStepServerLogReadPosition,
+                                                                     static_cast<int64_t> (maxBytesPerPoll)));
+    if (bytesToRead <= 0)
+        return;
+
+    juce::FileInputStream input(aceStepServerLogFile);
+    if (!input.openedOk())
+        return;
+
+    if (!input.setPosition(aceStepServerLogReadPosition))
+        return;
+
+    juce::MemoryBlock block;
+    block.setSize(static_cast<size_t> (bytesToRead), false);
+    const auto numRead = input.read(block.getData(), bytesToRead);
+    if (numRead <= 0)
+        return;
+
+    aceStepServerLogReadPosition += numRead;
+
+    aceStepServerOutputCarry << sanitiseAceStepServerOutput(juce::String::fromUTF8(static_cast<const char*> (block.getData()),
+                                                                                   numRead));
+    constexpr int maxCarryCharacters = 65536;
+    if (aceStepServerOutputCarry.length() > maxCarryCharacters)
+        aceStepServerOutputCarry = aceStepServerOutputCarry.substring(aceStepServerOutputCarry.length() - maxCarryCharacters);
+
+    const auto endedWithNewline = aceStepServerOutputCarry.endsWithChar('\n');
+    juce::StringArray lines;
+    lines.addLines(aceStepServerOutputCarry);
+
+    aceStepServerOutputCarry.clear();
+    if (!endedWithNewline && lines.size() > 0)
+    {
+        aceStepServerOutputCarry = lines[lines.size() - 1];
+        lines.remove(lines.size() - 1);
+    }
+
+    juce::String latestProgressLine;
+    juce::StringArray informationalLines;
+    for (const auto& rawLine : lines)
+    {
+        const auto line = rawLine.trim();
+        if (line.isEmpty())
+            continue;
+
+        if (isAceStepProgressLine(line))
+        {
+            latestProgressLine = line;
+            continue;
+        }
+
+        if (isAceStepInformationalLine(line))
+            informationalLines.add(line);
+    }
+
+    if (!informationalLines.isEmpty())
+    {
+        constexpr int maxInformationalLinesPerPoll = 6;
+        if (informationalLines.size() > maxInformationalLinesPerPoll)
+            informationalLines.removeRange(maxInformationalLinesPerPoll,
+                                           informationalLines.size() - maxInformationalLinesPerPoll);
+
+        appendActivityLog("ACE-Step Server", informationalLines.joinIntoString("\n"));
+    }
+
+    if (latestProgressLine.isNotEmpty())
+    {
+        const auto nowMs = juce::Time::getMillisecondCounter();
+        const bool shouldLogProgress = latestProgressLine != aceStepLastProgressLogLine
+            && (aceStepLastProgressLogMs == 0 || nowMs - aceStepLastProgressLogMs >= 2500);
+
+        aceStepLastProgressLogLine = latestProgressLine;
+        if (shouldLogProgress)
+        {
+            aceStepLastProgressLogMs = nowMs;
+            appendActivityLog("ACE-Step Download", latestProgressLine);
+        }
+    }
+}
+
 void StudioShellComponent::refreshPollingTimerState()
 {
     const bool hasOpenRackEditors = hasOpenRackEditorSessions();
@@ -15538,6 +17294,7 @@ void StudioShellComponent::refreshPollingTimerState()
         && !rackPreviewRunning
         && !projectPreviewRunning
         && !aiComposeBusy
+        && !aceStepGenerationBusy
         && !stemSeparationBusy;
 
     int targetHz = 0;
@@ -15553,7 +17310,7 @@ void StudioShellComponent::refreshPollingTimerState()
         else if (hasVisibleFloatingPianoRoll)
             targetHz = juce::jmin(targetHz, kPlaybackRefreshRateWithOpenPianoRollHz);
     }
-    else if (aiComposeBusy || stemSeparationBusy)
+    else if (aiComposeBusy || aceStepGenerationBusy || stemSeparationBusy)
     {
         targetHz = 6;
     }
@@ -15629,6 +17386,77 @@ void StudioShellComponent::pollAiComposeFuture()
     }
 
     setAiComposeBusy(false);
+}
+
+void StudioShellComponent::pollAceStepGenerationFuture()
+{
+    if (!aceStepGenerationBusy || !aceStepGenerationFuture.valid())
+        return;
+
+    if (aceStepGenerationFuture.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+        return;
+
+    try
+    {
+        const auto result = aceStepGenerationFuture.get();
+        if (!result.success)
+        {
+            const auto errorText = result.errorMessage.isNotEmpty()
+                ? result.errorMessage
+                : juce::String("ACE-Step generation failed.");
+            const bool bootstrapMessage = aceStepBootstrapMessageMatches(errorText);
+
+            juce::AlertWindow::showMessageBoxAsync(bootstrapMessage ? juce::AlertWindow::InfoIcon
+                                                                    : juce::AlertWindow::WarningIcon,
+                                                   bootstrapMessage ? "ACE-Step Setup In Progress"
+                                                                    : "ACE-Step Generation Failed",
+                                                   bootstrapMessage ? aceStepBootstrapUserMessage()
+                                                                    : errorText);
+            statusLabel.setText(bootstrapMessage ? aceStepBootstrapStatusText()
+                                                 : juce::String("ACE-Step generation failed."),
+                                juce::dontSendNotification);
+            appendActivityLog(bootstrapMessage ? "ACE-Step Setup" : "ACE-Step Error", errorText);
+            setAceStepGenerationBusy(false);
+            return;
+        }
+
+        juce::String trackName;
+        const auto placeResult = placeSampleFileOnTrackAtTick(result.generation.outputFile,
+                                                              result.trackIndex,
+                                                              result.insertTick,
+                                                              "Generate ACE-Step Audio",
+                                                              trackName);
+        if (placeResult.failed())
+            throw std::runtime_error(placeResult.getErrorMessage().toStdString());
+
+        setSelectedTrackIndex(result.trackIndex);
+        statusLabel.setText("Placed ACE-Step audio on " + trackName + ".", juce::dontSendNotification);
+        appendActivityLog("ACE-Step",
+                          "Inserted generated audio clip\nTrack: "
+                              + trackName
+                              + "\nFile: "
+                              + result.generation.outputFile.getFullPathName()
+                              + (result.generation.modelName.isNotEmpty()
+                                     ? "\nModel: " + result.generation.modelName
+                                     : juce::String()));
+    }
+    catch (const std::exception& exc)
+    {
+        const auto errorText = juce::String::fromUTF8(exc.what());
+        const bool bootstrapMessage = aceStepBootstrapMessageMatches(errorText);
+        juce::AlertWindow::showMessageBoxAsync(bootstrapMessage ? juce::AlertWindow::InfoIcon
+                                                                : juce::AlertWindow::WarningIcon,
+                                               bootstrapMessage ? "ACE-Step Setup In Progress"
+                                                                : "ACE-Step Generation Failed",
+                                               bootstrapMessage ? aceStepBootstrapUserMessage()
+                                                                : errorText);
+        statusLabel.setText(bootstrapMessage ? aceStepBootstrapStatusText()
+                                             : juce::String("ACE-Step generation failed."),
+                            juce::dontSendNotification);
+        appendActivityLog(bootstrapMessage ? "ACE-Step Setup" : "ACE-Step Error", errorText);
+    }
+
+    setAceStepGenerationBusy(false);
 }
 
 void StudioShellComponent::pollStemSeparationFuture()
@@ -15787,11 +17615,15 @@ void StudioShellComponent::updateAiStatusSummary()
     auto text = aiClient.authStatus();
     if (aiComposeBusy)
         text = (aiComposeBusyDetail.isNotEmpty() ? aiComposeBusyDetail : juce::String("AI processing...")) + "   " + text;
+    else if (aceStepGenerationBusy)
+        text = (aceStepBusyDetail.isNotEmpty() ? aceStepBusyDetail : juce::String("ACE-Step processing..."))
+            + "   "
+            + aceStepClient.statusSummary();
 
     aiStatusSummaryLabel.setColour(juce::Label::textColourId,
-                                   aiComposeBusy ? theme.infoText
-                                                 : (aiClient.isEnabled() ? theme.successText
-                                                                         : theme.warningText));
+                                   (aiComposeBusy || aceStepGenerationBusy) ? theme.infoText
+                                                                            : (aiClient.isEnabled() ? theme.successText
+                                                                                                    : theme.warningText));
     aiStatusSummaryLabel.setText(text, juce::dontSendNotification);
 }
 

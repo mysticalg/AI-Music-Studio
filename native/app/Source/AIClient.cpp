@@ -11,7 +11,14 @@ namespace
 {
 constexpr const char* kAppName = "Mutagen";
 constexpr const char* kOpenAiApiUrl = "https://api.openai.com/v1/responses";
-constexpr const char* kDefaultOpenAiModel = "gpt-5-codex";
+constexpr const char* kDefaultOpenAiModel = "gpt-5.2";
+constexpr const char* kDefaultAnthropicModel = "claude-sonnet-4-6";
+constexpr const char* kDefaultXAiModel = "grok-4";
+constexpr const char* kDefaultGeminiModel = "gemini-2.5-flash";
+constexpr const char* kOpenAiCompatibleFallbackModel = "gpt-5.2";
+constexpr const char* kDefaultAnthropicBaseUrl = "https://api.anthropic.com/v1";
+constexpr const char* kDefaultXAiBaseUrl = "https://api.x.ai/v1";
+constexpr const char* kDefaultGeminiBaseUrl = "https://generativelanguage.googleapis.com/v1beta/openai";
 constexpr const char* kDefaultOllamaBaseUrl = "http://127.0.0.1:11434";
 
 juce::var makeObjectVar()
@@ -189,6 +196,7 @@ AIClient::AIClient()
     remoteModel = getenvString("OPENAI_MODEL");
     if (remoteModel.isEmpty())
         remoteModel = kDefaultOpenAiModel;
+    remoteBaseUrl = defaultRemoteBaseUrlForProvider(provider);
 
     auto configuredOllamaBase = getenvString("OLLAMA_BASE_URL");
     if (configuredOllamaBase.isEmpty())
@@ -208,12 +216,32 @@ AIClient::Provider AIClient::getProvider() const noexcept
 
 juce::String AIClient::getProviderKey() const
 {
-    return provider == Provider::ollama ? "ollama" : "openai";
+    switch (provider)
+    {
+        case Provider::openAI: return "openai";
+        case Provider::anthropic: return "anthropic";
+        case Provider::xAI: return "xai";
+        case Provider::gemini: return "gemini";
+        case Provider::openAICompatible: return "openai_compatible";
+        case Provider::ollama: return "ollama";
+    }
+
+    return "openai";
+}
+
+juce::String AIClient::getProviderDisplayName() const
+{
+    return providerDisplayName(provider);
 }
 
 juce::String AIClient::getRemoteModel() const
 {
     return remoteModel;
+}
+
+juce::String AIClient::getRemoteBaseUrl() const
+{
+    return remoteBaseUrl;
 }
 
 juce::String AIClient::getOllamaBaseUrl() const
@@ -241,7 +269,13 @@ bool AIClient::isEnabled() const noexcept
     if (provider == Provider::ollama)
         return ollamaBaseUrl.isNotEmpty() && ollamaModel.isNotEmpty();
 
-    return hasSavedCredential();
+    if (provider == Provider::openAI)
+        return remoteModel.isNotEmpty() && hasSavedCredential();
+
+    if (provider == Provider::openAICompatible)
+        return apiKey.isNotEmpty() && remoteModel.isNotEmpty() && remoteBaseUrl.isNotEmpty();
+
+    return apiKey.isNotEmpty() && remoteModel.isNotEmpty();
 }
 
 juce::String AIClient::authStatus() const
@@ -253,7 +287,7 @@ juce::String AIClient::authStatus() const
         return "AI: Local Ollama at " + ollamaBaseUrl + " (no model selected)";
     }
 
-    if (oauthAccessToken.isNotEmpty())
+    if (provider == Provider::openAI && oauthAccessToken.isNotEmpty())
     {
         const auto nowSeconds = juce::Time::getCurrentTime().toMilliseconds() / 1000.0;
         if (oauthExpiresAt > nowSeconds)
@@ -265,23 +299,100 @@ juce::String AIClient::authStatus() const
         return "AI: OpenAI via OAuth";
     }
 
+    const auto providerName = providerDisplayName(provider);
     if (apiKey.isNotEmpty())
-        return "AI: OpenAI via API key";
+        return "AI: " + providerName + " via API key";
 
-    return "AI: OpenAI not connected";
+    return "AI: " + providerName + " not connected";
 }
 
-juce::StringArray AIClient::remoteModelChoices() const
+juce::StringArray AIClient::remoteModelChoices(Provider providerOverride) const
 {
     juce::StringArray choices;
-    for (const auto& value : { remoteModel, getenvString("OPENAI_MODEL"), juce::String(kDefaultOpenAiModel) })
+    const auto addChoice = [&choices] (const juce::String& value)
     {
         const auto trimmed = value.trim();
         if (trimmed.isNotEmpty() && !choices.contains(trimmed))
             choices.add(trimmed);
+    };
+
+    addChoice(remoteModel);
+
+    switch (providerOverride)
+    {
+        case Provider::openAI:
+            addChoice(getenvString("OPENAI_MODEL"));
+            addChoice(kDefaultOpenAiModel);
+            addChoice("gpt-5");
+            addChoice("gpt-5-mini");
+            break;
+        case Provider::anthropic:
+            addChoice(kDefaultAnthropicModel);
+            addChoice("claude-opus-4-6");
+            break;
+        case Provider::xAI:
+            addChoice(kDefaultXAiModel);
+            addChoice("grok-4-fast-reasoning");
+            break;
+        case Provider::gemini:
+            addChoice(kDefaultGeminiModel);
+            addChoice("gemini-2.5-pro");
+            addChoice("gemini-3-flash-preview");
+            break;
+        case Provider::openAICompatible:
+            addChoice(kOpenAiCompatibleFallbackModel);
+            break;
+        case Provider::ollama:
+            break;
     }
 
     return choices;
+}
+
+juce::String AIClient::providerDisplayName(Provider providerValue)
+{
+    switch (providerValue)
+    {
+        case Provider::openAI: return "OpenAI";
+        case Provider::anthropic: return "Claude";
+        case Provider::xAI: return "Grok";
+        case Provider::gemini: return "Gemini";
+        case Provider::openAICompatible: return "Custom Remote";
+        case Provider::ollama: return "Ollama";
+    }
+
+    return "OpenAI";
+}
+
+juce::String AIClient::defaultRemoteModelForProvider(Provider providerValue)
+{
+    switch (providerValue)
+    {
+        case Provider::openAI: return kDefaultOpenAiModel;
+        case Provider::anthropic: return kDefaultAnthropicModel;
+        case Provider::xAI: return kDefaultXAiModel;
+        case Provider::gemini: return kDefaultGeminiModel;
+        case Provider::openAICompatible: return kOpenAiCompatibleFallbackModel;
+        case Provider::ollama: return {};
+    }
+
+    return kDefaultOpenAiModel;
+}
+
+juce::String AIClient::defaultRemoteBaseUrlForProvider(Provider providerValue)
+{
+    switch (providerValue)
+    {
+        case Provider::anthropic: return kDefaultAnthropicBaseUrl;
+        case Provider::xAI: return kDefaultXAiBaseUrl;
+        case Provider::gemini: return kDefaultGeminiBaseUrl;
+        case Provider::openAICompatible: return {};
+        case Provider::openAI:
+        case Provider::ollama:
+            return {};
+    }
+
+    return {};
 }
 
 juce::StringArray AIClient::availableOllamaModels(const juce::String& baseUrl) const
@@ -319,15 +430,24 @@ juce::StringArray AIClient::availableOllamaModels(const juce::String& baseUrl) c
 void AIClient::setProvider(Provider newProvider)
 {
     provider = newProvider;
+    if (isRemoteProvider(provider) && remoteModel.trim().isEmpty())
+        setRemoteModel({});
+    if (provider != Provider::ollama)
+        remoteBaseUrl = normaliseRemoteBaseUrl(provider, remoteBaseUrl);
 }
 
 void AIClient::setRemoteModel(const juce::String& newModel)
 {
     remoteModel = newModel.trim();
-    if (remoteModel.isEmpty())
+    if (remoteModel.isEmpty() && provider == Provider::openAI)
         remoteModel = getenvString("OPENAI_MODEL");
     if (remoteModel.isEmpty())
-        remoteModel = kDefaultOpenAiModel;
+        remoteModel = defaultRemoteModelForProvider(provider);
+}
+
+void AIClient::setRemoteBaseUrl(const juce::String& newBaseUrl)
+{
+    remoteBaseUrl = normaliseRemoteBaseUrl(provider, newBaseUrl);
 }
 
 void AIClient::setOllamaConnection(const juce::String& newBaseUrl, const juce::String& newModel)
@@ -352,6 +472,7 @@ void AIClient::saveSettings() const
     auto preferences = loadJsonObject(preferencesFile());
     setObjectProperty(preferences, "ai_provider", getProviderKey());
     setObjectProperty(preferences, "ai_remote_model", remoteModel);
+    setObjectProperty(preferences, "ai_remote_base_url", remoteBaseUrl);
     setObjectProperty(preferences, "ai_ollama_base_url", ollamaBaseUrl);
     setObjectProperty(preferences, "ai_ollama_model", ollamaModel);
     setObjectProperty(preferences, "ai_request_timeout_seconds", requestTimeoutSeconds);
@@ -381,6 +502,9 @@ juce::var AIClient::runJsonPrompt(const juce::String& systemInstruction, const j
     if (provider == Provider::ollama)
         return runOllamaJsonPrompt(systemInstruction, userInstruction);
 
+    if (provider != Provider::openAI)
+        return runOpenAiCompatibleJsonPrompt(systemInstruction, userInstruction);
+
     return runOpenAiJsonPrompt(systemInstruction, userInstruction);
 }
 
@@ -389,8 +513,26 @@ AIClient::Provider AIClient::normaliseProvider(const juce::String& rawProvider)
     const auto value = rawProvider.trim().toLowerCase();
     if (value == "ollama" || value == "local" || value == "ollama_local")
         return Provider::ollama;
+    if (value == "anthropic" || value == "claude")
+        return Provider::anthropic;
+    if (value == "xai" || value == "grok")
+        return Provider::xAI;
+    if (value == "gemini" || value == "google")
+        return Provider::gemini;
+    if (value == "openai_compatible" || value == "openai-compatible" || value == "custom_remote" || value == "custom")
+        return Provider::openAICompatible;
 
     return Provider::openAI;
+}
+
+juce::String AIClient::normaliseRemoteBaseUrl(Provider providerValue, const juce::String& baseUrl)
+{
+    auto normalized = baseUrl.trim();
+    const auto defaultBaseUrl = defaultRemoteBaseUrlForProvider(providerValue);
+    if (normalized.isEmpty())
+        normalized = defaultBaseUrl;
+
+    return normalized.trimEnd().trimCharactersAtEnd("/");
 }
 
 juce::String AIClient::normaliseOllamaBaseUrl(const juce::String& baseUrl)
@@ -405,6 +547,11 @@ juce::String AIClient::normaliseOllamaBaseUrl(const juce::String& baseUrl)
 int AIClient::normaliseRequestTimeoutSeconds(int timeoutSeconds)
 {
     return juce::jlimit(minRequestTimeoutSeconds, maxRequestTimeoutSeconds, timeoutSeconds);
+}
+
+bool AIClient::isRemoteProvider(Provider providerValue) noexcept
+{
+    return providerValue != Provider::ollama;
 }
 
 juce::File AIClient::appDataDirectory() const
@@ -437,6 +584,7 @@ void AIClient::loadSavedSettings()
     const auto preferences = loadJsonObject(preferencesFile());
     provider = normaliseProvider(getStringProperty(preferences, "ai_provider", getProviderKey()));
     setRemoteModel(getStringProperty(preferences, "ai_remote_model", remoteModel));
+    setRemoteBaseUrl(getStringProperty(preferences, "ai_remote_base_url", remoteBaseUrl));
     setOllamaConnection(getStringProperty(preferences, "ai_ollama_base_url", ollamaBaseUrl),
                         getStringProperty(preferences, "ai_ollama_model", ollamaModel));
     setRequestTimeoutSeconds(getIntProperty(preferences,
@@ -470,6 +618,19 @@ juce::String AIClient::authorizationHeaderValue() const
 {
     const auto token = oauthAccessToken.isNotEmpty() ? oauthAccessToken : apiKey;
     return "Bearer " + token;
+}
+
+juce::String AIClient::remoteChatCompletionsUrl() const
+{
+    auto baseUrl = remoteBaseUrl.trim();
+    if (baseUrl.isEmpty())
+        baseUrl = defaultRemoteBaseUrlForProvider(provider);
+
+    auto cleanBaseUrl = baseUrl.trimEnd().trimCharactersAtEnd("/");
+    if (cleanBaseUrl.isEmpty())
+        return {};
+
+    return cleanBaseUrl + "/chat/completions";
 }
 
 juce::String AIClient::ollamaEndpoint(const juce::String& endpoint, const juce::String& overrideBaseUrl) const
@@ -565,8 +726,8 @@ juce::var AIClient::requestJson(const juce::String& url,
 
 juce::var AIClient::runOpenAiJsonPrompt(const juce::String& systemInstruction, const juce::String& userInstruction) const
 {
-    if (!hasSavedCredential())
-        throw std::runtime_error("Remote OpenAI is not connected. Open AI Settings and add an API key or use saved OAuth credentials.");
+    if (!isEnabled())
+        throw std::runtime_error("OpenAI is not connected. Open AI Settings and add an API key or use saved OAuth credentials.");
 
     auto payload = makeObjectVar();
     setObjectProperty(payload, "model", remoteModel.isNotEmpty() ? remoteModel : juce::String(kDefaultOpenAiModel));
@@ -635,6 +796,87 @@ juce::var AIClient::runOpenAiJsonPrompt(const juce::String& systemInstruction, c
 
     appendDebugLog("OpenAI Parsed Output", juce::JSON::toString(parsed, false));
     emitActivityLog("OpenAI Parsed Output", prettyJsonForActivityLog(parsed));
+    return parsed;
+}
+
+juce::var AIClient::runOpenAiCompatibleJsonPrompt(const juce::String& systemInstruction, const juce::String& userInstruction) const
+{
+    const auto providerName = providerDisplayName(provider);
+    if (!isEnabled())
+        throw std::runtime_error((providerName + " is not connected. Open AI Settings and add a model plus API key.").toStdString());
+
+    const auto url = remoteChatCompletionsUrl();
+    if (url.isEmpty())
+        throw std::runtime_error((providerName + " endpoint is missing.").toStdString());
+
+    auto payload = makeObjectVar();
+    setObjectProperty(payload, "model", remoteModel.isNotEmpty() ? remoteModel : defaultRemoteModelForProvider(provider));
+
+    juce::Array<juce::var> messages;
+    auto systemObject = makeObjectVar();
+    setObjectProperty(systemObject, "role", "system");
+    setObjectProperty(systemObject, "content", systemInstruction);
+    messages.add(systemObject);
+
+    auto userObject = makeObjectVar();
+    setObjectProperty(userObject, "role", "user");
+    setObjectProperty(userObject, "content", userInstruction);
+    messages.add(userObject);
+
+    setObjectProperty(payload, "messages", juce::var(messages));
+    setObjectProperty(payload, "stream", false);
+
+    juce::StringPairArray headers;
+    headers.set("Authorization", "Bearer " + apiKey.trim());
+    const auto response = requestJson(url,
+                                      &payload,
+                                      headers,
+                                      "POST",
+                                      requestTimeoutSeconds,
+                                      providerName);
+
+    juce::String text;
+    if (auto* object = response.getDynamicObject())
+    {
+        if (auto* choices = object->getProperty("choices").getArray(); choices != nullptr && !choices->isEmpty())
+        {
+            if (auto* choiceObject = (*choices)[0].getDynamicObject())
+            {
+                if (auto* messageObject = choiceObject->getProperty("message").getDynamicObject())
+                {
+                    const auto contentValue = messageObject->getProperty("content");
+                    if (contentValue.isString())
+                    {
+                        text = contentValue.toString().trim();
+                    }
+                    else if (auto* contentArray = contentValue.getArray())
+                    {
+                        for (const auto& contentPart : *contentArray)
+                        {
+                            if (auto* contentObject = contentPart.getDynamicObject())
+                            {
+                                const auto partText = getStringProperty(contentPart, "text").trim();
+                                if (partText.isNotEmpty())
+                                    text << partText;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (text.trim().isEmpty())
+        throw std::runtime_error(("No text returned by " + providerName + ".").toStdString());
+
+    appendDebugLog(providerName + " Output Text", text);
+
+    juce::var parsed;
+    if (juce::JSON::parse(text, parsed).failed() || !parsed.isObject())
+        throw std::runtime_error(("Model response was not valid JSON: " + text.substring(0, 300)).toStdString());
+
+    appendDebugLog(providerName + " Parsed Output", juce::JSON::toString(parsed, false));
+    emitActivityLog(providerName + " Parsed Output", prettyJsonForActivityLog(parsed));
     return parsed;
 }
 
