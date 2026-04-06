@@ -199,6 +199,10 @@ private:
     void openSelectedTrackRackEditor();
     void openTrackRackEditor(int trackIndex);
     void openTrackEffectEditorFromMixer(int trackIndex, int effectIndex);
+    void addTrackEffectFromReference(int trackIndex, const juce::String& reference);
+    void replaceTrackEffectReference(int trackIndex, int effectIndex, const juce::String& reference);
+    void removeTrackEffectFromTrack(int trackIndex, int effectIndex);
+    void setTrackEffectSlotBypassed(int trackIndex, int effectIndex, bool bypassed);
     void openSharedEffectBusEditor(const juce::String& busId);
     void openMasterEffectEditorFromMixer(int effectIndex);
     void saveSelectedTrackRackState();

@@ -190,6 +190,14 @@ struct ProjectTemplateOption
     bool builtIn = false;
 };
 
+struct PianoRollGridOption
+{
+    int id = 0;
+    int division = 4;
+    bool triplet = false;
+    juce::String label;
+};
+
 juce::String rackEntryDisplayName(const VstInstrument& entry)
 {
     if (entry.name.trim().isNotEmpty())
@@ -245,6 +253,82 @@ const VstInstrument* findRackEntryByReference(const ProjectState& project,
     }
 
     return nullptr;
+}
+
+const std::vector<PianoRollGridOption>& pianoRollGridOptions()
+{
+    static const std::vector<PianoRollGridOption> options =
+    {
+        { 1, 1, false, "1/1" },
+        { 2, 2, false, "1/2" },
+        { 3, 2, true, "1/2 triplet" },
+        { 4, 4, false, "1/4" },
+        { 5, 4, true, "1/4 triplet" },
+        { 6, 8, false, "1/8" },
+        { 7, 8, true, "1/8 triplet" },
+        { 8, 16, false, "1/16" },
+        { 9, 16, true, "1/16 triplet" },
+        { 10, 32, false, "1/32" },
+        { 11, 32, true, "1/32 triplet" },
+        { 12, 64, false, "1/64" }
+    };
+
+    return options;
+}
+
+int pianoRollGridOptionId(const ProjectState& project)
+{
+    const auto division = juce::jlimit(1, 64, project.quantizeDiv);
+    for (const auto& option : pianoRollGridOptions())
+    {
+        if (option.division == division && option.triplet == project.quantizeTriplet)
+            return option.id;
+    }
+
+    return 0;
+}
+
+const PianoRollGridOption* findPianoRollGridOptionById(int id)
+{
+    for (const auto& option : pianoRollGridOptions())
+    {
+        if (option.id == id)
+            return &option;
+    }
+
+    return nullptr;
+}
+
+juce::String effectReferenceDisplayName(const ProjectState& project, const juce::String& reference)
+{
+    const auto trimmedReference = reference.trim();
+    if (trimmedReference.isEmpty())
+        return {};
+
+    if (const auto* entry = findRackEntryByReference(project, trimmedReference, true))
+        return rackEntryDisplayName(*entry);
+
+    return trimmedReference.containsAnyOf("\\/")
+        ? juce::File(trimmedReference).getFileNameWithoutExtension()
+        : trimmedReference;
+}
+
+void ensureTrackFxBypassStateSize(std::vector<bool>& bypassStates, int effectCount)
+{
+    if (effectCount < 0)
+        effectCount = 0;
+
+    if (static_cast<int>(bypassStates.size()) < effectCount)
+        bypassStates.resize(static_cast<size_t>(effectCount), false);
+    else if (static_cast<int>(bypassStates.size()) > effectCount)
+        bypassStates.resize(static_cast<size_t>(effectCount));
+}
+
+bool trackFxSlotBypassed(const TrackState& track, int effectIndex)
+{
+    return effectIndex >= 0
+        && effectIndex < static_cast<int>(track.vstFxSlotBypassed.size())
+        && track.vstFxSlotBypassed[static_cast<size_t>(effectIndex)];
 }
 
 juce::File ensureTemplateSuffix(const juce::File& file)
@@ -4647,6 +4731,36 @@ public:
         keyQuantizeLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(214, 219, 227));
         addAndMakeVisible(keyQuantizeLabel);
 
+        pianoRollGridLabel.setText("Quantize", juce::dontSendNotification);
+        pianoRollGridLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(214, 219, 227));
+        addAndMakeVisible(pianoRollGridLabel);
+
+        for (const auto& option : pianoRollGridOptions())
+            pianoRollGridBox.addItem(option.label, option.id);
+        pianoRollGridBox.setTextWhenNothingSelected("Grid");
+        pianoRollGridBox.onChange = [this]
+        {
+            if (syncingKeyQuantizeControls)
+                return;
+
+            const auto* option = findPianoRollGridOptionById(pianoRollGridBox.getSelectedId());
+            if (option == nullptr)
+                return;
+
+            auto updatedProject = this->projectGetter();
+            if (updatedProject.quantizeDiv == option->division
+                && updatedProject.quantizeTriplet == option->triplet)
+            {
+                return;
+            }
+
+            updatedProject.quantizeDiv = option->division;
+            updatedProject.quantizeTriplet = option->triplet;
+            updatedProject.recalculateTimeFields();
+            this->projectWriter(updatedProject, true, "Change Piano Roll Quantize");
+        };
+        addAndMakeVisible(pianoRollGridBox);
+
         for (const auto& option : keyQuantizeOptions())
             keyQuantizeBox.addItem(option.label, option.id);
         keyQuantizeBox.setTextWhenNothingSelected("All Notes");
@@ -4843,6 +4957,7 @@ public:
     {
         syncingKeyQuantizeControls = true;
         const auto& currentProject = projectGetter();
+        pianoRollGridBox.setSelectedId(pianoRollGridOptionId(currentProject), juce::dontSendNotification);
         keyQuantizeBox.setSelectedId(keyQuantizeOptionId(currentProject), juce::dontSendNotification);
         noteRangeMinBox.setSelectedId(pianoRollPitchOptionId(currentProject.pianoRollVisiblePitchMin), juce::dontSendNotification);
         noteRangeMaxBox.setSelectedId(pianoRollPitchOptionId(currentProject.pianoRollVisiblePitchMax), juce::dontSendNotification);
@@ -4867,6 +4982,7 @@ public:
     {
         syncingKeyQuantizeControls = true;
         const auto& currentProject = projectGetter();
+        pianoRollGridBox.setSelectedId(pianoRollGridOptionId(currentProject), juce::dontSendNotification);
         keyQuantizeBox.setSelectedId(keyQuantizeOptionId(currentProject), juce::dontSendNotification);
         noteRangeMinBox.setSelectedId(pianoRollPitchOptionId(currentProject.pianoRollVisiblePitchMin), juce::dontSendNotification);
         noteRangeMaxBox.setSelectedId(pianoRollPitchOptionId(currentProject.pianoRollVisiblePitchMax), juce::dontSendNotification);
@@ -4955,6 +5071,10 @@ public:
         header.removeFromRight(8);
         noteRangeLabel.setBounds(header.removeFromRight(44));
         header.removeFromRight(14);
+        pianoRollGridBox.setBounds(header.removeFromRight(116));
+        header.removeFromRight(8);
+        pianoRollGridLabel.setBounds(header.removeFromRight(54));
+        header.removeFromRight(14);
         keyQuantizeBox.setBounds(header.removeFromRight(196));
         header.removeFromRight(8);
         keyQuantizeLabel.setBounds(header.removeFromRight(92));
@@ -5014,6 +5134,8 @@ private:
     std::function<void(float)> pianoRollZoomChangedCallback;
     std::function<void(float)> pianoRollRowHeightChangedCallback;
     juce::TabbedComponent tabs;
+    juce::Label pianoRollGridLabel;
+    juce::ComboBox pianoRollGridBox;
     juce::Label keyQuantizeLabel;
     juce::ComboBox keyQuantizeBox;
     juce::Label noteRangeLabel;
@@ -5334,6 +5456,36 @@ public:
         keyQuantizeLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(214, 219, 227));
         addChildComponent(keyQuantizeLabel);
 
+        pianoRollGridLabel.setText("Quantize", juce::dontSendNotification);
+        pianoRollGridLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(214, 219, 227));
+        addChildComponent(pianoRollGridLabel);
+
+        for (const auto& option : pianoRollGridOptions())
+            pianoRollGridBox.addItem(option.label, option.id);
+        pianoRollGridBox.setTextWhenNothingSelected("Grid");
+        pianoRollGridBox.onChange = [this]
+        {
+            if (syncingControls)
+                return;
+
+            const auto* option = findPianoRollGridOptionById(pianoRollGridBox.getSelectedId());
+            if (option == nullptr)
+                return;
+
+            auto updatedProject = projectGetter();
+            if (updatedProject.quantizeDiv == option->division
+                && updatedProject.quantizeTriplet == option->triplet)
+            {
+                return;
+            }
+
+            updatedProject.quantizeDiv = option->division;
+            updatedProject.quantizeTriplet = option->triplet;
+            updatedProject.recalculateTimeFields();
+            projectWriter(updatedProject, true, "Change Piano Roll Quantize");
+        };
+        addChildComponent(pianoRollGridBox);
+
         for (const auto& option : keyQuantizeOptions())
             keyQuantizeBox.addItem(option.label, option.id);
         keyQuantizeBox.setTextWhenNothingSelected("All Notes");
@@ -5431,6 +5583,8 @@ public:
         zoomSlider.setVisible(showHeader);
         rowHeightLabel.setVisible(showHeader);
         rowHeightSlider.setVisible(showHeader);
+        pianoRollGridLabel.setVisible(showHeader);
+        pianoRollGridBox.setVisible(showHeader);
         keyQuantizeLabel.setVisible(showHeader);
         keyQuantizeBox.setVisible(showHeader);
         noteRangeLabel.setVisible(showHeader);
@@ -5502,6 +5656,7 @@ public:
                                   juce::dontSendNotification);
             syncingControls = true;
             const auto& currentProject = projectGetter();
+            pianoRollGridBox.setSelectedId(pianoRollGridOptionId(currentProject), juce::dontSendNotification);
             keyQuantizeBox.setSelectedId(keyQuantizeOptionId(currentProject), juce::dontSendNotification);
             noteRangeMinBox.setSelectedId(pianoRollPitchOptionId(currentProject.pianoRollVisiblePitchMin), juce::dontSendNotification);
             noteRangeMaxBox.setSelectedId(pianoRollPitchOptionId(currentProject.pianoRollVisiblePitchMax), juce::dontSendNotification);
@@ -5559,30 +5714,36 @@ public:
         auto area = getLocalBounds().reduced(14);
         if (showHeader)
         {
-            auto header = area.removeFromTop(30);
-            titleLabel.setBounds(header.removeFromLeft(120));
-            auto controls = header.removeFromRight(juce::jmin(960, juce::jmax(0, header.getWidth())));
-            rowHeightSlider.setBounds(controls.removeFromRight(140));
-            controls.removeFromRight(8);
-            rowHeightLabel.setBounds(controls.removeFromRight(34));
+            auto header = area.removeFromTop(56);
+            auto headerTop = header.removeFromTop(22);
+            titleLabel.setBounds(headerTop.removeFromLeft(120));
+            toolHintLabel.setBounds(headerTop);
+            header.removeFromTop(6);
+            auto controls = header.removeFromTop(28);
+            controls.removeFromLeft(4);
+            rowHeightSlider.setBounds(controls.removeFromRight(132));
+            controls.removeFromRight(6);
+            rowHeightLabel.setBounds(controls.removeFromRight(30));
             controls.removeFromRight(10);
-            zoomSlider.setBounds(controls.removeFromRight(140));
-            controls.removeFromRight(8);
-            zoomLabel.setBounds(controls.removeFromRight(42));
-            controls.removeFromRight(14);
-            noteRangeMaxBox.setBounds(controls.removeFromRight(92));
+            zoomSlider.setBounds(controls.removeFromRight(132));
             controls.removeFromRight(6);
-            noteRangeSeparatorLabel.setBounds(controls.removeFromRight(20));
+            zoomLabel.setBounds(controls.removeFromRight(36));
+            controls.removeFromRight(10);
+            noteRangeMaxBox.setBounds(controls.removeFromRight(84));
+            controls.removeFromRight(4);
+            noteRangeSeparatorLabel.setBounds(controls.removeFromRight(18));
+            controls.removeFromRight(4);
+            noteRangeMinBox.setBounds(controls.removeFromRight(84));
             controls.removeFromRight(6);
-            noteRangeMinBox.setBounds(controls.removeFromRight(92));
-            controls.removeFromRight(8);
-            noteRangeLabel.setBounds(controls.removeFromRight(44));
-            controls.removeFromRight(14);
-            keyQuantizeBox.setBounds(controls.removeFromRight(188));
-            controls.removeFromRight(8);
-            keyQuantizeLabel.setBounds(controls.removeFromRight(92));
-            controls.removeFromRight(14);
-            toolHintLabel.setBounds(header);
+            noteRangeLabel.setBounds(controls.removeFromRight(42));
+            controls.removeFromRight(10);
+            keyQuantizeBox.setBounds(controls.removeFromRight(176));
+            controls.removeFromRight(6);
+            keyQuantizeLabel.setBounds(controls.removeFromRight(82));
+            controls.removeFromRight(10);
+            pianoRollGridBox.setBounds(controls.removeFromRight(116));
+            controls.removeFromRight(6);
+            pianoRollGridLabel.setBounds(controls.removeFromRight(52));
             area.removeFromTop(8);
         }
         else
@@ -5591,6 +5752,8 @@ public:
             zoomSlider.setBounds({});
             rowHeightLabel.setBounds({});
             rowHeightSlider.setBounds({});
+            pianoRollGridLabel.setBounds({});
+            pianoRollGridBox.setBounds({});
             keyQuantizeLabel.setBounds({});
             keyQuantizeBox.setBounds({});
             noteRangeLabel.setBounds({});
@@ -5694,6 +5857,8 @@ private:
     juce::Slider zoomSlider;
     juce::Label rowHeightLabel;
     juce::Slider rowHeightSlider;
+    juce::Label pianoRollGridLabel;
+    juce::ComboBox pianoRollGridBox;
     juce::Label keyQuantizeLabel;
     juce::ComboBox keyQuantizeBox;
     juce::Label noteRangeLabel;
@@ -6618,33 +6783,48 @@ class ModulationMatrixWindowComponent final : public juce::Component
 public:
     using ProjectGetter = std::function<const ProjectState&()>;
     using AddInstrumentTrack = std::function<void(const juce::String&)>;
+    using AddTrackEffect = std::function<void(int, const juce::String&)>;
     using AddSharedEffectBus = std::function<void(const juce::String&, int)>;
+    using ReplaceTrackEffect = std::function<void(int, int, const juce::String&)>;
     using ReplaceSharedEffectBus = std::function<void(const juce::String&, const juce::String&)>;
+    using RemoveTrackEffect = std::function<void(int, int)>;
     using RemoveSharedEffectBus = std::function<void(const juce::String&)>;
     using RouteTrackTarget = std::function<void(int, const juce::String&)>;
     using OpenTrackEditor = std::function<void(int)>;
+    using OpenTrackEffectEditor = std::function<void(int, int)>;
     using OpenSharedEffectEditor = std::function<void(const juce::String&)>;
+    using SetTrackEffectBypassed = std::function<void(int, int, bool)>;
     using ClearSharedEffectBusOutputs = std::function<void(const juce::String&)>;
     using SetSharedEffectBusOutputTargetEnabled = std::function<void(const juce::String&, const juce::String&, bool)>;
 
     ModulationMatrixWindowComponent(ProjectGetter projectGetterIn,
                                     AddInstrumentTrack addInstrumentTrackIn,
+                                    AddTrackEffect addTrackEffectIn,
                                     AddSharedEffectBus addSharedEffectBusIn,
+                                    ReplaceTrackEffect replaceTrackEffectIn,
                                     ReplaceSharedEffectBus replaceSharedEffectBusIn,
+                                    RemoveTrackEffect removeTrackEffectIn,
                                     RemoveSharedEffectBus removeSharedEffectBusIn,
                                     RouteTrackTarget routeTrackTargetIn,
                                     OpenTrackEditor openTrackEditorIn,
+                                    OpenTrackEffectEditor openTrackEffectEditorIn,
                                     OpenSharedEffectEditor openSharedEffectEditorIn,
+                                    SetTrackEffectBypassed setTrackEffectBypassedIn,
                                     ClearSharedEffectBusOutputs clearSharedEffectBusOutputsIn,
                                     SetSharedEffectBusOutputTargetEnabled setSharedEffectBusOutputTargetEnabledIn)
         : projectGetter(std::move(projectGetterIn)),
           addInstrumentTrack(std::move(addInstrumentTrackIn)),
+          addTrackEffect(std::move(addTrackEffectIn)),
           addSharedEffectBus(std::move(addSharedEffectBusIn)),
+          replaceTrackEffect(std::move(replaceTrackEffectIn)),
           replaceSharedEffectBus(std::move(replaceSharedEffectBusIn)),
+          removeTrackEffect(std::move(removeTrackEffectIn)),
           removeSharedEffectBus(std::move(removeSharedEffectBusIn)),
           routeTrackTarget(std::move(routeTrackTargetIn)),
           openTrackEditor(std::move(openTrackEditorIn)),
+          openTrackEffectEditor(std::move(openTrackEffectEditorIn)),
           openSharedEffectEditor(std::move(openSharedEffectEditorIn)),
+          setTrackEffectBypassed(std::move(setTrackEffectBypassedIn)),
           clearSharedEffectBusOutputs(std::move(clearSharedEffectBusOutputsIn)),
           setSharedEffectBusOutputTargetEnabled(std::move(setSharedEffectBusOutputTargetEnabledIn))
     {
@@ -6746,11 +6926,36 @@ public:
             return;
         }
 
+        if (event.mods.isShiftDown()
+            && (hit.node->kind == NodeKind::track
+                || hit.node->kind == NodeKind::trackFx
+                || hit.node->kind == NodeKind::bus))
+        {
+            routeSourceKind = hit.node->kind == NodeKind::bus
+                ? RouteSourceKind::bus
+                : (hit.node->kind == NodeKind::trackFx ? RouteSourceKind::trackFx : RouteSourceKind::track);
+            routeCandidateTrackIndex = hit.node->trackIndex;
+            routeCandidateTrackFxIndex = hit.node->kind == NodeKind::trackFx ? hit.node->effectIndex : -1;
+            routeCandidateBusId = hit.node->busId;
+            dragStartPosition = event.position;
+            dragCurrentPosition = event.position;
+            routeDragActive = true;
+            dragRouteTrackIndex = hit.node->trackIndex;
+            dragRouteTrackFxIndex = hit.node->kind == NodeKind::trackFx ? hit.node->effectIndex : -1;
+            dragRouteBusId = hit.node->busId;
+            if (hit.node->kind == NodeKind::track || hit.node->kind == NodeKind::trackFx)
+                pendingRouteTrackIndex = hit.node->trackIndex;
+            updateRouteDragTarget(event.position);
+            repaint();
+            return;
+        }
+
         if (hit.part == NodePart::outputPort
             && (hit.node->kind == NodeKind::track || hit.node->kind == NodeKind::bus))
         {
             routeSourceKind = hit.node->kind == NodeKind::track ? RouteSourceKind::track : RouteSourceKind::bus;
             routeCandidateTrackIndex = hit.node->trackIndex;
+            routeCandidateTrackFxIndex = -1;
             routeCandidateBusId = hit.node->busId;
             dragStartPosition = event.position;
             dragCurrentPosition = event.position;
@@ -6758,12 +6963,19 @@ public:
         }
 
         if (hit.part == NodePart::body
-            && (hit.node->kind == NodeKind::track || hit.node->kind == NodeKind::bus || hit.node->kind == NodeKind::master))
+            && (hit.node->kind == NodeKind::track
+                || hit.node->kind == NodeKind::trackFx
+                || hit.node->kind == NodeKind::bus
+                || hit.node->kind == NodeKind::master))
         {
             moveCandidateTrackIndex = -1;
+            moveCandidateTrackFxTrackIndex = -1;
+            moveCandidateTrackFxIndex = -1;
             moveCandidateBusId.clear();
             moveCandidateMaster = false;
             moveCandidateTrackIndex = hit.node->kind == NodeKind::track ? hit.node->trackIndex : -1;
+            moveCandidateTrackFxTrackIndex = hit.node->kind == NodeKind::trackFx ? hit.node->trackIndex : -1;
+            moveCandidateTrackFxIndex = hit.node->kind == NodeKind::trackFx ? hit.node->effectIndex : -1;
             moveCandidateBusId = hit.node->kind == NodeKind::bus ? hit.node->busId : juce::String();
             moveCandidateMaster = hit.node->kind == NodeKind::master;
             dragStartPosition = event.position;
@@ -6789,8 +7001,9 @@ public:
 
                 routeDragActive = true;
                 dragRouteTrackIndex = routeSourceKind == RouteSourceKind::track ? routeCandidateTrackIndex : -1;
+                dragRouteTrackFxIndex = routeSourceKind == RouteSourceKind::trackFx ? routeCandidateTrackFxIndex : -1;
                 dragRouteBusId = routeSourceKind == RouteSourceKind::bus ? routeCandidateBusId : juce::String();
-                if (routeSourceKind == RouteSourceKind::track)
+                if (routeSourceKind == RouteSourceKind::track || routeSourceKind == RouteSourceKind::trackFx)
                     pendingRouteTrackIndex = dragRouteTrackIndex;
             }
 
@@ -6800,8 +7013,13 @@ public:
             return;
         }
 
-        if (moveCandidateTrackIndex < 0 && moveCandidateBusId.isEmpty() && !moveCandidateMaster)
+        if (moveCandidateTrackIndex < 0
+            && moveCandidateTrackFxTrackIndex < 0
+            && moveCandidateBusId.isEmpty()
+            && !moveCandidateMaster)
+        {
             return;
+        }
 
         if (!nodeMoveActive && event.position.getDistanceFrom(dragStartPosition) < 2.0f)
             return;
@@ -6812,6 +7030,12 @@ public:
         {
             trackNodePositions[static_cast<size_t>(moveCandidateTrackIndex)] =
                 clampNodePosition(event.position - dragNodeOffset, trackNodeSize());
+        }
+        else if (moveCandidateTrackFxTrackIndex >= 0)
+        {
+            setTrackFxNodePosition(moveCandidateTrackFxTrackIndex,
+                                   moveCandidateTrackFxIndex,
+                                   clampNodePosition(event.position - dragNodeOffset, trackFxNodeSize()));
         }
         else if (moveCandidateBusId.isNotEmpty())
         {
@@ -6854,6 +7078,13 @@ public:
             return;
         }
 
+        if (hit.node->kind == NodeKind::trackFx)
+        {
+            if (openTrackEffectEditor != nullptr)
+                openTrackEffectEditor(hit.node->trackIndex, hit.node->effectIndex);
+            return;
+        }
+
         if (hit.node->kind == NodeKind::bus && openSharedEffectEditor != nullptr)
             openSharedEffectEditor(hit.node->busId);
     }
@@ -6862,6 +7093,7 @@ private:
     enum class NodeKind
     {
         track,
+        trackFx,
         bus,
         master
     };
@@ -6878,6 +7110,7 @@ private:
     {
         none,
         track,
+        trackFx,
         bus
     };
 
@@ -6888,10 +7121,13 @@ private:
         juce::Rectangle<float> inputPortBounds;
         juce::Rectangle<float> outputPortBounds;
         int trackIndex = -1;
+        int effectIndex = -1;
         juce::String busId;
+        juce::String effectReference;
         juce::String title;
         juce::String subtitle;
         juce::Colour colour;
+        bool bypassed = false;
     };
 
     struct HitResult
@@ -6908,11 +7144,15 @@ private:
 
         const auto& project = projectGetter();
         trackNodePositions.resize(project.tracks.size(), { -1.0f, -1.0f });
+        trackFxNodePositions.resize(project.tracks.size());
+        for (size_t trackIndex = 0; trackIndex < project.tracks.size(); ++trackIndex)
+            trackFxNodePositions[trackIndex].resize(project.tracks[trackIndex].vstFxChain.size(), { -1.0f, -1.0f });
         const auto content = canvasBounds.reduced(26, 24);
         if (content.isEmpty())
             return;
 
         const auto trackSize = trackNodeSize();
+        const auto trackFxSize = trackFxNodeSize();
         const auto busSize = busNodeSize();
         const auto masterSize = masterNodeSize();
         const auto defaultMasterPosition = juce::Point<float>(
@@ -6994,10 +7234,10 @@ private:
                                                  busSize.x,
                                                  busSize.y);
             node.title = bus.name.trim().isNotEmpty() ? bus.name.trim() : ("FX Bus " + juce::String(busIndex + 1));
-            if (const auto* entry = findRackEntryByReference(project, bus.effect, true))
-                node.subtitle = rackEntryDisplayName(*entry);
-            else
-                node.subtitle = bus.effect.trim().isNotEmpty() ? bus.effect.trim() : "Shared Effect";
+            const auto effectLabel = effectReferenceDisplayName(project, bus.effect);
+            node.subtitle = effectLabel.isNotEmpty()
+                ? "Shared FX: " + effectLabel
+                : "Shared FX Bus";
             node.colour = juce::Colour::fromRGB(74, 119, 193);
             assignNodePortBounds(node);
             nodes.push_back(std::move(node));
@@ -7013,6 +7253,78 @@ private:
         masterNode.colour = juce::Colour::fromRGB(86, 190, 152);
         assignNodePortBounds(masterNode);
         nodes.push_back(std::move(masterNode));
+
+        const auto* masterNodePtr = findNode(NodeKind::master, {}, -1);
+        for (int trackIndex = 0; trackIndex < static_cast<int>(project.tracks.size()); ++trackIndex)
+        {
+            const auto* trackNode = findNode(NodeKind::track, {}, trackIndex);
+            if (trackNode == nullptr || masterNodePtr == nullptr)
+                continue;
+
+            const auto& track = project.tracks[static_cast<size_t>(trackIndex)];
+            const auto effectCount = track.vstFxChain.size();
+            if (effectCount <= 0)
+                continue;
+
+            auto routeEndPoint = resolveTrackRouteTargetPoint(project,
+                                                              track,
+                                                              *trackNode,
+                                                              masterNodePtr->inputPortBounds.getCentre());
+            if (track.routingTarget.trim().equalsIgnoreCase("none"))
+            {
+                routeEndPoint = {
+                    juce::jmin(trackNode->outputPortBounds.getCentreX() + 360.0f,
+                                static_cast<float>(canvasBounds.getRight()) - trackFxSize.x * 0.5f - 14.0f),
+                    trackNode->outputPortBounds.getCentreY()
+                };
+            }
+
+            const auto startPoint = trackNode->outputPortBounds.getCentre();
+            auto direction = routeEndPoint - startPoint;
+            auto distance = direction.getDistanceFromOrigin();
+            if (distance <= 1.0f)
+            {
+                direction = { 1.0f, 0.0f };
+                distance = 1.0f;
+            }
+            else
+            {
+                direction /= distance;
+            }
+
+            const juce::Point<float> orthogonal(-direction.y, direction.x);
+            const auto baseColour = trackDisplayColour(track, trackIndex);
+
+            for (int effectIndex = 0; effectIndex < effectCount; ++effectIndex)
+            {
+                const auto fraction = static_cast<float>(effectIndex + 1) / static_cast<float>(effectCount + 1);
+                auto centre = startPoint + (routeEndPoint - startPoint) * fraction;
+                centre += orthogonal * ((static_cast<float>(effectIndex) - static_cast<float>(effectCount - 1) * 0.5f) * 8.0f);
+                auto position = findTrackFxNodePosition(trackIndex, effectIndex);
+                if (position.x < 0.0f || position.y < 0.0f)
+                    position = centre - trackFxSize * 0.5f;
+                const auto clampedPosition = clampNodePosition(position, trackFxSize);
+                setTrackFxNodePosition(trackIndex, effectIndex, clampedPosition);
+
+                Node node;
+                node.kind = NodeKind::trackFx;
+                node.trackIndex = trackIndex;
+                node.effectIndex = effectIndex;
+                node.effectReference = track.vstFxChain[effectIndex];
+                node.bounds = juce::Rectangle<float>(clampedPosition.x,
+                                                     clampedPosition.y,
+                                                     trackFxSize.x,
+                                                     trackFxSize.y);
+                node.title = effectReferenceDisplayName(project, node.effectReference);
+                if (node.title.isEmpty())
+                    node.title = "Track FX";
+                node.bypassed = trackFxSlotBypassed(track, effectIndex);
+                node.subtitle = node.bypassed ? "Track FX (bypassed)" : "Track FX";
+                node.colour = baseColour.interpolatedWith(juce::Colour::fromRGB(86, 105, 136), 0.28f);
+                assignNodePortBounds(node);
+                nodes.push_back(std::move(node));
+            }
+        }
     }
 
     void syncNodeStateFromProject()
@@ -7021,13 +7333,46 @@ private:
         if (!juce::isPositiveAndBelow(pendingRouteTrackIndex, static_cast<int>(project.tracks.size())))
             pendingRouteTrackIndex = -1;
         if (!juce::isPositiveAndBelow(routeCandidateTrackIndex, static_cast<int>(project.tracks.size())))
+        {
             routeCandidateTrackIndex = -1;
+            routeCandidateTrackFxIndex = -1;
+        }
         if (!juce::isPositiveAndBelow(dragRouteTrackIndex, static_cast<int>(project.tracks.size())))
+        {
             dragRouteTrackIndex = -1;
+            dragRouteTrackFxIndex = -1;
+        }
         if (!juce::isPositiveAndBelow(moveCandidateTrackIndex, static_cast<int>(project.tracks.size())))
             moveCandidateTrackIndex = -1;
+        if (!juce::isPositiveAndBelow(moveCandidateTrackFxTrackIndex, static_cast<int>(project.tracks.size())))
+        {
+            moveCandidateTrackFxTrackIndex = -1;
+            moveCandidateTrackFxIndex = -1;
+        }
 
         trackNodePositions.resize(project.tracks.size(), { -1.0f, -1.0f });
+        trackFxNodePositions.resize(project.tracks.size());
+        for (size_t trackIndex = 0; trackIndex < project.tracks.size(); ++trackIndex)
+            trackFxNodePositions[trackIndex].resize(project.tracks[trackIndex].vstFxChain.size(), { -1.0f, -1.0f });
+        if (juce::isPositiveAndBelow(moveCandidateTrackFxTrackIndex, static_cast<int>(project.tracks.size()))
+            && !juce::isPositiveAndBelow(moveCandidateTrackFxIndex,
+                                         static_cast<int>(project.tracks[static_cast<size_t>(moveCandidateTrackFxTrackIndex)].vstFxChain.size())))
+        {
+            moveCandidateTrackFxTrackIndex = -1;
+            moveCandidateTrackFxIndex = -1;
+        }
+        if (juce::isPositiveAndBelow(routeCandidateTrackIndex, static_cast<int>(project.tracks.size()))
+            && !juce::isPositiveAndBelow(routeCandidateTrackFxIndex,
+                                         static_cast<int>(project.tracks[static_cast<size_t>(routeCandidateTrackIndex)].vstFxChain.size())))
+        {
+            routeCandidateTrackFxIndex = -1;
+        }
+        if (juce::isPositiveAndBelow(dragRouteTrackIndex, static_cast<int>(project.tracks.size()))
+            && !juce::isPositiveAndBelow(dragRouteTrackFxIndex,
+                                         static_cast<int>(project.tracks[static_cast<size_t>(dragRouteTrackIndex)].vstFxChain.size())))
+        {
+            dragRouteTrackFxIndex = -1;
+        }
         busNodePositions.erase(std::remove_if(busNodePositions.begin(),
                                               busNodePositions.end(),
                                               [&project] (const auto& entry)
@@ -7054,21 +7399,36 @@ private:
             if (node.kind != NodeKind::track)
                 continue;
 
-            juce::Point<float> endPoint;
             juce::Colour lineColour = node.colour.withAlpha(0.78f);
-            const auto targetId = juce::isPositiveAndBelow(node.trackIndex, static_cast<int>(project.tracks.size()))
-                ? project.tracks[static_cast<size_t>(node.trackIndex)].routingTarget.trim()
-                : juce::String();
+            auto startPoint = connectionOutputPoint(node);
+            const auto trackFxNodes = findTrackFxNodes(node.trackIndex);
+            for (const auto* fxNode : trackFxNodes)
+            {
+                if (fxNode == nullptr)
+                    continue;
+
+                drawArrow(g,
+                          startPoint,
+                          connectionInputPoint(*fxNode),
+                          lineColour,
+                          pendingRouteTrackIndex == node.trackIndex ? 3.0f : 2.2f);
+                startPoint = connectionOutputPoint(*fxNode);
+            }
+
+            if (!juce::isPositiveAndBelow(node.trackIndex, static_cast<int>(project.tracks.size())))
+                continue;
+
+            const auto& track = project.tracks[static_cast<size_t>(node.trackIndex)];
+            const auto targetId = track.routingTarget.trim();
             if (targetId.equalsIgnoreCase("none"))
                 continue;
 
-            if (const auto* busNode = findNode(NodeKind::bus, targetId, -1))
-                endPoint = busNode->inputPortBounds.getCentre();
-            else
-                endPoint = masterNode->inputPortBounds.getCentre();
-
+            auto endPoint = resolveTrackRouteTargetPoint(project,
+                                                         track,
+                                                         node,
+                                                         masterNode->inputPortBounds.getCentre());
             drawArrow(g,
-                      node.outputPortBounds.getCentre(),
+                      startPoint,
                       endPoint,
                       lineColour,
                       pendingRouteTrackIndex == node.trackIndex ? 3.0f : 2.2f);
@@ -7090,12 +7450,12 @@ private:
 
             for (const auto& target : busIt->outputTargets)
             {
-                auto endPoint = masterNode->inputPortBounds.getCentre();
+                auto endPoint = connectionInputPoint(*masterNode);
                 if (const auto* busNode = findNode(NodeKind::bus, target, -1))
-                    endPoint = busNode->inputPortBounds.getCentre();
+                    endPoint = connectionInputPoint(*busNode);
 
                 drawArrow(g,
-                          node.outputPortBounds.getCentre(),
+                          connectionOutputPoint(node),
                           endPoint,
                           node.colour.withAlpha(0.85f),
                           2.4f);
@@ -7106,17 +7466,19 @@ private:
         {
             const auto* sourceNode = routeSourceKind == RouteSourceKind::track
                 ? findNode(NodeKind::track, {}, dragRouteTrackIndex)
-                : findNode(NodeKind::bus, dragRouteBusId, -1);
+                : (routeSourceKind == RouteSourceKind::trackFx
+                       ? findNode(NodeKind::trackFx, {}, dragRouteTrackIndex, dragRouteTrackFxIndex)
+                       : findNode(NodeKind::bus, dragRouteBusId, -1));
             if (sourceNode != nullptr)
             {
                 auto endPoint = dragCurrentPosition;
                 if (dragHoverMaster && masterNode != nullptr)
-                    endPoint = masterNode->inputPortBounds.getCentre();
+                    endPoint = connectionInputPoint(*masterNode);
                 else if (const auto* busNode = findNode(NodeKind::bus, dragHoverBusId, -1))
-                    endPoint = busNode->inputPortBounds.getCentre();
+                    endPoint = connectionInputPoint(*busNode);
 
                 drawArrow(g,
-                          sourceNode->outputPortBounds.getCentre(),
+                          connectionOutputPoint(*sourceNode),
                           endPoint,
                           sourceNode->colour.withAlpha(0.95f),
                           3.4f);
@@ -7130,26 +7492,31 @@ private:
         {
             const auto isPendingTrack = node.kind == NodeKind::track && node.trackIndex == pendingRouteTrackIndex;
             const auto isDragTrack = (node.kind == NodeKind::track && node.trackIndex == dragRouteTrackIndex)
+                || (node.kind == NodeKind::trackFx
+                    && node.trackIndex == dragRouteTrackIndex
+                    && node.effectIndex == dragRouteTrackFxIndex)
                 || (node.kind == NodeKind::bus && node.busId.equalsIgnoreCase(dragRouteBusId));
             const auto isHoverTarget = (node.kind == NodeKind::master && dragHoverMaster)
                 || (node.kind == NodeKind::bus && node.busId.equalsIgnoreCase(dragHoverBusId));
+            const auto isTrackFx = node.kind == NodeKind::trackFx;
             const auto baseColour = node.kind == NodeKind::master
                 ? node.colour.withAlpha(0.24f)
-                : node.colour.withAlpha((isPendingTrack || isDragTrack) ? 0.34f : 0.2f);
+                : node.colour.withAlpha((isPendingTrack || isDragTrack) ? 0.34f : (isTrackFx ? 0.18f : 0.2f));
 
             g.setColour(baseColour);
             g.fillRoundedRectangle(node.bounds, 12.0f);
 
-            g.setColour(node.colour.withAlpha((isPendingTrack || isDragTrack || isHoverTarget) ? 1.0f : 0.82f));
+            const auto borderAlpha = node.bypassed ? 0.52f : ((isPendingTrack || isDragTrack || isHoverTarget) ? 1.0f : 0.82f);
+            g.setColour(node.colour.withAlpha(borderAlpha));
             g.drawRoundedRectangle(node.bounds, 12.0f, (isPendingTrack || isDragTrack || isHoverTarget) ? 2.6f : 1.6f);
 
             auto textBounds = node.bounds.toNearestInt().reduced(12, 10);
-            g.setColour(juce::Colour::fromRGB(242, 246, 252));
-            g.setFont(ui::sectionFont());
-            g.drawText(node.title, textBounds.removeFromTop(20), juce::Justification::centredLeft, true);
-            g.setColour(juce::Colour::fromRGB(171, 182, 198));
+            g.setColour(juce::Colour::fromRGB(242, 246, 252).withAlpha(node.bypassed ? 0.72f : 1.0f));
+            g.setFont(isTrackFx ? ui::font() : ui::sectionFont());
+            g.drawText(node.title, textBounds.removeFromTop(20), juce::Justification::centred, true);
+            g.setColour(juce::Colour::fromRGB(171, 182, 198).withAlpha(node.bypassed ? 0.68f : 1.0f));
             g.setFont(ui::font());
-            g.drawText(node.subtitle, textBounds, juce::Justification::centredLeft, true);
+            g.drawText(node.subtitle, textBounds, juce::Justification::centred, true);
 
             auto drawPort = [&g, &node] (juce::Rectangle<float> bounds, bool highlighted)
             {
@@ -7160,16 +7527,25 @@ private:
                 g.fillEllipse(bounds);
             };
 
-            drawPort(node.inputPortBounds, isHoverTarget);
-            if (node.kind != NodeKind::master)
-                drawPort(node.outputPortBounds, isDragTrack);
+            if (!isTrackFx && (isHoverTarget || (routeDragActive && node.kind == NodeKind::master)))
+                drawPort(node.inputPortBounds, true);
+            if (node.kind != NodeKind::master && !isTrackFx && isDragTrack)
+                drawPort(node.outputPortBounds, true);
         }
     }
 
     HitResult hitTestNodePart(juce::Point<float> position) const
     {
-        for (const auto& node : nodes)
+        for (auto it = nodes.rbegin(); it != nodes.rend(); ++it)
         {
+            const auto& node = *it;
+            if (node.kind == NodeKind::trackFx)
+            {
+                if (node.bounds.expanded(8.0f).contains(position))
+                    return { &node, NodePart::body };
+                continue;
+            }
+
             if (node.outputPortBounds.contains(position) && node.kind != NodeKind::master)
                 return { &node, NodePart::outputPort };
             if (node.inputPortBounds.contains(position))
@@ -7186,7 +7562,7 @@ private:
         return hitTestNodePart(position).node;
     }
 
-    const Node* findNode(NodeKind kind, const juce::String& busId, int trackIndex) const
+    const Node* findNode(NodeKind kind, const juce::String& busId, int trackIndex, int effectIndex = -1) const
     {
         for (const auto& node : nodes)
         {
@@ -7196,9 +7572,62 @@ private:
                 continue;
             if (kind == NodeKind::track && node.trackIndex != trackIndex)
                 continue;
+            if (kind == NodeKind::trackFx
+                && (node.trackIndex != trackIndex || node.effectIndex != effectIndex))
+            {
+                continue;
+            }
             return &node;
         }
         return nullptr;
+    }
+
+    std::vector<const Node*> findTrackFxNodes(int trackIndex) const
+    {
+        std::vector<const Node*> result;
+        for (const auto& node : nodes)
+        {
+            if (node.kind == NodeKind::trackFx && node.trackIndex == trackIndex)
+                result.push_back(&node);
+        }
+
+        std::sort(result.begin(),
+                  result.end(),
+                  [] (const Node* lhs, const Node* rhs)
+                  {
+                      if (lhs == nullptr || rhs == nullptr)
+                          return lhs != nullptr;
+                      return lhs->effectIndex < rhs->effectIndex;
+                  });
+        return result;
+    }
+
+    juce::Point<float> resolveTrackRouteTargetPoint(const ProjectState& project,
+                                                    const TrackState& track,
+                                                    const Node& trackNode,
+                                                    juce::Point<float> masterPoint) const
+    {
+        const auto targetId = track.routingTarget.trim();
+        if (targetId.equalsIgnoreCase("none"))
+            return { juce::jmin(trackNode.outputPortBounds.getCentreX() + 360.0f,
+                                static_cast<float>(canvasBounds.getRight()) - 28.0f),
+                     trackNode.outputPortBounds.getCentreY() };
+
+        if (const auto* busNode = findNode(NodeKind::bus, targetId, -1))
+            return connectionInputPoint(*busNode);
+
+        juce::ignoreUnused(project);
+        return masterPoint;
+    }
+
+    static juce::Point<float> connectionInputPoint(const Node& node)
+    {
+        return node.bounds.getCentre();
+    }
+
+    static juce::Point<float> connectionOutputPoint(const Node& node)
+    {
+        return node.bounds.getCentre();
     }
 
     void updateRouteDragTarget(juce::Point<float> position)
@@ -7218,7 +7647,7 @@ private:
 
     void applyRouteDrag()
     {
-        if (routeSourceKind == RouteSourceKind::track
+        if ((routeSourceKind == RouteSourceKind::track || routeSourceKind == RouteSourceKind::trackFx)
             && routeTrackTarget != nullptr
             && dragRouteTrackIndex >= 0)
         {
@@ -7247,9 +7676,11 @@ private:
     {
         routeSourceKind = RouteSourceKind::none;
         routeCandidateTrackIndex = -1;
+        routeCandidateTrackFxIndex = -1;
         routeCandidateBusId.clear();
         routeDragActive = false;
         dragRouteTrackIndex = -1;
+        dragRouteTrackFxIndex = -1;
         dragRouteBusId.clear();
         pendingRouteTrackIndex = -1;
         dragHoverBusId.clear();
@@ -7259,6 +7690,8 @@ private:
     void cancelNodeMove()
     {
         moveCandidateTrackIndex = -1;
+        moveCandidateTrackFxTrackIndex = -1;
+        moveCandidateTrackFxIndex = -1;
         moveCandidateBusId.clear();
         moveCandidateMaster = false;
         nodeMoveActive = false;
@@ -7267,19 +7700,30 @@ private:
     void assignNodePortBounds(Node& node) const
     {
         constexpr float portSize = 10.0f;
-        node.inputPortBounds = { node.bounds.getX() - portSize * 0.5f,
-                                 node.bounds.getCentreY() - portSize * 0.5f,
-                                 portSize,
-                                 portSize };
+        if (node.kind == NodeKind::master)
+        {
+            node.inputPortBounds = { node.bounds.getCentreX() - portSize * 0.5f,
+                                     node.bounds.getCentreY() - portSize * 0.5f,
+                                     portSize,
+                                     portSize };
+        }
+        else
+        {
+            node.inputPortBounds = { node.bounds.getX() - portSize * 0.5f,
+                                     node.bounds.getCentreY() - portSize * 0.5f,
+                                     portSize,
+                                     portSize };
+        }
         node.outputPortBounds = { node.bounds.getRight() - portSize * 0.5f,
                                   node.bounds.getCentreY() - portSize * 0.5f,
                                   portSize,
                                   portSize };
     }
 
-    static juce::Point<float> trackNodeSize() { return { 244.0f, 64.0f }; }
-    static juce::Point<float> busNodeSize() { return { 212.0f, 60.0f }; }
-    static juce::Point<float> masterNodeSize() { return { 188.0f, 92.0f }; }
+    static juce::Point<float> trackNodeSize() { return { 140.0f, 64.0f }; }
+    static juce::Point<float> trackFxNodeSize() { return { 112.0f, 54.0f }; }
+    static juce::Point<float> busNodeSize() { return { 116.0f, 60.0f }; }
+    static juce::Point<float> masterNodeSize() { return { 120.0f, 92.0f }; }
 
     juce::Point<float> clampNodePosition(juce::Point<float> position, juce::Point<float> nodeSize) const
     {
@@ -7365,6 +7809,30 @@ private:
         busNodePositions.push_back({ busId, position });
     }
 
+    juce::Point<float> findTrackFxNodePosition(int trackIndex, int effectIndex) const
+    {
+        if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(trackFxNodePositions.size())))
+            return { -1.0f, -1.0f };
+
+        const auto& positions = trackFxNodePositions[static_cast<size_t>(trackIndex)];
+        if (!juce::isPositiveAndBelow(effectIndex, static_cast<int>(positions.size())))
+            return { -1.0f, -1.0f };
+
+        return positions[static_cast<size_t>(effectIndex)];
+    }
+
+    void setTrackFxNodePosition(int trackIndex, int effectIndex, juce::Point<float> position)
+    {
+        if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(trackFxNodePositions.size())))
+            return;
+
+        auto& positions = trackFxNodePositions[static_cast<size_t>(trackIndex)];
+        if (!juce::isPositiveAndBelow(effectIndex, static_cast<int>(positions.size())))
+            return;
+
+        positions[static_cast<size_t>(effectIndex)] = position;
+    }
+
     static void drawArrow(juce::Graphics& g,
                           juce::Point<float> start,
                           juce::Point<float> end,
@@ -7384,8 +7852,9 @@ private:
 
         delta /= length;
         const juce::Point<float> orthogonal(-delta.y, delta.x);
-        const auto tip = end;
-        const auto base = end - delta * 12.0f;
+        const auto midpoint = start + (end - start) * 0.5f;
+        const auto tip = midpoint + delta * 7.0f;
+        const auto base = midpoint - delta * 7.0f;
         juce::Path head;
         head.addTriangle(tip, base + orthogonal * 5.5f, base - orthogonal * 5.5f);
         g.fillPath(head);
@@ -7398,6 +7867,7 @@ private:
             switch (node->kind)
             {
                 case NodeKind::track: showTrackMenu(*node, screenPosition); break;
+                case NodeKind::trackFx: showTrackFxMenu(*node, screenPosition); break;
                 case NodeKind::bus: showBusMenu(*node, screenPosition); break;
                 case NodeKind::master: showMasterMenu(screenPosition); break;
             }
@@ -7439,7 +7909,7 @@ private:
         }
 
         menu.addSubMenu("Add Instrument Track", instrumentsMenu, !instrumentReferences.empty());
-        menu.addSubMenu("Add Shared Effect", effectsMenu, !effectReferences.empty());
+        menu.addSubMenu("Add Shared FX Bus", effectsMenu, !effectReferences.empty());
 
         auto options = juce::PopupMenu::Options()
             .withTargetScreenArea(juce::Rectangle<int>(screenPosition.x, screenPosition.y, 1, 1))
@@ -7485,15 +7955,18 @@ private:
         const auto& track = project.tracks[static_cast<size_t>(node.trackIndex)];
         juce::PopupMenu menu;
         juce::PopupMenu routeMenu;
-        juce::PopupMenu effectsMenu;
+        juce::PopupMenu trackEffectsMenu;
+        juce::PopupMenu sharedEffectsMenu;
         std::vector<juce::String> busIds;
-        std::vector<juce::String> effectReferences;
+        std::vector<juce::String> trackEffectReferences;
+        std::vector<juce::String> sharedEffectReferences;
 
         constexpr int openEditorId = 1;
         constexpr int routeMasterId = 10;
         constexpr int routeDisconnectId = 11;
         constexpr int routeBusBaseId = 100;
-        constexpr int insertEffectBaseId = 1000;
+        constexpr int addTrackEffectBaseId = 1000;
+        constexpr int addSharedEffectBaseId = 2000;
 
         menu.addItem(openEditorId, "Open Instrument Editor");
         menu.addSeparator();
@@ -7519,12 +7992,16 @@ private:
             if (label.isEmpty())
                 continue;
 
-            effectReferences.push_back(entry.path.isNotEmpty() ? entry.path : label);
-            effectsMenu.addItem(insertEffectBaseId + static_cast<int>(effectReferences.size()) - 1, label);
+            const auto reference = entry.path.isNotEmpty() ? entry.path : label;
+            trackEffectReferences.push_back(reference);
+            trackEffectsMenu.addItem(addTrackEffectBaseId + static_cast<int>(trackEffectReferences.size()) - 1, label);
+            sharedEffectReferences.push_back(reference);
+            sharedEffectsMenu.addItem(addSharedEffectBaseId + static_cast<int>(sharedEffectReferences.size()) - 1, label);
         }
 
         menu.addSubMenu("Route To", routeMenu, true);
-        menu.addSubMenu("Insert Shared Effect", effectsMenu, !effectReferences.empty());
+        menu.addSubMenu("Add Track FX", trackEffectsMenu, !trackEffectReferences.empty());
+        menu.addSubMenu("Add Shared FX Bus", sharedEffectsMenu, !sharedEffectReferences.empty());
 
         auto options = juce::PopupMenu::Options()
             .withTargetScreenArea(juce::Rectangle<int>(screenPosition.x, screenPosition.y, 1, 1))
@@ -7537,7 +8014,8 @@ private:
                                                                                 node.bounds.getY() - 6.0f),
                                                              busNodeSize()),
                             busIds,
-                            effectReferences] (int result)
+                            trackEffectReferences,
+                            sharedEffectReferences] (int result)
                            {
                                if (safeThis == nullptr || result == 0)
                                    return;
@@ -7570,14 +8048,113 @@ private:
                                    return;
                                }
 
-                               if (result >= 1000 && result < 1000 + static_cast<int>(effectReferences.size()))
+                               if (result >= addTrackEffectBaseId
+                                   && result < addTrackEffectBaseId + static_cast<int>(trackEffectReferences.size()))
+                               {
+                                   if (safeThis->addTrackEffect != nullptr)
+                                   {
+                                       safeThis->addTrackEffect(trackIndex,
+                                                               trackEffectReferences[static_cast<size_t>(result - addTrackEffectBaseId)]);
+                                   }
+                                   return;
+                               }
+
+                               if (result >= addSharedEffectBaseId
+                                   && result < addSharedEffectBaseId + static_cast<int>(sharedEffectReferences.size()))
                                {
                                    if (safeThis->addSharedEffectBus != nullptr)
                                    {
                                        safeThis->pendingBusPlacement = busPlacement;
-                                       safeThis->addSharedEffectBus(effectReferences[static_cast<size_t>(result - 1000)],
+                                       safeThis->addSharedEffectBus(sharedEffectReferences[static_cast<size_t>(result - addSharedEffectBaseId)],
                                                                    trackIndex);
                                    }
+                               }
+                           });
+    }
+
+    void showTrackFxMenu(const Node& node, juce::Point<int> screenPosition)
+    {
+        const auto& project = projectGetter();
+        if (!juce::isPositiveAndBelow(node.trackIndex, static_cast<int>(project.tracks.size())))
+            return;
+
+        const auto& track = project.tracks[static_cast<size_t>(node.trackIndex)];
+        if (!juce::isPositiveAndBelow(node.effectIndex, track.vstFxChain.size()))
+            return;
+
+        juce::PopupMenu menu;
+        juce::PopupMenu replaceMenu;
+        std::vector<juce::String> effectReferences;
+
+        constexpr int openEditorId = 1;
+        constexpr int toggleBypassId = 2;
+        constexpr int removeId = 3;
+        constexpr int replaceEffectBaseId = 1000;
+
+        menu.addItem(openEditorId, "Open FX Editor");
+        menu.addItem(toggleBypassId, "Bypass FX", true, trackFxSlotBypassed(track, node.effectIndex));
+        menu.addSeparator();
+
+        for (const auto& entry : project.vstRack)
+        {
+            if (!entry.isEffect)
+                continue;
+
+            const auto label = rackEntryDisplayName(entry);
+            if (label.isEmpty())
+                continue;
+
+            effectReferences.push_back(entry.path.isNotEmpty() ? entry.path : label);
+            replaceMenu.addItem(replaceEffectBaseId + static_cast<int>(effectReferences.size()) - 1, label);
+        }
+
+        menu.addSubMenu("Replace Track FX", replaceMenu, !effectReferences.empty());
+        menu.addItem(removeId, "Remove From Track");
+
+        auto options = juce::PopupMenu::Options()
+            .withTargetScreenArea(juce::Rectangle<int>(screenPosition.x, screenPosition.y, 1, 1))
+            .withMinimumWidth(240);
+
+        menu.showMenuAsync(options,
+                           [safeThis = juce::Component::SafePointer<ModulationMatrixWindowComponent>(this),
+                            trackIndex = node.trackIndex,
+                            effectIndex = node.effectIndex,
+                            effectReferences,
+                            bypassed = node.bypassed] (int result)
+                           {
+                               if (safeThis == nullptr || result == 0)
+                                   return;
+
+                               if (result == openEditorId)
+                               {
+                                   if (safeThis->openTrackEffectEditor != nullptr)
+                                       safeThis->openTrackEffectEditor(trackIndex, effectIndex);
+                                   return;
+                               }
+
+                               if (result == toggleBypassId)
+                               {
+                                   if (safeThis->setTrackEffectBypassed != nullptr)
+                                       safeThis->setTrackEffectBypassed(trackIndex, effectIndex, !bypassed);
+                                   return;
+                               }
+
+                               if (result >= replaceEffectBaseId
+                                   && result < replaceEffectBaseId + static_cast<int>(effectReferences.size()))
+                               {
+                                   if (safeThis->replaceTrackEffect != nullptr)
+                                   {
+                                       safeThis->replaceTrackEffect(trackIndex,
+                                                                    effectIndex,
+                                                                    effectReferences[static_cast<size_t>(result - replaceEffectBaseId)]);
+                                   }
+                                   return;
+                               }
+
+                               if (result == removeId)
+                               {
+                                   if (safeThis->removeTrackEffect != nullptr)
+                                       safeThis->removeTrackEffect(trackIndex, effectIndex);
                                }
                            });
     }
@@ -7650,7 +8227,7 @@ private:
         menu.addSubMenu("Outputs", outputsMenu, true);
         menu.addItem(clearOutputsId, "Disconnect All Outputs", !enabledTargets.isEmpty());
         menu.addSubMenu("Replace Effect", replaceMenu, !effectReferences.empty());
-        menu.addItem(removeBusId, "Remove Effect Bus");
+        menu.addItem(removeBusId, "Remove Shared FX Bus");
 
         auto options = juce::PopupMenu::Options()
             .withTargetScreenArea(juce::Rectangle<int>(screenPosition.x, screenPosition.y, 1, 1))
@@ -7757,12 +8334,17 @@ private:
 
     ProjectGetter projectGetter;
     AddInstrumentTrack addInstrumentTrack;
+    AddTrackEffect addTrackEffect;
     AddSharedEffectBus addSharedEffectBus;
+    ReplaceTrackEffect replaceTrackEffect;
     ReplaceSharedEffectBus replaceSharedEffectBus;
+    RemoveTrackEffect removeTrackEffect;
     RemoveSharedEffectBus removeSharedEffectBus;
     RouteTrackTarget routeTrackTarget;
     OpenTrackEditor openTrackEditor;
+    OpenTrackEffectEditor openTrackEffectEditor;
     OpenSharedEffectEditor openSharedEffectEditor;
+    SetTrackEffectBypassed setTrackEffectBypassed;
     ClearSharedEffectBusOutputs clearSharedEffectBusOutputs;
     SetSharedEffectBusOutputTargetEnabled setSharedEffectBusOutputTargetEnabled;
     juce::Label titleLabel;
@@ -7771,10 +8353,14 @@ private:
     std::vector<Node> nodes;
     int pendingRouteTrackIndex = -1;
     int routeCandidateTrackIndex = -1;
+    int routeCandidateTrackFxIndex = -1;
     juce::String routeCandidateBusId;
     int dragRouteTrackIndex = -1;
+    int dragRouteTrackFxIndex = -1;
     juce::String dragRouteBusId;
     int moveCandidateTrackIndex = -1;
+    int moveCandidateTrackFxTrackIndex = -1;
+    int moveCandidateTrackFxIndex = -1;
     juce::String moveCandidateBusId;
     bool moveCandidateMaster = false;
     bool nodeMoveActive = false;
@@ -7789,6 +8375,7 @@ private:
     juce::Point<float> pendingBusPlacement { -1.0f, -1.0f };
     juce::Point<float> masterNodePosition { -1.0f, -1.0f };
     std::vector<juce::Point<float>> trackNodePositions;
+    std::vector<std::vector<juce::Point<float>>> trackFxNodePositions;
     std::vector<std::pair<juce::String, juce::Point<float>>> busNodePositions;
 };
 
@@ -14046,13 +14633,25 @@ void StudioShellComponent::ensureModulationMatrixWindowCreated()
                                                                             {
                                                                                 addInstrumentTrackFromReference(reference);
                                                                             },
+                                                                            [this] (int trackIndex, const juce::String& reference)
+                                                                            {
+                                                                                addTrackEffectFromReference(trackIndex, reference);
+                                                                            },
                                                                             [this] (const juce::String& reference, int inputTrackIndex)
                                                                             {
                                                                                 addSharedEffectBusFromReference(reference, inputTrackIndex);
                                                                             },
+                                                                            [this] (int trackIndex, int effectIndex, const juce::String& reference)
+                                                                            {
+                                                                                replaceTrackEffectReference(trackIndex, effectIndex, reference);
+                                                                            },
                                                                             [this] (const juce::String& busId, const juce::String& reference)
                                                                             {
                                                                                 replaceSharedEffectBusReference(busId, reference);
+                                                                            },
+                                                                            [this] (int trackIndex, int effectIndex)
+                                                                            {
+                                                                                removeTrackEffectFromTrack(trackIndex, effectIndex);
                                                                             },
                                                                             [this] (const juce::String& busId)
                                                                             {
@@ -14066,9 +14665,17 @@ void StudioShellComponent::ensureModulationMatrixWindowCreated()
                                                                             {
                                                                                 openTrackRackEditor(trackIndex);
                                                                             },
+                                                                            [this] (int trackIndex, int effectIndex)
+                                                                            {
+                                                                                openTrackEffectEditorFromMixer(trackIndex, effectIndex);
+                                                                            },
                                                                             [this] (const juce::String& busId)
                                                                             {
                                                                                 openSharedEffectBusEditor(busId);
+                                                                            },
+                                                                            [this] (int trackIndex, int effectIndex, bool bypassed)
+                                                                            {
+                                                                                setTrackEffectSlotBypassed(trackIndex, effectIndex, bypassed);
                                                                             },
                                                                             [this] (const juce::String& busId)
                                                                             {
@@ -14773,6 +15380,90 @@ void StudioShellComponent::addInstrumentTrackFromReference(const juce::String& r
     applyProjectStateEdit(updatedProject, "Add Instrument Track");
     trackTable.selectRow(static_cast<int>(documentState.project.tracks.size()) - 1);
     statusLabel.setText("Added instrument track: " + (entryLabel.isNotEmpty() ? entryLabel : "Instrument") + ".", juce::dontSendNotification);
+}
+
+void StudioShellComponent::addTrackEffectFromReference(int trackIndex, const juce::String& reference)
+{
+    if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(documentState.project.tracks.size())))
+        return;
+
+    const auto* entry = findRackEntryByReference(documentState.project, reference, true);
+    if (entry == nullptr || !entry->isEffect)
+        return;
+
+    auto updatedTrack = documentState.project.tracks[static_cast<size_t>(trackIndex)];
+    const auto resolvedReference = entry->path.isNotEmpty() ? entry->path : rackEntryDisplayName(*entry);
+    if (resolvedReference.trim().isEmpty() || updatedTrack.vstFxChain.contains(resolvedReference, true))
+        return;
+
+    updatedTrack.vstFxChain.add(resolvedReference);
+    ensureTrackFxBypassStateSize(updatedTrack.vstFxSlotBypassed, updatedTrack.vstFxChain.size());
+    applyTrackStateEdit(trackIndex, updatedTrack, "Add Track FX");
+    statusLabel.setText("Added track FX to " + updatedTrack.name + ".", juce::dontSendNotification);
+}
+
+void StudioShellComponent::replaceTrackEffectReference(int trackIndex, int effectIndex, const juce::String& reference)
+{
+    if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(documentState.project.tracks.size())))
+        return;
+
+    const auto* entry = findRackEntryByReference(documentState.project, reference, true);
+    if (entry == nullptr || !entry->isEffect)
+        return;
+
+    auto updatedTrack = documentState.project.tracks[static_cast<size_t>(trackIndex)];
+    if (!juce::isPositiveAndBelow(effectIndex, updatedTrack.vstFxChain.size()))
+        return;
+
+    const auto resolvedReference = entry->path.isNotEmpty() ? entry->path : rackEntryDisplayName(*entry);
+    if (resolvedReference.trim().isEmpty()
+        || updatedTrack.vstFxChain[effectIndex].equalsIgnoreCase(resolvedReference))
+    {
+        return;
+    }
+
+    updatedTrack.vstFxChain.set(effectIndex, resolvedReference);
+    ensureTrackFxBypassStateSize(updatedTrack.vstFxSlotBypassed, updatedTrack.vstFxChain.size());
+    applyTrackStateEdit(trackIndex, updatedTrack, "Replace Track FX");
+    statusLabel.setText("Updated track FX on " + updatedTrack.name + ".", juce::dontSendNotification);
+}
+
+void StudioShellComponent::removeTrackEffectFromTrack(int trackIndex, int effectIndex)
+{
+    if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(documentState.project.tracks.size())))
+        return;
+
+    auto updatedTrack = documentState.project.tracks[static_cast<size_t>(trackIndex)];
+    if (!juce::isPositiveAndBelow(effectIndex, updatedTrack.vstFxChain.size()))
+        return;
+
+    updatedTrack.vstFxChain.remove(effectIndex);
+    if (juce::isPositiveAndBelow(effectIndex, static_cast<int>(updatedTrack.vstFxSlotBypassed.size())))
+        updatedTrack.vstFxSlotBypassed.erase(updatedTrack.vstFxSlotBypassed.begin() + effectIndex);
+    ensureTrackFxBypassStateSize(updatedTrack.vstFxSlotBypassed, updatedTrack.vstFxChain.size());
+    applyTrackStateEdit(trackIndex, updatedTrack, "Remove Track FX");
+    statusLabel.setText("Removed track FX from " + updatedTrack.name + ".", juce::dontSendNotification);
+}
+
+void StudioShellComponent::setTrackEffectSlotBypassed(int trackIndex, int effectIndex, bool bypassed)
+{
+    if (!juce::isPositiveAndBelow(trackIndex, static_cast<int>(documentState.project.tracks.size())))
+        return;
+
+    auto updatedTrack = documentState.project.tracks[static_cast<size_t>(trackIndex)];
+    if (!juce::isPositiveAndBelow(effectIndex, updatedTrack.vstFxChain.size()))
+        return;
+
+    ensureTrackFxBypassStateSize(updatedTrack.vstFxSlotBypassed, updatedTrack.vstFxChain.size());
+    if (!juce::isPositiveAndBelow(effectIndex, static_cast<int>(updatedTrack.vstFxSlotBypassed.size()))
+        || updatedTrack.vstFxSlotBypassed[static_cast<size_t>(effectIndex)] == bypassed)
+    {
+        return;
+    }
+
+    updatedTrack.vstFxSlotBypassed[static_cast<size_t>(effectIndex)] = bypassed;
+    applyTrackStateEdit(trackIndex, updatedTrack, bypassed ? "Bypass Track FX" : "Enable Track FX");
+    statusLabel.setText("Updated track FX state on " + updatedTrack.name + ".", juce::dontSendNotification);
 }
 
 void StudioShellComponent::addSharedEffectBusFromReference(const juce::String& reference, int inputTrackIndex)
