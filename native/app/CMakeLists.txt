@@ -15,6 +15,8 @@ juce_add_binary_data(MutagenAssets
     SOURCES
         Assets/mutagen-logo-source.png
         Assets/mutagen-logo-80.png
+        Assets/demucs_separate.py
+        Assets/audio_to_midi.py
 )
 
 set(AIMS_HOST_COMPILE_DEFINITIONS

@@ -16,6 +16,7 @@ Guide: [GUIDE.md](GUIDE.md)
 - Pattern sequencer, piano roll, controller lane, mixer, automation, samples, transport, themes, and floating panels
 - Shared live plugin instances for playback and editor windows, so parameter moves apply directly during playback
 - Native AI compose/settings flow and on-disk activity or HTTP debug logs
+- Audio import to stem-split MIDI tracks through the native File menu when Demucs and the transcription backend are installed
 - Static GitHub Pages site in `docs/`
 
 ## Repository layout
@@ -124,6 +125,7 @@ AI request and response diagnostics are written to the native log folder, includ
 
 - The native runtime path now prefers direct shared-engine exports over the older JSON command path.
 - Remaining generic host-command usage is limited to offline helper surfaces, not normal playback or editor interaction.
+- `File -> Import Audio As MIDI...` depends on external Python packages. Install them with `py -3.10 -m pip install demucs basic-pitch librosa pretty_midi soundfile numpy scipy`.
 - Temporary debug screenshots and scratch directories are ignored through [.gitignore](.gitignore).
 
 For day-to-day workflow details, use the repo guide: [GUIDE.md](GUIDE.md).

@@ -64,11 +64,27 @@ juce::File nativeGeneratedAudioDirectory()
         .getChildFile("generated-audio");
 }
 
+juce::File nativeSupportScriptsDirectory()
+{
+    return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+        .getChildFile("Mutagen")
+        .getChildFile("support");
+}
+
+juce::File nativeAudioToMidiDirectory()
+{
+    return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+        .getChildFile("Mutagen")
+        .getChildFile("audio-to-midi");
+}
+
 constexpr const char* kMidiInputSelectionDisabled = "__mutagen_midi_input_disabled__";
 constexpr const char* kAceStepGitHubUrl = "https://github.com/ace-step/ACE-Step-1.5";
 constexpr const char* kOllamaSiteUrl = "https://ollama.com/";
 constexpr const char* kOllamaWindowsDownloadUrl = "https://ollama.com/download/windows";
 constexpr const char* kDemucsInstallUrl = "https://github.com/facebookresearch/demucs";
+constexpr const char* kDemucsFastCpuModel = "6b9c2ca1";
+constexpr const char* kAudioToMidiBackendUrl = "https://github.com/spotify/basic-pitch";
 constexpr const char* kBuiltInDefaultTemplateId = "__mutagen_builtin_default_template__";
 constexpr const char* kProjectTemplateWildcard = "*.aimstpl";
 
@@ -166,20 +182,284 @@ bool isAceStepInformationalLine(const juce::String& text)
         || trimmed.containsIgnoreCase("ERROR");
 }
 
-enum class MidiImportAssignmentMode
-{
-    generalMidi,
-    tryNativeRack
-};
-
 constexpr int kMidiImportModeGeneralMidiId = 1;
 constexpr int kMidiImportModeNativeRackId = 2;
+constexpr int kAudioToMidiSeparationFastCpuId = 1;
+constexpr int kAudioToMidiSeparationBetterId = 2;
+constexpr int kAudioToMidiSeparationHighAccuracyId = 3;
+constexpr int kAudioToMidiSeparationSixStemId = 4;
+constexpr int kAudioToMidiTranscriptionBalancedId = 1;
+constexpr int kAudioToMidiTranscriptionCleanerId = 2;
+constexpr int kAudioToMidiTranscriptionMoreDetailId = 3;
+constexpr int kAudioToMidiTempoDetectedId = 1;
+constexpr int kAudioToMidiTempoProjectId = 2;
+constexpr int kAudioToMidiQuantizeNoneId = 1;
+constexpr int kAudioToMidiQuantizeProjectGridId = 2;
+constexpr int kAudioToMidiQuantizeStraight8Id = 3;
+constexpr int kAudioToMidiQuantizeStraight16Id = 4;
+constexpr int kAudioToMidiQuantizeTriplet16Id = 5;
 
 MidiImportAssignmentMode midiImportAssignmentModeFromComboId(int comboId)
 {
     return comboId == kMidiImportModeNativeRackId
         ? MidiImportAssignmentMode::tryNativeRack
         : MidiImportAssignmentMode::generalMidi;
+}
+
+AudioToMidiSeparationMode audioToMidiSeparationModeFromComboId(int comboId)
+{
+    if (comboId == kAudioToMidiSeparationBetterId)
+        return AudioToMidiSeparationMode::betterSeparation;
+    if (comboId == kAudioToMidiSeparationHighAccuracyId)
+        return AudioToMidiSeparationMode::highAccuracy;
+    if (comboId == kAudioToMidiSeparationSixStemId)
+        return AudioToMidiSeparationMode::sixStemSeparation;
+    return AudioToMidiSeparationMode::fastCpu;
+}
+
+AudioToMidiTranscriptionMode audioToMidiTranscriptionModeFromComboId(int comboId)
+{
+    if (comboId == kAudioToMidiTranscriptionCleanerId)
+        return AudioToMidiTranscriptionMode::cleaner;
+    if (comboId == kAudioToMidiTranscriptionMoreDetailId)
+        return AudioToMidiTranscriptionMode::moreDetail;
+    return AudioToMidiTranscriptionMode::balanced;
+}
+
+AudioToMidiTempoMode audioToMidiTempoModeFromComboId(int comboId)
+{
+    return comboId == kAudioToMidiTempoProjectId
+        ? AudioToMidiTempoMode::useProjectTempo
+        : AudioToMidiTempoMode::detectedFromAudio;
+}
+
+AudioToMidiQuantizeMode audioToMidiQuantizeModeFromComboId(int comboId)
+{
+    switch (comboId)
+    {
+        case kAudioToMidiQuantizeProjectGridId: return AudioToMidiQuantizeMode::useProjectGrid;
+        case kAudioToMidiQuantizeStraight8Id: return AudioToMidiQuantizeMode::straight8;
+        case kAudioToMidiQuantizeStraight16Id: return AudioToMidiQuantizeMode::straight16;
+        case kAudioToMidiQuantizeTriplet16Id: return AudioToMidiQuantizeMode::triplet16;
+        case kAudioToMidiQuantizeNoneId:
+        default: return AudioToMidiQuantizeMode::none;
+    }
+}
+
+juce::String audioToMidiDemucsModelName(AudioToMidiSeparationMode mode)
+{
+    switch (mode)
+    {
+        case AudioToMidiSeparationMode::betterSeparation:
+            return "mdx_q";
+        case AudioToMidiSeparationMode::highAccuracy:
+            return "htdemucs_ft";
+        case AudioToMidiSeparationMode::sixStemSeparation:
+            return "htdemucs_6s";
+        case AudioToMidiSeparationMode::fastCpu:
+        default:
+            return juce::String(kDemucsFastCpuModel);
+    }
+}
+
+juce::String audioToMidiDemucsSegmentLength(AudioToMidiSeparationMode mode)
+{
+    switch (mode)
+    {
+        case AudioToMidiSeparationMode::sixStemSeparation:
+            return "7.5";
+        case AudioToMidiSeparationMode::highAccuracy:
+        case AudioToMidiSeparationMode::betterSeparation:
+        case AudioToMidiSeparationMode::fastCpu:
+        default:
+            return "8";
+    }
+}
+
+juce::String audioToMidiDemucsShiftCount(AudioToMidiSeparationMode mode)
+{
+    switch (mode)
+    {
+        case AudioToMidiSeparationMode::highAccuracy:
+            return "2";
+        case AudioToMidiSeparationMode::sixStemSeparation:
+        case AudioToMidiSeparationMode::betterSeparation:
+        case AudioToMidiSeparationMode::fastCpu:
+        default:
+            return "1";
+    }
+}
+
+juce::String audioToMidiDemucsOverlapValue(AudioToMidiSeparationMode mode)
+{
+    switch (mode)
+    {
+        case AudioToMidiSeparationMode::highAccuracy:
+            return "0.5";
+        case AudioToMidiSeparationMode::sixStemSeparation:
+        case AudioToMidiSeparationMode::betterSeparation:
+        case AudioToMidiSeparationMode::fastCpu:
+        default:
+            return "0.25";
+    }
+}
+
+juce::String audioToMidiSeparationModeDisplayName(AudioToMidiSeparationMode mode)
+{
+    switch (mode)
+    {
+        case AudioToMidiSeparationMode::betterSeparation:
+            return "better separation";
+        case AudioToMidiSeparationMode::highAccuracy:
+            return "high-accuracy separation";
+        case AudioToMidiSeparationMode::sixStemSeparation:
+            return "6-stem separation";
+        case AudioToMidiSeparationMode::fastCpu:
+        default:
+            return "fast CPU separation";
+    }
+}
+
+juce::String audioToMidiTranscriptionProfileName(AudioToMidiTranscriptionMode mode)
+{
+    switch (mode)
+    {
+        case AudioToMidiTranscriptionMode::cleaner: return "cleaner";
+        case AudioToMidiTranscriptionMode::moreDetail: return "detail";
+        case AudioToMidiTranscriptionMode::balanced:
+        default: return "balanced";
+    }
+}
+
+juce::String audioToMidiTranscriptionModeDisplayName(AudioToMidiTranscriptionMode mode)
+{
+    switch (mode)
+    {
+        case AudioToMidiTranscriptionMode::cleaner: return "cleaner notes";
+        case AudioToMidiTranscriptionMode::moreDetail: return "more detail";
+        case AudioToMidiTranscriptionMode::balanced:
+        default: return "balanced notes";
+    }
+}
+
+juce::String audioToMidiTempoModeDisplayName(AudioToMidiTempoMode mode)
+{
+    return mode == AudioToMidiTempoMode::useProjectTempo
+        ? juce::String("project tempo")
+        : juce::String("detected tempo");
+}
+
+juce::String audioToMidiQuantizeModeDisplayName(AudioToMidiQuantizeMode mode, const ProjectState& project)
+{
+    const auto projectDivision = juce::jmax(1, project.quantizeDiv);
+    auto projectGridLabel = "1/" + juce::String(projectDivision);
+    if (project.quantizeTriplet)
+        projectGridLabel << " triplet";
+
+    switch (mode)
+    {
+        case AudioToMidiQuantizeMode::useProjectGrid:
+            return "project grid (" + projectGridLabel + ")";
+        case AudioToMidiQuantizeMode::straight8:
+            return "1/8";
+        case AudioToMidiQuantizeMode::straight16:
+            return "1/16";
+        case AudioToMidiQuantizeMode::triplet16:
+            return "1/16 triplet";
+        case AudioToMidiQuantizeMode::none:
+        default:
+            return "off";
+    }
+}
+
+int audioToMidiQuantizeGridTick(AudioToMidiQuantizeMode mode, const ProjectState& project)
+{
+    const auto projectDivision = juce::jmax(1, project.quantizeDiv);
+    auto projectBeats = 4.0 / static_cast<double>(projectDivision);
+    if (project.quantizeTriplet)
+        projectBeats *= (2.0 / 3.0);
+
+    switch (mode)
+    {
+        case AudioToMidiQuantizeMode::useProjectGrid:
+            return juce::jmax(1, static_cast<int>(std::round(projectBeats * static_cast<double>(kTicksPerBeat))));
+        case AudioToMidiQuantizeMode::straight8:
+            return kTicksPerBeat / 2;
+        case AudioToMidiQuantizeMode::straight16:
+            return kTicksPerBeat / 4;
+        case AudioToMidiQuantizeMode::triplet16:
+            return juce::jmax(1, static_cast<int>(std::round((static_cast<double>(kTicksPerBeat) / 4.0) * (2.0 / 3.0))));
+        case AudioToMidiQuantizeMode::none:
+        default:
+            return 0;
+    }
+}
+
+void applyAudioToMidiQuantization(ProjectState& project, int gridTick)
+{
+    if (gridTick <= 0)
+        return;
+
+    auto quantizeNotes = [gridTick](std::vector<MidiNote>& notes)
+    {
+        for (auto& note : notes)
+        {
+            const auto quantizedStartTick = juce::jmax(0,
+                                                       static_cast<int>(std::llround(static_cast<double>(juce::jmax(0, note.startTick))
+                                                                                     / static_cast<double>(gridTick)))
+                                                           * gridTick);
+            const auto quantizedDurationTick = juce::jmax(gridTick,
+                                                          static_cast<int>(std::llround(static_cast<double>(juce::jmax(1, note.durationTick))
+                                                                                        / static_cast<double>(gridTick)))
+                                                              * gridTick);
+            note.startTick = quantizedStartTick;
+            note.durationTick = quantizedDurationTick;
+        }
+
+        std::sort(notes.begin(),
+                  notes.end(),
+                  [] (const MidiNote& lhs, const MidiNote& rhs)
+                  {
+                      if (lhs.startTick != rhs.startTick)
+                          return lhs.startTick < rhs.startTick;
+                      if (lhs.pitch != rhs.pitch)
+                          return lhs.pitch > rhs.pitch;
+                      return lhs.durationTick < rhs.durationTick;
+                  });
+    };
+
+    for (auto& track : project.tracks)
+        quantizeNotes(track.notes);
+
+    const auto minimumPatternTicks = ticksPerBar(project);
+    for (auto& pattern : project.midiPatterns)
+    {
+        quantizeNotes(pattern.notes);
+        int patternEndTick = minimumPatternTicks;
+        for (const auto& note : pattern.notes)
+            patternEndTick = juce::jmax(patternEndTick, note.startTick + note.durationTick);
+        pattern.lengthTicks = juce::jmax(minimumPatternTicks, patternEndTick);
+    }
+
+    for (auto& section : project.midiSections)
+    {
+        for (const auto& pattern : project.midiPatterns)
+        {
+            if (pattern.id == section.patternId)
+            {
+                section.lengthTicks = pattern.lengthTicks;
+                break;
+            }
+        }
+    }
+
+    int rightLocator = minimumPatternTicks;
+    for (const auto& track : project.tracks)
+        for (const auto& note : track.notes)
+            rightLocator = juce::jmax(rightLocator, note.startTick + note.durationTick);
+    project.rightLocatorTick = juce::jmax(project.leftLocatorTick + 1,
+                                          rightLocator + ticksPerTimeSignatureBeat(project));
+    project.recalculateTimeFields();
 }
 
 struct ProjectTemplateOption
@@ -288,6 +568,15 @@ int pianoRollGridOptionId(const ProjectState& project)
     return 0;
 }
 
+juce::String pianoRollGridOptionLabel(const ProjectState& project)
+{
+    const auto division = juce::jmax(1, project.quantizeDiv);
+    auto label = "1/" + juce::String(division);
+    if (project.quantizeTriplet)
+        label << " triplet";
+    return label;
+}
+
 const PianoRollGridOption* findPianoRollGridOptionById(int id)
 {
     for (const auto& option : pianoRollGridOptions())
@@ -379,13 +668,42 @@ juce::String suggestTemplateBaseName(const juce::File& currentProjectFile, const
     return name.isNotEmpty() ? name : juce::String("Mutagen Template");
 }
 
-bool tryDetectDemucsCommand(juce::StringArray& outCommandPrefix)
+juce::Result ensureBundledDemucsSeparationScriptFile(juce::File& outFile)
 {
-    const std::array<juce::String, 2> launchers = { "py", "python" };
-    for (const auto& launcher : launchers)
+    auto supportDirectory = nativeSupportScriptsDirectory();
+    if (!supportDirectory.exists() && !supportDirectory.createDirectory())
+        return juce::Result::fail("Could not create the support scripts folder.");
+
+    auto scriptFile = supportDirectory.getChildFile("demucs_separate.py");
+    if (!scriptFile.replaceWithData(BinaryData::demucs_separate_py,
+                                    static_cast<size_t>(BinaryData::demucs_separate_pySize)))
+    {
+        return juce::Result::fail("Could not write the bundled stem-separation helper script.");
+    }
+
+    outFile = scriptFile;
+    return juce::Result::ok();
+}
+
+bool tryDetectDemucsCommand(const juce::File& scriptFile,
+                            juce::StringArray& outCommandPrefix,
+                            juce::String& outDiagnostic)
+{
+    const std::array<juce::StringArray, 5> launchers =
+    {{
+        juce::StringArray { "py", "-3.10" },
+        juce::StringArray { "py", "-3.11" },
+        juce::StringArray { "py", "-3.12" },
+        juce::StringArray { "py" },
+        juce::StringArray { "python" }
+    }};
+
+    for (const auto& launcherPrefix : launchers)
     {
         juce::ChildProcess probe;
-        juce::StringArray probeCommand { launcher, "-m", "demucs", "--help" };
+        auto probeCommand = launcherPrefix;
+        probeCommand.add(scriptFile.getFullPathName());
+        probeCommand.add("--check");
         if (!probe.start(probeCommand))
             continue;
 
@@ -394,11 +712,81 @@ bool tryDetectDemucsCommand(juce::StringArray& outCommandPrefix)
 
         if (probe.getExitCode() == 0)
         {
-            outCommandPrefix = { launcher, "-m", "demucs" };
+            outCommandPrefix = launcherPrefix;
+            outCommandPrefix.add(scriptFile.getFullPathName());
             return true;
         }
+
+        const auto diagnostic = probe.readAllProcessOutput().trim();
+        if (diagnostic.isNotEmpty())
+            outDiagnostic = diagnostic;
     }
 
+    if (outDiagnostic.isEmpty())
+        outDiagnostic = "Could not launch the bundled stem-separation backend with the available Python runtimes.";
+
+    return false;
+}
+
+juce::Result ensureBundledAudioToMidiScriptFile(juce::File& outFile)
+{
+    auto supportDirectory = nativeSupportScriptsDirectory();
+    if (!supportDirectory.exists() && !supportDirectory.createDirectory())
+        return juce::Result::fail("Could not create the support scripts folder.");
+
+    auto scriptFile = supportDirectory.getChildFile("audio_to_midi.py");
+    if (!scriptFile.replaceWithData(BinaryData::audio_to_midi_py,
+                                    static_cast<size_t>(BinaryData::audio_to_midi_pySize)))
+    {
+        return juce::Result::fail("Could not write the bundled audio-to-MIDI helper script.");
+    }
+
+    outFile = scriptFile;
+    return juce::Result::ok();
+}
+
+bool tryDetectAudioToMidiCommand(const juce::File& scriptFile,
+                                 juce::StringArray& outCommandPrefix,
+                                 juce::String& outDiagnostic)
+{
+    const std::array<juce::StringArray, 5> launchers =
+    {{
+        juce::StringArray { "py", "-3.10" },
+        juce::StringArray { "py", "-3.11" },
+        juce::StringArray { "py", "-3.12" },
+        juce::StringArray { "py" },
+        juce::StringArray { "python" }
+    }};
+
+    for (const auto& launcherPrefix : launchers)
+    {
+        juce::ChildProcess probe;
+        auto probeCommand = launcherPrefix;
+        probeCommand.add(scriptFile.getFullPathName());
+        probeCommand.add("--check");
+        if (!probe.start(probeCommand))
+            continue;
+
+        if (!probe.waitForProcessToFinish(60000))
+        {
+            outDiagnostic = "The audio-to-MIDI backend check timed out.";
+            continue;
+        }
+
+        const auto probeOutput = probe.readAllProcessOutput().trim();
+        if (probe.getExitCode() == 0)
+        {
+            outCommandPrefix = launcherPrefix;
+            outCommandPrefix.add(scriptFile.getFullPathName());
+            return true;
+        }
+
+        if (probeOutput.isNotEmpty())
+            outDiagnostic = probeOutput;
+    }
+
+    if (outDiagnostic.isEmpty())
+        outDiagnostic = "Mutagen could not find a working Python launcher for the bundled audio-to-MIDI backend.";
     return false;
 }
 
@@ -5423,7 +5811,7 @@ public:
         addChildComponent(zoomLabel);
 
         zoomSlider.setSliderStyle(juce::Slider::LinearHorizontal);
-        zoomSlider.setRange(12.0, 96.0, 1.0);
+        zoomSlider.setRange(4.0, 96.0, 1.0);
         zoomSlider.setChangeNotificationOnlyOnRelease(false);
         zoomSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 52, 22);
         zoomSlider.setTextValueSuffix(" px/beat");
@@ -10867,6 +11255,19 @@ StudioShellComponent::StudioShellComponent()
     patternBarsBox.setJustificationType(juce::Justification::centredLeft);
     addAndMakeVisible(patternBarsBox);
 
+    pianoRollGridLabel.setText("Quantize", juce::dontSendNotification);
+    pianoRollGridLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(214, 219, 227));
+    pianoRollGridLabel.setFont(ui::font());
+    addAndMakeVisible(pianoRollGridLabel);
+
+    for (const auto& option : pianoRollGridOptions())
+        pianoRollGridBox.addItem(option.label, option.id);
+    pianoRollGridBox.setTextWhenNothingSelected("Grid");
+    pianoRollGridBox.onChange = [this] { handlePianoRollGridChanged(); };
+    pianoRollGridBox.setLookAndFeel(compactHeaderLookAndFeel.get());
+    pianoRollGridBox.setJustificationType(juce::Justification::centredLeft);
+    addAndMakeVisible(pianoRollGridBox);
+
     keyQuantizeLabel.setText("Key Quantize", juce::dontSendNotification);
     keyQuantizeLabel.setColour(juce::Label::textColourId, juce::Colour::fromRGB(214, 219, 227));
     keyQuantizeLabel.setFont(ui::font());
@@ -11030,6 +11431,7 @@ StudioShellComponent::~StudioShellComponent()
     timeSignatureNumeratorBox.setLookAndFeel(nullptr);
     timeSignatureDenominatorBox.setLookAndFeel(nullptr);
     patternBarsBox.setLookAndFeel(nullptr);
+    pianoRollGridBox.setLookAndFeel(nullptr);
     keyQuantizeBox.setLookAndFeel(nullptr);
     arrangementSnapBox.setLookAndFeel(nullptr);
     arrangementZoomSlider.setLookAndFeel(nullptr);
@@ -11122,7 +11524,7 @@ void StudioShellComponent::restorePersistedSessionState()
                                                80.0f,
                                                static_cast<float>(windowStateSettings->getDoubleValue("session_arrangement_lane_height_pixels",
                                                                                                       arrangementLaneHeightPixels)));
-    pianoRollZoomPixelsPerBeat = juce::jlimit(12.0f,
+    pianoRollZoomPixelsPerBeat = juce::jlimit(4.0f,
                                               96.0f,
                                               static_cast<float>(windowStateSettings->getDoubleValue("session_piano_roll_zoom_pixels_per_beat",
                                                                                                      pianoRollZoomPixelsPerBeat)));
@@ -11395,6 +11797,7 @@ void StudioShellComponent::applyTheme()
     tempoLabel.setColour(juce::Label::textColourId, theme.primaryText);
     patternBarsLabel.setColour(juce::Label::textColourId, theme.primaryText);
     keyQuantizeLabel.setColour(juce::Label::textColourId, theme.primaryText);
+    pianoRollGridLabel.setColour(juce::Label::textColourId, theme.primaryText);
     arrangementSnapLabel.setColour(juce::Label::textColourId, theme.primaryText);
     arrangementZoomLabel.setColour(juce::Label::textColourId, theme.primaryText);
     arrangementLaneHeightLabel.setColour(juce::Label::textColourId, theme.primaryText);
@@ -11577,6 +11980,9 @@ void StudioShellComponent::resized()
     toolbar2.removeFromLeft(4);
     patternBarsLabel.setBounds(toolbar2.removeFromLeft(64));
     patternBarsBox.setBounds(toolbar2.removeFromLeft(84));
+    toolbar2.removeFromLeft(4);
+    pianoRollGridLabel.setBounds(toolbar2.removeFromLeft(50));
+    pianoRollGridBox.setBounds(toolbar2.removeFromLeft(82));
     toolbar2.removeFromLeft(4);
     keyQuantizeLabel.setBounds(toolbar2.removeFromLeft(66));
     keyQuantizeBox.setBounds(toolbar2.removeFromLeft(138));
@@ -11960,6 +12366,7 @@ void StudioShellComponent::timerCallback()
     pollAiComposeFuture();
     pollAceStepGenerationFuture();
     pollStemSeparationFuture();
+    pollAudioToMidiImportFuture();
 
     const bool hasSharedRackHost = nativeVstHost.isReady();
     const bool hasOpenRackEditors = hasOpenRackEditorSessions();
@@ -12207,6 +12614,9 @@ void StudioShellComponent::refreshUi()
     patternBarsBox.setSelectedId(patternBarsSelection, juce::dontSendNotification);
     if (patternBarsBox.getSelectedId() != patternBarsSelection)
         patternBarsBox.setText(sequenceTickLabel(patternBarsSelection, documentState.project), juce::dontSendNotification);
+    pianoRollGridBox.setSelectedId(pianoRollGridOptionId(documentState.project), juce::dontSendNotification);
+    if (pianoRollGridBox.getSelectedId() == 0)
+        pianoRollGridBox.setText(pianoRollGridOptionLabel(documentState.project), juce::dontSendNotification);
     keyQuantizeBox.setSelectedId(keyQuantizeOptionId(documentState.project), juce::dontSendNotification);
     if (keyQuantizeBox.getSelectedId() == 0)
         keyQuantizeBox.setText(keyQuantizeDisplayName(documentState.project.keyQuantizeRoot, documentState.project.keyQuantizeScale),
@@ -12377,6 +12787,9 @@ void StudioShellComponent::updateEditorState()
     patternBarsBox.setSelectedId(patternBarsSelection, juce::dontSendNotification);
     if (patternBarsBox.getSelectedId() != patternBarsSelection)
         patternBarsBox.setText(sequenceTickLabel(patternBarsSelection, documentState.project), juce::dontSendNotification);
+    pianoRollGridBox.setSelectedId(pianoRollGridOptionId(documentState.project), juce::dontSendNotification);
+    if (pianoRollGridBox.getSelectedId() == 0)
+        pianoRollGridBox.setText(pianoRollGridOptionLabel(documentState.project), juce::dontSendNotification);
     keyQuantizeBox.setSelectedId(keyQuantizeOptionId(documentState.project), juce::dontSendNotification);
     if (keyQuantizeBox.getSelectedId() == 0)
         keyQuantizeBox.setText(keyQuantizeDisplayName(documentState.project.keyQuantizeRoot, documentState.project.keyQuantizeScale),
@@ -12409,7 +12822,7 @@ void StudioShellComponent::updateEditorState()
     exportWavButton.setEnabled(!documentState.project.tracks.empty() || !documentState.project.sampleClips.empty());
     const auto selectedTrack = getSelectedTrack();
     const bool selectedTrackIsSample = selectedTrack != nullptr && selectedTrack->trackType.equalsIgnoreCase("sample");
-    const bool aiTaskBusy = aiComposeBusy || aceStepGenerationBusy;
+    const bool aiTaskBusy = aiComposeBusy || aceStepGenerationBusy || audioToMidiImportBusy;
     aiSettingsButton.setEnabled(!aiTaskBusy);
     aiComposeButton.setEnabled(!aiTaskBusy);
     aceStepGenerateButton.setEnabled(!aiTaskBusy && selectedTrackIsSample);
@@ -15887,6 +16300,23 @@ void StudioShellComponent::handleKeyQuantizeChanged()
     applyProjectStateEdit(updatedProject, "Change Key Quantize");
 }
 
+void StudioShellComponent::handlePianoRollGridChanged()
+{
+    const auto* option = findPianoRollGridOptionById(pianoRollGridBox.getSelectedId());
+    if (option == nullptr)
+        return;
+
+    auto updatedProject = documentState.project;
+    updatedProject.quantizeDiv = option->division;
+    updatedProject.quantizeTriplet = option->triplet;
+
+    if (fingerprint(updatedProject) == fingerprint(documentState.project))
+        return;
+
+    updatedProject.recalculateTimeFields();
+    applyProjectStateEdit(updatedProject, "Change Piano Roll Quantize");
+}
+
 void StudioShellComponent::handleArrangementSnapChanged()
 {
     const auto tickLength = normaliseSequenceTickLength(arrangementSnapBox.getSelectedId(),
@@ -15923,6 +16353,174 @@ void StudioShellComponent::handlePianoRollRowHeightChanged()
 {
     pianoRollRowHeightPixels = static_cast<float>(pianoRollRowHeightSlider.getValue());
     applyEditorViewScaleState();
+}
+
+void StudioShellComponent::showMidiImportAssignmentDialog(const juce::String& title,
+                                                          const juce::String& introText,
+                                                          std::function<void(MidiImportAssignmentMode)> onConfirm)
+{
+    auto* dialog = new juce::AlertWindow(title,
+                                         "Choose how Mutagen should assign instruments for the imported MIDI tracks.",
+                                         juce::AlertWindow::NoIcon);
+    dialog->addComboBox("mode",
+                        { "General MIDI (As Is)",
+                          "Try Native VST Instruments (fallback to GM)" },
+                        "Instrument Assignment");
+    dialog->addTextBlock(introText
+                         + "\n\nGeneral MIDI keeps the file as standard GM tracks with GM program changes.\n\n"
+                         + "Native VST mode tries to map GM sounds like piano, strings, organ, flute, violin, bass and drums "
+                           "onto your native rack instruments. If a track does not match anything suitable, it stays General MIDI.");
+    if (auto* modeBox = dialog->getComboBoxComponent("mode"))
+        modeBox->setSelectedId(kMidiImportModeNativeRackId, juce::dontSendNotification);
+    dialog->setSize(560, 300);
+    dialog->addButton("Import", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    dialog->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+
+    auto safeDialog = juce::Component::SafePointer<juce::AlertWindow>(dialog);
+    dialog->enterModalState(true,
+                            juce::ModalCallbackFunction::create([safeThis = juce::Component::SafePointer<StudioShellComponent>(this),
+                                                                 safeDialog,
+                                                                 onConfirm = std::move(onConfirm)](int result)
+                            {
+                                if (safeThis == nullptr || safeDialog == nullptr || result != 1 || !onConfirm)
+                                    return;
+
+                                const auto importMode = midiImportAssignmentModeFromComboId(
+                                    safeDialog->getComboBoxComponent("mode") != nullptr
+                                        ? safeDialog->getComboBoxComponent("mode")->getSelectedId()
+                                        : kMidiImportModeGeneralMidiId);
+                                onConfirm(importMode);
+                            }),
+                            true);
+}
+
+void StudioShellComponent::showAudioToMidiImportDialog(const juce::String& title,
+                                                       const juce::String& introText,
+                                                       std::function<void(AudioToMidiImportOptions)> onConfirm)
+{
+    auto* dialog = new juce::AlertWindow(title,
+                                         "Choose how Mutagen should separate stems and transcribe them into MIDI.",
+                                         juce::AlertWindow::NoIcon);
+    dialog->addComboBox("mode",
+                        { "General MIDI (As Is)",
+                          "Try Native VST Instruments (fallback to GM)" },
+                        "Instrument Assignment");
+    dialog->addComboBox("separation",
+                        { "Fast CPU Separation (Recommended)",
+                          "Better Separation (Slower)",
+                          "High Accuracy 4 Stems (Slowest / Cleanest)",
+                          "6 Stems: Drums/Bass/Other/Vocals/Guitar/Piano (Slowest)" },
+                        "Stem Separation");
+    dialog->addComboBox("transcription",
+                        { "Balanced Notes (Recommended)",
+                          "Cleaner Notes / Fewer False Hits",
+                          "More Detail / More Notes" },
+                        "MIDI Extraction");
+    dialog->addComboBox("tempo",
+                        { "Detect From Audio (Recommended)",
+                          "Use Current Project Tempo" },
+                        "Tempo");
+    dialog->addComboBox("quantize",
+                        { "No Quantize",
+                          "Use Current Project Grid",
+                          "1/8 Straight",
+                          "1/16 Straight",
+                          "1/16 Triplet" },
+                        "Timing Quantize");
+    dialog->addTextBlock(introText
+                         + "\n\nFast CPU separation uses a single Demucs model and is much quicker on CPU."
+                           "\n\nBetter separation uses a heavier Demucs bag model and can isolate stems more cleanly, but it takes longer."
+                           "\n\nHigh accuracy uses htdemucs_ft with shift averaging for the cleanest 4-stem split, but it is the slowest CPU option."
+                           "\n\n6-stem separation uses the 6-source Demucs model so guitar and piano can come back as separate stems instead of being folded into 'other'."
+                           "\n\nCleaner notes raises extraction thresholds to reduce sketchy MIDI."
+                           "\n\nMore detail lowers thresholds to capture more notes, but it can introduce extra noise."
+                           "\n\nUse Current Project Tempo keeps the imported MIDI locked to your current session BPM."
+                           "\n\nTiming Quantize snaps imported notes after transcription to tighten loose timing.");
+    if (auto* modeBox = dialog->getComboBoxComponent("mode"))
+        modeBox->setSelectedId(kMidiImportModeNativeRackId, juce::dontSendNotification);
+    if (auto* separationBox = dialog->getComboBoxComponent("separation"))
+        separationBox->setSelectedId(kAudioToMidiSeparationFastCpuId, juce::dontSendNotification);
+    if (auto* transcriptionBox = dialog->getComboBoxComponent("transcription"))
+        transcriptionBox->setSelectedId(kAudioToMidiTranscriptionBalancedId, juce::dontSendNotification);
+    if (auto* tempoBox = dialog->getComboBoxComponent("tempo"))
+        tempoBox->setSelectedId(kAudioToMidiTempoDetectedId, juce::dontSendNotification);
+    if (auto* quantizeBox = dialog->getComboBoxComponent("quantize"))
+        quantizeBox->setSelectedId(kAudioToMidiQuantizeProjectGridId, juce::dontSendNotification);
+
+    dialog->setSize(620, 470);
+    dialog->addButton("Import", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    dialog->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+
+    auto safeDialog = juce::Component::SafePointer<juce::AlertWindow>(dialog);
+    dialog->enterModalState(true,
+                            juce::ModalCallbackFunction::create([safeThis = juce::Component::SafePointer<StudioShellComponent>(this),
+                                                                 safeDialog,
+                                                                 onConfirm = std::move(onConfirm)](int result)
+                            {
+                                if (safeThis == nullptr || safeDialog == nullptr || result != 1 || !onConfirm)
+                                    return;
+
+                                AudioToMidiImportOptions options;
+                                if (const auto* modeBox = safeDialog->getComboBoxComponent("mode"))
+                                    options.assignmentMode = midiImportAssignmentModeFromComboId(modeBox->getSelectedId());
+                                if (const auto* separationBox = safeDialog->getComboBoxComponent("separation"))
+                                    options.separationMode = audioToMidiSeparationModeFromComboId(separationBox->getSelectedId());
+                                if (const auto* transcriptionBox = safeDialog->getComboBoxComponent("transcription"))
+                                    options.transcriptionMode = audioToMidiTranscriptionModeFromComboId(transcriptionBox->getSelectedId());
+                                if (const auto* tempoBox = safeDialog->getComboBoxComponent("tempo"))
+                                    options.tempoMode = audioToMidiTempoModeFromComboId(tempoBox->getSelectedId());
+                                if (const auto* quantizeBox = safeDialog->getComboBoxComponent("quantize"))
+                                    options.quantizeMode = audioToMidiQuantizeModeFromComboId(quantizeBox->getSelectedId());
+
+                                onConfirm(options);
+                            }),
+                            true);
+}
+
+juce::Result StudioShellComponent::importMidiFileWithAssignment(const juce::File& file,
+                                                                MidiImportAssignmentMode importMode,
+                                                                ProjectState& outProject,
+                                                                int& outNativeAssignedCount,
+                                                                int& outGmFallbackCount) const
+{
+    outNativeAssignedCount = 0;
+    outGmFallbackCount = 0;
+    outProject = documentState.project;
+
+    const auto importResult = importMidiFileToProject(file, outProject);
+    if (importResult.failed())
+        return importResult;
+
+    if (importMode != MidiImportAssignmentMode::tryNativeRack)
+        return juce::Result::ok();
+
+    for (auto& track : outProject.tracks)
+    {
+        if (!track.trackType.trim().equalsIgnoreCase("instrument"))
+            continue;
+
+        const auto suggestedIndex = suggestedNativeInstrumentIndexForTrack(outProject, track);
+        if (suggestedIndex < 0)
+        {
+            track.instrumentMode = "General MIDI";
+            track.rackVst.clear();
+            ++outGmFallbackCount;
+            continue;
+        }
+
+        const auto& entry = outProject.vstRack[static_cast<size_t>(suggestedIndex)];
+        const auto entryLabel = entry.name.isNotEmpty() ? entry.name
+            : (entry.pluginName.isNotEmpty() ? entry.pluginName
+                                             : juce::File(entry.path).getFileNameWithoutExtension());
+
+        track.instrumentMode = "VSTI Rack";
+        track.rackVst = entryLabel.isNotEmpty() ? entryLabel : entry.path.trim();
+        track.vstiStatePath.clear();
+        track.vstiStateBase64.clear();
+        ++outNativeAssignedCount;
+    }
+
+    return juce::Result::ok();
 }
 
 void StudioShellComponent::promptImportJson()
@@ -15971,73 +16569,27 @@ void StudioShellComponent::promptImportMidi()
                                        if (selected == juce::File())
                                            return;
 
-                                       auto* dialog = new juce::AlertWindow("Import MIDI",
-                                                                            "Choose how Mutagen should assign instruments for the imported MIDI tracks.",
-                                                                            juce::AlertWindow::NoIcon);
-                                       dialog->addComboBox("mode",
-                                                           { "General MIDI (As Is)",
-                                                             "Try Native VST Instruments (fallback to GM)" },
-                                                           "Instrument Assignment");
-                                       dialog->addTextBlock("General MIDI keeps the file as standard GM tracks with GM program changes.\n\n"
-                                                            "Native VST mode tries to map GM sounds like piano, strings, organ, flute, violin, bass and drums "
-                                                            "onto your native rack instruments. If a track does not match anything suitable, it stays General MIDI.");
-                                       if (auto* modeBox = dialog->getComboBoxComponent("mode"))
-                                           modeBox->setSelectedId(kMidiImportModeNativeRackId, juce::dontSendNotification);
-                                       dialog->setSize(560, 260);
-                                       dialog->addButton("Import", 1, juce::KeyPress(juce::KeyPress::returnKey));
-                                       dialog->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
-
-                                       auto safeDialog = juce::Component::SafePointer<juce::AlertWindow>(dialog);
-                                       dialog->enterModalState(true,
-                                                               juce::ModalCallbackFunction::create([safeThis, safeDialog, selected] (int result)
+                                       safeThis->showMidiImportAssignmentDialog("Import MIDI",
+                                                                               "Import the selected MIDI file.",
+                                                                               [safeThis, selected] (MidiImportAssignmentMode importMode)
                                                                {
-                                                                   if (safeThis == nullptr || safeDialog == nullptr || result != 1)
+                                                                   if (safeThis == nullptr)
                                                                        return;
 
-                                                                   const auto importMode = midiImportAssignmentModeFromComboId(
-                                                                       safeDialog->getComboBoxComponent("mode") != nullptr
-                                                                           ? safeDialog->getComboBoxComponent("mode")->getSelectedId()
-                                                                           : kMidiImportModeGeneralMidiId);
-
-                                                                   auto importedProject = safeThis->documentState.project;
-                                                                   const auto importResult = importMidiFileToProject(selected, importedProject);
+                                                                   ProjectState importedProject;
+                                                                   int nativeAssignedCount = 0;
+                                                                   int gmFallbackCount = 0;
+                                                                   const auto importResult = safeThis->importMidiFileWithAssignment(selected,
+                                                                                                                                    importMode,
+                                                                                                                                    importedProject,
+                                                                                                                                    nativeAssignedCount,
+                                                                                                                                    gmFallbackCount);
                                                                    if (importResult.failed())
                                                                    {
                                                                        juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
                                                                                                               "Import MIDI Failed",
                                                                                                               importResult.getErrorMessage());
                                                                        return;
-                                                                   }
-
-                                                                   int nativeAssignedCount = 0;
-                                                                   int gmFallbackCount = 0;
-                                                                   if (importMode == MidiImportAssignmentMode::tryNativeRack)
-                                                                   {
-                                                                       for (auto& track : importedProject.tracks)
-                                                                       {
-                                                                           if (!track.trackType.trim().equalsIgnoreCase("instrument"))
-                                                                               continue;
-
-                                                                           const auto suggestedIndex = suggestedNativeInstrumentIndexForTrack(importedProject, track);
-                                                                           if (suggestedIndex < 0)
-                                                                           {
-                                                                               track.instrumentMode = "General MIDI";
-                                                                               track.rackVst.clear();
-                                                                               ++gmFallbackCount;
-                                                                               continue;
-                                                                           }
-
-                                                                           const auto& entry = importedProject.vstRack[static_cast<size_t>(suggestedIndex)];
-                                                                           const auto entryLabel = entry.name.isNotEmpty() ? entry.name
-                                                                               : (entry.pluginName.isNotEmpty() ? entry.pluginName
-                                                                                                                : juce::File(entry.path).getFileNameWithoutExtension());
-
-                                                                           track.instrumentMode = "VSTI Rack";
-                                                                           track.rackVst = entryLabel.isNotEmpty() ? entryLabel : entry.path.trim();
-                                                                           track.vstiStatePath.clear();
-                                                                           track.vstiStateBase64.clear();
-                                                                           ++nativeAssignedCount;
-                                                                       }
                                                                    }
 
                                                                    safeThis->applyProjectStateEdit(importedProject, "Import MIDI");
@@ -16063,8 +16615,41 @@ void StudioShellComponent::promptImportMidi()
                                                                    }
 
                                                                    safeThis->statusLabel.setText(statusText, juce::dontSendNotification);
-                                                               }),
-                                                               true);
+                                                               });
+                                   });
+}
+
+void StudioShellComponent::promptImportAudioAsMidi()
+{
+    if (audioToMidiImportBusy)
+    {
+        statusLabel.setText("Audio-to-MIDI import is already running.", juce::dontSendNotification);
+        return;
+    }
+
+    activeFileChooser = std::make_unique<juce::FileChooser>("Import Audio As MIDI",
+                                                            juce::File(),
+                                                            "*.wav;*.aiff;*.aif;*.flac;*.ogg;*.mp3");
+    activeFileChooser->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+                                   [safeThis = juce::Component::SafePointer<StudioShellComponent>(this)](const juce::FileChooser& chooser)
+                                   {
+                                       const auto selected = chooser.getResult();
+                                       if (safeThis == nullptr)
+                                           return;
+
+                                       safeThis->activeFileChooser.reset();
+                                       if (selected == juce::File())
+                                           return;
+
+                                       safeThis->showAudioToMidiImportDialog("Import Audio As MIDI",
+                                                                            "Mutagen will split the file into stems first, then transcribe each stem into its own MIDI track.\n\n"
+                                                                            "Bass stems stay bass-focused, drum stems become drum hits, and melodic stems are assigned the closest GM instrument before import.",
+                                                                            [safeThis, selected] (AudioToMidiImportOptions options)
+                                                                            {
+                                                                                if (safeThis == nullptr)
+                                                                                    return;
+                                                                                safeThis->startAudioToMidiImport(selected, options);
+                                                                            });
                                    });
 }
 
@@ -16658,6 +17243,225 @@ void StudioShellComponent::promptImportSample()
                                     });
 }
 
+void StudioShellComponent::startAudioToMidiImport(const juce::File& sourceFile, AudioToMidiImportOptions options)
+{
+    if (audioToMidiImportBusy || stemSeparationBusy || aiComposeBusy || aceStepGenerationBusy)
+    {
+        statusLabel.setText("Finish the current background task before starting audio-to-MIDI import.",
+                            juce::dontSendNotification);
+        return;
+    }
+
+    juce::File demucsSeparationScript;
+    const auto demucsScriptResult = ensureBundledDemucsSeparationScriptFile(demucsSeparationScript);
+    if (demucsScriptResult.failed())
+    {
+        juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
+                                               "Audio Stem Extraction Unavailable",
+                                               demucsScriptResult.getErrorMessage());
+        return;
+    }
+
+    juce::StringArray demucsCommandPrefix;
+    juce::String demucsDiagnostic;
+    if (!tryDetectDemucsCommand(demucsSeparationScript, demucsCommandPrefix, demucsDiagnostic))
+    {
+        juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::InfoIcon,
+                                               "Audio Stem Extraction Unavailable",
+                                               demucsDiagnostic
+                                                   + "\n\nInstall the backend with:\npy -3.10 -m pip install demucs librosa soundfile numpy scipy\n\nMore info: "
+                                                   + juce::String(kDemucsInstallUrl));
+        return;
+    }
+
+    juce::File audioToMidiScript;
+    const auto scriptResult = ensureBundledAudioToMidiScriptFile(audioToMidiScript);
+    if (scriptResult.failed())
+    {
+        juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
+                                               "Audio-to-MIDI Backend Failed",
+                                               scriptResult.getErrorMessage());
+        return;
+    }
+
+    juce::StringArray audioToMidiCommandPrefix;
+    juce::String backendDiagnostic;
+    if (!tryDetectAudioToMidiCommand(audioToMidiScript, audioToMidiCommandPrefix, backendDiagnostic))
+    {
+        juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::InfoIcon,
+                                               "Audio-to-MIDI Backend Unavailable",
+                                               backendDiagnostic
+                                                   + "\n\nInstall the backend with:\npy -m pip install basic-pitch librosa pretty_midi soundfile numpy scipy\n\nMore info: "
+                                                   + juce::String(kAudioToMidiBackendUrl));
+        return;
+    }
+
+    if (!sourceFile.existsAsFile())
+    {
+        juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
+                                               "Import Audio As MIDI Failed",
+                                               "The selected audio file could not be found.");
+        return;
+    }
+
+    audioToMidiImportBusy = true;
+    refreshPollingTimerState();
+    updateEditorState();
+    statusLabel.setText("Importing audio as MIDI from " + sourceFile.getFileName()
+                            + " using "
+                            + audioToMidiSeparationModeDisplayName(options.separationMode)
+                            + " and "
+                            + audioToMidiTranscriptionModeDisplayName(options.transcriptionMode)
+                            + " at "
+                            + audioToMidiTempoModeDisplayName(options.tempoMode)
+                            + " with quantize "
+                            + audioToMidiQuantizeModeDisplayName(options.quantizeMode, documentState.project)
+                            + "...",
+                        juce::dontSendNotification);
+    appendActivityLog("Audio To MIDI",
+                      "Started audio-to-MIDI import\nSource: "
+                          + sourceFile.getFullPathName()
+                          + "\nSeparation: "
+                          + audioToMidiSeparationModeDisplayName(options.separationMode)
+                          + "\nTranscription: "
+                          + audioToMidiTranscriptionModeDisplayName(options.transcriptionMode)
+                          + "\nTempo: "
+                          + audioToMidiTempoModeDisplayName(options.tempoMode)
+                          + "\nQuantize: "
+                          + audioToMidiQuantizeModeDisplayName(options.quantizeMode, documentState.project));
+
+    const auto projectTempoBpm = documentState.project.bpm;
+    const auto quantizeGridTick = audioToMidiQuantizeGridTick(options.quantizeMode, documentState.project);
+    const auto quantizeLabel = audioToMidiQuantizeModeDisplayName(options.quantizeMode, documentState.project);
+
+    audioToMidiImportFuture = std::async(std::launch::async,
+                                         [sourceFile, options, projectTempoBpm, quantizeGridTick, quantizeLabel, demucsCommandPrefix, audioToMidiCommandPrefix]() -> AudioToMidiImportResult
+                                         {
+                                             AudioToMidiImportResult result;
+                                             result.sourceFile = sourceFile;
+                                             result.assignmentMode = options.assignmentMode;
+                                             result.overrideTempo = options.tempoMode == AudioToMidiTempoMode::useProjectTempo;
+                                             result.targetTempoBpm = projectTempoBpm;
+                                             result.quantizeGridTick = quantizeGridTick;
+                                             result.quantizeLabel = quantizeLabel;
+
+                                             if (!sourceFile.existsAsFile())
+                                             {
+                                                 result.errorMessage = "The selected audio file could not be found.";
+                                                 return result;
+                                             }
+
+                                             auto outputRoot = nativeAudioToMidiDirectory();
+                                             if (!outputRoot.exists() && !outputRoot.createDirectory())
+                                             {
+                                                 result.errorMessage = "Could not create the audio-to-MIDI folder.";
+                                                 return result;
+                                             }
+
+                                             const auto baseName = juce::File::createLegalFileName(sourceFile.getFileNameWithoutExtension());
+                                             const auto jobFolderName = (baseName.isNotEmpty() ? baseName : juce::String("audio-to-midi"))
+                                                 + "-"
+                                                 + juce::String::toHexString(static_cast<juce::int64>(juce::Time::getCurrentTime().toMilliseconds()));
+                                             const auto jobFolder = outputRoot.getChildFile(jobFolderName);
+                                             if (!jobFolder.createDirectory())
+                                             {
+                                                 result.errorMessage = "Could not create the audio-to-MIDI job folder.";
+                                                 return result;
+                                             }
+
+                                             juce::StringArray demucsCommand(demucsCommandPrefix);
+                                             demucsCommand.add("--input");
+                                             demucsCommand.add(sourceFile.getFullPathName());
+                                             demucsCommand.add("--output-dir");
+                                             demucsCommand.add(jobFolder.getFullPathName());
+                                             demucsCommand.add("--model");
+                                             demucsCommand.add(audioToMidiDemucsModelName(options.separationMode));
+                                             demucsCommand.add("--device");
+                                             demucsCommand.add("cpu");
+                                             demucsCommand.add("--segment");
+                                             demucsCommand.add(audioToMidiDemucsSegmentLength(options.separationMode));
+                                             demucsCommand.add("--shifts");
+                                             demucsCommand.add(audioToMidiDemucsShiftCount(options.separationMode));
+                                             demucsCommand.add("--overlap");
+                                             demucsCommand.add(audioToMidiDemucsOverlapValue(options.separationMode));
+
+                                             juce::ChildProcess demucsProcess;
+                                             if (!demucsProcess.start(demucsCommand))
+                                             {
+                                                 result.errorMessage = "Could not launch Demucs. Install it with: py -m pip install demucs";
+                                                 return result;
+                                             }
+
+                                             demucsProcess.waitForProcessToFinish(-1);
+                                             const auto demucsOutput = demucsProcess.readAllProcessOutput().trim();
+                                             if (demucsProcess.getExitCode() != 0)
+                                             {
+                                                 result.errorMessage = "Demucs failed to separate the stems with "
+                                                     + audioToMidiSeparationModeDisplayName(options.separationMode)
+                                                     + " ("
+                                                     + audioToMidiDemucsModelName(options.separationMode)
+                                                     + ")."
+                                                     + (demucsOutput.isNotEmpty() ? "\n\n" + demucsOutput : juce::String());
+                                                 return result;
+                                             }
+
+                                             auto stemFiles = jobFolder.findChildFiles(juce::File::findFiles, true, "*.wav");
+                                             if (stemFiles.isEmpty())
+                                                 stemFiles = jobFolder.findChildFiles(juce::File::findFiles, true, "*.flac");
+                                             if (stemFiles.isEmpty())
+                                             {
+                                                 result.errorMessage = "No stem audio files were produced.";
+                                                 return result;
+                                             }
+
+                                             const auto outputMidiFile = jobFolder.getChildFile("imported-audio.mid");
+                                             const auto summaryFile = jobFolder.getChildFile("imported-audio-summary.json");
+
+                                             juce::StringArray transcriptionCommand(audioToMidiCommandPrefix);
+                                             transcriptionCommand.add("--input-dir");
+                                             transcriptionCommand.add(jobFolder.getFullPathName());
+                                             transcriptionCommand.add("--output-midi");
+                                             transcriptionCommand.add(outputMidiFile.getFullPathName());
+                                             transcriptionCommand.add("--output-summary");
+                                             transcriptionCommand.add(summaryFile.getFullPathName());
+                                             transcriptionCommand.add("--profile");
+                                             transcriptionCommand.add(audioToMidiTranscriptionProfileName(options.transcriptionMode));
+                                             if (result.overrideTempo)
+                                             {
+                                                 transcriptionCommand.add("--tempo-bpm");
+                                                 transcriptionCommand.add(juce::String(result.targetTempoBpm));
+                                             }
+
+                                             juce::ChildProcess transcriptionProcess;
+                                             if (!transcriptionProcess.start(transcriptionCommand))
+                                             {
+                                                 result.errorMessage = "Could not launch the bundled audio-to-MIDI backend.";
+                                                 return result;
+                                             }
+
+                                             transcriptionProcess.waitForProcessToFinish(-1);
+                                             const auto transcriptionOutput = transcriptionProcess.readAllProcessOutput().trim();
+                                             if (transcriptionProcess.getExitCode() != 0)
+                                             {
+                                                 result.errorMessage = "The audio-to-MIDI backend failed."
+                                                     + (transcriptionOutput.isNotEmpty() ? "\n\n" + transcriptionOutput : juce::String());
+                                                 return result;
+                                             }
+
+                                             if (!outputMidiFile.existsAsFile())
+                                             {
+                                                 result.errorMessage = "The audio-to-MIDI backend did not produce a MIDI file.";
+                                                 return result;
+                                             }
+
+                                             result.outputDirectory = jobFolder;
+                                             result.generatedMidiFile = outputMidiFile;
+                                             result.stemCount = stemFiles.size();
+                                             result.success = true;
+                                             return result;
+                                         });
+}
+
 void StudioShellComponent::separateSampleClipToStems(int clipIndex)
 {
     if (stemSeparationBusy)
@@ -16674,12 +17478,24 @@ void StudioShellComponent::separateSampleClipToStems(int clipIndex)
         return;
     }
 
+    juce::File demucsSeparationScript;
+    const auto demucsScriptResult = ensureBundledDemucsSeparationScriptFile(demucsSeparationScript);
+    if (demucsScriptResult.failed())
+    {
+        juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
+                                               "Audio Stem Extraction Unavailable",
+                                               demucsScriptResult.getErrorMessage());
+        return;
+    }
+
     juce::StringArray demucsCommandPrefix;
-    if (!tryDetectDemucsCommand(demucsCommandPrefix))
+    juce::String demucsDiagnostic;
+    if (!tryDetectDemucsCommand(demucsSeparationScript, demucsCommandPrefix, demucsDiagnostic))
     {
         juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::InfoIcon,
                                                "Audio Stem Extraction Unavailable",
-                                               "Audio stem extraction requires Demucs.\n\nInstall it with:\npy -m pip install demucs\n\nMore info: "
+                                               demucsDiagnostic
+                                                   + "\n\nInstall the backend with:\npy -3.10 -m pip install demucs librosa soundfile numpy scipy\n\nMore info: "
                                                    + juce::String(kDemucsInstallUrl));
         return;
     }
@@ -16701,7 +17517,9 @@ void StudioShellComponent::separateSampleClipToStems(int clipIndex)
     stemSeparationBusy = true;
     refreshPollingTimerState();
     updateEditorState();
-    statusLabel.setText("Extracting stems for " + sourceFile.getFileName() + "...", juce::dontSendNotification);
+    statusLabel.setText("Extracting stems for " + sourceFile.getFileName()
+                            + " using fast CPU mode...",
+                        juce::dontSendNotification);
     appendActivityLog("Audio Stem Extraction",
                       "Started audio stem extraction\nSource: "
                           + sourceFile.getFullPathName()
@@ -16741,11 +17559,16 @@ void StudioShellComponent::separateSampleClipToStems(int clipIndex)
                                           }
 
                                           juce::StringArray command(demucsCommandPrefix);
-                                          command.add("-d");
-                                          command.add("cpu");
-                                          command.add("--out");
-                                          command.add(jobFolder.getFullPathName());
+                                          command.add("--input");
                                           command.add(inputFile.getFullPathName());
+                                          command.add("--output-dir");
+                                          command.add(jobFolder.getFullPathName());
+                                          command.add("--model");
+                                          command.add(kDemucsFastCpuModel);
+                                          command.add("--device");
+                                          command.add("cpu");
+                                          command.add("--segment");
+                                          command.add("8");
 
                                           juce::ChildProcess process;
                                           if (!process.start(command))
@@ -16758,7 +17581,9 @@ void StudioShellComponent::separateSampleClipToStems(int clipIndex)
                                           const auto processOutput = process.readAllProcessOutput().trim();
                                           if (process.getExitCode() != 0)
                                           {
-                                              result.errorMessage = "Demucs failed to separate the stems."
+                                              result.errorMessage = "Demucs failed to separate the stems with fast CPU mode ("
+                                                  + juce::String(kDemucsFastCpuModel)
+                                                  + ")."
                                                   + (processOutput.isNotEmpty() ? "\n\n" + processOutput : juce::String());
                                               return result;
                                           }
@@ -18106,7 +18931,8 @@ void StudioShellComponent::refreshPollingTimerState()
         && !projectPreviewRunning
         && !aiComposeBusy
         && !aceStepGenerationBusy
-        && !stemSeparationBusy;
+        && !stemSeparationBusy
+        && !audioToMidiImportBusy;
 
     int targetHz = 0;
     if (shouldPauseForRackEditor)
@@ -18121,7 +18947,7 @@ void StudioShellComponent::refreshPollingTimerState()
         else if (hasVisibleFloatingPianoRoll)
             targetHz = juce::jmin(targetHz, kPlaybackRefreshRateWithOpenPianoRollHz);
     }
-    else if (aiComposeBusy || aceStepGenerationBusy || stemSeparationBusy)
+    else if (aiComposeBusy || aceStepGenerationBusy || stemSeparationBusy || audioToMidiImportBusy)
     {
         targetHz = 6;
     }
@@ -18415,6 +19241,116 @@ void StudioShellComponent::pollStemSeparationFuture()
                                                juce::String::fromUTF8(exc.what()));
         statusLabel.setText("Stem separation failed.", juce::dontSendNotification);
         appendActivityLog("Stem Separation Error", juce::String::fromUTF8(exc.what()));
+    }
+
+    finishBusyState();
+}
+
+void StudioShellComponent::pollAudioToMidiImportFuture()
+{
+    if (!audioToMidiImportBusy || !audioToMidiImportFuture.valid())
+        return;
+
+    if (audioToMidiImportFuture.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+        return;
+
+    auto finishBusyState = [this]()
+    {
+        audioToMidiImportBusy = false;
+        refreshPollingTimerState();
+        updateEditorState();
+    };
+
+    try
+    {
+        const auto result = audioToMidiImportFuture.get();
+        if (!result.success)
+        {
+            juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
+                                                   "Import Audio As MIDI Failed",
+                                                   result.errorMessage.isNotEmpty()
+                                                       ? result.errorMessage
+                                                       : juce::String("Audio-to-MIDI import failed."));
+            statusLabel.setText("Audio-to-MIDI import failed.", juce::dontSendNotification);
+            appendActivityLog("Audio To MIDI Error",
+                              result.errorMessage.isNotEmpty() ? result.errorMessage
+                                                               : juce::String("Audio-to-MIDI import failed."));
+            finishBusyState();
+            return;
+        }
+
+        ProjectState importedProject;
+        int nativeAssignedCount = 0;
+        int gmFallbackCount = 0;
+        const auto importResult = importMidiFileWithAssignment(result.generatedMidiFile,
+                                                               result.assignmentMode,
+                                                               importedProject,
+                                                               nativeAssignedCount,
+                                                               gmFallbackCount);
+        if (importResult.failed())
+            throw std::runtime_error(importResult.getErrorMessage().toStdString());
+
+        if (result.overrideTempo)
+        {
+            importedProject.bpm = juce::jlimit(20, 300, result.targetTempoBpm);
+            importedProject.tempoMarkers.clear();
+            importedProject.tempoMarkers.push_back({ 0, importedProject.bpm });
+            importedProject.recalculateTimeFields();
+        }
+
+        if (result.quantizeGridTick > 0)
+            applyAudioToMidiQuantization(importedProject, result.quantizeGridTick);
+
+        applyProjectStateEdit(importedProject, "Import Audio As MIDI");
+        trackTable.selectRow(0);
+
+        auto statusText = "Imported audio as MIDI: "
+            + result.sourceFile.getFileName()
+            + "   "
+            + juce::String(static_cast<int>(importedProject.tracks.size()))
+            + " track(s)   "
+            + juce::String(importedProject.bpm)
+            + " BPM   "
+            + timeSignatureDisplayName(importedProject)
+            + "   Q: "
+            + (result.quantizeGridTick > 0 ? result.quantizeLabel : juce::String("off"));
+        if (result.assignmentMode == MidiImportAssignmentMode::tryNativeRack)
+        {
+            statusText << "   "
+                       << juce::String(nativeAssignedCount)
+                       << " native / "
+                       << juce::String(gmFallbackCount)
+                       << " GM";
+        }
+        else
+        {
+            statusText << "   General MIDI";
+        }
+
+        statusLabel.setText(statusText, juce::dontSendNotification);
+        appendActivityLog("Audio To MIDI",
+                          "Imported audio as MIDI\nSource: "
+                              + result.sourceFile.getFullPathName()
+                              + "\nStems: "
+                              + juce::String(result.stemCount)
+                              + "\nMIDI: "
+                              + result.generatedMidiFile.getFullPathName()
+                              + "\nTempo: "
+                              + juce::String(importedProject.bpm)
+                              + " BPM"
+                              + (result.overrideTempo ? " (project)" : " (detected)")
+                              + "\nQuantize: "
+                              + (result.quantizeGridTick > 0 ? result.quantizeLabel : juce::String("off"))
+                              + "\nOutput: "
+                              + result.outputDirectory.getFullPathName());
+    }
+    catch (const std::exception& exc)
+    {
+        juce::AlertWindow::showMessageBoxAsync(juce::AlertWindow::WarningIcon,
+                                               "Import Audio As MIDI Failed",
+                                               juce::String::fromUTF8(exc.what()));
+        statusLabel.setText("Audio-to-MIDI import failed.", juce::dontSendNotification);
+        appendActivityLog("Audio To MIDI Error", juce::String::fromUTF8(exc.what()));
     }
 
     finishBusyState();
@@ -20206,6 +21142,7 @@ juce::PopupMenu MainWindow::getMenuForIndex(int topLevelMenuIndex, const juce::S
             menu.addSeparator();
             menu.addItem(menuFileImportJson, "Import JSON Project...");
             menu.addItem(menuFileImportMidi, "Import MIDI...");
+            menu.addItem(menuFileImportAudioAsMidi, "Import Audio As MIDI...");
             menu.addItem(menuFileImportSample, "Import Sample...");
             menu.addSeparator();
             menu.addItem(menuFileExportJson, "Export Project as JSON...");
@@ -20339,6 +21276,7 @@ void MainWindow::menuItemSelected(int menuItemID, int topLevelMenuIndex)
         case menuFileAddSampleTrack: shell->addSampleTrack(); break;
         case menuFileImportJson: shell->promptImportJson(); break;
         case menuFileImportMidi: shell->promptImportMidi(); break;
+        case menuFileImportAudioAsMidi: shell->promptImportAudioAsMidi(); break;
         case menuFileImportSample: shell->promptImportSample(); break;
         case menuFileExportJson: shell->promptExportJson(); break;
         case menuFileExportMp3: shell->promptExportMp3(); break;

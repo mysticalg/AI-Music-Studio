@@ -16,6 +16,7 @@
 #include <juce_gui_extra/juce_gui_extra.h>
 
 #include <cstdint>
+#include <functional>
 #include <future>
 
 namespace aims
@@ -27,6 +28,42 @@ enum class AIComposeTargetMode
     replaceAllTracks,
     addToCurrentTrack,
     addToAllTracks
+};
+
+enum class MidiImportAssignmentMode
+{
+    generalMidi,
+    tryNativeRack
+};
+
+enum class AudioToMidiSeparationMode
+{
+    fastCpu,
+    betterSeparation,
+    highAccuracy,
+    sixStemSeparation
+};
+
+enum class AudioToMidiTranscriptionMode
+{
+    balanced,
+    cleaner,
+    moreDetail
+};
+
+enum class AudioToMidiTempoMode
+{
+    detectedFromAudio,
+    useProjectTempo
+};
+
+enum class AudioToMidiQuantizeMode
+{
+    none,
+    useProjectGrid,
+    straight8,
+    straight16,
+    triplet16
 };
 
 class FloatingPanelWindow;
@@ -133,6 +170,30 @@ private:
         std::vector<StemSeparationStem> stems;
     };
 
+    struct AudioToMidiImportResult
+    {
+        bool success = false;
+        juce::String errorMessage;
+        juce::File sourceFile;
+        juce::File outputDirectory;
+        juce::File generatedMidiFile;
+        MidiImportAssignmentMode assignmentMode = MidiImportAssignmentMode::generalMidi;
+        int stemCount = 0;
+        bool overrideTempo = false;
+        int targetTempoBpm = 120;
+        int quantizeGridTick = 0;
+        juce::String quantizeLabel;
+    };
+
+    struct AudioToMidiImportOptions
+    {
+        MidiImportAssignmentMode assignmentMode = MidiImportAssignmentMode::tryNativeRack;
+        AudioToMidiSeparationMode separationMode = AudioToMidiSeparationMode::fastCpu;
+        AudioToMidiTranscriptionMode transcriptionMode = AudioToMidiTranscriptionMode::balanced;
+        AudioToMidiTempoMode tempoMode = AudioToMidiTempoMode::detectedFromAudio;
+        AudioToMidiQuantizeMode quantizeMode = AudioToMidiQuantizeMode::useProjectGrid;
+    };
+
     struct AceStepTrackGenerationResult
     {
         bool success = false;
@@ -171,14 +232,27 @@ private:
     void handleTempoChanged();
     void handleTimeSignatureChanged();
     void handlePatternBarsChanged();
+    void handlePianoRollGridChanged();
     void handleKeyQuantizeChanged();
     void handleArrangementSnapChanged();
     void handleArrangementZoomChanged();
     void handleArrangementLaneHeightChanged();
     void handlePianoRollZoomChanged();
     void handlePianoRollRowHeightChanged();
+    void showMidiImportAssignmentDialog(const juce::String& title,
+                                        const juce::String& introText,
+                                        std::function<void(MidiImportAssignmentMode)> onConfirm);
+    void showAudioToMidiImportDialog(const juce::String& title,
+                                     const juce::String& introText,
+                                     std::function<void(AudioToMidiImportOptions)> onConfirm);
+    juce::Result importMidiFileWithAssignment(const juce::File& file,
+                                              MidiImportAssignmentMode importMode,
+                                              ProjectState& outProject,
+                                              int& outNativeAssignedCount,
+                                              int& outGmFallbackCount) const;
     void promptImportJson();
     void promptImportMidi();
+    void promptImportAudioAsMidi();
     void promptExportJson();
     void promptExportMidi();
     void promptExportMp3();
@@ -328,7 +402,9 @@ private:
     void handleRealtimeMidiRecordingNoteOff(int pitch);
     void finishActiveRealtimeRecordedNotes(int endTick = -1);
     void separateSampleClipToStems(int clipIndex);
+    void startAudioToMidiImport(const juce::File& sourceFile, AudioToMidiImportOptions options);
     void pollStemSeparationFuture();
+    void pollAudioToMidiImportFuture();
     void insertLiveMidiNote(int pitch,
                             int velocity = 100,
                             bool flashVirtualKey = false,
@@ -499,6 +575,8 @@ private:
     juce::ComboBox timeSignatureDenominatorBox;
     juce::Label patternBarsLabel;
     juce::ComboBox patternBarsBox;
+    juce::Label pianoRollGridLabel;
+    juce::ComboBox pianoRollGridBox;
     juce::Label keyQuantizeLabel;
     juce::ComboBox keyQuantizeBox;
     juce::Label arrangementSnapLabel;
@@ -525,6 +603,7 @@ private:
     std::future<AIComposeResult> aiComposeFuture;
     std::future<AceStepTrackGenerationResult> aceStepGenerationFuture;
     std::future<StemSeparationResult> stemSeparationFuture;
+    std::future<AudioToMidiImportResult> audioToMidiImportFuture;
     juce::String aiComposeBusyDetail;
     juce::String aceStepBusyDetail;
     juce::String aiComposeDefaultPrompt;
@@ -546,6 +625,7 @@ private:
     bool aceStepGenerationBusy = false;
     bool aceStepBootstrapNoticeShown = false;
     bool stemSeparationBusy = false;
+    bool audioToMidiImportBusy = false;
     std::unique_ptr<juce::ChildProcess> aceStepServerProcess;
     juce::File aceStepServerLogFile;
     int64_t aceStepServerLogReadPosition = 0;
@@ -673,6 +753,7 @@ private:
         menuFileAddSampleTrack,
         menuFileImportJson,
         menuFileImportMidi,
+        menuFileImportAudioAsMidi,
         menuFileImportSample,
         menuFileExportJson,
         menuFileExportMp3,

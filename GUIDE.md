@@ -86,6 +86,12 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_native_app.ps1 -Configu
 python .\scripts\profile_native_stress.py
 ```
 
+- Audio-to-MIDI import depends on an external Python backend. Install it with:
+
+```powershell
+py -3.10 -m pip install demucs basic-pitch librosa pretty_midi soundfile numpy scipy
+```
+
 ## AI and logging
 
 - `AI Compose` and provider settings are native C++ features.

@@ -370,7 +370,7 @@ void PianoRollComponent::setSurfaceMode(SurfaceMode mode)
 
 void PianoRollComponent::setHorizontalZoom(float pixelsPerBeat)
 {
-    const auto clamped = juce::jlimit(12.0f, 96.0f, pixelsPerBeat);
+    const auto clamped = juce::jlimit(4.0f, 96.0f, pixelsPerBeat);
     if (std::abs(cellWidth - clamped) < 0.01f)
         return;
 
