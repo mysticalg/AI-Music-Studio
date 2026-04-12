@@ -1,6 +1,8 @@
-# Mutagen
+# Mutagen AI Music Studio
 
-Mutagen is a native C++ desktop music workstation built with JUCE. This repository is now centered on the standalone native app, the shared live VST engine, the bundled VST3 instrument set, and the static documentation site.
+Mutagen is a native C++ AI music workstation and desktop MIDI sequencer built with JUCE. It combines a piano roll editor, pattern-based arrangement, live VST3 hosting, bundled instruments, automation, sample workflows, and AI-assisted composition in a standalone desktop DAW-style app.
+
+This repository is centered on the standalone native app, the shared live VST engine, the bundled VST3 instrument set, and the static documentation site.
 
 The legacy Python/PySide shell, PyInstaller packaging path, and Python bridge helpers are no longer part of the supported workflow in this repo.
 
@@ -18,6 +20,25 @@ Guide: [GUIDE.md](GUIDE.md)
 - Native AI compose/settings flow and on-disk activity or HTTP debug logs
 - Audio import to stem-split MIDI tracks through the native File menu when Demucs and the transcription backend are installed
 - Static GitHub Pages site in `docs/`
+
+## Why Mutagen
+
+- AI music studio workflow for sketching, arranging, and refining MIDI ideas on desktop
+- Native desktop DAW-style editor built with JUCE instead of a browser shell
+- Live VST3 host with shared playback and editor state for immediate sound design feedback
+- Built-in instrument collection including Virus Synth and additional bundled VST3 instruments
+- Windows release automation for downloadable builds, installers, and GitHub Pages docs
+
+## Screenshots
+
+![Mutagen AI Music Studio main window](docs/assets/screenshots/main-window.png)
+_Main Mutagen window with the desktop MIDI sequencer, track list, transport, and arrangement view._
+
+![Mutagen track panel and rack controls](docs/assets/screenshots/tracks-panel.png)
+_Track panel with mute, solo, VST3 visibility, rack assignment, and session control columns._
+
+![Virus Synth bundled VST3 instrument](docs/assets/screenshots/virus/virus-synth-overview.png)
+_Virus Synth, the flagship bundled VST3 instrument included with Mutagen AI Music Studio._
 
 ## Repository layout
 

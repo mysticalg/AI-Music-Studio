@@ -54,6 +54,7 @@ enum class AudioToMidiTranscriptionMode
 enum class AudioToMidiTempoMode
 {
     detectedFromAudio,
+    detectedFromDrums,
     useProjectTempo
 };
 
@@ -183,6 +184,9 @@ private:
         int targetTempoBpm = 120;
         int quantizeGridTick = 0;
         juce::String quantizeLabel;
+        float quantizeStrength = 1.0f;
+        bool rawTiming = false;
+        int fixedVelocity = 0;
     };
 
     struct AudioToMidiImportOptions
@@ -192,6 +196,9 @@ private:
         AudioToMidiTranscriptionMode transcriptionMode = AudioToMidiTranscriptionMode::balanced;
         AudioToMidiTempoMode tempoMode = AudioToMidiTempoMode::detectedFromAudio;
         AudioToMidiQuantizeMode quantizeMode = AudioToMidiQuantizeMode::useProjectGrid;
+        float quantizeStrength = 1.0f;
+        bool rawTiming = false;
+        int fixedVelocity = 0;
     };
 
     struct AceStepTrackGenerationResult

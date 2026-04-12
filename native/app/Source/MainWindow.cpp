@@ -192,7 +192,8 @@ constexpr int kAudioToMidiTranscriptionBalancedId = 1;
 constexpr int kAudioToMidiTranscriptionCleanerId = 2;
 constexpr int kAudioToMidiTranscriptionMoreDetailId = 3;
 constexpr int kAudioToMidiTempoDetectedId = 1;
-constexpr int kAudioToMidiTempoProjectId = 2;
+constexpr int kAudioToMidiTempoDrumsId = 2;
+constexpr int kAudioToMidiTempoProjectId = 3;
 constexpr int kAudioToMidiQuantizeNoneId = 1;
 constexpr int kAudioToMidiQuantizeProjectGridId = 2;
 constexpr int kAudioToMidiQuantizeStraight8Id = 3;
@@ -228,9 +229,11 @@ AudioToMidiTranscriptionMode audioToMidiTranscriptionModeFromComboId(int comboId
 
 AudioToMidiTempoMode audioToMidiTempoModeFromComboId(int comboId)
 {
-    return comboId == kAudioToMidiTempoProjectId
-        ? AudioToMidiTempoMode::useProjectTempo
-        : AudioToMidiTempoMode::detectedFromAudio;
+    if (comboId == kAudioToMidiTempoProjectId)
+        return AudioToMidiTempoMode::useProjectTempo;
+    if (comboId == kAudioToMidiTempoDrumsId)
+        return AudioToMidiTempoMode::detectedFromDrums;
+    return AudioToMidiTempoMode::detectedFromAudio;
 }
 
 AudioToMidiQuantizeMode audioToMidiQuantizeModeFromComboId(int comboId)
@@ -344,9 +347,16 @@ juce::String audioToMidiTranscriptionModeDisplayName(AudioToMidiTranscriptionMod
 
 juce::String audioToMidiTempoModeDisplayName(AudioToMidiTempoMode mode)
 {
-    return mode == AudioToMidiTempoMode::useProjectTempo
-        ? juce::String("project tempo")
-        : juce::String("detected tempo");
+    switch (mode)
+    {
+        case AudioToMidiTempoMode::useProjectTempo:
+            return "project tempo";
+        case AudioToMidiTempoMode::detectedFromDrums:
+            return "drum-detected tempo";
+        case AudioToMidiTempoMode::detectedFromAudio:
+        default:
+            return "detected tempo";
+    }
 }
 
 juce::String audioToMidiQuantizeModeDisplayName(AudioToMidiQuantizeMode mode, const ProjectState& project)
@@ -395,25 +405,29 @@ int audioToMidiQuantizeGridTick(AudioToMidiQuantizeMode mode, const ProjectState
     }
 }
 
-void applyAudioToMidiQuantization(ProjectState& project, int gridTick)
+void applyAudioToMidiQuantization(ProjectState& project, int gridTick, float strength)
 {
     if (gridTick <= 0)
         return;
 
-    auto quantizeNotes = [gridTick](std::vector<MidiNote>& notes)
+    const auto clampedStrength = juce::jlimit(0.0f, 1.0f, strength);
+    if (clampedStrength <= 0.0f)
+        return;
+
+    auto quantizeNotes = [gridTick, clampedStrength](std::vector<MidiNote>& notes)
     {
         for (auto& note : notes)
         {
-            const auto quantizedStartTick = juce::jmax(0,
-                                                       static_cast<int>(std::llround(static_cast<double>(juce::jmax(0, note.startTick))
-                                                                                     / static_cast<double>(gridTick)))
-                                                           * gridTick);
-            const auto quantizedDurationTick = juce::jmax(gridTick,
-                                                          static_cast<int>(std::llround(static_cast<double>(juce::jmax(1, note.durationTick))
-                                                                                        / static_cast<double>(gridTick)))
-                                                              * gridTick);
-            note.startTick = quantizedStartTick;
-            note.durationTick = quantizedDurationTick;
+            const auto originalStart = juce::jmax(0, note.startTick);
+            const auto originalDuration = juce::jmax(1, note.durationTick);
+            const auto quantizedStart = static_cast<int>(std::llround(static_cast<double>(originalStart) / static_cast<double>(gridTick))) * gridTick;
+            const auto quantizedDuration = static_cast<int>(std::llround(static_cast<double>(originalDuration) / static_cast<double>(gridTick))) * gridTick;
+            const auto blendedStart = static_cast<double>(originalStart)
+                + (static_cast<double>(quantizedStart - originalStart) * static_cast<double>(clampedStrength));
+            const auto blendedDuration = static_cast<double>(originalDuration)
+                + (static_cast<double>(quantizedDuration - originalDuration) * static_cast<double>(clampedStrength));
+            note.startTick = juce::jmax(0, static_cast<int>(std::llround(blendedStart)));
+            note.durationTick = juce::jmax(1, static_cast<int>(std::llround(blendedDuration)));
         }
 
         std::sort(notes.begin(),
@@ -16398,6 +16412,102 @@ void StudioShellComponent::showAudioToMidiImportDialog(const juce::String& title
                                                        const juce::String& introText,
                                                        std::function<void(AudioToMidiImportOptions)> onConfirm)
 {
+    class QuantizeStrengthComponent final : public juce::Component
+    {
+    public:
+        QuantizeStrengthComponent()
+        {
+            label.setText("Quantize Strength", juce::dontSendNotification);
+            label.setColour(juce::Label::textColourId, juce::Colour::fromRGB(214, 219, 227));
+            addAndMakeVisible(label);
+
+            slider.setSliderStyle(juce::Slider::LinearHorizontal);
+            slider.setRange(0.0, 100.0, 1.0);
+            slider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 52, 20);
+            slider.setTextValueSuffix("%");
+            slider.setValue(80.0, juce::dontSendNotification);
+            addAndMakeVisible(slider);
+
+            setSize(300, 34);
+        }
+
+        float strength() const
+        {
+            return static_cast<float>(slider.getValue()) / 100.0f;
+        }
+
+        void resized() override
+        {
+            auto area = getLocalBounds();
+            label.setBounds(area.removeFromLeft(130));
+            slider.setBounds(area);
+        }
+
+    private:
+        juce::Label label;
+        juce::Slider slider;
+    };
+
+    class RawTimingComponent final : public juce::Component
+    {
+    public:
+        RawTimingComponent()
+        {
+            toggle.setButtonText("Preserve Raw Timing (skip cleanup)");
+            toggle.setToggleState(false, juce::dontSendNotification);
+            addAndMakeVisible(toggle);
+            setSize(320, 22);
+        }
+
+        bool rawTimingEnabled() const
+        {
+            return toggle.getToggleState();
+        }
+
+        void resized() override
+        {
+            toggle.setBounds(getLocalBounds());
+        }
+
+    private:
+        juce::ToggleButton toggle;
+    };
+
+    class FixedVelocityComponent final : public juce::Component
+    {
+    public:
+        FixedVelocityComponent()
+        {
+            toggle.setButtonText("Fix All Velocities");
+            toggle.setToggleState(false, juce::dontSendNotification);
+            addAndMakeVisible(toggle);
+
+            slider.setSliderStyle(juce::Slider::LinearHorizontal);
+            slider.setRange(1.0, 127.0, 1.0);
+            slider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 52, 20);
+            slider.setValue(96.0, juce::dontSendNotification);
+            addAndMakeVisible(slider);
+
+            setSize(320, 34);
+        }
+
+        int fixedVelocity() const
+        {
+            return toggle.getToggleState() ? juce::roundToInt(slider.getValue()) : 0;
+        }
+
+        void resized() override
+        {
+            auto area = getLocalBounds();
+            toggle.setBounds(area.removeFromLeft(170));
+            slider.setBounds(area);
+        }
+
+    private:
+        juce::ToggleButton toggle;
+        juce::Slider slider;
+    };
+
     auto* dialog = new juce::AlertWindow(title,
                                          "Choose how Mutagen should separate stems and transcribe them into MIDI.",
                                          juce::AlertWindow::NoIcon);
@@ -16418,6 +16528,7 @@ void StudioShellComponent::showAudioToMidiImportDialog(const juce::String& title
                         "MIDI Extraction");
     dialog->addComboBox("tempo",
                         { "Detect From Audio (Recommended)",
+                          "Detect From Drum Stem",
                           "Use Current Project Tempo" },
                         "Tempo");
     dialog->addComboBox("quantize",
@@ -16427,6 +16538,12 @@ void StudioShellComponent::showAudioToMidiImportDialog(const juce::String& title
                           "1/16 Straight",
                           "1/16 Triplet" },
                         "Timing Quantize");
+    auto* quantizeStrength = new QuantizeStrengthComponent();
+    dialog->addCustomComponent(quantizeStrength);
+    auto* rawTiming = new RawTimingComponent();
+    dialog->addCustomComponent(rawTiming);
+    auto* fixedVelocity = new FixedVelocityComponent();
+    dialog->addCustomComponent(fixedVelocity);
     dialog->addTextBlock(introText
                          + "\n\nFast CPU separation uses a single Demucs model and is much quicker on CPU."
                            "\n\nBetter separation uses a heavier Demucs bag model and can isolate stems more cleanly, but it takes longer."
@@ -16434,8 +16551,11 @@ void StudioShellComponent::showAudioToMidiImportDialog(const juce::String& title
                            "\n\n6-stem separation uses the 6-source Demucs model so guitar and piano can come back as separate stems instead of being folded into 'other'."
                            "\n\nCleaner notes raises extraction thresholds to reduce sketchy MIDI."
                            "\n\nMore detail lowers thresholds to capture more notes, but it can introduce extra noise."
+                           "\n\nDetect From Drum Stem prioritizes the separated drum stem when estimating tempo."
                            "\n\nUse Current Project Tempo keeps the imported MIDI locked to your current session BPM."
-                           "\n\nTiming Quantize snaps imported notes after transcription to tighten loose timing.");
+                           "\n\nTiming Quantize snaps imported notes after transcription to tighten loose timing."
+                           "\n\nPreserve Raw Timing skips cleanup and keeps the raw transcription timing."
+                           "\n\nFix All Velocities forces a single velocity across all notes.");
     if (auto* modeBox = dialog->getComboBoxComponent("mode"))
         modeBox->setSelectedId(kMidiImportModeNativeRackId, juce::dontSendNotification);
     if (auto* separationBox = dialog->getComboBoxComponent("separation"))
@@ -16447,7 +16567,7 @@ void StudioShellComponent::showAudioToMidiImportDialog(const juce::String& title
     if (auto* quantizeBox = dialog->getComboBoxComponent("quantize"))
         quantizeBox->setSelectedId(kAudioToMidiQuantizeProjectGridId, juce::dontSendNotification);
 
-    dialog->setSize(620, 470);
+    dialog->setSize(620, 560);
     dialog->addButton("Import", 1, juce::KeyPress(juce::KeyPress::returnKey));
     dialog->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
 
@@ -16455,8 +16575,14 @@ void StudioShellComponent::showAudioToMidiImportDialog(const juce::String& title
     dialog->enterModalState(true,
                             juce::ModalCallbackFunction::create([safeThis = juce::Component::SafePointer<StudioShellComponent>(this),
                                                                  safeDialog,
+                                                                 quantizeStrength,
+                                                                 rawTiming,
+                                                                 fixedVelocity,
                                                                  onConfirm = std::move(onConfirm)](int result)
                             {
+                                std::unique_ptr<QuantizeStrengthComponent> quantizeStrengthHolder(quantizeStrength);
+                                std::unique_ptr<RawTimingComponent> rawTimingHolder(rawTiming);
+                                std::unique_ptr<FixedVelocityComponent> fixedVelocityHolder(fixedVelocity);
                                 if (safeThis == nullptr || safeDialog == nullptr || result != 1 || !onConfirm)
                                     return;
 
@@ -16471,6 +16597,16 @@ void StudioShellComponent::showAudioToMidiImportDialog(const juce::String& title
                                     options.tempoMode = audioToMidiTempoModeFromComboId(tempoBox->getSelectedId());
                                 if (const auto* quantizeBox = safeDialog->getComboBoxComponent("quantize"))
                                     options.quantizeMode = audioToMidiQuantizeModeFromComboId(quantizeBox->getSelectedId());
+                                options.quantizeStrength = quantizeStrength != nullptr ? quantizeStrength->strength() : 1.0f;
+                                if (options.quantizeMode == AudioToMidiQuantizeMode::none)
+                                    options.quantizeStrength = 0.0f;
+                                options.rawTiming = rawTiming != nullptr && rawTiming->rawTimingEnabled();
+                                if (options.rawTiming)
+                                {
+                                    options.quantizeMode = AudioToMidiQuantizeMode::none;
+                                    options.quantizeStrength = 0.0f;
+                                }
+                                options.fixedVelocity = fixedVelocity != nullptr ? fixedVelocity->fixedVelocity() : 0;
 
                                 onConfirm(options);
                             }),
@@ -17314,8 +17450,14 @@ void StudioShellComponent::startAudioToMidiImport(const juce::File& sourceFile, 
                             + audioToMidiTranscriptionModeDisplayName(options.transcriptionMode)
                             + " at "
                             + audioToMidiTempoModeDisplayName(options.tempoMode)
-                            + " with quantize "
-                            + audioToMidiQuantizeModeDisplayName(options.quantizeMode, documentState.project)
+                            + (options.rawTiming ? " with raw timing" : " with quantize ")
+                            + (options.rawTiming
+                                   ? juce::String("")
+                                   : audioToMidiQuantizeModeDisplayName(options.quantizeMode, documentState.project)
+                                         + (options.quantizeMode == AudioToMidiQuantizeMode::none
+                                                ? juce::String("")
+                                                : " (" + juce::String(juce::roundToInt(options.quantizeStrength * 100.0f)) + "%)"))
+                            + (options.fixedVelocity > 0 ? " vel=" + juce::String(options.fixedVelocity) : juce::String())
                             + "...",
                         juce::dontSendNotification);
     appendActivityLog("Audio To MIDI",
@@ -17328,12 +17470,19 @@ void StudioShellComponent::startAudioToMidiImport(const juce::File& sourceFile, 
                           + "\nTempo: "
                           + audioToMidiTempoModeDisplayName(options.tempoMode)
                           + "\nQuantize: "
-                          + audioToMidiQuantizeModeDisplayName(options.quantizeMode, documentState.project));
+                          + (options.rawTiming
+                                 ? juce::String("raw timing")
+                                 : audioToMidiQuantizeModeDisplayName(options.quantizeMode, documentState.project)
+                                       + (options.quantizeMode == AudioToMidiQuantizeMode::none
+                                              ? juce::String("")
+                                              : " (" + juce::String(juce::roundToInt(options.quantizeStrength * 100.0f)) + "%)"))
+                          + (options.fixedVelocity > 0 ? "\nVelocity: " + juce::String(options.fixedVelocity) : juce::String()));
 
     const auto projectTempoBpm = documentState.project.bpm;
-    const auto quantizeGridTick = audioToMidiQuantizeGridTick(options.quantizeMode, documentState.project);
+    const auto quantizeGridTick = options.rawTiming
+        ? 0
+        : audioToMidiQuantizeGridTick(options.quantizeMode, documentState.project);
     const auto quantizeLabel = audioToMidiQuantizeModeDisplayName(options.quantizeMode, documentState.project);
-
     audioToMidiImportFuture = std::async(std::launch::async,
                                          [sourceFile, options, projectTempoBpm, quantizeGridTick, quantizeLabel, demucsCommandPrefix, audioToMidiCommandPrefix]() -> AudioToMidiImportResult
                                          {
@@ -17344,6 +17493,9 @@ void StudioShellComponent::startAudioToMidiImport(const juce::File& sourceFile, 
                                              result.targetTempoBpm = projectTempoBpm;
                                              result.quantizeGridTick = quantizeGridTick;
                                              result.quantizeLabel = quantizeLabel;
+                                             result.quantizeStrength = options.quantizeStrength;
+                                             result.rawTiming = options.rawTiming;
+                                             result.fixedVelocity = options.fixedVelocity;
 
                                              if (!sourceFile.existsAsFile())
                                              {
@@ -17430,6 +17582,20 @@ void StudioShellComponent::startAudioToMidiImport(const juce::File& sourceFile, 
                                              {
                                                  transcriptionCommand.add("--tempo-bpm");
                                                  transcriptionCommand.add(juce::String(result.targetTempoBpm));
+                                             }
+                                             if (options.tempoMode == AudioToMidiTempoMode::detectedFromDrums)
+                                             {
+                                                 transcriptionCommand.add("--tempo-source");
+                                                 transcriptionCommand.add("drums");
+                                             }
+                                             if (options.rawTiming)
+                                             {
+                                                 transcriptionCommand.add("--raw-timing");
+                                             }
+                                             if (options.fixedVelocity > 0)
+                                             {
+                                                 transcriptionCommand.add("--fixed-velocity");
+                                                 transcriptionCommand.add(juce::String(options.fixedVelocity));
                                              }
 
                                              juce::ChildProcess transcriptionProcess;
@@ -19299,7 +19465,7 @@ void StudioShellComponent::pollAudioToMidiImportFuture()
         }
 
         if (result.quantizeGridTick > 0)
-            applyAudioToMidiQuantization(importedProject, result.quantizeGridTick);
+            applyAudioToMidiQuantization(importedProject, result.quantizeGridTick, result.quantizeStrength);
 
         applyProjectStateEdit(importedProject, "Import Audio As MIDI");
         trackTable.selectRow(0);
@@ -19313,7 +19479,10 @@ void StudioShellComponent::pollAudioToMidiImportFuture()
             + " BPM   "
             + timeSignatureDisplayName(importedProject)
             + "   Q: "
-            + (result.quantizeGridTick > 0 ? result.quantizeLabel : juce::String("off"));
+            + (result.rawTiming
+                   ? juce::String("raw timing")
+                   : (result.quantizeGridTick > 0 ? result.quantizeLabel + " (" + juce::String(juce::roundToInt(result.quantizeStrength * 100.0f)) + "%)"
+                                                  : juce::String("off")));
         if (result.assignmentMode == MidiImportAssignmentMode::tryNativeRack)
         {
             statusText << "   "
@@ -19340,7 +19509,10 @@ void StudioShellComponent::pollAudioToMidiImportFuture()
                               + " BPM"
                               + (result.overrideTempo ? " (project)" : " (detected)")
                               + "\nQuantize: "
-                              + (result.quantizeGridTick > 0 ? result.quantizeLabel : juce::String("off"))
+                              + (result.rawTiming
+                                     ? juce::String("raw timing")
+                                     : (result.quantizeGridTick > 0 ? result.quantizeLabel + " (" + juce::String(juce::roundToInt(result.quantizeStrength * 100.0f)) + "%)"
+                                                                    : juce::String("off")))
                               + "\nOutput: "
                               + result.outputDirectory.getFullPathName());
     }

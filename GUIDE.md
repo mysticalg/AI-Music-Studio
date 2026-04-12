@@ -1,6 +1,14 @@
-# Mutagen Guide
+# Mutagen Help Guide
 
-This guide covers the supported native workflow for Mutagen.
+This help guide covers the supported native workflow for Mutagen AI Music Studio, including the desktop MIDI sequencer, piano roll, VST3 workflow, AI composition features, packaging, and logging.
+
+## What Mutagen includes
+
+- Native JUCE desktop music workstation workflow
+- Pattern-based MIDI sequencer and piano roll editing
+- Live VST3 hosting with bundled instruments
+- AI-assisted composition and activity logging
+- Windows packaging and release automation
 
 ## Build and run
 
@@ -31,11 +39,11 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_native_app.ps1 -Configu
 ## Main workflow
 
 1. Create or select a track.
-2. Draw pattern blocks in the sequencer.
+2. Draw pattern blocks in the desktop sequencer.
 3. Double-click a pattern to edit it in the piano roll.
 4. Use the lower controller pane for velocity, MIDI CC, or automation drawing.
 5. Assign a bundled or third-party VST3 to the track and open `Edit VST`.
-6. Play, loop, mix, and render directly from the native app.
+6. Play, loop, mix, export, and review logs directly from the native app.
 
 ## Sequencer
 
@@ -43,7 +51,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_native_app.ps1 -Configu
 - Sequencer snap is independent from piano-roll quantize.
 - Pattern clips can be drawn, moved, resized, duplicated, pasted, glued, or erased.
 - Resizing a clip trims notes and controller data that fall outside the new bounds.
-- Double-click opens the clip in the piano roll.
+- Double-click opens the clip in the piano roll editor.
 
 ## Piano roll
 
@@ -94,7 +102,7 @@ py -3.10 -m pip install demucs basic-pitch librosa pretty_midi soundfile numpy s
 
 ## AI and logging
 
-- `AI Compose` and provider settings are native C++ features.
+- `AI Compose` and provider settings are native C++ desktop features.
 - `Windows > Show Activity Log Window` shows request, response, and app events.
 - AI HTTP diagnostics are written to `ai-http-debug.log` in the Mutagen app-data logs folder.
 
@@ -115,3 +123,5 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_installer.ps1 -
 ## Scope note
 
 The supported repo path is now the native Mutagen application. The old Python shell and Python bridge tooling have been removed from the supported tree.
+
+For the public product overview and screenshots, see the GitHub Pages site: <https://mysticalg.github.io/AI-Music-Studio/>.

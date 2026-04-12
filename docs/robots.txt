@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://mysticalg.github.io/AI-Music-Studio/sitemap.xml

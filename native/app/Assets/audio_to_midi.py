@@ -35,13 +35,13 @@ TRANSCRIPTION_PROFILES = {
     "detail": {
         "onset_threshold": 0.42,
         "frame_threshold": 0.24,
-        "minimum_note_length": 90.0,
+        "minimum_note_length": 60.0,
         "drum_min_gap_seconds": 0.05,
         "drum_energy_quantile": 0.40,
         "melodia_trick": True,
-        "note_velocity_floor": 28,
-        "isolated_short_note_seconds": 0.08,
-        "polyphony_limit": 8,
+        "note_velocity_floor": 20,
+        "isolated_short_note_seconds": 0.05,
+        "polyphony_limit": 10,
     },
 }
 ROLE_ORDER = {
@@ -447,11 +447,13 @@ def first_float(value, fallback: float) -> float:
         return fallback
 
 
-def estimate_tempo(stem_files, librosa, np) -> float:
+def estimate_tempo(stem_files, librosa, np, prefer_drums: bool = False) -> float:
     ordered = sorted(stem_files, key=lambda path: (0 if infer_stem_role(path) == "drums" else 1, stem_sort_key(path)))
     for stem_file in ordered:
+        if prefer_drums and infer_stem_role(stem_file) != "drums":
+            continue
         try:
-            audio, sample_rate = librosa.load(str(stem_file), sr=22050, mono=True, duration=120.0)
+            audio, sample_rate = librosa.load(str(stem_file), sr=22050, mono=True, duration=180.0)
         except Exception:
             continue
 
@@ -460,7 +462,11 @@ def estimate_tempo(stem_files, librosa, np) -> float:
         if float(np.max(np.abs(audio))) < 1.0e-4:
             continue
 
-        onset_envelope = librosa.onset.onset_strength(y=audio, sr=sample_rate)
+        if prefer_drums:
+            _, percussive = librosa.effects.hpss(audio)
+            onset_envelope = librosa.onset.onset_strength(y=percussive, sr=sample_rate)
+        else:
+            onset_envelope = librosa.onset.onset_strength(y=audio, sr=sample_rate)
         if onset_envelope.size == 0:
             continue
 
@@ -469,6 +475,11 @@ def estimate_tempo(stem_files, librosa, np) -> float:
         if 40.0 <= tempo_value <= 220.0:
             return tempo_value
 
+        if prefer_drums:
+            continue
+
+    if prefer_drums:
+        return estimate_tempo(stem_files, librosa, np, prefer_drums=False)
     return 120.0
 
 
@@ -536,7 +547,7 @@ def spectral_centroid_from_slice(slice_spectrum, frequencies, np):
     return float(np.sum(slice_spectrum * frequencies) / total)
 
 
-def transcribe_drum_stem(stem_file, track_name, pretty_midi, librosa, np, profile):
+def transcribe_drum_stem(stem_file, track_name, pretty_midi, librosa, np, profile, fixed_velocity=0):
     audio, sample_rate = librosa.load(str(stem_file), sr=22050, mono=True)
     if audio.size == 0 or float(np.max(np.abs(audio))) < 1.0e-4:
         return None, 0
@@ -772,7 +783,10 @@ def transcribe_drum_stem(stem_file, track_name, pretty_midi, librosa, np, profil
             velocity_weight = (tom_ratio + (low_ratio * 0.4)) * 1.0
         else:
             velocity_weight = low_ratio * 1.1
-        velocity = int(max(28, min(127, round(total_energy * (1.5 + (velocity_weight * 3.0))))))
+        if fixed_velocity:
+            velocity = int(fixed_velocity)
+        else:
+            velocity = int(max(28, min(127, round(total_energy * (1.5 + (velocity_weight * 3.0))))))
         instrument.notes.append(
             pretty_midi.Note(
                 velocity=velocity,
@@ -889,7 +903,7 @@ def filter_low_confidence_pitched_notes(notes, role, profile, pretty_midi):
         isolated = previous_gap > 0.24 and next_gap > 0.24
         velocity = int(note.velocity)
 
-        if velocity < minimum_velocity and duration < (isolated_floor * 0.8) and isolated:
+        if velocity < minimum_velocity and duration < isolated_floor and isolated:
             continue
         if role in {"bass", "vocals"} and velocity < (minimum_velocity + 5) and duration < isolated_floor:
             continue
@@ -971,9 +985,16 @@ def cleanup_piano_notes(notes, pretty_midi, profile):
     if not notes:
         return []
 
-    clusters = cluster_notes_by_start(notes, 0.045)
+    profile_limit = int(profile.get("polyphony_limit", 6))
+    if profile_limit >= 9:
+        cluster_window = 0.03
+    elif profile_limit <= 5:
+        cluster_window = 0.06
+    else:
+        cluster_window = 0.045
+    clusters = cluster_notes_by_start(notes, cluster_window)
     cleaned = []
-    max_polyphony = int(profile.get("polyphony_limit", 6))
+    max_polyphony = profile_limit
     for cluster in clusters:
         deduped = {}
         for note in cluster:
@@ -996,9 +1017,16 @@ def cleanup_guitar_notes(notes, pretty_midi, profile):
     if not notes:
         return []
 
-    clusters = cluster_notes_by_start(notes, 0.09)
+    profile_limit = int(profile.get("polyphony_limit", 6))
+    if profile_limit >= 9:
+        cluster_window = 0.06
+    elif profile_limit <= 5:
+        cluster_window = 0.12
+    else:
+        cluster_window = 0.09
+    clusters = cluster_notes_by_start(notes, cluster_window)
     cleaned = []
-    max_polyphony = min(6, int(profile.get("polyphony_limit", 6)))
+    max_polyphony = min(6, profile_limit)
     for cluster in clusters:
         deduped = {}
         for note in cluster:
@@ -1021,9 +1049,16 @@ def cleanup_polyphonic_sustain_notes(notes, pretty_midi, profile):
     if not notes:
         return []
 
-    clusters = cluster_notes_by_start(notes, 0.05)
+    profile_limit = int(profile.get("polyphony_limit", 6))
+    if profile_limit >= 9:
+        cluster_window = 0.03
+    elif profile_limit <= 5:
+        cluster_window = 0.07
+    else:
+        cluster_window = 0.05
+    clusters = cluster_notes_by_start(notes, cluster_window)
     cleaned = []
-    max_polyphony = int(profile.get("polyphony_limit", 6))
+    max_polyphony = profile_limit
     for cluster in clusters:
         deduped = {}
         for note in cluster:
@@ -1050,7 +1085,7 @@ def apply_role_specific_cleanup(instrument, role, pretty_midi, profile):
     return rebuild_instrument_notes(instrument, notes, pretty_midi)
 
 
-def transcribe_pitched_stem(stem_file, track_name, role, pretty_midi, predict, tempo_bpm, profile):
+def transcribe_pitched_stem(stem_file, track_name, role, pretty_midi, predict, tempo_bpm, profile, raw_timing=False, fixed_velocity=0):
     minimum_frequency, maximum_frequency = role_frequency_range(role)
     _, midi_data, _ = predict(
         str(stem_file),
@@ -1079,26 +1114,30 @@ def transcribe_pitched_stem(stem_file, track_name, role, pretty_midi, predict, t
     )
 
     for note in notes:
+        velocity = int(fixed_velocity) if fixed_velocity else int(note.velocity)
         instrument.notes.append(
             pretty_midi.Note(
-                velocity=max(1, min(127, int(note.velocity))),
+                velocity=max(1, min(127, velocity)),
                 pitch=max(0, min(127, int(note.pitch))),
                 start=float(note.start),
                 end=max(float(note.end), float(note.start) + 0.05),
             )
         )
 
-    normalize_instrument_notes(instrument, pretty_midi)
-    filtered_notes = filter_low_confidence_pitched_notes(instrument.notes, role, profile, pretty_midi)
-    rebuild_instrument_notes(instrument, filtered_notes, pretty_midi)
-    apply_role_specific_cleanup(instrument, role, pretty_midi, profile)
-    normalize_instrument_notes(instrument, pretty_midi)
+    if raw_timing:
+        rebuild_instrument_notes(instrument, instrument.notes, pretty_midi)
+    else:
+        normalize_instrument_notes(instrument, pretty_midi)
+        filtered_notes = filter_low_confidence_pitched_notes(instrument.notes, role, profile, pretty_midi)
+        rebuild_instrument_notes(instrument, filtered_notes, pretty_midi)
+        apply_role_specific_cleanup(instrument, role, pretty_midi, profile)
+        normalize_instrument_notes(instrument, pretty_midi)
     if not instrument.notes:
         return None, 0
     return instrument, len(instrument.notes)
 
 
-def build_output(stem_files, output_midi, output_summary, profile_name, forced_tempo_bpm=None):
+def build_output(stem_files, output_midi, output_summary, profile_name, forced_tempo_bpm=None, tempo_source="auto", raw_timing=False, fixed_velocity=0):
     np, librosa, pretty_midi, predict = require_backends()
 
     if not stem_files:
@@ -1108,7 +1147,8 @@ def build_output(stem_files, output_midi, output_summary, profile_name, forced_t
     if profile is None:
         raise RuntimeError(f"Unknown transcription profile: {profile_name}")
 
-    tempo_bpm = float(forced_tempo_bpm) if forced_tempo_bpm is not None else estimate_tempo(stem_files, librosa, np)
+    prefer_drums = str(tempo_source).strip().lower() == "drums"
+    tempo_bpm = float(forced_tempo_bpm) if forced_tempo_bpm is not None else estimate_tempo(stem_files, librosa, np, prefer_drums=prefer_drums)
     midi = pretty_midi.PrettyMIDI(initial_tempo=tempo_bpm)
     midi.time_signature_changes.append(pretty_midi.TimeSignature(4, 4, 0.0))
 
@@ -1124,7 +1164,7 @@ def build_output(stem_files, output_midi, output_summary, profile_name, forced_t
             track_name = display_name_for_role(role)
 
         if role == "drums":
-            instrument, note_count = transcribe_drum_stem(stem_file, track_name, pretty_midi, librosa, np, profile)
+            instrument, note_count = transcribe_drum_stem(stem_file, track_name, pretty_midi, librosa, np, profile, fixed_velocity=fixed_velocity)
         else:
             instrument, note_count = transcribe_pitched_stem(
                 stem_file,
@@ -1134,6 +1174,8 @@ def build_output(stem_files, output_midi, output_summary, profile_name, forced_t
                 predict,
                 tempo_bpm,
                 profile,
+                raw_timing=raw_timing,
+                fixed_velocity=fixed_velocity,
             )
 
         if instrument is None or note_count <= 0:
@@ -1164,7 +1206,9 @@ def build_output(stem_files, output_midi, output_summary, profile_name, forced_t
             json.dumps(
                 {
                     "tempo_bpm": round(float(tempo_bpm), 2),
-                    "tempo_source": "forced" if forced_tempo_bpm is not None else "detected",
+                    "tempo_source": "forced" if forced_tempo_bpm is not None else ("drums" if prefer_drums else "detected"),
+                    "raw_timing": bool(raw_timing),
+                    "fixed_velocity": int(fixed_velocity) if fixed_velocity else 0,
                     "profile": profile_name,
                     "track_count": track_count,
                     "tracks": summary_tracks,
@@ -1184,6 +1228,9 @@ def parse_args():
     parser.add_argument("--profile", choices=sorted(TRANSCRIPTION_PROFILES.keys()), default="balanced",
                         help="Transcription profile that trades density for accuracy.")
     parser.add_argument("--tempo-bpm", type=float, help="Override the detected MIDI tempo with a fixed BPM.")
+    parser.add_argument("--tempo-source", default="auto", help="Tempo source: auto or drums.")
+    parser.add_argument("--raw-timing", action="store_true", help="Preserve raw timing and skip cleanup.")
+    parser.add_argument("--fixed-velocity", type=int, help="Force a fixed velocity for all notes (1-127).")
     return parser.parse_args()
 
 
@@ -1205,7 +1252,14 @@ def main():
 
     try:
         stem_files = discover_audio_files(args.input_dir)
-        build_output(stem_files, args.output_midi, args.output_summary, args.profile, args.tempo_bpm)
+        build_output(stem_files,
+                     args.output_midi,
+                     args.output_summary,
+                     args.profile,
+                     args.tempo_bpm,
+                     args.tempo_source,
+                     args.raw_timing,
+                     args.fixed_velocity or 0)
     except Exception as exc:
         print(str(exc), file=sys.stderr)
         return 1
