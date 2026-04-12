@@ -79,13 +79,13 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_native_app.ps1 -Configu
 Portable ZIP:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_release.ps1 -ReleaseVersion v0.3.2
+powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_release.ps1 -ReleaseVersion v0.3.4
 ```
 
 Installer:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_installer.ps1 -ReleaseVersion v0.3.2
+powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_installer.ps1 -ReleaseVersion v0.3.4
 ```
 
 The release pipeline currently publishes Windows native builds only. The packaging output is a `Mutagen.exe` portable bundle plus a Windows installer.

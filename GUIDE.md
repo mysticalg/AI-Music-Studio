@@ -111,13 +111,13 @@ py -3.10 -m pip install demucs basic-pitch librosa pretty_midi soundfile numpy s
 Portable ZIP:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_release.ps1 -ReleaseVersion v0.3.2
+powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_release.ps1 -ReleaseVersion v0.3.4
 ```
 
 Installer:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_installer.ps1 -ReleaseVersion v0.3.2
+powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_installer.ps1 -ReleaseVersion v0.3.4
 ```
 
 ## Scope note
