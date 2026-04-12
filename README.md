@@ -1,6 +1,8 @@
-# Mutagen
+# Mutagen AI Music Studio
 
-Mutagen is a native C++ desktop music workstation built with JUCE. This repository is now centered on the standalone native app, the shared live VST engine, the bundled VST3 instrument set, and the static documentation site.
+Mutagen is a native C++ AI music workstation and desktop MIDI sequencer built with JUCE. It combines a piano roll editor, pattern-based arrangement, live VST3 hosting, bundled instruments, automation, sample workflows, and AI-assisted composition in a standalone desktop DAW-style app.
+
+This repository is centered on the standalone native app, the shared live VST engine, the bundled VST3 instrument set, and the static documentation site.
 
 The legacy Python/PySide shell, PyInstaller packaging path, and Python bridge helpers are no longer part of the supported workflow in this repo.
 
@@ -16,7 +18,27 @@ Guide: [GUIDE.md](GUIDE.md)
 - Pattern sequencer, piano roll, controller lane, mixer, automation, samples, transport, themes, and floating panels
 - Shared live plugin instances for playback and editor windows, so parameter moves apply directly during playback
 - Native AI compose/settings flow and on-disk activity or HTTP debug logs
+- Audio import to stem-split MIDI tracks through the native File menu when Demucs and the transcription backend are installed
 - Static GitHub Pages site in `docs/`
+
+## Why Mutagen
+
+- AI music studio workflow for sketching, arranging, and refining MIDI ideas on desktop
+- Native desktop DAW-style editor built with JUCE instead of a browser shell
+- Live VST3 host with shared playback and editor state for immediate sound design feedback
+- Built-in instrument collection including Virus Synth and additional bundled VST3 instruments
+- Windows release automation for downloadable builds, installers, and GitHub Pages docs
+
+## Screenshots
+
+![Mutagen AI Music Studio main window](docs/assets/screenshots/main-window.png)
+_Main Mutagen window with the desktop MIDI sequencer, track list, transport, and arrangement view._
+
+![Mutagen track panel and rack controls](docs/assets/screenshots/tracks-panel.png)
+_Track panel with mute, solo, VST3 visibility, rack assignment, and session control columns._
+
+![Virus Synth bundled VST3 instrument](docs/assets/screenshots/virus/virus-synth-overview.png)
+_Virus Synth, the flagship bundled VST3 instrument included with Mutagen AI Music Studio._
 
 ## Repository layout
 
@@ -124,6 +146,7 @@ AI request and response diagnostics are written to the native log folder, includ
 
 - The native runtime path now prefers direct shared-engine exports over the older JSON command path.
 - Remaining generic host-command usage is limited to offline helper surfaces, not normal playback or editor interaction.
+- `File -> Import Audio As MIDI...` depends on external Python packages. Install them with `py -3.10 -m pip install demucs basic-pitch librosa pretty_midi soundfile numpy scipy`.
 - Temporary debug screenshots and scratch directories are ignored through [.gitignore](.gitignore).
 
 For day-to-day workflow details, use the repo guide: [GUIDE.md](GUIDE.md).

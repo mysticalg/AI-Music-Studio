@@ -3,11 +3,46 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Mutagen</title>
+    <title>Mutagen AI Music Studio | Desktop MIDI Sequencer, VST3 Host & AI Music Workstation</title>
     <meta
       name="description"
-      content="Mutagen is a native C++ desktop music workstation with a sequencer, piano roll, shared live VST3 engine, bundled instruments, automation, samples, and AI-assisted composition."
+      content="Mutagen is a desktop AI music workstation with a MIDI sequencer, piano roll, VST3 host, bundled instruments, automation, samples, and AI-assisted composition for Windows."
     />
+    <link rel="canonical" href="https://mysticalg.github.io/AI-Music-Studio/" />
+    <meta name="robots" content="index, follow" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Mutagen AI Music Studio" />
+    <meta property="og:title" content="Mutagen AI Music Studio | Desktop MIDI Sequencer, VST3 Host & AI Music Workstation" />
+    <meta
+      property="og:description"
+      content="Create, arrange, and edit music in Mutagen with a desktop MIDI sequencer, live VST3 hosting, bundled instruments, and AI-assisted composition tools."
+    />
+    <meta property="og:url" content="https://mysticalg.github.io/AI-Music-Studio/" />
+    <meta property="og:image" content="https://mysticalg.github.io/AI-Music-Studio/assets/screenshots/main-window.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Mutagen AI Music Studio" />
+    <meta
+      name="twitter:description"
+      content="Desktop AI music workstation with MIDI sequencing, piano roll editing, VST3 hosting, bundled instruments, and Windows releases."
+    />
+    <meta name="twitter:image" content="https://mysticalg.github.io/AI-Music-Studio/assets/screenshots/main-window.png" />
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareApplication",
+        "name": "Mutagen AI Music Studio",
+        "applicationCategory": "MultimediaApplication",
+        "operatingSystem": "Windows",
+        "description": "Mutagen is a native desktop AI music workstation with a MIDI sequencer, piano roll, live VST3 host, bundled instruments, automation, samples, and AI-assisted composition tools.",
+        "url": "https://mysticalg.github.io/AI-Music-Studio/",
+        "downloadUrl": "https://github.com/mysticalg/AI-Music-Studio/releases",
+        "image": "https://mysticalg.github.io/AI-Music-Studio/assets/screenshots/main-window.png",
+        "author": {
+          "@type": "Organization",
+          "name": "Mysticalg"
+        }
+      }
+    </script>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
@@ -17,34 +52,34 @@
           <div class="hero-brand">
             <img class="hero-logo" src="assets/mutagen-logo.png" alt="Mutagen logo" />
             <div class="hero-brand-copy">
-              <p class="eyebrow">Native JUCE workstation</p>
-              <h1>Mutagen</h1>
+              <p class="eyebrow">Desktop AI music workstation</p>
+              <h1>Mutagen AI Music Studio</h1>
             </div>
           </div>
           <p class="lede">
-            A native C++ desktop music workstation with a pattern sequencer, dedicated piano roll,
-            shared live VST3 playback and editor instances, bundled instruments, samples, automation,
-            AI composition, and release-ready Windows packaging.
+            Mutagen is a native C++ music production app for MIDI-first workflows. It combines a desktop
+            sequencer, piano roll editor, live VST3 hosting, bundled synths and instruments, sample tools,
+            automation, and AI-assisted composition in a standalone Windows-ready workstation.
           </p>
           <div class="hero-actions">
             <a class="button button-primary" href="https://github.com/mysticalg/AI-Music-Studio/releases">Download latest release</a>
             <a class="button button-secondary" href="https://github.com/mysticalg/AI-Music-Studio">View source on GitHub</a>
-            <a class="button button-secondary" href="https://github.com/mysticalg/AI-Music-Studio/blob/main/GUIDE.md">Open workflow guide</a>
-            <a class="button button-secondary" href="virus-synth.html">Open Virus Synth manual</a>
+            <a class="button button-secondary" href="https://github.com/mysticalg/AI-Music-Studio/blob/main/GUIDE.md">Open help guide</a>
+            <a class="button button-secondary" href="virus-synth.html">Read Virus Synth manual</a>
           </div>
           <ul class="hero-points">
-            <li>Native app path only. The old Python shell is no longer the supported workflow.</li>
-            <li>Sequencer, piano roll, controller lane, mixer, automation, samples, themes, and floating windows.</li>
-            <li>Shared live engine so VST editor moves affect playback immediately.</li>
+            <li>Desktop AI music studio workflow with sequencer, piano roll, controller lanes, mixer, and arrangement tools.</li>
+            <li>Live VST3 engine with shared playback and editor state, so sound design changes hit the running session immediately.</li>
+            <li>Current supported path is the native app. The deprecated Python shell is no longer part of the shipping workflow.</li>
           </ul>
         </div>
         <div class="hero-card">
-          <div class="hero-card-title">Release flow</div>
+          <div class="hero-card-title">Why people use Mutagen</div>
           <ol>
-            <li>Push changes to <code>main</code></li>
-            <li>Create and push a <code>v*</code> tag</li>
-            <li>GitHub Actions builds the native Windows ZIP and installer</li>
-            <li>GitHub Pages republishes from <code>/docs</code></li>
+            <li>Sketch MIDI ideas fast with a pattern sequencer and piano roll.</li>
+            <li>Open bundled or third-party VST3 instruments in a live desktop workflow.</li>
+            <li>Use AI composition tools, automation, samples, and floating editors in one app.</li>
+            <li>Download Windows releases or build from source with JUCE-based native tooling.</li>
           </ol>
         </div>
       </header>
@@ -52,58 +87,91 @@
       <main>
         <section class="section">
           <div class="section-heading">
+            <p class="eyebrow">Features</p>
+            <h2>Built for desktop MIDI production and AI-assisted music workflows</h2>
+          </div>
+          <div class="note-grid">
+            <div class="note-card">
+              <h3>Desktop MIDI sequencer</h3>
+              <p>Arrange pattern clips, edit notes in the piano roll, and shape controller data in a dedicated desktop music production workflow.</p>
+            </div>
+            <div class="note-card">
+              <h3>Live VST3 host</h3>
+              <p>Run bundled and third-party VST3 instruments with shared playback and editor instances so parameter changes affect the live engine immediately.</p>
+            </div>
+            <div class="note-card">
+              <h3>AI music tools</h3>
+              <p>Use native AI composition features plus log inspection and HTTP diagnostics when tuning prompts or debugging music generation output.</p>
+            </div>
+            <div class="note-card">
+              <h3>Windows releases</h3>
+              <p>Download packaged Windows builds from GitHub Releases or build the JUCE desktop app locally from this repository.</p>
+            </div>
+            <div class="note-card">
+              <h3>Bundled instruments</h3>
+              <p>Start with the included VST3 instrument set, including Virus Synth and a growing bundled collection for synth, drum, and sampled sounds.</p>
+            </div>
+            <div class="note-card">
+              <h3>Native workflow</h3>
+              <p>Mutagen is now focused on the supported native app path rather than the earlier Python prototype, packaging shell, or bridge tooling.</p>
+            </div>
+          </div>
+        </section>
+
+        <section class="section">
+          <div class="section-heading">
             <p class="eyebrow">Screenshots</p>
-            <h2>What Mutagen looks like</h2>
+            <h2>Mutagen screenshots</h2>
           </div>
           <div class="shot-grid">
             <figure class="shot shot-wide">
-              <img src="assets/screenshots/main-window.png" alt="Mutagen main editor with compact transport, track table, and sequencer" />
-              <figcaption>Main editor with the compact header, rack-aware track list, sequencer lanes, and locator-driven arrangement view.</figcaption>
+              <img src="assets/screenshots/main-window.png" alt="Mutagen AI Music Studio desktop DAW main window with MIDI sequencer, track list, and arrangement editor" />
+              <figcaption>Main Mutagen AI Music Studio window showing the desktop sequencer, rack-aware track list, transport controls, and arrangement workspace for MIDI production.</figcaption>
             </figure>
             <figure class="shot">
-              <img src="assets/screenshots/tracks-panel.png" alt="Mutagen track table with mute, solo, VST, rack instrument, and track name columns" />
-              <figcaption>Track table with mute, solo, VST visibility, rack instrument assignment, and numbered track names in the current theme.</figcaption>
+              <img src="assets/screenshots/tracks-panel.png" alt="Mutagen track panel with mute, solo, VST3 controls, rack instrument selection, and track names" />
+              <figcaption>Track management panel with mute, solo, VST3 editor visibility, rack instrument assignment, and numbered tracks for fast session control.</figcaption>
             </figure>
             <figure class="shot">
-              <img src="assets/screenshots/transport-header.png" alt="Mutagen transport header with tempo, time signature, pattern size, and key quantize controls" />
-              <figcaption>Compact transport header with play, compose, loop, metro, tempo, time signature, pattern size, and key quantize controls always within reach.</figcaption>
+              <img src="assets/screenshots/transport-header.png" alt="Mutagen transport bar with tempo, time signature, pattern size, compose, loop, and quantize controls" />
+              <figcaption>Compact transport header with tempo, time signature, pattern size, compose, loop, metronome, and quantize settings for quick music workflow changes.</figcaption>
             </figure>
             <figure class="shot">
-              <img src="assets/screenshots/sequencer-view.png" alt="Mutagen sequencer lanes with pattern clips and transport locators" />
-              <figcaption>Sequencer lanes with pattern clips, bar grid, and draggable playback locators for fast arrangement edits.</figcaption>
+              <img src="assets/screenshots/sequencer-view.png" alt="Mutagen MIDI sequencer lanes with bar grid, track rows, and draggable playback locators" />
+              <figcaption>MIDI sequencer lanes with a bar grid, track rows, and draggable locators for setting playback ranges and arranging song structure.</figcaption>
             </figure>
           </div>
         </section>
 
         <section class="section">
           <div class="section-heading">
-            <p class="eyebrow">Guide</p>
-            <h2>Core workflow</h2>
+            <p class="eyebrow">Help</p>
+            <h2>Core Mutagen workflow</h2>
           </div>
           <div class="guide-grid">
             <article class="guide-card">
               <h3>1. Add or select a track</h3>
-              <p>Create an instrument or sample track, then assign a bundled or third-party VST3 when needed.</p>
+              <p>Create an instrument or sample track, then load a bundled or third-party VST3 plugin when you need a synth, sampler, or drum source.</p>
             </article>
             <article class="guide-card">
               <h3>2. Draw pattern clips</h3>
-              <p>Use the sequencer to draw pattern blocks at the current pattern size. Double-click a block to edit it in the piano roll.</p>
+              <p>Use the desktop sequencer to draw pattern blocks at the current pattern size, then open them directly in the piano roll for note editing.</p>
             </article>
             <article class="guide-card">
               <h3>3. Edit notes and controllers</h3>
-              <p>Use the piano roll for notes, and the always-visible lower pane for velocity, MIDI CC, or automation-style controller drawing.</p>
+              <p>Use the piano roll for notes and the lower pane for velocity, MIDI CC, and automation-style controller editing inside the same music workflow.</p>
             </article>
             <article class="guide-card">
               <h3>4. Open the live VST</h3>
-              <p>Use <strong>Edit VST</strong> or the track <strong>V</strong> toggle to open the live editor. Parameter moves apply straight to the running engine.</p>
+              <p>Use <strong>Edit VST</strong> or the track <strong>V</strong> toggle to open the live plugin editor. Parameter moves apply straight to the running engine.</p>
             </article>
             <article class="guide-card">
               <h3>5. Mix and arrange</h3>
-              <p>Use the mixer, locator handles, pattern tools, and floating windows to build the arrangement and balance the session.</p>
+              <p>Use the mixer, locator handles, pattern tools, and floating windows to arrange the song structure and balance the session.</p>
             </article>
             <article class="guide-card">
               <h3>6. Export and inspect logs</h3>
-              <p>Export stems or track renders, and use the activity log plus AI HTTP debug log when diagnosing model responses.</p>
+              <p>Export stems or track renders, then inspect the activity log and AI HTTP debug log when diagnosing AI-assisted composition output.</p>
             </article>
           </div>
         </section>
@@ -115,13 +183,13 @@
           </div>
           <div class="feature-split">
             <figure class="shot">
-              <img src="assets/screenshots/virus/virus-synth-overview.png" alt="Virus Synth editor overview" />
-              <figcaption>Virus Synth ships with a TI-style panel, LCD workflow, preview keyboard, and hardware-inspired modulation pages.</figcaption>
+              <img src="assets/screenshots/virus/virus-synth-overview.png" alt="Virus Synth bundled VST3 instrument in Mutagen with TI-style panel and LCD editor workflow" />
+              <figcaption>Virus Synth is Mutagen’s flagship bundled VST3 instrument, with a TI-style panel, LCD workflow, preview keyboard, and hardware-inspired modulation pages.</figcaption>
             </figure>
             <div class="feature-copy">
               <p>
                 Virus Synth is the most detailed bundled instrument in the rack. It includes shared oscillator controls,
-                modulation and matrix pages, dual filters, FX pages, a shift layer, and preset browsing through the LCD/OSD workflow.
+                modulation and matrix pages, dual filters, FX pages, a shift layer, and preset browsing through the LCD and OSD workflow.
               </p>
               <ul class="feature-list">
                 <li>LCD-based preset browsing and page navigation</li>
@@ -158,25 +226,25 @@ git push origin main --tags</code></pre>
 
         <section class="section">
           <div class="section-heading">
-            <p class="eyebrow">Notes</p>
-            <h2>Current packaging and compatibility</h2>
+            <p class="eyebrow">Compatibility</p>
+            <h2>Current packaging and platform notes</h2>
           </div>
           <div class="note-grid">
             <div class="note-card">
               <h3>Plugin support</h3>
-              <p>Mutagen targets <strong>VST3</strong> plugin hosting for the current native workflow.</p>
+              <p>Mutagen targets <strong>VST3</strong> plugin hosting for the supported native desktop workflow.</p>
             </div>
             <div class="note-card">
               <h3>Release target</h3>
-              <p>The automated release pipeline currently ships the native Windows build and installer.</p>
+              <p>The automated release pipeline currently ships the native Windows build and installer for desktop music production use.</p>
             </div>
             <div class="note-card">
               <h3>Bundled instruments</h3>
               <p>The portable package includes the bundled VST3 instrument set from the <code>plugins/AdvancedVSTi</code> submodule.</p>
             </div>
             <div class="note-card">
-              <h3>More docs</h3>
-              <p>For build steps, packaging notes, and workflow details, read the <a href="https://github.com/mysticalg/AI-Music-Studio/blob/main/README.md">README</a> and <a href="https://github.com/mysticalg/AI-Music-Studio/blob/main/GUIDE.md">guide</a>.</p>
+              <h3>Help and docs</h3>
+              <p>For build steps, packaging notes, workflow help, and release details, read the <a href="https://github.com/mysticalg/AI-Music-Studio/blob/main/README.md">README</a> and <a href="https://github.com/mysticalg/AI-Music-Studio/blob/main/GUIDE.md">help guide</a>.</p>
             </div>
           </div>
         </section>
